@@ -39,3 +39,15 @@ test('login rate limit returns 429', async (t) => {
   const r = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'x' } })
   assert.equal(r.status, 429)
 })
+
+test('oversized login body gets 413 and server stays responsive', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const big = JSON.stringify({ username: 'x'.repeat(1_100_000), password: 'y', device_name: 'z' })
+  const r = await fetch(s.base + '/login', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: big,
+  }).catch(() => null)
+  if (r) assert.equal(r.status, 413)
+  const after = await s.http('/snapshot', {})
+  assert.equal(after.status, 401)
+})

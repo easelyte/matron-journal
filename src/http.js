@@ -2,15 +2,29 @@ import { login, authToken } from './auth.js'
 import { snapshot, messagesBefore } from './journal.js'
 
 const json = (res, status, obj) => {
+  if (res.writableEnded || res.destroyed) return
   res.writeHead(status, { 'content-type': 'application/json' })
   res.end(JSON.stringify(obj))
 }
 
 const readBody = (req) => new Promise((resolve, reject) => {
   let data = ''
-  req.on('data', (c) => { data += c; if (data.length > 1e6) req.destroy() })
-  req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}) } catch (e) { reject(e) } })
-  req.on('error', reject)
+  let settled = false
+  const fail = (err) => { if (!settled) { settled = true; reject(err) } }
+  req.setEncoding('utf8')
+  req.on('data', (c) => {
+    data += c
+    if (data.length > 1e6) {
+      fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
+    }
+  })
+  req.on('end', () => {
+    if (settled) return
+    settled = true
+    try { resolve(data ? JSON.parse(data) : {}) } catch (e) { reject(e) }
+  })
+  req.on('close', () => fail(new Error('connection closed')))
+  req.on('error', fail)
 })
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
@@ -45,6 +59,7 @@ export function makeHttpHandler({ db, rateLimiter }) {
       }
       return json(res, 404, { error: 'not_found' })
     } catch (e) {
+      if (e.statusCode === 413) return json(res, 413, { error: 'too_large' })
       return json(res, 500, { error: 'internal', message: e.message })
     }
   }
