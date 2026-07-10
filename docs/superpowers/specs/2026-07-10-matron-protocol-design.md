@@ -163,7 +163,7 @@ Rules: push only for journal events in conversations the device isn't actively v
 
 - **Runtime:** Node 20+, `better-sqlite3` (synchronous, transactional, ideal for a single-writer journal), `ws`. Single process; systemd unit; Chef-deployable like the bridge.
 - **Why Node:** the bridge is Node — its battle-tested `prompt-detector`, `live-output`, `iv-uploads` logic ports into the agent/publisher module nearly as-is; the team already maintains Node services. At ~10 users / ~10 agents, performance headroom is orders of magnitude beyond need.
-- **Repos:** `Matronhq/matron-server` (this repo: server + admin CLI + protocol docs + conformance fixtures). Bridge changes land in `claude-matrix-bridge` (publisher module replacing/paralleling the Matrix output layer). Matron app repo gains the Swift protocol layer.
+- **Repos:** `Matronhq/matron-journal` (this repo: server + admin CLI + protocol docs + conformance fixtures; "matron-server" is taken by the tuwunel fork until it is decommissioned). Bridge changes land in `claude-matrix-bridge` (publisher module replacing/paralleling the Matrix output layer). Matron app repo gains the Swift protocol layer.
 
 ## 14. Effort estimate
 
