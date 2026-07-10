@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent } from '../src/auth.js'
 
@@ -52,7 +54,11 @@ export async function runAdmin(db, argv) {
   throw new Error(USAGE)
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+let isMain = false
+try {
+  isMain = !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+} catch { /* argv[1] missing or unresolvable: not the entrypoint */ }
+if (isMain) {
   const db = openDb(process.env.MATRON_DB || './matron.db')
   runAdmin(db, process.argv.slice(2))
     .then((out) => { console.log(out); db.close() })

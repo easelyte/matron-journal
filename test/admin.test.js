@@ -1,5 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { openDb } from '../src/db.js'
 import { authToken } from '../src/auth.js'
 import { runAdmin } from '../bin/matron-admin.js'
@@ -21,4 +25,21 @@ test('admin CLI: user add, agent add, status', async () => {
   assert.match(status, /dan devices=0 agents=1 head_seq=0/)
 
   await assert.rejects(runAdmin(db, ['bogus']), /usage/i)
+})
+
+test('CLI entrypoint works directly and via symlink (npx-style)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const env = { ...process.env, MATRON_DB: dbPath }
+  const real = path.resolve('bin/matron-admin.js')
+
+  const direct = execFileSync(process.execPath, [real, 'status'], { env }).toString()
+  assert.match(direct, /total events: 0/)
+
+  const link = path.join(dir, 'matron-admin-link.js')
+  fs.symlinkSync(real, link)
+  const viaLink = execFileSync(process.execPath, [link, 'status'], { env }).toString()
+  assert.match(viaLink, /total events: 0/)
+
+  fs.rmSync(dir, { recursive: true, force: true })
 })
