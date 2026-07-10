@@ -68,14 +68,17 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
           // tail is what guarantees no live event can slip through the gap between the
           // end of replay and live registration.
           hub.register(conn)
+          conn.registered = true
           return
         }
         handleOp({ db, hub, conn, msg })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
-        // process down.
-        if (!conn) {
+        // process down. Exceptions before registration (e.g. during replay) close the
+        // socket (clients resume from their cursor by design); after registration they
+        // send an error-frame and keep the connection.
+        if (!conn || !conn.registered) {
           ws.close()
         } else {
           ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'internal', ref: msg && msg.op }))
