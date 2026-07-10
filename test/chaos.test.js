@@ -19,13 +19,18 @@ function rng(seed) {
 test('client store converges despite random disconnects', { timeout: 60000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-chaos-'))
   const s = await startTestServer({ dbPath: path.join(dir, 'chaos.db') })
-  t.after(() => { s.close(); fs.rmSync(dir, { recursive: true, force: true }) })
+  t.after(async () => { await s.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   const dan = await createUser(s.db, 'dan', 'pw')
   const ag = createAgent(s.db, dan.id, 'chaos-agent')
   const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'chaos' } })
-  const rand = rng(1337)
-  const TOTAL = 300
+  // Two independent PRNGs, one per concurrent flow: publishAll and the reconnect loop
+  // race against each other, so a single shared generator would make draw order (and
+  // therefore reproducibility) depend on OS scheduling. Each flow's own draws are still
+  // deterministic in isolation; only the interleaving between flows is OS-scheduled.
+  const randPace = rng(1337)
+  const randKill = rng(7331)
+  const TOTAL = 1200 // > 2 replay batches (500 each) so multi-batch replay + its yield path run
   const CONVOS = ['s1', 's2', 's3']
 
   // agent: steady publish stream
@@ -34,11 +39,15 @@ test('client store converges despite random disconnects', { timeout: 60000 }, as
   for (const c of CONVOS) agent.send({ op: 'convo_upsert', convo_id: c, title: c })
   const publishAll = (async () => {
     for (let i = 0; i < TOTAL; i++) {
-      agent.send({
+      const frame = {
         op: 'publish', convo_id: CONVOS[i % 3], type: 'text',
         payload: { body: `msg-${i}` }, idem_key: `k${i}`,
-      })
-      if (rand() < 0.3) await new Promise((r) => setTimeout(r, 5))
+      }
+      agent.send(frame)
+      // Simulate an ack-timeout retry: re-send the IDENTICAL frame (same convo_id,
+      // idem_key, payload). The server's idem_key dedup must absorb it as a no-op.
+      if (randPace() < 0.15) agent.send(frame)
+      if (randPace() < 0.3) await new Promise((r) => setTimeout(r, 5))
     }
   })()
 
@@ -47,8 +56,9 @@ test('client store converges despite random disconnects', { timeout: 60000 }, as
   let cursor = 0
   // journal will hold exactly TOTAL events: convo_upsert without session_state appends nothing
   while (store.size < TOTAL) {
+    const helloCursor = cursor
     const c = await makeWsClient(s.base, { token: login.json.token, cursor })
-    const killAfter = 1 + Math.floor(rand() * 40)
+    const killAfter = 1 + Math.floor(randKill() * 40)
     try {
       await c.waitFor((f) => {
         for (const fr of c.journal()) {
@@ -59,11 +69,26 @@ test('client store converges despite random disconnects', { timeout: 60000 }, as
       }, 5000)
     } catch { /* quiet period - reconnect */ }
     c.ws.terminate() // simulate abrupt network death, not clean close
+
+    // Per-connection exactly-once: cross-connection re-delivery is legitimate (a client
+    // killed after frames arrived but before it drained them lags its cursor, and the
+    // next connection correctly re-receives them — at-least-once + client-side dedup by
+    // seq is the design). What must never happen is a duplicate or out-of-order seq
+    // WITHIN a single connection's delivery, relative to the cursor it said hello with.
+    const delivered = c.journal().map((f) => f.seq)
+    for (let i = 0; i < delivered.length; i++) {
+      assert.ok(delivered[i] > helloCursor, `seq ${delivered[i]} <= hello cursor ${helloCursor} (duplicate within connection)`)
+      if (i > 0) assert.ok(delivered[i] > delivered[i - 1], `non-ascending delivery: ${delivered[i - 1]} then ${delivered[i]}`)
+    }
   }
   await publishAll
 
   // convergence: local store must be an exact copy of the journal
   const rows = s.db.prepare('SELECT seq, type, payload FROM events WHERE user_id=? ORDER BY seq').all(dan.id)
+  // The journal must land at exactly TOTAL rows: convo_upsert without session_state
+  // appends nothing, and ~15% of publishes were retried with an identical idem_key,
+  // so this also proves the retries created no extra rows (idem dedupe held).
+  assert.equal(rows.length, TOTAL)
   assert.equal(store.size, rows.length)
   for (const r of rows) {
     const local = store.get(r.seq)
