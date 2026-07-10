@@ -110,3 +110,28 @@ test('send, prompt_reply, read_marker round-trip to a second device', async (t) 
   await mac.waitFor((x) => x.kind === 'control' && x.op === 'error' && x.code === 'forbidden')
   mac.close(); phone.close()
 })
+
+test('send type whitelist and ack validation', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: l.json.token, cursor: 0 })
+  await c.waitFor((f) => f.op === 'hello_ok')
+
+  c.send({ op: 'send', convo_id: 'c1', type: 'session_status', payload: { state: 'archived' } })
+  await c.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden' && f.ref === 'send')
+  assert.equal(s.db.prepare("SELECT session_state FROM conversations WHERE id='c1'").get().session_state, 'running')
+
+  c.send({ op: 'ack', cursor: -5 })
+  await c.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request')
+  c.send({ op: 'ack' })
+  await c.waitFor((f) => c.frames.filter((x) => x.code === 'bad_request').length >= 2)
+  assert.equal(s.db.prepare('SELECT cursor FROM devices WHERE id=?').get(l.json.device_id).cursor, 0)
+
+  c.send({ op: 'ack', cursor: 7 })
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(s.db.prepare('SELECT cursor FROM devices WHERE id=?').get(l.json.device_id).cursor, 7)
+  c.close()
+})

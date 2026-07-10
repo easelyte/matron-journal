@@ -7,6 +7,8 @@ const journalFrame = (e) => ({
   sender: e.sender, type: e.type, payload: e.payload,
 })
 
+const CLIENT_SEND_TYPES = new Set(['text'])
+
 export function attachWs({ server, db, hub, pingMs = 20000 }) {
   const wss = new WebSocketServer({ server, path: '/ws' })
   const interval = setInterval(() => {
@@ -112,13 +114,16 @@ export function handleOp({ db, hub, conn, msg }) {
         conn.viewingConvoId = msg.convo_id ?? null
         break
       case 'ack':
+        if (!Number.isInteger(msg.cursor) || msg.cursor < 0) return fail('bad_request')
         db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(msg.cursor, conn.deviceId)
         break
       case 'send': {
         if (conn.kind !== 'client') return fail('forbidden')
+        const type = msg.type || 'text'
+        if (!CLIENT_SEND_TYPES.has(type)) return fail('forbidden')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
-          sender: `user:${conn.username}`, type: msg.type || 'text',
+          sender: `user:${conn.username}`, type,
           payload: msg.payload,
           idemKey: msg.local_id ? `client:${conn.deviceId}:${msg.local_id}` : null,
         })
