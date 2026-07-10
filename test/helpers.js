@@ -1,8 +1,8 @@
 import WebSocket from 'ws'
 import { startServer } from '../src/server.js'
 
-export async function startTestServer() {
-  const s = await startServer({ dbPath: ':memory:', port: 0 })
+export async function startTestServer(opts = {}) {
+  const s = await startServer({ dbPath: ':memory:', port: 0, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,
