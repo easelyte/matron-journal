@@ -51,3 +51,28 @@ test('oversized login body gets 413 and server stays responsive', async (t) => {
   const after = await s.http('/snapshot', {})
   assert.equal(after.status, 401)
 })
+
+test('server stops consuming an oversized streaming body', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const { request } = await import('node:http')
+  const bytesWritten = await new Promise((resolve) => {
+    const req = request(s.base + '/login', { method: 'POST', headers: { 'content-type': 'application/json' } })
+    let written = 0
+    let done = false
+    const finish = () => { if (!done) { done = true; resolve(written) } }
+    const chunk = 'x'.repeat(65536)
+    req.on('error', finish)
+    req.on('response', (res) => { res.resume(); res.on('end', () => setTimeout(finish, 100)) })
+    setTimeout(finish, 4000)
+    const pump = () => {
+      while (written < 32e6 && !done) {
+        written += chunk.length
+        if (!req.write(chunk)) { req.once('drain', pump); return }
+      }
+      if (!done) req.end()
+    }
+    pump()
+  })
+  assert.ok(bytesWritten < 16e6, `client managed to write ${bytesWritten} bytes — server still consuming`)
+})

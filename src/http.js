@@ -15,6 +15,8 @@ const readBody = (req) => new Promise((resolve, reject) => {
   req.on('data', (c) => {
     data += c
     if (data.length > 1e6) {
+      req.removeAllListeners('data')
+      req.pause()
       fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
     }
   })
@@ -59,7 +61,15 @@ export function makeHttpHandler({ db, rateLimiter }) {
       }
       return json(res, 404, { error: 'not_found' })
     } catch (e) {
-      if (e.statusCode === 413) return json(res, 413, { error: 'too_large' })
+      if (e.statusCode === 413) {
+        // The request body was left partially unconsumed (readBody stopped
+        // draining it once the size cap tripped), so this socket cannot be
+        // safely reused for a subsequent keep-alive request — leftover body
+        // bytes would desync the next request's parse, and Node will not
+        // otherwise destroy the socket, leaking it indefinitely. Force close.
+        res.setHeader('Connection', 'close')
+        return json(res, 413, { error: 'too_large' })
+      }
       return json(res, 500, { error: 'internal', message: e.message })
     }
   }
