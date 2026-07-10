@@ -165,6 +165,7 @@ export function handleOp({ db, hub, conn, msg }) {
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.type !== 'string' || !msg.type || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -183,6 +184,7 @@ export function handleOp({ db, hub, conn, msg }) {
       }
       case 'finalize': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type || 'text', payload: msg.payload,
