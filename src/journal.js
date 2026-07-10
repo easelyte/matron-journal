@@ -35,7 +35,7 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
     if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
     if (idemKey) {
-      const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+      const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND convo_id=? AND idem_key=?').get(userId, convoId, idemKey)
       if (dup) return { seq: dup.seq, ts: dup.ts, duplicate: true }
     }
     const seq = nextSeq(db, userId)

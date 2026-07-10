@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS events(
 );
 CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
-  ON events(user_id, idem_key) WHERE idem_key IS NOT NULL;
+  ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL

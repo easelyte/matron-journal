@@ -40,6 +40,19 @@ test('idempotency key dedupes', async () => {
   assert.equal(again.seq, first.seq)
   assert.equal(again.duplicate, true)
   assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 1)
+  const c1 = db.prepare("SELECT last_seq, unread_count FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.last_seq, first.seq)
+  assert.equal(c1.unread_count, 1)
+})
+
+test('same idemKey in different conversations inserts both', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'c2', ownerUserId: dan.id })
+  const a = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'one' }, idemKey: 'fin:m1' })
+  const b = append(db, { userId: dan.id, convoId: 'c2', sender: 'agent:a', type: 'text', payload: { body: 'two' }, idemKey: 'fin:m1' })
+  assert.equal(b.duplicate, false)
+  assert.notEqual(a.seq, b.seq)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 2)
 })
 
 test('append to unowned convo throws', async () => {
