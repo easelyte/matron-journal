@@ -131,6 +131,53 @@ test('convo_meta and non-done session_status never push at all (no alert, no bac
   assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
 })
 
+test('a client "send" (sender user:*) never triggers an alert push, not even to the user\'s OTHER devices', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const originDeviceId = registerDevice(db, dan.id, 'origin-phone')
+  const otherDeviceId = registerDevice(db, dan.id, 'other-laptop')
+
+  // A user's own words/actions must not ring ANY of their devices — origin
+  // exclusion alone isn't enough here (that only covers the SAME device);
+  // classify() must return null for a `user:*` sender outright. (T2)
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: 'my own message' } })
+  pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:dan', type: 'text', payload: { body: 'my own message' } }, originDeviceId)
+  // Long enough for both an immediate AND a would-be trailing coalesced push.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'a user\'s own message must not alert-push any of their devices')
+
+  // ...and it must not have claimed the coalescing slot either: a real
+  // (agent-sourced) routine event right after still gets its leading push —
+  // to BOTH registered devices (two devices, two independent coalescing
+  // slots keyed by device id).
+  const r2 = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'actual content' } })
+  pipeline.onAppend(dan.id, { seq: r2.seq, convo_id: 'c1', ts: r2.ts, sender: 'agent:a', type: 'text', payload: { body: 'actual content' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 2)
+  assert.ok(stub.calls.every((c) => c.payload.aps.alert.body === 'actual content'))
+  assert.deepEqual(stub.calls.map((c) => c.deviceToken).sort(), ['origin-phone-token', 'other-laptop-token'].sort())
+  void otherDeviceId
+})
+
+test('origin-device exclusion applies to every push type, not just read_marker (defensive: a push recipient device that is also the event\'s origin is skipped)', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t)
+  const originDeviceId = registerDevice(db, dan.id, 'origin-phone')
+  const otherDeviceId = registerDevice(db, dan.id, 'other-laptop')
+
+  // Hand-crafted: an alert-classified, agent-sourced event (so it's not
+  // suppressed by the user:* rule) whose originDeviceId happens to be a
+  // registered client push device. In practice today only read_marker's own
+  // device is ever also a push recipient, but the exclusion must hold
+  // uniformly for every push type — not asymmetrically special-cased to
+  // read_marker alone.
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: '?' } })
+  pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: '?' } }, originDeviceId)
+  await new Promise((res) => setImmediate(res))
+
+  assert.equal(stub.calls.length, 1, 'only the non-origin device should be pushed to')
+  assert.equal(stub.calls[0].deviceToken, 'other-laptop-token')
+  void otherDeviceId
+})
+
 test('alert body: title falls back to convo id, body is the event snippet, badge is the owner unread sum', async (t) => {
   const db = openDb(':memory:')
   const hub = makeHub()
@@ -275,6 +322,36 @@ test('coalescing state is evicted once a (device, convo) pair goes idle', async 
   await new Promise((res) => setTimeout(res, 10))
   assert.equal(stub.calls.length, 2)
   assert.equal(stub.calls[1].payload.aps.alert.body, 'after idle')
+})
+
+test('coalesced/deferred pushes compute the badge at SEND time, not at the time the push was scheduled (avoids a stale badge)', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 60 })
+  registerDevice(db, dan.id, 'phone')
+
+  const send = (body) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+    return r
+  }
+
+  send('first') // idle -> leading send, badge should be 1 (one unread event so far)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.badge, 1)
+
+  send('second') // within window -> held as the pending trailing build (badge was 2 at this point)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1, 'still just the leading send so far')
+
+  // More unread activity arrives BEFORE the trailing push actually fires.
+  // The trailing push (built back when the badge was 2) must report the
+  // CURRENT badge (3) at the moment it is transmitted, not the value that
+  // was true when it was scheduled/built.
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'third, arrives before trailing fires' } })
+
+  await new Promise((res) => setTimeout(res, 90)) // let the trailing timer fire
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].payload.aps.badge, 3, 'trailing push must report the badge as of send time, not schedule/build time')
 })
 
 test('read_marker triggers a background badge-clearing push to other devices, never back to the originating device', async (t) => {
@@ -425,4 +502,27 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
   assert.equal(phoneBackground.length, 0, 'the originating device must never get a push about its own read_marker')
 
   agent.close(); phone.close()
+})
+
+test('end-to-end wiring: a client "send" (own message, sender user:*) never triggers an alert push to any of the user\'s registered devices', async (t) => {
+  const stub = makeStubApnsClient()
+  const s = await startTestServer({ apnsClient: stub })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'wire-2', ownerUserId: dan.id })
+
+  const login1 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  await s.http('/push/register', { method: 'POST', token: login1.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
+  const login2 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'laptop' } })
+  await s.http('/push/register', { method: 'POST', token: login2.json.token, body: { apns_token: 'laptop-token', environment: 'prod' } })
+
+  const phone = await makeWsClient(s.base, { token: login1.json.token, cursor: null })
+  await phone.waitFor((f) => f.op === 'hello_ok')
+  phone.send({ op: 'send', convo_id: 'wire-2', payload: { body: 'hello from myself' } })
+  await phone.waitFor((f) => f.kind === 'journal' && f.type === 'text')
+  await new Promise((res) => setTimeout(res, 60))
+
+  const alerts = stub.calls.filter((c) => c.payload.aps.alert)
+  assert.equal(alerts.length, 0, 'a user\'s own "send" must not alert-push any device, including their own other ones')
+  phone.close()
 })

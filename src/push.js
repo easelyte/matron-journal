@@ -10,7 +10,17 @@ const ROUTINE_COALESCE_MS = 10000
 // connected device learns them from the journal frame, and nothing about
 // them warrants buzzing a pocket. prompt/permission_request already cover
 // "the session needs you", and the 'done' alert stays.
-function classify(type, payload) {
+function classify(type, payload, sender) {
+  // A user's own words/actions (sender `user:*`) must never trigger an
+  // alert push, to ANY of that user's devices — not just the originating
+  // one (that's origin-device exclusion, a separate, narrower rule below).
+  // Mirrors the unread predicate (journal.js append()/markRead(): a
+  // `user:*` sender never counts as unread either) — your own message must
+  // not ring your other phone, same as it doesn't inflate your own unread
+  // badge. (T2). read_marker is handled entirely separately (its own
+  // background-push branch in onAppend, never reaches classify()) and keeps
+  // its existing behavior regardless of sender.
+  if (typeof sender === 'string' && sender.startsWith('user:')) return null
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false }
   if (type === 'session_status') {
     return payload && payload.state === 'done' ? { priority: 10, coalesce: false } : null
@@ -57,14 +67,23 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
   }
 
-  function doSend(device, opts) {
+  function doSend(device, userId, opts) {
+    // Badge must reflect unread state as of the moment we actually transmit,
+    // not whenever the push was built/scheduled — a coalesced or trailing
+    // push can sit queued for up to `coalesceMs`, during which more events
+    // can arrive (or the user can read elsewhere), making a badge captured
+    // at build time stale by the time it's sent. Recomputed fresh on every
+    // send, here, rather than once up in onAppend and closed over by the
+    // opts builders.
+    const badge = unreadBadge(db, userId)
+    const opts2 = { ...opts, payload: { ...opts.payload, aps: { ...opts.payload.aps, badge } } }
     // Fire and forget from the caller's perspective: apnsClient.send() is
     // documented to never reject, but the .catch() (and the sync try/catch —
     // doSend is also called from timer callbacks, where an escaped throw
     // would crash the process) are backstops so a bug there can never leak
     // an unhandled rejection or exception out of the push pipeline.
     try {
-      Promise.resolve(apnsClient.send({ deviceToken: device.apns_token, env: device.apns_env, ...opts }))
+      Promise.resolve(apnsClient.send({ deviceToken: device.apns_token, env: device.apns_env, ...opts2 }))
         .then((result) => handleResult(device, result))
         .catch((err) => {
           counters.failed += 1
@@ -85,7 +104,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // elapses. Invariant: an entry exists in coalesceState iff its window
   // timer is armed — a timer that fires with nothing pending evicts the
   // entry, so the map never grows unboundedly across (device, convo) pairs.
-  function scheduleRoutine(device, convoId, buildOpts) {
+  function scheduleRoutine(device, userId, convoId, buildOpts) {
     const key = `${device.id}:${convoId}`
     const state = coalesceState.get(key)
     if (state) {
@@ -94,17 +113,17 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
     const fresh = { timer: null, pendingBuild: null }
     coalesceState.set(key, fresh)
-    doSend(device, buildOpts()) // idle: leading send
-    armWindow(key, fresh, device)
+    doSend(device, userId, buildOpts()) // idle: leading send
+    armWindow(key, fresh, device, userId)
   }
 
-  function armWindow(key, state, device) {
+  function armWindow(key, state, device, userId) {
     state.timer = setTimeout(() => {
       const build = state.pendingBuild
       state.pendingBuild = null
       if (build) {
-        doSend(device, build()) // trailing push, then a fresh window
-        armWindow(key, state, device)
+        doSend(device, userId, build()) // trailing push, then a fresh window
+        armWindow(key, state, device, userId)
       } else {
         coalesceState.delete(key) // idle window: evict
       }
@@ -121,14 +140,16 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // kind='client' only — agent devices are never pushed to.
     const devices = clientDevicesForPush(db, userId)
     if (devices.length === 0) return
-    const badge = unreadBadge(db, userId)
+    // Badge is no longer captured here — doSend recomputes it fresh at
+    // actual send time (see doSend), so a coalesced/deferred push never
+    // reports a stale value.
 
     if (event.type === 'read_marker') {
       for (const device of devices) {
         if (device.id === originDeviceId) continue // never push a device its own read_marker
         if (!device.apns_env) continue
-        doSend(device, {
-          payload: { aps: { 'content-available': 1, badge } },
+        doSend(device, userId, {
+          payload: { aps: { 'content-available': 1 } },
           priority: 5,
           pushType: 'background',
         })
@@ -136,24 +157,32 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       return
     }
 
-    const cls = classify(event.type, event.payload)
-    if (!cls) return // journal-sync-only type (convo_meta, non-done session_status)
+    const cls = classify(event.type, event.payload, event.sender)
+    if (!cls) return // journal-sync-only type (convo_meta, non-done session_status), or a user's own event (T2)
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
     for (const device of devices) {
+      // Origin-device exclusion, uniformly for every push type (not just
+      // read_marker above): a device must never be pushed about an event it
+      // itself originated. In practice today this only ever fires for
+      // read_marker (agent-originated alert types never coincide with a
+      // client push device; user:*-sourced alert types are already filtered
+      // out by classify() above) — kept here anyway so the rule holds
+      // uniformly rather than being asymmetrically special-cased.
+      if (device.id === originDeviceId) continue
       if (!device.apns_env) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({
-        payload: { aps: { alert: { title, body }, badge, 'thread-id': event.convo_id } },
+        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id } },
         priority: cls.priority,
         pushType: 'alert',
         collapseId: event.convo_id,
       })
       if (cls.coalesce) {
-        scheduleRoutine(device, event.convo_id, buildOpts)
+        scheduleRoutine(device, userId, event.convo_id, buildOpts)
       } else {
-        doSend(device, buildOpts())
+        doSend(device, userId, buildOpts())
       }
     }
   }
