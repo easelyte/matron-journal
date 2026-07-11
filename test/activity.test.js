@@ -128,6 +128,39 @@ test('activity detail is truncated at 200 chars, not rejected', async (t) => {
   agent.close(); client.close()
 })
 
+test('non-string activity detail (number/object) does not crash; frame arrives with detail omitted', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-act-nonstr' })
+  await new Promise((r) => setTimeout(r, 20))
+  client.send({ op: 'viewing', convo_id: 'sess-act-nonstr' })
+  await new Promise((r) => setTimeout(r, 50))
+
+  // Sent one at a time (awaiting delivery between them) — the hub coalesces
+  // activity frames of one convo under a single key, so two rapid sends
+  // would collapse to the latest and the first assertion would race.
+  agent.send({ op: 'activity', convo_id: 'sess-act-nonstr', state: 'thinking', detail: 42 })
+  const numFrame = await client.waitFor((f) => f.kind === 'ephemeral' && f.activity && f.activity.state === 'thinking')
+  assert.equal('detail' in numFrame.activity, false)
+
+  agent.send({ op: 'activity', convo_id: 'sess-act-nonstr', state: 'tool', detail: { nested: 'object' } })
+  const objFrame = await client.waitFor((f) => f.kind === 'ephemeral' && f.activity && f.activity.state === 'tool')
+  assert.equal('detail' in objFrame.activity, false)
+
+  // no error frames, connection intact — a non-string detail is dropped, never fatal
+  assert.equal(agent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
+  assert.equal(agent.ws.readyState, 1)
+  agent.close(); client.close()
+})
+
 test('activity never touches the journal or the push pipeline', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

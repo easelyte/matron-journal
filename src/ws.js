@@ -361,6 +361,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
       }
       case 'stream': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // TODO(grants): add an ownership check (authorize(), as `activity` does) when grants/sharing lands — inert today only because sendEphemeral is scoped to the agent's own user.
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,
