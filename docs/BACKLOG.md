@@ -21,6 +21,15 @@ trusted first-party code, iPhones on the public internet.
   is due (no locking; worst case one orphaned blob file).
 - Boot-time offload runs synchronously in the listen callback — fine while
   the journal is young; revisit if the first big offload wave slows boot.
+- `stream` has no convo ownership check (unlike `activity`, which calls
+  `authorize()`): inert today because `hub.sendEphemeral` is scoped to the
+  agent's own user and there is no grants table, but it must land together
+  with the future grants/sharing work (see the TODO on the `stream` case in
+  ws.js).
+- The `viewing` op accepts agent connections too, so an agent can
+  self-subscribe to its user's ephemeral frames (stream/activity). Harmless
+  today (agents are trusted first-party code seeing only their own user's
+  data); tighten alongside grants.
 
 ## Deferred by design (revisit with the Matron Swift client)
 

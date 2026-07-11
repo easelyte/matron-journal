@@ -64,10 +64,11 @@ and last-seen time.
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
   Client ops: send, prompt_reply, read_marker, ack, viewing.
-  Agent ops: convo_upsert, publish, stream (ephemeral), finalize. `read_marker`
-  is available to both kinds: an agent (bridge) connection may advance its
-  user's read marker too — e.g. after mirroring the user's own message into
-  the journal, so that mirrored round-trip doesn't inflate the unread badge.
+  Agent ops: convo_upsert, publish, stream (ephemeral), finalize, activity
+  (ephemeral). `read_marker` is available to both kinds: an agent (bridge)
+  connection may advance its user's read marker too — e.g. after mirroring
+  the user's own message into the journal, so that mirrored round-trip
+  doesn't inflate the unread badge.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
@@ -92,6 +93,14 @@ and last-seen time.
   `finalize`'s internally composed `fin:<ref>` keys) with
   `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
   reserved'}`; nothing is appended.
+- Agent `activity {convo_id, state, detail?}` broadcasts a typing/tool-use
+  indicator: `state` must be one of `thinking`/`tool`/`idle` (else
+  `bad_request`); `detail` is an optional string, truncated (not rejected) at
+  200 chars. Same ownership rule as every other agent write (missing/not-owned
+  convo → `forbidden`). Delivered as `{kind:'ephemeral', convo_id,
+  activity:{state, detail}}` only to the owning user's client connections
+  currently `viewing` that conversation, via the same hub fan-out `stream`
+  uses — never written to the journal (no seq, no unread/push effects).
 - `POST /push/register` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`

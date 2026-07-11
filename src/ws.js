@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws'
-import { authToken } from './auth.js'
+import { authToken, authorize } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -16,6 +16,11 @@ const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit',
 ])
+
+// activity op (typing/tool-use indicators, spec §6 ephemeral): the only
+// states a bridge may broadcast. Anything else is bad_request.
+const ACTIVITY_STATES = new Set(['thinking', 'tool', 'idle'])
+const ACTIVITY_DETAIL_MAX_CHARS = 200
 
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
@@ -356,9 +361,26 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
       }
       case 'stream': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // TODO(grants): add an ownership check (authorize(), as `activity` does) when grants/sharing lands — inert today only because sendEphemeral is scoped to the agent's own user.
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,
+        })
+        break
+      }
+      case 'activity': {
+        // Same ownership stance as every other agent write path (append/
+        // markRead/upsertConversation): missing or not-owned fails closed as
+        // forbidden. Unlike those, this never touches the journal — it's
+        // purely a hub.sendEphemeral fan-out, same delivery path as stream
+        // (viewing-scoped, coalesced, never throws on a dead/slow socket).
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
+        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
+        hub.sendEphemeral(conn.userId, msg.convo_id, {
+          kind: 'ephemeral', convo_id: msg.convo_id,
+          activity: { state: msg.state, detail },
         })
         break
       }
