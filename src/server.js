@@ -11,10 +11,29 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload } from './retention.js'
 
-const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
-const DEFAULT_MAX_REPLAY = 50000
+export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
+
+// Shared validator for small numeric env knobs that guard a size/gap check
+// (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
+// expected "use the default" case (no warning). But an unparseable or
+// non-positive value must never silently become NaN and disable the check
+// it guards — `x > NaN` is always false, so e.g. a garbage
+// MATRON_MEDIA_MAX_BYTES would make the upload size cap accept anything,
+// and a garbage MATRON_MAX_REPLAY would make the snapshot_required valve
+// never fire. Fails closed to `defaultValue` instead, with one warn log
+// naming the var, so a misconfiguration is loud rather than invisible.
+export function resolveNumericEnv(name, raw, defaultValue) {
+  if (raw === undefined) return defaultValue
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n <= 0) {
+    console.warn(`${name}=${JSON.stringify(raw)} is invalid (must be a positive integer) — using default ${defaultValue}`)
+    return defaultValue
+  }
+  return n
+}
 
 // `override` is startServer's `retentionDays` opt — when given, it takes
 // precedence over the env var (this is how tests disable/shrink the window
@@ -87,8 +106,8 @@ export function startServer({
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
-  const resolvedMediaMaxBytes = mediaMaxBytes ?? (process.env.MATRON_MEDIA_MAX_BYTES ? Number(process.env.MATRON_MEDIA_MAX_BYTES) : DEFAULT_MEDIA_MAX_BYTES)
-  const resolvedMaxReplay = maxReplay ?? (process.env.MATRON_MAX_REPLAY ? Number(process.env.MATRON_MAX_REPLAY) : DEFAULT_MAX_REPLAY)
+  const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
+  const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
