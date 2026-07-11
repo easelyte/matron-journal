@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs'
+import fs, { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent } from '../src/auth.js'
@@ -51,16 +51,33 @@ export async function runAdmin(db, argv) {
     return `offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`
   }
   if (a === 'status') {
+    // DB-derived stats only (this reads the SQLite file directly, no
+    // running server involved) — connected-socket count and APNs counters
+    // live in server-process memory and are only available via the running
+    // server's GET /metrics, not here.
     const rows = db.prepare(
-      `SELECT u.name,
+      `SELECT u.id, u.name,
          (SELECT COUNT(*) FROM devices d WHERE d.user_id=u.id AND d.kind='client') AS devices,
          (SELECT COUNT(*) FROM devices d WHERE d.user_id=u.id AND d.kind='agent') AS agents,
          COALESCE((SELECT seq FROM user_seq s WHERE s.user_id=u.id), 0) AS head_seq
        FROM users u ORDER BY u.name`
     ).all()
+    const lines = []
+    for (const r of rows) {
+      lines.push(`${r.name} devices=${r.devices} agents=${r.agents} head_seq=${r.head_seq}`)
+      const devices = db.prepare('SELECT id, kind, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(r.id)
+      for (const d of devices) {
+        lines.push(`  device ${d.id} kind=${d.kind} cursor=${d.cursor} lag=${r.head_seq - d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`)
+      }
+    }
     const total = db.prepare('SELECT COUNT(*) n FROM events').get().n
-    return rows.map((r) => `${r.name} devices=${r.devices} agents=${r.agents} head_seq=${r.head_seq}`)
-      .concat(`total events: ${total}`).join('\n')
+    lines.push(`total events: ${total}`)
+    let dbSize = 'n/a'
+    try {
+      if (db.name && db.name !== ':memory:') dbSize = fs.statSync(db.name).size
+    } catch { /* file missing/unreadable — report n/a rather than crash the CLI */ }
+    lines.push(`db file size: ${dbSize}`)
+    return lines.join('\n')
   }
   throw new Error(USAGE)
 }

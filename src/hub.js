@@ -14,6 +14,14 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     connsOf(userId) {
       return [...(byUser.get(userId) || [])]
     },
+    // Global connected-socket count across every user — a /metrics-only
+    // aggregate (no per-user scoping concern: it's just a number, not
+    // anyone's identity).
+    totalConnections() {
+      let n = 0
+      for (const set of byUser.values()) n += set.size
+      return n
+    },
     // Per-device "is this device connected AND looking at this convo right
     // now" — the push pipeline's suppression rule. conn.deviceId is already
     // carried on every registered connection (see ws.js hello handling).

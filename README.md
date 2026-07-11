@@ -72,6 +72,19 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
   missing/non-string `apns_token` (unless it's `null`).
+- `GET /metrics` (Bearer, any valid device — client or agent, no admin
+  concept in v1) -> JSON: `{user: {head_seq, devices: [{device_id, kind,
+  cursor, lag, last_seen_at}]}, sockets_connected, journal_row_count,
+  db_file_size_bytes, push: {sent, failed, pruned, by_reason}}`. The `user`
+  section is scoped to the caller's own user only — never another user's
+  devices or username; the rest are global aggregates (bare numbers/
+  counters, safe for any authenticated caller). `push` mirrors the push
+  pipeline's in-memory counters (all zero when push is disabled).
+  `matron-admin status` prints the DB-derived subset of the same numbers
+  (per-user head seq, per-device kind/cursor/lag/last_seen_at, total events,
+  DB file size) directly from the SQLite file — connected-socket count and
+  APNs counters only exist in a running server's memory, so those are
+  `/metrics`-only.
 
 ## Push notifications (APNs)
 

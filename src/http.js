@@ -3,6 +3,7 @@ import { login, authToken } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration } from './db.js'
 import { receiveBlob } from './media.js'
+import { buildMetrics } from './metrics.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -52,7 +53,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -79,6 +80,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (!who) return json(res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         return json(res, 200, snapshot(db, who.userId))
+      }
+      if (req.method === 'GET' && url.pathname === '/metrics') {
+        // Any valid device (client or agent) — no admin-only concept in v1.
+        // Scoping (no cross-user leakage) is enforced inside buildMetrics.
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box

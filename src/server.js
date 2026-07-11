@@ -83,12 +83,13 @@ export function startServer({
   const loginGuard = makeLoginGuard()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? (process.env.MATRON_MEDIA_MAX_BYTES ? Number(process.env.MATRON_MEDIA_MAX_BYTES) : DEFAULT_MEDIA_MAX_BYTES)
-  const server = http.createServer(makeHttpHandler({
-    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
-  }))
   const hub = makeHub()
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  const server = http.createServer(makeHttpHandler({
+    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    hub, pushPipeline, dbPath: resolvedDbPath,
+  }))
   const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes })
   let retentionInterval = null
   return new Promise((resolve) => {

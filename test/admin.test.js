@@ -55,6 +55,26 @@ test('admin CLI: offload runs runOffload with --days (default 30), second run no
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('admin CLI: status prints per-device kind/cursor/lag/last_seen_at and db file size (DB-derived only, no socket/APNs counters)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-status-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  const login = await import('../src/auth.js').then((m) => m.login(db, { username: 'dan', password: 'pw', deviceName: 'mac' }))
+  db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(0, login.deviceId)
+
+  const status = await runAdmin(db, ['status'])
+  assert.match(status, /dan devices=1 agents=0 head_seq=1/)
+  assert.match(status, new RegExp(`device ${login.deviceId} kind=client cursor=0 lag=1 last_seen_at=`))
+  assert.match(status, /total events: 1/)
+  assert.match(status, /db file size: \d+/)
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-'))
   const dbPath = path.join(dir, 'cli.db')
