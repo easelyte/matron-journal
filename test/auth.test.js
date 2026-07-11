@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import argon2 from 'argon2'
 import { openDb } from '../src/db.js'
 import {
   createUser, login, createAgent, authToken, revokeDevice,
@@ -78,6 +79,22 @@ test('login guard lockout caps at capMs and success resets the count', () => {
   assert.ok(locked.retryAfterMs <= 40, `lockout ${locked.retryAfterMs}ms exceeds cap`)
   g.ok('dan') // successful login clears failures and any lock
   assert.equal(g.check('dan').allowed, true)
+})
+
+test('login closes the user-enumeration timing oracle: an unknown username still runs one argon2.verify', async (t) => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'hunter22')
+  const verifySpy = t.mock.method(argon2, 'verify')
+
+  assert.equal(await login(db, { username: 'dan', password: 'wrong', deviceName: 'x' }), null)
+  assert.equal(await login(db, { username: 'ghost', password: 'wrong', deviceName: 'x' }), null)
+  // One argon2.verify per attempt — the unknown user is not fast-pathed
+  // (previously it returned null before ever hashing, a measurable timing
+  // difference an attacker could use to enumerate valid usernames).
+  assert.equal(verifySpy.mock.callCount(), 2)
+
+  // A correct password for a known user still authenticates normally.
+  assert.notEqual(await login(db, { username: 'dan', password: 'hunter22', deviceName: 'x' }), null)
 })
 
 test('rate limiter window actually expires', async () => {

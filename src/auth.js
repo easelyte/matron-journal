@@ -26,9 +26,24 @@ function issueDevice(db, userId, kind, name) {
   return { token, deviceId: r.lastInsertRowid }
 }
 
+// Precomputed once, lazily, and reused for every unknown-username login
+// attempt (see login() below) — never recomputed per request.
+let dummyHashPromise = null
+function getDummyHash() {
+  if (!dummyHashPromise) dummyHashPromise = argon2.hash(crypto.randomBytes(32).toString('hex'), { type: argon2.argon2id })
+  return dummyHashPromise
+}
+
 export async function login(db, { username, password, deviceName }) {
   const user = db.prepare('SELECT id, password_hash FROM users WHERE name=?').get(username)
-  if (!user) return null
+  if (!user) {
+    // No user-enumeration timing oracle: verify against a fixed dummy hash
+    // so "no such user" takes the same wall-clock time (one argon2.verify)
+    // as "wrong password for a real user", instead of returning near-
+    // instantly for unknown usernames.
+    await argon2.verify(await getDummyHash(), password)
+    return null
+  }
   if (!(await argon2.verify(user.password_hash, password))) return null
   const d = issueDevice(db, user.id, 'client', deviceName || 'unnamed')
   return { ...d, userId: user.id }
