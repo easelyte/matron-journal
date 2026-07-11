@@ -26,13 +26,17 @@ function issueDevice(db, userId, kind, name) {
   return { token, deviceId: r.lastInsertRowid }
 }
 
-// Precomputed once, lazily, and reused for every unknown-username login
-// attempt (see login() below) — never recomputed per request.
-let dummyHashPromise = null
-function getDummyHash() {
-  if (!dummyHashPromise) dummyHashPromise = argon2.hash(crypto.randomBytes(32).toString('hex'), { type: argon2.argon2id })
-  return dummyHashPromise
-}
+// Precomputed at module load and reused for every unknown-username login
+// attempt (see login() below). Deliberately NOT lazy: minting it on first
+// use would make the FIRST unknown-username attempt after boot pay
+// hash+verify (~2x the timing of every later one) — a one-shot
+// user-enumeration oracle. Hashing is async, so this doesn't block startup.
+const dummyHashPromise = argon2.hash(crypto.randomBytes(32).toString('hex'), { type: argon2.argon2id })
+// argon2.hash with these fixed, valid inputs never rejects in practice; the
+// no-op catch just guarantees a hypothetical rejection can't crash the
+// process as an unhandled rejection before the first login awaits it (that
+// login would then surface the same error itself, failing closed).
+dummyHashPromise.catch(() => {})
 
 export async function login(db, { username, password, deviceName }) {
   const user = db.prepare('SELECT id, password_hash FROM users WHERE name=?').get(username)
@@ -41,7 +45,7 @@ export async function login(db, { username, password, deviceName }) {
     // so "no such user" takes the same wall-clock time (one argon2.verify)
     // as "wrong password for a real user", instead of returning near-
     // instantly for unknown usernames.
-    await argon2.verify(await getDummyHash(), password)
+    await argon2.verify(await dummyHashPromise, password)
     return null
   }
   if (!(await argon2.verify(user.password_hash, password))) return null

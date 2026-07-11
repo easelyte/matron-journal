@@ -81,6 +81,23 @@ test('login guard lockout caps at capMs and success resets the count', () => {
   assert.equal(g.check('dan').allowed, true)
 })
 
+// NOTE: this test must run BEFORE any other test in this file (= this
+// process) performs an unknown-username login — it asserts the dummy hash
+// was precomputed at module load, and a lazily-minted hash would already be
+// cached by an earlier unknown-username attempt, hiding the regression.
+test('dummy hash is precomputed at module load: the first unknown-username login pays no lazy argon2.hash', async (t) => {
+  const db = openDb(':memory:')
+  const hashSpy = t.mock.method(argon2, 'hash')
+  const verifySpy = t.mock.method(argon2, 'verify')
+  assert.equal(await login(db, { username: 'first-ever-ghost', password: 'x', deviceName: 'd' }), null)
+  assert.equal(verifySpy.mock.callCount(), 1)
+  // A lazily-computed dummy hash would make the FIRST unknown-username
+  // attempt after boot pay hash+verify (~2x the timing of later ones) — a
+  // one-shot user-enumeration oracle. Precomputed at load, so no hash here.
+  assert.equal(hashSpy.mock.callCount(), 0,
+    'dummy hash must be precomputed at module load, not minted lazily on first use')
+})
+
 test('login closes the user-enumeration timing oracle: an unknown username still runs one argon2.verify', async (t) => {
   const db = openDb(':memory:')
   await createUser(db, 'dan', 'hunter22')
