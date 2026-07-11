@@ -139,6 +139,28 @@ test('MATRON_RETENTION_DAYS=0 (retentionDays: 0) disables retention — no offlo
   assert.equal(row.blob_ref, null)
 })
 
+test('an invalid retentionDays override (negative/non-integer) disables retention — it must NOT compute a future cutoff and offload everything', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  for (const badDays of [-5, 1.5, 'abc']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-badopt-'))
+    const dbPath = path.join(dir, 'test.db')
+    const preDb = openDb(dbPath)
+    const dan = await createUser(preDb, 'dan', 'pw')
+    upsertConversation(preDb, { id: 'c1', ownerUserId: dan.id })
+    // A RECENT row: with days=-5 the cutoff lands 5 days in the future, so a
+    // buggy pass-through would offload even this brand-new payload.
+    const r = append(preDb, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'fresh' } })
+    preDb.close()
+
+    const mute = t.mock.method(console, 'warn', () => {}) // expected one disabled-log line; keep output clean
+    const s = await startTestServer({ dbPath, retentionDays: badDays })
+    const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
+    await s.close()
+    mute.mock.restore()
+    assert.equal(row.blob_ref, null, `retentionDays=${JSON.stringify(badDays)} must disable retention, not offload`)
+  }
+})
+
 test('default retention (no override, no env) is enabled at 30 days', async (t) => {
   const { startTestServer } = await import('./helpers.js')
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-default-'))

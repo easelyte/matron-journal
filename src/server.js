@@ -16,19 +16,26 @@ const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 
-// `override` is startServer's `retentionDays` opt — when given (including
-// `0`), it wins outright (this is how tests disable/shrink the window
-// without touching process.env). Otherwise: unset env means ENABLED at the
-// 30-day default; `0` or anything that doesn't parse to a non-negative
-// integer disables it with one log line (an invalid value fails closed
-// rather than silently retaining everything forever).
+// `override` is startServer's `retentionDays` opt — when given, it takes
+// precedence over the env var (this is how tests disable/shrink the window
+// without touching process.env), but BOTH sources run through the same
+// validation: unset means ENABLED at the 30-day default; `0` disables; and
+// anything that isn't a non-negative integer disables with one log line —
+// fails closed. (A raw pass-through of a negative override would compute a
+// FUTURE cutoff and offload every payload including brand-new ones.)
+// Returns the window in days, or null when retention is disabled.
 function resolveRetentionDays(override) {
-  if (override !== undefined) return override
-  const raw = process.env.MATRON_RETENTION_DAYS
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_RETENTION_DAYS : override
   if (raw === undefined) return DEFAULT_RETENTION_DAYS
+  const name = fromEnv ? 'MATRON_RETENTION_DAYS' : 'retentionDays'
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: MATRON_RETENTION_DAYS=${JSON.stringify(raw)} is invalid — retention disabled`)
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — retention disabled`)
     return null
   }
   return n
@@ -39,10 +46,7 @@ function resolveRetentionDays(override) {
 // the interval handle (for close()) or null when retention is disabled.
 function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs }) {
   const days = resolveRetentionDays(retentionDays)
-  if (!days) {
-    if (days === 0) console.warn('retention: MATRON_RETENTION_DAYS=0 — retention disabled')
-    return null
-  }
+  if (days === null) return null
   const run = () => {
     try {
       const r = runOffload(db, { days, mediaDir })
