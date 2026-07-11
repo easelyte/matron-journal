@@ -109,12 +109,23 @@ export function attachWs({
               // Yield between batches only — a large backlog must not block the event
               // loop (and starve other connections' pings) while replaying.
               await new Promise((r) => setImmediate(r))
+              // The socket may have closed while we were awaiting above; its 'close'
+              // handler already ran (unregister was a pre-registration no-op), so
+              // finishing the replay and registering would insert a permanently-dead
+              // conn into the hub that nothing ever prunes. Bail out instead.
+              if (conn.closed) return
             }
           }
-          // INVARIANT: no yield between the final eventsAfter call (the batch that broke
-          // the loop above, batch.length < 500) and hub.register(conn). That synchronous
-          // tail is what guarantees no live event can slip through the gap between the
-          // end of replay and live registration.
+          // INVARIANT (live-event gap): no yield between the final eventsAfter call (the
+          // batch that broke the loop above, batch.length < 500) and hub.register(conn).
+          // That synchronous tail is what guarantees no live event can slip through the
+          // gap between the end of replay and live registration.
+          // INVARIANT (no dead registrations): a closed socket must never remain
+          // registered — 'close' can fire during the replay awaits, before registration,
+          // making its hub.unregister a no-op; the conn.closed re-check here (and inside
+          // the loop above) closes that window. Both checks are synchronous with
+          // register, so 'close' cannot interleave between check and register.
+          if (conn.closed) return
           hub.register(conn)
           conn.registered = true
           return
@@ -134,7 +145,14 @@ export function attachWs({
       }
     })
 
-    ws.on('close', () => { if (conn) hub.unregister(conn) })
+    ws.on('close', () => {
+      if (!conn) return
+      // Mark first, then unregister: if this fires mid-replay (before
+      // registration), unregister is a no-op and the flag is what stops the
+      // replay path from registering a dead conn afterwards.
+      conn.closed = true
+      hub.unregister(conn)
+    })
   })
   return wss
 }

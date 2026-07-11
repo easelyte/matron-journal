@@ -290,3 +290,30 @@ test('replay backpressure wait-loop is wired into a real connection: even at a t
   seqs.forEach((v, i) => assert.equal(v, i + 1))
   c.close()
 })
+
+test('a socket that closes mid-replay is never left registered in the hub', async (t) => {
+  // replayBackpressureBytes: -1 parks the replay loop in waitForDrain at the
+  // first batch boundary indefinitely (bufferedAmount >= 0 is always > -1)
+  // until the socket stops being open — a deterministic stand-in for a peer
+  // that stops reading during a large replay, with no dependence on real
+  // kernel buffer sizes.
+  const s = await startTestServer({ replayBackpressureBytes: -1 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'big', ownerUserId: dan.id })
+  for (let i = 0; i < 520; i++) {
+    append(s.db, { userId: dan.id, convoId: 'big', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  // Receiving seq 500 (the batch-1 boundary) proves the server has sent the
+  // whole first batch and moved on to the drain wait, where it is now parked.
+  await c.waitFor((f) => f.kind === 'journal' && f.seq === 500, 10000)
+  assert.equal(s.hub.connsOf(dan.id).length, 0, 'precondition: registration must not have happened mid-replay')
+  // Close while the server is parked mid-replay. Its 'close' handler runs
+  // before registration — the bug was that replay then completed and
+  // registered a permanently-dead conn nothing would ever prune.
+  c.ws.terminate()
+  await new Promise((r) => setTimeout(r, 300))
+  assert.equal(s.hub.connsOf(dan.id).length, 0, 'a closed socket must never remain registered')
+})
