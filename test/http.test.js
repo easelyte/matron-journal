@@ -29,7 +29,109 @@ test('login → snapshot → pagination over HTTP', async (t) => {
 
   await createUser(s.db, 'pat', 'pw')
   const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
-  assert.equal((await s.http('/convo/c1/messages', { token: pat.json.token })).status, 403)
+  // Unauthorized and missing are indistinguishable: both 404, same body as
+  // GET /media/:id's unknown-id response — never 403 (that would leak that
+  // the convo id exists at all).
+  const forbidden = await s.http('/convo/c1/messages', { token: pat.json.token })
+  assert.equal(forbidden.status, 404)
+  assert.deepEqual(forbidden.json, { error: 'not_found' })
+  const unknown = await s.http('/convo/does-not-exist/messages', { token: ok.json.token })
+  assert.equal(unknown.status, 404)
+  assert.deepEqual(unknown.json, { error: 'not_found' })
+})
+
+test('GET /convo/:id/messages validates limit, before_seq, and percent-encoding', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  for (let i = 0; i < 5; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  for (const limit of ['0', '-1', 'abc', '1.5', 'NaN']) {
+    const r = await s.http(`/convo/c1/messages?limit=${limit}`, { token })
+    assert.equal(r.status, 400, `limit=${limit} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  // over 200 is clamped, not rejected
+  const clamped = await s.http('/convo/c1/messages?limit=500', { token })
+  assert.equal(clamped.status, 200)
+  const atCap = await s.http('/convo/c1/messages?limit=200', { token })
+  assert.equal(atCap.status, 200)
+
+  for (const beforeSeq of ['abc', '1.5', 'Infinity']) {
+    const r = await s.http(`/convo/c1/messages?before_seq=${beforeSeq}`, { token })
+    assert.equal(r.status, 400, `before_seq=${beforeSeq} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  const validBeforeSeq = await s.http('/convo/c1/messages?before_seq=3', { token })
+  assert.equal(validBeforeSeq.status, 200)
+
+  // malformed percent-encoding in the convo id path segment
+  const badEncoding = await fetch(s.base + '/convo/%zz/messages', { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(badEncoding.status, 400)
+  assert.deepEqual(await badEncoding.json(), { error: 'bad_request' })
+})
+
+test('POST /login and /push/register reject a non-object JSON body (null, array, bare primitive) with 400, not 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  // Each /login attempt gets its own cf-connecting-ip so this loop doesn't
+  // trip the 5/min per-IP rate limiter (unrelated to what's under test here).
+  let nextIp = 1
+  const postRaw = (path, rawBody, tok) => fetch(s.base + path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'cf-connecting-ip': `10.9.9.${nextIp++}`,
+      ...(tok ? { authorization: `Bearer ${tok}` } : {}),
+    },
+    body: rawBody,
+  })
+
+  for (const rawBody of ['null', '"a string"', '42', 'true', '[1,2,3]']) {
+    const r1 = await postRaw('/login', rawBody)
+    assert.equal(r1.status, 400, `/login body=${rawBody}`)
+    assert.deepEqual(await r1.json(), { error: 'bad_request' })
+
+    const r2 = await postRaw('/push/register', rawBody, token)
+    assert.equal(r2.status, 400, `/push/register body=${rawBody}`)
+    assert.deepEqual(await r2.json(), { error: 'bad_request' })
+  }
+  // genuinely malformed JSON syntax also 400s at the same shared guard, not 500
+  const r3 = await postRaw('/login', '{not json')
+  assert.equal(r3.status, 400)
+  assert.deepEqual(await r3.json(), { error: 'bad_request' })
+})
+
+test('an unexpected internal error responds 500 with a generic body only, no message leak, and the server stays up', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log; keep test output clean
+  s.db.exec('DROP TABLE conversations')
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 500)
+  assert.deepEqual(r.json, { error: 'internal' })
+  assert.ok(mute.mock.callCount() >= 1, 'expected the error to be logged server-side')
+  // server keeps answering other requests after an internal error
+  assert.equal((await s.http('/snapshot', {})).status, 401)
+})
+
+test('login for an unknown username still gets the normal rejection, not a 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const r = await s.http('/login', { method: 'POST', body: { username: 'nobody-here', password: 'x', device_name: 'y' } })
+  assert.equal(r.status, 403)
+  assert.deepEqual(r.json, { error: 'bad_credentials' })
 })
 
 test('POST /push/register: client devices can register/unregister an apns token; agents get 403', async (t) => {

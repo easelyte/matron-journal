@@ -22,7 +22,10 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
   lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
 - `GET /snapshot` (Bearer) -> `{conversations, seq}`
-- `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`
+- `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
+  is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
+  must be an integer (400 otherwise). Owner-only; missing or not-owned are
+  indistinguishable, both 404 `{error:'not_found'}` (never 403).
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte

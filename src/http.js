@@ -26,7 +26,25 @@ const readBody = (req) => new Promise((resolve, reject) => {
   req.on('end', () => {
     if (settled) return
     settled = true
-    try { resolve(data ? JSON.parse(data) : {}) } catch (e) { reject(e) }
+    if (!data) { resolve({}); return }
+    let parsed
+    try {
+      parsed = JSON.parse(data)
+    } catch {
+      reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }))
+      return
+    }
+    // Shared guard for every POST handler below: any JSON value that isn't a
+    // plain object (literal `null`, an array, or a bare string/number/bool)
+    // would otherwise reach a handler's `const {x} = body` destructure and
+    // either throw outright (null → 500) or silently produce `undefined`
+    // fields that fail deeper and less legibly (e.g. as a DB bind-type
+    // error → 500).
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      reject(Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 }))
+      return
+    }
+    resolve(parsed)
   })
   req.on('close', () => fail(new Error('connection closed')))
   req.on('error', fail)
@@ -79,13 +97,29 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {
-        const beforeSeq = url.searchParams.has('before_seq') ? Number(url.searchParams.get('before_seq')) : null
-        const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200)
+        let convoId
         try {
-          const events = messagesBefore(db, who.userId, decodeURIComponent(m[1]), { beforeSeq, limit }).map(toEventShape)
+          convoId = decodeURIComponent(m[1])
+        } catch (e) {
+          if (e instanceof URIError) return json(res, 400, { error: 'bad_request' })
+          throw e
+        }
+        let beforeSeq = null
+        if (url.searchParams.has('before_seq')) {
+          beforeSeq = Number(url.searchParams.get('before_seq'))
+          if (!Number.isInteger(beforeSeq)) return json(res, 400, { error: 'bad_request' })
+        }
+        const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
+        const limit = Math.min(rawLimit, 200)
+        try {
+          const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
           return json(res, 200, { events })
         } catch (e) {
-          if (/not authorized/.test(e.message)) return json(res, 403, { error: 'forbidden' })
+          // Unauthorized and missing are indistinguishable: both 404, same
+          // body as GET /media/:id's unknown-id response — never 403 (that
+          // would confirm the convo id exists to a caller who can't read it).
+          if (/not authorized/.test(e.message)) return json(res, 404, { error: 'not_found' })
           throw e
         }
       }
@@ -141,7 +175,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         res.setHeader('Connection', 'close')
         return json(res, 413, { error: 'too_large' })
       }
-      return json(res, 500, { error: 'internal', message: e.message })
+      if (e.statusCode === 400) return json(res, 400, { error: 'bad_request' })
+      // Never leak e.message to the client (could echo internals like a SQL
+      // error) — log it server-side instead.
+      console.error('http handler error:', e)
+      return json(res, 500, { error: 'internal' })
     }
   }
 }
