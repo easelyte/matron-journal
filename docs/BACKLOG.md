@@ -43,6 +43,11 @@ a Cloudflare tunnel, bridge agents are trusted first-party code.
 - Replay backpressure: check `ws.bufferedAmount` between batches.
 - Login timing side-channel: dummy argon2 verify on unknown usernames.
 - snippetOf/session_status payload guards in journal.js (null payload from agents).
+- Ephemeral stream frames are dropped during a connection's replay window
+  (hub.register runs after replay; sendEphemeral only targets registered conns —
+  Bugbot finding). Low impact: ephemeral is best-effort by design, the next
+  coalesced frame or the finalize journal row catches the client up. Revisit
+  when the client data layer defines `viewing` semantics.
 - Port the realpathSync entrypoint guard from matron-admin to src/server.js (symmetry;
   systemd's direct invocation works today).
 
