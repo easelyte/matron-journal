@@ -154,6 +154,35 @@ test('agent read_marker resets unread and fans out; up_to_seq null resolves to h
   agent.close(); client.close()
 })
 
+test('agent publish type whitelist: rejects server-generated/unknown types, accepts exactly the allowed set', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-wl' })
+
+  // convo_meta/session_status/read_marker are server-generated (only reachable
+  // via convo_upsert / the read_marker op) and must not be forgeable via a
+  // bare publish; unknown/future type strings are rejected the same way.
+  const rejected = ['session_status', 'read_marker', 'convo_meta', 'bogus', 'm.text']
+  for (const type of rejected) {
+    agent.send({ op: 'publish', convo_id: 'sess-wl', type, payload: { body: 'x' } })
+  }
+  await agent.waitFor((f) =>
+    agent.frames.filter((x) => x.kind === 'control' && x.op === 'error' && x.code === 'bad_request' && x.ref === 'publish').length >= rejected.length)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='sess-wl'").get().n, 0)
+
+  const allowed = ['text', 'prompt', 'prompt_reply', 'tool_output', 'diff', 'permission_request', 'file', 'image', 'edit']
+  for (const type of allowed) {
+    agent.send({ op: 'publish', convo_id: 'sess-wl', type, payload: { body: 'ok' } })
+  }
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'edit') // the last one sent
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='sess-wl'").get().n, allowed.length)
+  agent.close()
+})
+
 test("agent read_marker on a convo the agent's user does not own fails closed", async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

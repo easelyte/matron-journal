@@ -6,10 +6,40 @@ const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
 const CLIENT_SEND_TYPES = new Set(['text'])
 
+// Exactly what an agent may hand-author via `publish`. `session_status` is
+// server-generated (only reachable via convo_upsert); `read_marker` and
+// `convo_meta` are server-generated too (read_marker via the read_marker op,
+// convo_meta via convo_upsert's title-change detection) — none of the three
+// may be forged through a bare publish. Unknown/future types arrive via a
+// server upgrade to this whitelist, never through a bare agent frame.
+const AGENT_PUBLISH_TYPES = new Set([
+  'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
+  'permission_request', 'file', 'image', 'edit',
+])
+
+const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
+
+// Between replay batches, a slow/paused reader must not let the server
+// buffer an unbounded amount of backlog in the socket's outgoing queue.
+const REPLAY_BACKPRESSURE_BYTES = 4 * 1024 * 1024 // 4 MB
+
 const noopPushPipeline = { onAppend() {} }
 
-export function attachWs({ server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline }) {
-  const wss = new WebSocketServer({ server, path: '/ws' })
+// Polls ws.bufferedAmount until it drains below thresholdBytes, or the
+// socket stops being open (no point waiting on a dead connection — the
+// replay loop's next send would be a no-op anyway). Exported standalone so
+// the polling logic itself is unit-testable without a real socket.
+export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
+  while (ws.readyState === 1 && ws.bufferedAmount > thresholdBytes) {
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+}
+
+export function attachWs({
+  server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
+  replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES,
+}) {
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const interval = setInterval(() => {
     for (const ws of wss.clients) {
       if (ws._alive === false) { ws.terminate(); continue }
@@ -22,6 +52,13 @@ export function attachWs({ server, db, hub, pingMs = 20000, pushPipeline = noopP
   wss.on('connection', (ws) => {
     ws._alive = true
     ws.on('pong', () => { ws._alive = true })
+    // Without a listener, a protocol-level error (e.g. a frame over
+    // maxPayload, a bad opcode, invalid UTF-8) makes 'ws' emit 'error' on
+    // this socket; an unhandled 'error' event is a Node EventEmitter throw,
+    // which would otherwise crash the process. Fails-closed: terminate just
+    // this connection instead (the WS library has typically already started
+    // tearing the socket down by the time this fires).
+    ws.on('error', () => { ws.terminate() })
     let conn = null
 
     ws.on('message', async (data) => {
@@ -43,6 +80,11 @@ export function attachWs({ server, db, hub, pingMs = 20000, pushPipeline = noopP
             ws.close()
             return
           }
+          if (msg.cursor !== undefined && msg.cursor !== null && !Number.isInteger(msg.cursor)) {
+            ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
+            ws.close()
+            return
+          }
           // conn is assigned here, before replay/registration complete below. If another
           // message arrives while the replay loop is yielded (see setImmediate below),
           // it will be dispatched to handleOp before hub.register(conn) runs. That's safe
@@ -60,6 +102,10 @@ export function attachWs({ server, db, hub, pingMs = 20000, pushPipeline = noopP
               for (const e of batch) ws.send(JSON.stringify(journalFrame(e)))
               if (batch.length < 500) break
               cursor = batch[batch.length - 1].seq
+              // A slow/paused reader must not let the server buffer an unbounded amount
+              // of replay data in the socket's outgoing queue — wait for it to drain
+              // below the threshold before fetching/sending the next batch.
+              await waitForDrain(ws, replayBackpressureBytes)
               // Yield between batches only — a large backlog must not block the event
               // loop (and starve other connections' pings) while replaying.
               await new Promise((r) => setImmediate(r))
@@ -135,6 +181,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
         if (conn.kind !== 'client') return fail('forbidden')
         const type = msg.type || 'text'
         if (!CLIENT_SEND_TYPES.has(type)) return fail('forbidden')
+        if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type,
@@ -145,6 +192,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
       }
       case 'prompt_reply': {
         if (conn.kind !== 'client') return fail('forbidden')
+        if (!Number.isInteger(msg.target_seq)) return fail('bad_request')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type: 'prompt_reply',
@@ -153,6 +201,11 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
         break
       }
       case 'read_marker': {
+        // null means "resolve server-side to the conversation head" (see
+        // markRead); anything else must be a genuine non-negative seq.
+        if (msg.up_to_seq != null && (!Number.isInteger(msg.up_to_seq) || msg.up_to_seq < 0)) {
+          return fail('bad_request')
+        }
         // Both kinds may advance the read marker: a client marking read for
         // itself, or an agent (bridge) marking read on behalf of its user —
         // e.g. after mirroring the user's own message into the journal, so
@@ -194,7 +247,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        if (typeof msg.type !== 'string' || !msg.type || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         // finalize composes `fin:<ref>` idem keys internally — a raw publish
         // must not be able to collide with (or forge) one of those.
         if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {

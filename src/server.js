@@ -27,7 +27,7 @@ function resolveApnsClient(injected) {
   return { client: undefined, owned: false }
 }
 
-export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient } = {}) {
+export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
   const rateLimiter = makeRateLimiter()
@@ -40,7 +40,7 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
   const hub = makeHub()
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
-  const wss = attachWs({ server, db, hub, pushPipeline })
+  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes })
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       resolve({
