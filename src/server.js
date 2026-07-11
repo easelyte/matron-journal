@@ -12,6 +12,7 @@ import { resolveMediaDir } from './media.js'
 import { runOffload } from './retention.js'
 
 const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 
@@ -75,7 +76,7 @@ function resolveApnsClient(injected) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs,
+  retentionDays, retentionIntervalMs, maxReplay,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -83,6 +84,7 @@ export function startServer({
   const loginGuard = makeLoginGuard()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? (process.env.MATRON_MEDIA_MAX_BYTES ? Number(process.env.MATRON_MEDIA_MAX_BYTES) : DEFAULT_MEDIA_MAX_BYTES)
+  const resolvedMaxReplay = maxReplay ?? (process.env.MATRON_MAX_REPLAY ? Number(process.env.MATRON_MAX_REPLAY) : DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
@@ -90,7 +92,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     hub, pushPipeline, dbPath: resolvedDbPath,
   }))
-  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes })
+  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay })
   let retentionInterval = null
   return new Promise((resolve) => {
     server.listen(port, bind, () => {

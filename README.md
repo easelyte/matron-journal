@@ -38,6 +38,12 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
   404 `{error:'not_found'}`.
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
   Server: `hello_ok {seq}`, then journal frames `> cursor`, then live.
+  If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
+  (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
+  instead of replaying and closes the socket with code `4009` — the client
+  wipes its local store, calls `GET /snapshot`, and reconnects with the
+  fresh cursor (spec §6). Journal rows are never deleted, so this is an
+  efficiency valve, not a data-loss boundary.
   Client ops: send, prompt_reply, read_marker, ack, viewing.
   Agent ops: convo_upsert, publish, stream (ephemeral), finalize. `read_marker`
   is available to both kinds: an agent (bridge) connection may advance its

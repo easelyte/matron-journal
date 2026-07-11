@@ -23,6 +23,12 @@ const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
 const REPLAY_BACKPRESSURE_BYTES = 4 * 1024 * 1024 // 4 MB
 
+// Efficiency valve (spec §6): a resume gap this large (device offline for
+// months, or a fresh install with cursor 0 against a huge journal) isn't
+// worth replaying frame-by-frame. Journal rows are never deleted, so this
+// is never a data-loss boundary — just a "go get a snapshot instead" nudge.
+const DEFAULT_MAX_REPLAY = 50000
+
 const noopPushPipeline = { onAppend() {} }
 
 // Polls ws.bufferedAmount until it drains below thresholdBytes, or the
@@ -37,7 +43,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 
 export function attachWs({
   server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
-  replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES,
+  replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const interval = setInterval(() => {
@@ -94,8 +100,18 @@ export function attachWs({
           conn = { ws, ...who, viewingConvoId: null }
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
-          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: head ? head.seq : 0 }))
+          const headSeq = head ? head.seq : 0
+          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq }))
           if (msg.cursor != null) {
+            // snapshot_required valve (spec §6): a gap this large is not worth
+            // replaying — tell the client to wipe, GET /snapshot, and reconnect
+            // with the fresh cursor instead. Close 4009 right after; the socket
+            // is never registered (no live traffic for this abandoned attempt).
+            if (headSeq - msg.cursor > maxReplay) {
+              ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
+              ws.close(4009)
+              return
+            }
             let cursor = msg.cursor
             for (;;) {
               const batch = eventsAfter(db, who.userId, cursor, 500)

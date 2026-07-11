@@ -291,6 +291,49 @@ test('replay backpressure wait-loop is wired into a real connection: even at a t
   c.close()
 })
 
+test('snapshot_required: a replay gap over MATRON_MAX_REPLAY sends the control frame instead of replaying and closes 4009', async (t) => {
+  const s = await startTestServer({ maxReplay: 5 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  for (let i = 0; i < 10; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  const raw = new (await import('ws')).default(s.base.replace('http', 'ws') + '/ws')
+  await new Promise((r) => raw.on('open', r))
+  const frames = []
+  raw.on('message', (d) => frames.push(JSON.parse(d)))
+  let closeCode = null
+  raw.on('close', (code) => { closeCode = code })
+  raw.send(JSON.stringify({ op: 'hello', token: login.json.token, cursor: 0 })) // gap = 10 - 0 = 10 > 5
+  await new Promise((r) => raw.on('close', r))
+
+  assert.ok(frames.some((f) => f.kind === 'control' && f.op === 'hello_ok'), 'hello_ok should still be sent before the valve trips')
+  assert.ok(frames.some((f) => f.kind === 'control' && f.op === 'snapshot_required'), 'expected a snapshot_required control frame')
+  assert.equal(frames.filter((f) => f.kind === 'journal').length, 0, 'no journal frames should be replayed once the gap valve trips')
+  assert.equal(closeCode, 4009)
+  assert.equal(s.hub.connsOf(dan.id).length, 0, 'a snapshot_required socket must never be registered in the hub')
+})
+
+test('snapshot_required: a replay gap at or under MATRON_MAX_REPLAY still replays normally', async (t) => {
+  const s = await startTestServer({ maxReplay: 100 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  for (let i = 0; i < 10; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await c.waitFor((f) => f.kind === 'journal' && f.seq === 10)
+  assert.equal(c.journal().length, 10)
+  assert.ok(!c.frames.some((f) => f.op === 'snapshot_required'))
+  assert.equal(s.hub.connsOf(dan.id).length, 1)
+  c.close()
+})
+
 test('a socket that closes mid-replay is never left registered in the hub', async (t) => {
   // replayBackpressureBytes: -1 parks the replay loop in waitForDrain at the
   // first batch boundary indefinitely (bufferedAmount >= 0 is always > -1)
