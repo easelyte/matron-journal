@@ -170,9 +170,10 @@ rows themselves are never deleted; only payloads move. Idempotent — a row
 already offloaded (or one whose payload already has the offloaded shape) is
 never reprocessed.
 
-`MATRON_RETENTION_DAYS=0`, or an unset/invalid value, disables retention
-(one warn log line at boot); any other non-negative integer sets the window
-in days. Manual run: `matron-admin offload [--days N]` (default 30).
+Unset `MATRON_RETENTION_DAYS` means ENABLED at the 30-day default.
+`MATRON_RETENTION_DAYS=0`, or any value that isn't a non-negative integer,
+disables retention instead (one warn log line at boot). Manual run:
+`matron-admin offload [--days N]` (default 30).
 
 ## Test
 
