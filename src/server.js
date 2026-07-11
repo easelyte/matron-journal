@@ -1,6 +1,6 @@
 import http from 'node:http'
 import { openDb } from './db.js'
-import { makeRateLimiter } from './auth.js'
+import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
@@ -8,7 +8,8 @@ import { attachWs } from './ws.js'
 export function startServer({ dbPath, port = 0, bind = '127.0.0.1' } = {}) {
   const db = openDb(dbPath || process.env.MATRON_DB || './matron.db')
   const rateLimiter = makeRateLimiter()
-  const server = http.createServer(makeHttpHandler({ db, rateLimiter }))
+  const loginGuard = makeLoginGuard()
+  const server = http.createServer(makeHttpHandler({ db, rateLimiter, loginGuard }))
   const hub = makeHub()
   const wss = attachWs({ server, db, hub })
   return new Promise((resolve) => {

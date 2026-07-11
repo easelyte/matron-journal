@@ -17,7 +17,10 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
 
 ## Protocol (v1 core)
 
-- `POST /login {username, password, device_name}` -> `{token, device_id, user_id}`
+- `POST /login {username, password, device_name}` -> `{token, device_id, user_id}`.
+  Brute-force protection: 5 attempts/min per IP (429 `rate_limited`), plus per-username
+  lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
+  a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
 - `GET /snapshot` (Bearer) -> `{conversations, seq}`
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).

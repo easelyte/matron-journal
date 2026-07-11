@@ -31,7 +31,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
-export function makeHttpHandler({ db, rateLimiter }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -42,8 +42,16 @@ export function makeHttpHandler({ db, rateLimiter }) {
         const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
         if (!rateLimiter.allow(ip)) return json(res, 429, { error: 'rate_limited' })
         const { username, password, device_name } = await readBody(req)
+        const guardKey = String(username ?? '')
+        const gate = loginGuard.check(guardKey)
+        if (!gate.allowed) {
+          const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
+          res.setHeader('Retry-After', retryAfter)
+          return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
+        }
         const s = await login(db, { username, password, deviceName: device_name })
-        if (!s) return json(res, 403, { error: 'bad_credentials' })
+        if (!s) { loginGuard.fail(guardKey); return json(res, 403, { error: 'bad_credentials' }) }
+        loginGuard.ok(guardKey)
         return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
       }
       const who = bearer(req) && authToken(db, bearer(req))

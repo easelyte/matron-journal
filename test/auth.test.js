@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import {
   createUser, login, createAgent, authToken, revokeDevice,
-  authorize, makeRateLimiter, setPassword,
+  authorize, makeRateLimiter, makeLoginGuard, setPassword,
 } from '../src/auth.js'
 
 test('login issues a device token; authToken resolves it', async () => {
@@ -50,6 +50,34 @@ test('setPassword rotates the password and rejects unknown users', async () => {
   assert.equal(await login(db, { username: 'dan', password: 'oldpw', deviceName: 'x' }), null)
   assert.notEqual(await login(db, { username: 'dan', password: 'newpw', deviceName: 'x' }), null)
   await assert.rejects(() => setPassword(db, 'nobody', 'pw'), /no such user/)
+})
+
+test('login guard locks at threshold, isolates usernames, and doubles the lockout', async () => {
+  const g = makeLoginGuard({ threshold: 3, baseMs: 50, capMs: 60000 })
+  g.fail('dan')
+  g.fail('dan')
+  assert.equal(g.check('dan').allowed, true) // 2 fails < threshold
+  g.fail('dan') // 3rd consecutive failure -> locked for baseMs
+  const locked = g.check('dan')
+  assert.equal(locked.allowed, false)
+  assert.ok(locked.retryAfterMs > 0 && locked.retryAfterMs <= 50)
+  assert.equal(g.check('pat').allowed, true) // other usernames unaffected
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(g.check('dan').allowed, true) // lock expired
+  g.fail('dan') // 4th failure -> lockout doubles (baseMs * 2)
+  const relocked = g.check('dan')
+  assert.equal(relocked.allowed, false)
+  assert.ok(relocked.retryAfterMs > 50, `expected doubled lockout, got ${relocked.retryAfterMs}ms`)
+})
+
+test('login guard lockout caps at capMs and success resets the count', () => {
+  const g = makeLoginGuard({ threshold: 1, baseMs: 10, capMs: 40 })
+  for (let i = 0; i < 10; i++) g.fail('dan') // 10 * doubling would be ~5s uncapped
+  const locked = g.check('dan')
+  assert.equal(locked.allowed, false)
+  assert.ok(locked.retryAfterMs <= 40, `lockout ${locked.retryAfterMs}ms exceeds cap`)
+  g.ok('dan') // successful login clears failures and any lock
+  assert.equal(g.check('dan').allowed, true)
 })
 
 test('rate limiter window actually expires', async () => {

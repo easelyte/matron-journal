@@ -57,6 +57,39 @@ export function authorize(db, userId, convoId) {
   return !!row && row.owner_user_id === userId
 }
 
+// Per-username failed-login lockout with exponential backoff (spec §8). Complements
+// the per-IP limiter: an attacker rotating IPs is still locked out of the username.
+// Flip side: anyone who knows a username can keep its real owner locked out for the
+// lockout window — acceptable for an internal team tool behind the tunnel.
+// In-memory like makeRateLimiter: a restart forgets failure counts, which is fine.
+export function makeLoginGuard({ threshold = 5, baseMs = 30000, capMs = 3600000 } = {}) {
+  const state = new Map() // username -> { fails, lockedUntil }
+  return {
+    // Called before the argon2 verify, so a locked username costs no hashing work
+    // and responds identically whether the guessed password was right or wrong.
+    check(username) {
+      const now = Date.now()
+      // Same unbounded-key guard as makeRateLimiter: sweep expired locks when large.
+      // Sub-threshold failure counts are swept too — bounded memory over perfect memory.
+      if (state.size > 10000) {
+        for (const [k, v] of state) if (now >= v.lockedUntil) state.delete(k)
+      }
+      const s = state.get(username)
+      if (s && now < s.lockedUntil) return { allowed: false, retryAfterMs: s.lockedUntil - now }
+      return { allowed: true }
+    },
+    fail(username) {
+      const s = state.get(username) || { fails: 0, lockedUntil: 0 }
+      s.fails += 1
+      if (s.fails >= threshold) {
+        s.lockedUntil = Date.now() + Math.min(baseMs * 2 ** (s.fails - threshold), capMs)
+      }
+      state.set(username, s)
+    },
+    ok(username) { state.delete(username) },
+  }
+}
+
 export function makeRateLimiter({ max = 5, windowMs = 60000 } = {}) {
   const hits = new Map()
   return {

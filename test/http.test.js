@@ -47,23 +47,72 @@ test('login rate limit keys on cf-connecting-ip, not the tunnel-shared socket ad
   const s = await startTestServer()
   t.after(() => s.close())
   await createUser(s.db, 'dan', 'pw')
+  await createUser(s.db, 'pat', 'pw2')
 
-  const loginAs = (cfIp, password) => fetch(s.base + '/login', {
+  const loginAs = (cfIp, username, password) => fetch(s.base + '/login', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
-    body: JSON.stringify({ username: 'dan', password, device_name: 'x' }),
+    body: JSON.stringify({ username, password, device_name: 'x' }),
   })
 
   // Behind the tunnel every request arrives from the same socket (127.0.0.1), so
   // without per-header keying this would lock out every client after 5 bad logins
   // from any one of them. Exhaust the limit for client A...
-  for (let i = 0; i < 5; i++) await loginAs('1.1.1.1', 'wrong')
-  const blockedA = await loginAs('1.1.1.1', 'wrong')
+  for (let i = 0; i < 5; i++) await loginAs('1.1.1.1', 'dan', 'wrong')
+  const blockedA = await loginAs('1.1.1.1', 'dan', 'wrong')
   assert.equal(blockedA.status, 429)
 
   // ...client B, a different cf-connecting-ip, must still be able to log in.
-  const okB = await loginAs('2.2.2.2', 'pw')
+  // B is a different user: dan is per-username locked at this point regardless of IP.
+  const okB = await loginAs('2.2.2.2', 'pat', 'pw2')
   assert.equal(okB.status, 200)
+})
+
+test('per-username lockout blocks distributed brute force across IPs', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  await createUser(s.db, 'pat', 'pw2')
+
+  const loginAs = (cfIp, username, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username, password, device_name: 'x' }),
+  })
+
+  // 5 failures against one username from 5 DIFFERENT IPs: each IP is used once,
+  // so the per-IP limiter never trips - only per-username tracking can catch this.
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await loginAs(`10.0.0.${i}`, 'dan', 'wrong')).status, 403)
+  }
+  // 6th attempt from a fresh IP is locked out - even with the CORRECT password
+  // (the guard runs before the verify, so a locked username gives no oracle).
+  const blocked = await loginAs('10.0.0.99', 'dan', 'pw')
+  assert.equal(blocked.status, 429)
+  const body = await blocked.json()
+  assert.equal(body.error, 'locked_out')
+  assert.ok(body.retry_after >= 1)
+  assert.ok(Number(blocked.headers.get('retry-after')) >= 1)
+  // other usernames are unaffected by dan's lockout
+  assert.equal((await loginAs('10.0.0.99', 'pat', 'pw2')).status, 200)
+})
+
+test('successful login resets the per-username failure count', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  const loginAs = (cfIp, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username: 'dan', password, device_name: 'x' }),
+  })
+  // 4 failures (below the threshold of 5), then a success...
+  for (let i = 0; i < 4; i++) await loginAs(`10.0.1.${i}`, 'wrong')
+  assert.equal((await loginAs('10.0.1.50', 'pw')).status, 200)
+  // ...4 more failures: without the reset these would be failures 5-8 and lock
+  // the account; with it the count restarted from zero.
+  for (let i = 0; i < 4; i++) await loginAs(`10.0.2.${i}`, 'wrong')
+  assert.equal((await loginAs('10.0.2.50', 'pw')).status, 200)
 })
 
 test('oversized login body gets 413 and server stays responsive', async (t) => {
