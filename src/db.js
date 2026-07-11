@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS blobs(
+  id TEXT PRIMARY KEY,
+  owner_user_id INTEGER NOT NULL REFERENCES users(id),
+  content_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  disk_path TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
@@ -56,4 +65,14 @@ export function openDb(path) {
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA)
   return db
+}
+
+export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath }) {
+  db.prepare(
+    'INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at) VALUES(?,?,?,?,?,?,?)'
+  ).run(id, ownerUserId, contentType, size, sha256, diskPath, Date.now())
+}
+
+export function getBlob(db, id) {
+  return db.prepare('SELECT * FROM blobs WHERE id=?').get(id)
 }

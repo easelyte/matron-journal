@@ -1,15 +1,23 @@
 import http from 'node:http'
+import path from 'node:path'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 
-export function startServer({ dbPath, port = 0, bind = '127.0.0.1' } = {}) {
-  const db = openDb(dbPath || process.env.MATRON_DB || './matron.db')
+const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+
+export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes } = {}) {
+  const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
+  const db = openDb(resolvedDbPath)
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
-  const server = http.createServer(makeHttpHandler({ db, rateLimiter, loginGuard }))
+  const resolvedMediaDir = mediaDir || process.env.MATRON_MEDIA_DIR || path.join(path.dirname(resolvedDbPath), 'media')
+  const resolvedMediaMaxBytes = mediaMaxBytes ?? (process.env.MATRON_MEDIA_MAX_BYTES ? Number(process.env.MATRON_MEDIA_MAX_BYTES) : DEFAULT_MEDIA_MAX_BYTES)
+  const server = http.createServer(makeHttpHandler({
+    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+  }))
   const hub = makeHub()
   const wss = attachWs({ server, db, hub })
   return new Promise((resolve) => {

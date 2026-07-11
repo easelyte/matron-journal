@@ -1,5 +1,8 @@
+import fs from 'node:fs'
 import { login, authToken } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
+import { insertBlob, getBlob } from './db.js'
+import { receiveBlob } from './media.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -31,7 +34,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -70,6 +73,47 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard }) {
           if (/not authorized/.test(e.message)) return json(res, 403, { error: 'forbidden' })
           throw e
         }
+      }
+      if (req.method === 'POST' && url.pathname === '/media') {
+        let received
+        try {
+          received = await receiveBlob(req, { root: mediaDir, maxBytes: mediaMaxBytes })
+        } catch (e) {
+          if (e.code === 'empty') return json(res, 400, { error: 'empty' })
+          if (e.code === 'too_large') throw Object.assign(new Error('too large'), { statusCode: 413 })
+          throw e
+        }
+        const contentType = req.headers['content-type'] || 'application/octet-stream'
+        insertBlob(db, {
+          id: received.id,
+          ownerUserId: who.userId,
+          contentType,
+          size: received.size,
+          sha256: received.sha256,
+          diskPath: received.diskPath,
+        })
+        return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256 })
+      }
+      const mm = url.pathname.match(/^\/media\/([^/]+)$/)
+      if (req.method === 'GET' && mm) {
+        // Missing and not-owned are made indistinguishable (404, never 403): a
+        // media id is an unguessable random handle, so there is nothing an
+        // owner learns from a 403 that a 404 doesn't already hide just as well,
+        // and callers can't probe for the existence of someone else's blob.
+        const blob = getBlob(db, mm[1])
+        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        res.writeHead(200, {
+          'content-type': blob.content_type,
+          'content-length': String(blob.size),
+          'cache-control': 'private, max-age=31536000, immutable',
+        })
+        await new Promise((resolve) => {
+          const stream = fs.createReadStream(blob.disk_path)
+          stream.on('error', () => { res.destroy(); resolve() })
+          stream.on('close', resolve)
+          stream.pipe(res)
+        })
+        return
       }
       return json(res, 404, { error: 'not_found' })
     } catch (e) {
