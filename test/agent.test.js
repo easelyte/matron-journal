@@ -183,6 +183,25 @@ test('agent publish type whitelist: rejects server-generated/unknown types, acce
   agent.close()
 })
 
+test('agent finalize with type session_status and a payload missing a valid state fails cleanly, connection survives', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 's-fin-ss' })
+
+  // finalize isn't subject to the publish whitelist, so this is the one
+  // remaining agent-reachable path to append()'s session_status branch with
+  // an arbitrary payload shape — must fail cleanly, not crash the process.
+  agent.send({ op: 'finalize', convo_id: 's-fin-ss', message_ref: 'm1', type: 'session_status', payload: {} })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'finalize')
+  assert.equal(agent.ws.readyState, 1)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='s-fin-ss' AND type='session_status'").get().n, 0)
+  agent.close()
+})
+
 test("agent read_marker on a convo the agent's user does not own fails closed", async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

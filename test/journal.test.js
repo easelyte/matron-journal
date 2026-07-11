@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { createUser } from '../src/auth.js'
-import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead } from '../src/journal.js'
+import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf } from '../src/journal.js'
 
 async function setup() {
   const db = openDb(':memory:')
@@ -137,4 +137,44 @@ test('markRead fails closed on a convo the caller does not own', async () => {
   const pat = await createUser(db, 'pat3', 'pw')
   assert.throws(() => markRead(db, pat.id, 'c1', null), /not authorized/)
   assert.throws(() => markRead(db, pat.id, 'c1', 4), /not authorized/)
+})
+
+test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
+  for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
+    assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)
+    assert.doesNotThrow(() => snippetOf(type, undefined), `type=${type} payload=undefined`)
+    assert.doesNotThrow(() => snippetOf(type, 'not an object'), `type=${type} payload=string`)
+    assert.doesNotThrow(() => snippetOf(type, 42), `type=${type} payload=number`)
+  }
+  assert.equal(snippetOf('text', null), '')
+  assert.equal(snippetOf('prompt', undefined), '? ')
+  assert.equal(snippetOf('permission_request', null), 'permission: ')
+  assert.equal(snippetOf('unknown_type', null), '[unknown_type]')
+})
+
+test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
+  const { db, dan } = await setup()
+  for (const badPayload of [null, undefined, {}, 'nope', 42, { state: 42 }]) {
+    assert.throws(
+      () => append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'session_status', payload: badPayload }),
+      /invalid session_status payload/,
+      `payload=${JSON.stringify(badPayload)}`
+    )
+  }
+  // nothing landed, and the conversation's session_state is untouched
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE type='session_status'").get().n, 0)
+  assert.equal(db.prepare("SELECT session_state FROM conversations WHERE id='c1'").get().session_state, 'running')
+
+  // a well-formed payload still works
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'session_status', payload: { state: 'waiting' } })
+  assert.ok(r.seq > 0)
+  assert.equal(db.prepare("SELECT session_state FROM conversations WHERE id='c1'").get().session_state, 'waiting')
+})
+
+test('append with a MESSAGE_TYPES type and a null/non-object payload does not crash', async () => {
+  const { db, dan } = await setup()
+  assert.doesNotThrow(() => append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: null }))
+  const c1 = db.prepare("SELECT snippet, last_seq, unread_count FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.snippet, '')
+  assert.equal(c1.unread_count, 1)
 })

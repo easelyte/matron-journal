@@ -5,10 +5,14 @@ export const MESSAGE_TYPES = [
 ]
 
 export function snippetOf(type, payload) {
-  if (type === 'text') return String(payload.body || '').slice(0, 120)
-  if (type === 'prompt') return `? ${String(payload.question || '').slice(0, 110)}`
-  if (type === 'permission_request') return `permission: ${String(payload.description || '').slice(0, 100)}`
-  if (payload && payload.snippet) return String(payload.snippet).slice(0, 120)
+  // Tolerate whatever an agent hands us — null/undefined/a bare string or
+  // number — rather than crashing on `payload.body` etc. A malformed
+  // payload just yields an empty/placeholder snippet, never a thrown error.
+  const p = payload && typeof payload === 'object' ? payload : {}
+  if (type === 'text') return String(p.body || '').slice(0, 120)
+  if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
+  if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
+  if (p.snippet) return String(p.snippet).slice(0, 120)
   return `[${type}]`
 }
 
@@ -52,12 +56,24 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     }
     const seq = nextSeq(db, userId)
     const ts = Date.now()
+    // JSON.stringify(undefined) is the JS value `undefined`, not a string —
+    // binding that would hit the payload column's NOT NULL constraint as a
+    // raw SQLite error. A caller that omits `payload` entirely gets `null`
+    // stored instead, so this always fails at the same clean layer as an
+    // explicit null/non-object payload (see the guards below).
+    const payloadJson = JSON.stringify(payload === undefined ? null : payload)
     db.prepare(
       'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
-    ).run(userId, seq, convoId, ts, sender, type, JSON.stringify(payload), blobRef, idemKey)
+    ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
     if (type === 'session_status') {
+      // Guard against a malformed agent payload (null/undefined/non-object,
+      // or an object with no string `state`) reaching the DB as a raw
+      // bind-type or CHECK-constraint crash — fail with one clear, expected
+      // error instead (still rolls back the whole transaction).
+      const state = payload && typeof payload === 'object' ? payload.state : undefined
+      if (typeof state !== 'string') throw new Error('invalid session_status payload: state must be a string')
       db.prepare('UPDATE conversations SET last_seq=?, session_state=? WHERE id=?')
-        .run(seq, payload.state, convoId)
+        .run(seq, state, convoId)
     } else if (MESSAGE_TYPES.includes(type)) {
       // A user's own message (sender `user:*`) never inflates their own unread
       // badge — only content from someone/something else (an agent, mirroring
