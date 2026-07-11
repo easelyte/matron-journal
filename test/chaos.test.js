@@ -48,10 +48,15 @@ test('client store converges despite random disconnects', { timeout: 60000 }, as
   const TOTAL = 1200 // grand total across both phases
   const CONVOS = ['s1', 's2', 's3']
 
-  // agent: steady publish stream
+  // agent: steady publish stream. No title: convo_upsert with a non-empty
+  // title now fans out a convo_meta journal event (decision 1), and this
+  // test's convergence loop below counts every kind:'journal' frame (not
+  // just message types) toward TOTAL — an untitled convo keeps this test's
+  // own stated invariant true ("convo_upsert without session_state appends
+  // nothing") instead of racing 3 extra frames into that count.
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
-  for (const c of CONVOS) agent.send({ op: 'convo_upsert', convo_id: c, title: c })
+  for (const c of CONVOS) agent.send({ op: 'convo_upsert', convo_id: c })
 
   const publishOne = (i) => {
     const frame = {

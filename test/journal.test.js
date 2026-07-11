@@ -92,3 +92,49 @@ test('messagesBefore rejects foreign convo', async () => {
   const pat = await createUser(db, 'pat2', 'pw')
   assert.throws(() => messagesBefore(db, pat.id, 'c1', {}), /not authorized/)
 })
+
+test('a user-sender message does not bump unread; an agent-sender message does', async () => {
+  const { db, dan } = await setup()
+  const mine = append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: 'mine' } })
+  let c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.unread_count, 0)
+  assert.equal(c1.last_seq, mine.seq)
+  assert.equal(c1.snippet, 'mine') // snippet still tracks the latest message either way
+
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'theirs' } })
+  c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.unread_count, 1)
+})
+
+test('markRead with up_to_seq >= last_seq resets unread_count to 0', async () => {
+  const { db, dan } = await setup()
+  for (let i = 1; i <= 3; i++) {
+    append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: `m${i}` } })
+  }
+  let c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.unread_count, 3)
+  markRead(db, dan.id, 'c1', c1.last_seq)
+  c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.unread_count, 0)
+})
+
+test('markRead with up_to_seq null resolves server-side to the conversation head', async () => {
+  const { db, dan } = await setup()
+  for (let i = 1; i <= 3; i++) {
+    append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: `m${i}` } })
+  }
+  const before = db.prepare("SELECT last_seq FROM conversations WHERE id='c1'").get()
+  const r = markRead(db, dan.id, 'c1', null)
+  assert.equal(r.upToSeq, before.last_seq)
+  const c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.unread_count, 0)
+  const row = db.prepare('SELECT payload FROM events WHERE seq=?').get(r.seq)
+  assert.equal(JSON.parse(row.payload).up_to_seq, before.last_seq)
+})
+
+test('markRead fails closed on a convo the caller does not own', async () => {
+  const { db } = await setup()
+  const pat = await createUser(db, 'pat3', 'pw')
+  assert.throws(() => markRead(db, pat.id, 'c1', null), /not authorized/)
+  assert.throws(() => markRead(db, pat.id, 'c1', 4), /not authorized/)
+})

@@ -95,6 +95,8 @@ test('send, prompt_reply, read_marker round-trip to a second device', async (t) 
   const f = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'text')
   assert.equal(f.payload.body, 'do it')
   assert.equal(f.sender, 'user:dan')
+  // a user's own send must not inflate their own unread badge
+  assert.equal(s.db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 0)
 
   mac.send({ op: 'read_marker', convo_id: 'c1', up_to_seq: f.seq })
   const rm = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'read_marker')

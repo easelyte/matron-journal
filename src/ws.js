@@ -93,8 +93,8 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
 
 // Extended by Tasks 7-8 with client and agent operations.
 export function handleOp({ db, hub, conn, msg }) {
-  const fail = (code) =>
-    conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op }))
+  const fail = (code, detail) =>
+    conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   const appendAndFan = (args) => {
     const r = append(db, args)
     if (!r.duplicate) {
@@ -136,18 +136,23 @@ export function handleOp({ db, hub, conn, msg }) {
         break
       }
       case 'read_marker': {
-        if (conn.kind !== 'client') return fail('forbidden')
-        const r = markRead(db, conn.userId, msg.convo_id, msg.up_to_seq)
+        // Both kinds may advance the read marker: a client marking read for
+        // itself, or an agent (bridge) marking read on behalf of its user —
+        // e.g. after mirroring the user's own message into the journal, so
+        // that mirrored round-trip doesn't inflate the unread badge. Sender
+        // follows each connection's normal identity convention.
+        const sender = conn.kind === 'agent' ? `agent:${conn.name}` : `user:${conn.username}`
+        const r = markRead(db, conn.userId, msg.convo_id, msg.up_to_seq, sender)
         hub.broadcastJournal(conn.userId, journalFrame({
           seq: r.seq, convo_id: msg.convo_id, ts: r.ts,
-          sender: `user:${conn.username}`, type: 'read_marker',
-          payload: { convo_id: msg.convo_id, up_to_seq: msg.up_to_seq },
+          sender, type: 'read_marker',
+          payload: { convo_id: msg.convo_id, up_to_seq: r.upToSeq },
         }))
         break
       }
       case 'convo_upsert': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        upsertConversation(db, {
+        const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
         })
@@ -158,11 +163,26 @@ export function handleOp({ db, hub, conn, msg }) {
             payload: { state: msg.session_state },
           })
         }
+        // Other devices learn renames live instead of only via /snapshot.
+        // No event when the title is unchanged, absent, or this was a
+        // state-only upsert (see upsertConversation's titleChanged logic).
+        if (convo.titleChanged) {
+          appendAndFan({
+            userId: conn.userId, convoId: msg.convo_id,
+            sender: `agent:${conn.name}`, type: 'convo_meta',
+            payload: { title: convo.title },
+          })
+        }
         break
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
         if (typeof msg.type !== 'string' || !msg.type || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // finalize composes `fin:<ref>` idem keys internally — a raw publish
+        // must not be able to collide with (or forge) one of those.
+        if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {
+          return fail('bad_request', 'idem_key prefix fin: is reserved')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
