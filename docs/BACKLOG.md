@@ -1,72 +1,54 @@
-# v1-completion backlog
+# Backlog
 
-Carried out of the server-v1-core final review (2026-07-10). Items the review
-triaged as FIX-IN-V1-COMPLETION, plus spec features explicitly deferred.
-Deployment context for severity calls: internal team tool (~10 users), behind
-a Cloudflare tunnel, bridge agents are trusted first-party code.
+Rewritten after the v1-completion branch (2026-07-11) — the previous backlog
+(media, APNs push, retention, /metrics, snapshot_required, /password, device
+revocation, protocol decisions, hardening pass) shipped in PR #2. Deployment
+context for severity calls: internal team tool (~10 users), behind a
+Cloudflare tunnel (chat.example.com, no CF Access), bridge agents are
+trusted first-party code, iPhones on the public internet.
 
-## Deferred spec features (plan follows spec §14/§15)
+## Follow-ups from the PR #2 final whole-branch review
 
-- Media upload/download (`POST /media`, `GET /media/:id`) with authorize on reads
-- APNs push (direct HTTP/2 with the existing .p8; collapse-id coalescing; §9 rules).
-  Lessons from sygnal's dead tokens (2026-07-11): store the APNs environment
-  (sandbox vs prod) per device — Xcode dev builds register sandbox tokens that
-  prod APNs rejects as 400 BadDeviceToken — and prune device tokens on 410
-  Unregistered instead of retrying them forever.
-- Retention/offload job (tool_output payloads → blob files after window)
-- `/metrics` (or `matron-admin status` extension): per-device cursor lag, socket counts, head seq
-- Golden conformance fixtures (shared with the Matron Swift client's CI)
-- `snapshot_required` valve for pathological cursor gaps (spec §6)
-- `POST /password` self-service change (spec §8)
-- Device revocation end-to-end: `matron-admin device revoke` CLI + mid-socket
-  enforcement (WS auths only at hello today; spec §8 promises close-on-next-frame)
+- `MATRON_MEDIA_MAX_BYTES` garbage value → NaN → upload size cap silently
+  disabled (fails open). One-line validator: non-integer/<=0 → default+warn.
+- Push: a user's own `send` still triggers routine alert pushes to their
+  other devices — mirror the unread predicate (own messages aren't unread)
+  into the push decision, or advance suppression via the sender device's
+  cursor. Product wart, not a defect.
+- `GET /media/:id`: stat the file before writeHead so a DB-vs-disk size
+  mismatch (ops error) yields a clean 5xx instead of 200-then-reset.
+- `upsertConversation` runs SELECT-then-write outside `db.transaction()` —
+  safe only because the server is single-process/synchronous; add the
+  one-line invariant comment.
+- chaos.test.js convergence loop counts all journal frames type-agnostically;
+  filter to `type === 'text'` so future non-message event types can't race
+  the target count.
+- Dedicated boundary test for `gap === MATRON_MAX_REPLAY` (current behavior:
+  `>` — exactly-at-threshold replays normally, matching README "exceeds").
+- README: note not to run `matron-admin offload` while the server's interval
+  is due (no locking; worst case one orphaned blob file).
+- Boot-time offload runs synchronously in the listen callback — fine while
+  the journal is young; revisit if the first big offload wave slows boot.
 
-## Protocol decisions needed before the Matron client data layer
+## Deferred by design (revisit with the Matron Swift client)
 
-- **Convo metadata live sync**: title-only `convo_upsert` reaches other devices
-  only via `/snapshot` today. Decide: `convo_meta` journal event vs title in
-  `session_status` payload.
-- **unread_count semantics**: a user's own `send` currently increments their
-  unread count (`src/journal.js` message-type branch). Decide before badges render.
-- **Duplicate-send confirmation**: at-least-once + client dedup by seq is the
-  design; document that a retried send gets no dedicated confirmation frame.
-- **Reserved idem-key prefix**: agent `finalize` uses `fin:<message_ref>`; a raw
-  `publish` idem_key could collide. Document or namespace.
-- **Global convo-id namespace**: conversation ids are a global PK; bridges must
-  use globally unique ids (Claude session UUIDs qualify). Document.
-
-## Hardening pass (one work item, touch each file once)
-
-- Client-op validation: `send` missing payload → bad_request (not internal);
-  `read_marker` up_to_seq integer check; `hello` cursor integer-or-null check.
-- Agent publish type whitelist (trusted, but `session_status` via publish can
-  bypass convo_upsert semantics; bad state currently 500-frames via CHECK).
-- HTTP: clamp `limit` to 1..200 (reject -1/NaN — `LIMIT -1` returns everything);
-  `before_seq` integer check; URIError → 400; stop leaking `e.message` in 500s.
-- WS `maxPayload` ~1 MB (ws default is 100 MiB; a 100 MB payload row replays forever).
-- Replay backpressure: check `ws.bufferedAmount` between batches.
-- Login timing side-channel: dummy argon2 verify on unknown usernames.
-- snippetOf/session_status payload guards in journal.js (null payload from agents).
 - Ephemeral stream frames are dropped during a connection's replay window
-  (hub.register runs after replay; sendEphemeral only targets registered conns —
-  Bugbot finding). Low impact: ephemeral is best-effort by design, the next
-  coalesced frame or the finalize journal row catches the client up. Revisit
+  (hub registration happens after replay; ephemeral is best-effort). Revisit
   when the client data layer defines `viewing` semantics.
-- Port the realpathSync entrypoint guard from matron-admin to src/server.js (symmetry;
-  systemd's direct invocation works today).
-
-## Deployment (before the hostname goes live)
-
-- cloudflared ingress rule + hostname → 127.0.0.1:9810 (port 9803 / tg-viewer2 is
-  retired and free to repurpose).
-- `ExecStartPre=/usr/bin/mkdir -p .../data` in the systemd unit (fresh clone
-  crash-loops on SQLITE_CANTOPEN otherwise).
-- Rate-limiter keying via `cf-connecting-ip` is DONE (5a14e6c); revisit Map
-  eviction thresholds only if /metrics shows growth.
+- Bridge-side: message-edit mirroring and ephemeral streaming of live output
+  (stream/finalize) — the proper fix for edits, once viewing semantics exist.
+- Golden conformance fixtures shared with the Swift client's CI (spec §12) —
+  build alongside the Swift data layer.
+- Media `dims` for images (bridge passes Matrix's values when present; the
+  server never computes them).
 
 ## Accepted (reviewed, deliberately not fixing)
 
-Raw SqliteError on duplicate admin user; per-call db.prepare rebuilds; style
-inconsistencies (inline auth checks, hello-path readyState, hub layering nit);
-password on admin argv (single-user boxes); 429 body drain; test-only keep-alive
-latency; utf8 cap counting chars not bytes.
+title:'' upsert fires convo_meta{title:''} (rename-to-empty is defensible);
+conversations-row write + meta/status append non-atomic (single-process,
+snapshot recovers); buildOpts-throw could strand a coalesce entry
+(unreachable today); matron-admin status db-size via db.name vs /metrics
+dbPath (same file by construction); offload scan concurrency (see README
+follow-up above); raw SqliteError on duplicate admin user; per-call
+db.prepare rebuilds; password on admin argv (single-user boxes); 429 body
+drain; utf8 cap counting chars not bytes.
