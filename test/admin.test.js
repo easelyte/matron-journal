@@ -55,6 +55,26 @@ test('admin CLI: offload runs runOffload with --days (default 30), second run no
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('admin CLI: offload --days 0 (or negative) refuses instead of offloading everything (cutoff would be now/future)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-offload-zero-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id })
+  // A brand-new row — `--days 0` computes cutoff=now, so a buggy
+  // pass-through would offload even this.
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'brand new' } })
+
+  await assert.rejects(runAdmin(db, ['offload', '--days', '0']), /positive integer/i)
+  await assert.rejects(runAdmin(db, ['offload', '--days', '-5']), /positive integer/i)
+  await assert.rejects(runAdmin(db, ['offload', '--days', 'garbage']), /positive integer/i)
+
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events WHERE blob_ref IS NOT NULL').get().n, 0, 'nothing should have been offloaded by a refused --days value')
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('admin CLI: status prints per-device kind/cursor/lag/last_seen_at and db file size (DB-derived only, no socket/APNs counters)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-status-'))
   const dbPath = path.join(dir, 'cli.db')

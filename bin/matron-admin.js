@@ -68,7 +68,15 @@ export async function runAdmin(db, argv) {
   if (a === 'offload') {
     const daysFlag = flag(argv, '--days')
     const days = daysFlag != null ? Number(daysFlag) : 30
-    if (!Number.isInteger(days) || days < 0) throw new Error(USAGE)
+    // Matches the env-var semantics elsewhere (MATRON_RETENTION_DAYS /
+    // MATRON_MAX_REPLAY / MATRON_MEDIA_MAX_BYTES): a non-integer or <=0
+    // value is a misconfiguration, not "process everything now". `--days 0`
+    // (or negative/garbage) would otherwise compute a cutoff of now (or the
+    // future), offloading every tool_output row including brand-new ones —
+    // refuse outright instead of silently doing that on a one-shot CLI run.
+    if (!Number.isInteger(days) || days <= 0) {
+      throw new Error(`${USAGE}\n\n--days must be a positive integer (got ${JSON.stringify(daysFlag)})`)
+    }
     const mediaDir = resolveMediaDir(db.name)
     const r = runOffload(db, { days, mediaDir })
     return `offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`
