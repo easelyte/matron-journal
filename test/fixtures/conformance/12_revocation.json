@@ -1,0 +1,31 @@
+{
+  "name": "revocation: a revoked device's next WS frame gets error{code:'revoked'} and closes 4001; its token also 401s over HTTP",
+  "description": "Deleting a device row (what `matron-admin device revoke` does) doesn't tear the socket down immediately — enforcement is next-frame: the connection's next inbound frame after revocation gets {kind:'control', op:'error', code:'revoked'} and the server closes with code 4001. The same token is rejected by every HTTP endpoint on the very next request (token-hash lookup per request, no separate revocation list).",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-17" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-17", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$bind": "dan_device_id" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "client" },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "wait", "ms": 50 },
+
+    { "kind": "admin_revoke_device", "device_id": { "$ref": "dan_device_id" } },
+
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "error", "code": "revoked" } },
+    { "kind": "ws_expect_close", "conn": "client", "code": 4001 },
+
+    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
+      "expect": { "status": 401, "body": { "error": "unauthenticated" } } }
+  ]
+}

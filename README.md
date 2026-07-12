@@ -193,5 +193,10 @@ disables retention instead (one warn log line at boot). Manual run:
 
     npm test
 
-Deferred to v1 completion: conformance fixtures (see the spec, §15 and plan
-docs).
+Includes the protocol conformance suite (spec §12): golden JSON fixtures
+under `test/fixtures/conformance/`, replayed against a real in-process
+server by `test/conformance.test.js`. These are the canonical wire-protocol
+exchanges the Matron Swift client's test suite also replays, so the two
+implementations can't silently drift — see
+`test/fixtures/conformance/README.md` for the fixture schema and the tiny
+bind/ref/type/ignore variable convention a Swift harness re-implements.

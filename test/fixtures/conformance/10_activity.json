@@ -1,0 +1,46 @@
+{
+  "name": "agent activity: delivered only to the viewing device as an ephemeral, never journaled; bad state and client-sent are rejected",
+  "description": "activity is a typing/tool-use indicator: only the owning user's connection(s) currently `viewing` that conversation get the ephemeral frame; a second connection of the same user that isn't viewing gets nothing. An invalid state is bad_request; only agents may send activity (a client gets forbidden).",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-16" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "mac_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "ipad" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "ipad_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "mac" },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "ipad" },
+    { "kind": "ws_send", "conn": "ipad", "frame": { "op": "hello", "token": { "$ref": "ipad_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "wait", "ms": 50 },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c1", "state": "thinking", "detail": "analyzing files" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "thinking", "detail": "analyzing files" }
+    } },
+    { "kind": "ws_expect_none", "conn": "ipad", "ms": 250 },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c1", "state": "bogus" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "activity" } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "activity", "convo_id": "c1", "state": "thinking" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "error", "code": "forbidden", "ref": "activity" } }
+  ]
+}
