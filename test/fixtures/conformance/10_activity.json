@@ -1,6 +1,6 @@
 {
   "name": "agent activity: delivered only to the viewing device as an ephemeral, never journaled; bad state and client-sent are rejected",
-  "description": "activity is a typing/tool-use indicator: only the owning user's connection(s) currently `viewing` that conversation get the ephemeral frame; a second connection of the same user that isn't viewing gets nothing. An invalid state is bad_request; only agents may send activity (a client gets forbidden).",
+  "description": "activity is a typing/tool-use indicator: only the owning user's connection(s) currently `viewing` that conversation get the ephemeral frame; a second connection of the same user that isn't viewing gets nothing. An invalid state is bad_request; only agents may send activity (a client gets forbidden). No wall-clock waits: after mac sends `viewing` it sends a durable `send` on the same connection — per-connection FIFO means that once the resulting journal frame reaches the AGENT's socket, the server has necessarily already applied mac's `viewing` — so the subsequent activity's delivery is deterministic. The non-viewing device's no-delivery check is a ws_expect_none window: inherently time-boxed, since a negative assertion has no positive signal to wait on.",
   "seed": {
     "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-16" }],
     "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
@@ -29,7 +29,19 @@
     { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
 
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
-    { "kind": "wait", "ms": 50 },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c1", "state": "thinking", "detail": "analyzing files" } },
     { "kind": "ws_expect", "conn": "mac", "frame": {

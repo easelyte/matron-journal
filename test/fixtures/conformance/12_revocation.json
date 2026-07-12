@@ -1,6 +1,6 @@
 {
   "name": "revocation: a revoked device's next WS frame gets error{code:'revoked'} and closes 4001; its token also 401s over HTTP",
-  "description": "Deleting a device row (what `matron-admin device revoke` does) doesn't tear the socket down immediately — enforcement is next-frame: the connection's next inbound frame after revocation gets {kind:'control', op:'error', code:'revoked'} and the server closes with code 4001. The same token is rejected by every HTTP endpoint on the very next request (token-hash lookup per request, no separate revocation list).",
+  "description": "Deleting a device row (what `matron-admin device revoke` does) doesn't tear the socket down immediately — enforcement is next-frame: the connection's next inbound frame after revocation gets {kind:'control', op:'error', code:'revoked'} and the server closes with code 4001. The same token is rejected by every HTTP endpoint on the very next request (token-hash lookup per request, no separate revocation list). No wall-clock waits: the pre-revocation `send`'s journal echo both proves normal frames work before revocation AND is the causal barrier guaranteeing every earlier frame was processed before the row is deleted (per-connection FIFO); admin_revoke_device itself is synchronous in the runner.",
   "seed": {
     "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-17" }],
     "conversations": [{ "id": "c1", "owner": "dan" }]
@@ -16,8 +16,11 @@
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
     { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
 
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "viewing", "convo_id": "c1" } },
-    { "kind": "wait", "ms": 50 },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "pre-revocation" }, "local_id": "p1" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "pre-revocation" }
+    } },
 
     { "kind": "admin_revoke_device", "device_id": { "$ref": "dan_device_id" } },
 

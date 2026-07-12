@@ -1,6 +1,6 @@
 {
   "name": "ack advances the device's server-side cursor copy, observable via GET /metrics",
-  "description": "ack has no dedicated confirmation frame — its effect (devices.cursor / lag) is only observable via GET /metrics (or an admin CLI status read of the same DB row). Before ack, cursor is 0 and lag equals head_seq; after ack(3), cursor is 3 and lag is 0.",
+  "description": "ack has no dedicated confirmation frame — its effect (devices.cursor / lag) is only observable via GET /metrics (or an admin CLI status read of the same DB row). Before ack, cursor is 0 and lag equals head_seq (3). No wall-clock waits: after `ack` the client sends a durable `send` on the SAME connection and waits for its journal echo — per-connection FIFO means the echo proves the earlier ack was already applied, so the following /metrics read is deterministic: cursor 3, head_seq 4 (the barrier send took seq 4), lag 1.",
   "seed": {
     "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-12" }],
     "conversations": [{ "id": "c1", "owner": "dan" }],
@@ -32,15 +32,19 @@
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": null } },
     { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 3 } },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "ack", "cursor": 3 } },
-    { "kind": "wait", "ms": 150 },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: ack applied" }, "local_id": "b1" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: ack applied" }
+    } },
 
     { "kind": "http", "method": "GET", "path": "/metrics", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": {
-        "user": { "head_seq": 3, "devices": [
-          { "device_id": { "$ref": "dan_device_id" }, "kind": "client", "cursor": 3, "last_seen_at": { "$type": "integer" }, "lag": 0 }
+        "user": { "head_seq": 4, "devices": [
+          { "device_id": { "$ref": "dan_device_id" }, "kind": "client", "cursor": 3, "last_seen_at": { "$type": "integer" }, "lag": 1 }
         ] },
         "sockets_connected": 1,
-        "journal_row_count": 3,
+        "journal_row_count": 4,
         "db_file_size_bytes": 0,
         "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} }
       } } }

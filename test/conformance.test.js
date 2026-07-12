@@ -261,6 +261,14 @@ async function expectFrame(conn, step, bindings, timeoutMs = 2000) {
 async function expectNoFrame(conn, step) {
   if (!conn) throw new Error('ws_expect_none: no such connection')
   await new Promise((r) => setTimeout(r, step.ms || 200))
+  // A dead socket receives nothing trivially — "no frame arrived" is only a
+  // meaningful observation on a connection that is still open. Without this
+  // check, a server that (wrongly) closed the connection would pass every
+  // ws_expect_none. Swift ports must implement the same liveness assertion.
+  assert.equal(
+    conn.closed, false,
+    'ws_expect_none: the connection closed during the quiet window — a dead socket must not pass a no-frame assertion'
+  )
   assert.equal(
     conn.nextIdx, conn.frames.length,
     `expected no new frame, but got: ${JSON.stringify(conn.frames.slice(conn.nextIdx))}`

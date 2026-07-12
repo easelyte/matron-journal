@@ -78,19 +78,30 @@ inferred from that conversation, not repeated per event.
   first `ws_send`).
 - **`ws_send`** — `{kind, conn, frame}`. Sends `frame` (matcher-resolved) as
   a JSON text frame on the named connection.
-- **`ws_expect`** — `{kind, conn, frame}`. Waits for and consumes the next
+- **`ws_expect`** — `{kind, conn, frame}`. Waits (up to a **2000 ms**
+  timeout — a harness constant, not per-fixture) for and consumes the next
   unconsumed frame on that connection (frames are asserted **in arrival
   order, per connection** — each connection has its own FIFO cursor), and
   matches it against `frame`.
 - **`ws_expect_none`** — `{kind, conn, ms?}`. Asserts no new frame arrives
-  on that connection within `ms` (default 200) — used to prove something is
-  *not* delivered (e.g. ephemerals to a non-viewing device, a deduped
-  resend).
-- **`ws_expect_close`** — `{kind, conn, code?}`. Waits for the connection to
-  close; if `code` is given, asserts the WS close code matches.
-- **`wait`** — `{kind, ms}`. A plain pause, for the handful of exchanges
-  that are genuinely timing-observable server-side (e.g. `ack` advancing a
-  device's cursor row, which has no dedicated confirmation frame).
+  on that connection within `ms` (default **200 ms**) — used to prove
+  something is *not* delivered (e.g. ephemerals to a non-viewing device, a
+  deduped resend). **Liveness requirement:** the step must ALSO assert the
+  connection is still open at the end of the window — a closed socket
+  receives nothing trivially, so a dead connection must FAIL this step, not
+  pass it vacuously. Swift ports must implement the same check.
+- **`ws_expect_close`** — `{kind, conn, code?}`. Waits (up to the same
+  **2000 ms** timeout as `ws_expect`) for the connection to close; if
+  `code` is given, asserts the WS close code matches.
+- **`wait`** — `{kind, ms}`. A plain pause. **Last resort only** — a bare
+  sleep is a flake waiting to happen. Prefer a *causal barrier*: the server
+  is single-threaded and processes each connection's frames in FIFO order,
+  so sending a durable op after the frame whose effect you need applied,
+  and `ws_expect`-ing that op's journal echo (on whichever connection needs
+  the guarantee), proves the earlier frame was processed — see the
+  `08_ack`/`10_activity`/`12_revocation` fixtures' descriptions. No current
+  fixture uses `wait`; if one ever must (a genuinely signal-free exchange),
+  its `description` must say why no barrier exists.
 - **`admin_revoke_device`** — `{kind, device_id}`. **Not a wire message** —
   this is what `matron-admin device revoke <id>` does under the hood
   (delete the `devices` row). It exists so a fixture can construct the
@@ -171,6 +182,10 @@ an afternoon:
 4. For outbound (`body`, `frame`, `token`) resolution: recursively replace
    `{"$ref": "name"}` nodes with the bound value; everything else passes
    through unchanged.
+5. Timeouts and liveness: `ws_expect`/`ws_expect_close` wait up to 2000 ms;
+   `ws_expect_none` observes a `ms` (default 200 ms) quiet window AND must
+   assert the connection is still open at its end — a closed socket must
+   fail the step, never pass it vacuously (see "Step kinds").
 
 The Swift CI job spawns a real matron-journal server instance (`node
 src/server.js` against a throwaway DB, or the equivalent test harness in
