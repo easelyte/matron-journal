@@ -81,6 +81,17 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'apns_env')) {
     db.exec('ALTER TABLE devices ADD COLUMN apns_env TEXT')
   }
+  // Which agent device manages this conversation — recorded by convo_upsert,
+  // read by the delivery scoping in ws.js/hub.js. NULL (every row predating
+  // this column, or a convo whose bridge hasn't re-upserted yet) means
+  // "unknown": those keep the legacy broadcast-to-all-agents delivery.
+  // Deliberately NOT a foreign key: device revocation is a bare DELETE on
+  // devices (revokeDevice), and a dangling owner id here must never block
+  // it — a dangling id simply matches no live connection.
+  const convoCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!convoCols.some((c) => c.name === 'agent_device_id')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN agent_device_id INTEGER')
+  }
   return db
 }
 

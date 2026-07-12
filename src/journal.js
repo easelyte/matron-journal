@@ -21,20 +21,23 @@ export function snippetOf(type, payload) {
 // or a brand-new convo was created with a non-empty title. Callers (ws.js)
 // use that flag to decide whether to fan out a `convo_meta` journal event;
 // no event on an unchanged title, an absent title, or a state-only upsert.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   let titleChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     if (title != null && title !== existing.title) titleChanged = true
+    // agent_device_id: last upsert wins — the device currently managing the
+    // session owns delivery (see hub.js). An absent agentDeviceId leaves the
+    // recorded owner untouched.
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, id)
   } else {
     const initialTitle = title || ''
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, created_at) VALUES(?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, created_at) VALUES(?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, Date.now())
     if (initialTitle) titleChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)

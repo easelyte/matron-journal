@@ -39,8 +39,15 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       }
       return false
     },
-    broadcastJournal(userId, frame) {
+    // agentDeviceId scopes delivery to agent connections: client devices
+    // always receive every frame, but an agent device only receives frames
+    // for conversations it owns (multi-bridge fleets: a bridge getting
+    // another bridge's user input treats it as an unknown convo and bounces
+    // it into the chat). null means "owner unknown" — legacy rows and
+    // convo-less frames keep the old broadcast-to-everyone behavior.
+    broadcastJournal(userId, frame, agentDeviceId = null) {
       for (const c of byUser.get(userId) || []) {
+        if (c.kind === 'agent' && agentDeviceId != null && c.deviceId !== agentDeviceId) continue
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },

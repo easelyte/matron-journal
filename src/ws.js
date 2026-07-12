@@ -152,9 +152,26 @@ export function attachWs({
               return
             }
             let cursor = msg.cursor
+            // Agent connections replay only their own conversations' frames —
+            // the same ownership scoping hub.broadcastJournal applies to live
+            // traffic (NULL owner = legacy broadcast). Cached per convo for
+            // the duration of this replay; ownership changing mid-replay is
+            // indistinguishable from it changing right after and is harmless.
+            const ownerCache = who.kind === 'agent' ? new Map() : null
+            const replaysTo = (convoId) => {
+              let owner = ownerCache.get(convoId)
+              if (owner === undefined) {
+                owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+                ownerCache.set(convoId, owner)
+              }
+              return owner == null || owner === who.deviceId
+            }
             for (;;) {
               const batch = eventsAfter(db, who.userId, cursor, 500)
-              for (const e of batch) ws.send(JSON.stringify(journalFrame(e)))
+              for (const e of batch) {
+                if (ownerCache && !replaysTo(e.convo_id)) continue
+                ws.send(JSON.stringify(journalFrame(e)))
+              }
               if (batch.length < 500) break
               cursor = batch[batch.length - 1].seq
               // A slow/paused reader must not let the server buffer an unbounded amount
@@ -249,7 +266,11 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
   // letting it bubble up and surface as a spurious {op:'error'} frame for an
   // op that, from the client's perspective, already succeeded.
   const fanOut = (frame) => {
-    hub.broadcastJournal(conn.userId, frame)
+    // Delivery scoping (see hub.broadcastJournal): agent connections only
+    // receive frames for conversations they own. Looked up per frame — the
+    // convo row is already hot from append()'s own authorization read.
+    const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)
+    hub.broadcastJournal(conn.userId, frame, owner ? owner.agent_device_id : null)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId)
     } catch (err) {
@@ -323,6 +344,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
+          agentDeviceId: conn.deviceId,
         })
         if (msg.session_state) {
           appendAndFan({

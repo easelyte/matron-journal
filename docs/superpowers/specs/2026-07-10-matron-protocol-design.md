@@ -121,6 +121,21 @@ Unknown types must be rendered by clients as a labeled fallback (type name + JSO
 
 Every read path (snapshot, pagination, socket fan-out, media) passes `authorize(user, convo)`. In v1 it returns `convo.owner_user_id == user.id`. The sharing door: a future `grants(convo_id, user_id, level)` table extends `authorize` and fan-out without any protocol change. Shared-conversation events would fan out into each grantee's journal by reference.
 
+### Agent delivery scoping
+
+Client devices receive the user's full journal (every convo — that's the
+multi-device sync contract). Agent devices do not: each conversation records
+the agent device that manages it (`conversations.agent_device_id`, set by
+every `convo_upsert`, last writer wins), and both live broadcast and hello
+replay deliver a convo's frames only to that agent. Without this, every
+bridge in a multi-box fleet receives every other bridge's user input as an
+unknown convo and bounces "session no longer active" into the chat — one
+bounce per non-owning bridge per message. A convo with no recorded owner
+(row predating the column, or its bridge hasn't re-upserted since) falls
+back to broadcast-to-all-agents, so the scoping needs no migration flag day:
+each bridge's next `convo_upsert` (session start, auto-resume, control-convo
+boot) claims its convos.
+
 ## 8. Auth
 
 - **Login:** `POST /login {username, password, device_name}` → long-lived device token (random 256-bit, stored hashed). Matron shows a login screen once per device. Rate-limited (5 attempts/min/IP) with exponential lockout.
