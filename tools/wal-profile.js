@@ -56,6 +56,18 @@
 //   node tools/wal-profile.js [--duration=120] [--agents=10] [--convos=300]
 //     [--out-of-proc] [--stall-threshold=100] [--slow-stmt=20]
 //     [--loop-stall=50] [--json-out=path] [--keep-db]
+//
+// Mitigation experiment flags (applied to the SERVER's db handle so
+// candidates can be measured before any src/ change is committed):
+//   --wal-autocheckpoint=N   PRAGMA wal_autocheckpoint=N (0 disables)
+//   --ckpt-interval=MS       run PRAGMA wal_checkpoint(PASSIVE) on a timer;
+//                            every timer checkpoint's duration + result
+//                            (busy/log/checkpointed) is logged, so the
+//                            mitigation's own blocking cost gets a full
+//                            distribution, not just its slow tail
+//   --journal-size-limit=B   PRAGMA journal_size_limit=B (WAL truncates to
+//                            <=B on reset instead of keeping its high-water
+//                            size forever)
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -265,12 +277,45 @@ function instrumentDb(db, walSampler, { slowMs = 20 } = {}) {
   return { slowStmts }
 }
 
+// --- mitigation experiment knobs -------------------------------------------------
+// Applies candidate settings to the live server db handle and (optionally)
+// runs the explicit PASSIVE-checkpoint timer that candidate B productizes.
+// Every timer checkpoint is logged unconditionally (atMs, durMs, and
+// SQLite's busy/log/checkpointed counters) — the mitigation still blocks the
+// loop while it runs, so its full duration distribution is part of the data.
+function applyExperiment(db, exp) {
+  const applied = {}
+  if (exp.walAutocheckpoint != null) {
+    db.pragma(`wal_autocheckpoint = ${Number(exp.walAutocheckpoint)}`)
+    applied.walAutocheckpoint = Number(exp.walAutocheckpoint)
+  }
+  if (exp.journalSizeLimit != null) {
+    db.pragma(`journal_size_limit = ${Number(exp.journalSizeLimit)}`)
+    applied.journalSizeLimit = Number(exp.journalSizeLimit)
+  }
+  const ckptLog = []
+  let timer = null
+  if (exp.ckptIntervalMs != null) {
+    applied.ckptIntervalMs = Number(exp.ckptIntervalMs)
+    timer = setInterval(() => {
+      const t0 = Date.now()
+      const r = db.pragma('wal_checkpoint(PASSIVE)')
+      const t1 = Date.now()
+      ckptLog.push({ atMs: t0, durMs: t1 - t0, ...(Array.isArray(r) ? r[0] : r) })
+    }, applied.ckptIntervalMs)
+    timer.unref()
+  }
+  return { applied, ckptLog, stop: () => { if (timer) clearInterval(timer) } }
+}
+
 // --- server-side instrumentation bundle ----------------------------------------
-function attachServerInstrumentation(db, dbPath, { slowStmtMs, loopStallMs }) {
+function attachServerInstrumentation(db, dbPath, { slowStmtMs, loopStallMs, experiment = {} }) {
   const walSampler = makeWalSampler(dbPath)
   const gc = makeGcLog()
   const loopLog = makeLoopStallLog({ thresholdMs: loopStallMs })
   const { slowStmts } = instrumentDb(db, walSampler, { slowMs: slowStmtMs })
+  // after instrumentDb so the timer's pragma calls also hit the slow log
+  const exp = applyExperiment(db, experiment)
   const loopDelay = monitorEventLoopDelay({ resolution: 2 })
   loopDelay.enable()
   return {
@@ -279,8 +324,11 @@ function attachServerInstrumentation(db, dbPath, { slowStmtMs, loopStallMs }) {
       walSampler.stop()
       gc.stop()
       loopLog.stop()
+      exp.stop()
       const p = (x) => +(loopDelay.percentile(x) / 1e6).toFixed(2)
       return {
+        experiment: exp.applied,
+        timerCheckpoints: exp.ckptLog,
         slowStmts,
         gc: gc.entries,
         loopStalls: loopLog.stalls,
