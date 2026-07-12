@@ -200,3 +200,7 @@ exchanges the Matron Swift client's test suite also replays, so the two
 implementations can't silently drift — see
 `test/fixtures/conformance/README.md` for the fixture schema and the tiny
 bind/ref/type/ignore variable convention a Swift harness re-implements.
+
+## Ops
+
+- Team rollout (single-user → whole team, Matrix retirement): [docs/runbooks/team-rollout.md](docs/runbooks/team-rollout.md)
