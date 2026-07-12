@@ -137,10 +137,17 @@ under `~/.config/matron/` (never printed, never committed):
 
 ```
 # [BOX:<dev-box-host>]
-install -m 600 /dev/stdin ~/.config/matron/agent.<dev-box-host>.token <<< '<TOKEN>'
+# paste the token at the hidden prompt and press Enter — read -rs keeps it
+# out of shell history and off the terminal:
+read -rs MATRON_AGENT_TOKEN
+(umask 077; printf '%s\n' "$MATRON_AGENT_TOKEN" > ~/.config/matron/agent.<dev-box-host>.token)
+unset MATRON_AGENT_TOKEN
 # verify perms only (do NOT cat the file):
 ls -l ~/.config/matron/agent.<dev-box-host>.token   # -> -rw------- (600)
 ```
+
+(The token file is read once at bridge boot and trimmed — `.env.example` —
+so the trailing newline is fine.)
 
 **c. Point the bridge at the journal — [BOX:&lt;dev-box-host&gt;].** Edit the
 bridge's `.env` (see `claude-matrix-bridge/.env.example` for the full set).
@@ -200,10 +207,12 @@ data bags per `~/.claude/DEV-MACHINE-SETUP.md`; `./scripts/provision-server
 
 Secret mechanism: DEV-MACHINE-SETUP.md states host secrets (RDP password,
 CircleCI token, tunnel credentials) live in the **encrypted `development`
-credentials data bag**, and that the GitHub PAT is injected into a service via
-a **systemd drop-in** sourced from a managed secret. Follow the same pattern:
-store each box's agent token in the encrypted credentials data bag and have the
-recipe render it to the `600` token file (or a bridge systemd drop-in).
+credentials data bag**; separately, it notes the GitHub MCP token
+(`GITHUB_PERSONAL_ACCESS_TOKEN`) is injected into a service by a **systemd
+drop-in from `gh auth token`** — a locally-derived value, not a data-bag
+secret. For the agent token, follow the data-bag pattern: store each box's
+token in the encrypted credentials data bag and have the recipe render it to
+the `600` token file (or a bridge systemd drop-in).
 
 - **OPEN (Chef):** exact data-bag key layout for a per-host agent token, and
   whether the token is rendered to the file vs. injected as `JOURNAL_TOKEN`
@@ -270,11 +279,14 @@ Run after each enrollment. Mix of **[CENTRAL]** and client checks.
 - [ ] **Push received — client.** With server APNs enabled (§9) and a device
       registered `prod`/`sandbox` correctly, a `prompt`/`permission_request`
       in a **not-currently-viewed** conversation delivers a notification.
-- [ ] **Lag sane — [CENTRAL].** `/metrics` (or `matron-admin status`) shows the
-      device's `lag` near 0 and `sockets_connected` incremented:
+- [ ] **Lag sane — [CENTRAL].** `matron-admin status` shows the device's
+      `lag` near 0. `sockets_connected` only exists in the running server's
+      memory — it is `/metrics`-only, never printed by `status` (README) —
+      so check it incremented via the `/metrics` curl:
       ```
       # [CENTRAL]
       MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin status
+      curl -fsS http://127.0.0.1:9810/metrics -H "Authorization: Bearer <token>"   # -> sockets_connected
       ```
 
 ---
