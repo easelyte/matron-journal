@@ -5,7 +5,8 @@
   "bin": { "matron-admin": "bin/matron-admin.js" },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test 'test/**/*.js'"
+    "test": "node --test 'test/**/*.js'",
+    "loadtest": "node tools/load-test.js"
   },
   "engines": { "node": ">=20" },
   "dependencies": {
