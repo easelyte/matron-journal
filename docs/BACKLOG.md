@@ -43,6 +43,23 @@ trusted first-party code, iPhones on the public internet.
 - Media `dims` for images (bridge passes Matrix's values when present; the
   server never computes them).
 
+## Follow-ups from the tool-output-streaming branch final review
+
+- Ephemeral backpressure valve: drop/skip `tool_stream` ephemerals when a
+  conn's `bufferedAmount` is high (client recovers via re-`viewing` sync);
+  the viewing sync loop and hub pending slots are otherwise unbounded within
+  same-user scope.
+- `mergeEphemeral`: flush a pending append before queueing an `end` frame
+  (count-cap eviction can drop ≤200 ms of tail output).
+- `evictOldest()` guard for `maxBuffers <= 0` (test-opts-only exposure).
+- Duplicate-finalize-after-free and retention branch tests (missing blobs
+  row; `scheduleRetention` one-pass-fails/both-disabled); `expire-logs`
+  default-24 assertion.
+- Global (not per-user) buffer-count cap: one user's runaway agent can evict
+  another user's live streams (multi-user deployments).
+- `resolveToolLogTtlHours`/`resolveRetentionDays` duplication; `handleOp`
+  noop default for `toolStreams`.
+
 ## Accepted (reviewed, deliberately not fixing)
 
 title:'' upsert fires convo_meta{title:''} (rename-to-empty is defensible);

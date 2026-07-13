@@ -63,7 +63,7 @@ export function makeToolStreamStore({
       let e = buffers.get(key)
       if (!e) {
         if (offset > 0) return { status: 'resync', have: 0 }
-        if (!meta || typeof meta !== 'object') return { status: 'need_meta' }
+        if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return { status: 'need_meta' }
         const evicted = []
         while (buffers.size >= maxBuffers) evicted.push(evictOldest())
         e = {

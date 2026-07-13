@@ -13,6 +13,7 @@ test('create requires meta; offset>0 with no buffer asks resync from 0', () => {
   assert.equal(r.offset, 0)
   assert.equal(r.accepted, 'hello')
   assert.equal(s.size(), 1)
+  assert.equal(s.append({ userId: 1, convoId: 'c1', ref: 'rA', offset: 0, chunk: 'x', meta: ['Bash'] }).status, 'need_meta')
 })
 
 test('offset reconciliation: contiguous append, overlap trim, duplicate, gap', () => {

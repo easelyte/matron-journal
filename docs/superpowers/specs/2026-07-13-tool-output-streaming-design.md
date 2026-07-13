@@ -153,7 +153,11 @@ arrives with the same `message_ref` in its **payload**, exactly how
 assistant-text overlays retire today. The client replaces the live view with
 the durable rendering. A client that detects an offset gap while viewing
 (shouldn't happen on an ordered socket) recovers by re-sending `viewing`,
-which re-delivers sync frames.
+which re-delivers sync frames. Journal frames bypass the hub's coalescing
+window but ephemerals don't, so a pending `append` can flush up to 200 ms
+after the completion frame for the same `message_ref`; clients must ignore
+`tool_stream` ephemerals for a `message_ref` already retired by a durable
+event rather than re-opening a retired overlay.
 
 ### 5.3 Durable completion event
 
@@ -246,8 +250,12 @@ is already set) → "output expired", identical to today's dead viewer link.
 ## 8. Security
 
 - **Transport:** live chunks ride the authenticated journal WS only; delivery
-  is owner-scoped, viewing-scoped, and client-kind-scoped. Device revocation
-  (next-frame or ≤60 s) applies as everywhere else.
+  is owner-scoped and viewing-scoped — any same-user connection whose
+  `viewing` conversation matches receives appends, agent connections
+  included, consistent with the legacy `stream`/`activity` ephemerals. Only
+  the viewing-time `sync` frames are additionally gated to `client`
+  connections. Device revocation (next-frame or ≤60 s) applies as everywhere
+  else.
 - **At rest:** chunks live only in the in-memory buffer (≤ caps) while the
   command runs; full logs are Bearer-auth'd owner-only media, deleted after
   24 h; snippets persist like any journal payload.

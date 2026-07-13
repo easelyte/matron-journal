@@ -131,7 +131,11 @@ the machine-checkable version of this page.
   precedes their accumulated end); `{event:'end', reason:'stale'}` when the
   idle sweep frees a buffer whose bridge died. Normal completion sends no
   ephemeral: the durable `tool_output` event arrives with the same
-  `message_ref` in its payload and retires the live view.
+  `message_ref` in its payload and retires the live view. Because journal
+  frames bypass the hub's coalescing but ephemerals don't, a pending
+  `tool_stream` append can flush up to 200 ms after that completion frame —
+  clients must ignore `tool_stream` ephemerals for a `message_ref` already
+  retired by a durable event rather than re-opening a retired overlay.
 - `finalize` accepts an optional top-level `blob_ref` (same passthrough as
   `publish`) and frees the matching live-stream buffer.
 
