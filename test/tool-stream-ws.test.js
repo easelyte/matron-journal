@@ -79,3 +79,27 @@ test('chunks never touch the journal', async (t) => {
   const rows = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE payload LIKE '%secret-live-bytes%'").get()
   assert.equal(rows.n, 0)
 })
+
+test('a client that starts viewing mid-command gets a sync frame with full scrollback', async (t) => {
+  const { agent, client } = await setup(t)
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu6', offset: 0, chunk: 'line one\n', meta: { tool: 'Bash', command: 'make build' } })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu6', offset: 9, chunk: 'line two\n' })
+  // barrier on the agent conn: a journalled op round-trips → both appends applied
+  agent.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  const sync = await client.waitFor((f) => f.tool_stream?.event === 'sync')
+  assert.equal(sync.message_ref, 'tu6')
+  assert.deepEqual(sync.tool_stream.meta, { tool: 'Bash', command: 'make build' })
+  assert.equal(sync.tool_stream.offset, 0)
+  assert.equal(sync.tool_stream.content, 'line one\nline two\n')
+  assert.equal(sync.tool_stream.head_truncated, false)
+})
+
+test('viewing a convo with no active streams sends no sync frames', async (t) => {
+  const { client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(client.frames.some((f) => f.tool_stream), false)
+})

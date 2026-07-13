@@ -300,9 +300,26 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
   }
   try {
     switch (msg.op) {
-      case 'viewing':
+      case 'viewing': {
         conn.viewingConvoId = msg.convo_id ?? null
+        // Catch-up for live tool-output streams: whoever just started viewing
+        // gets full scrollback-so-far, one sync frame per active buffer, sent
+        // directly (not via hub coalescing) and synchronously — no append can
+        // interleave before these because handleOp runs in one event-loop
+        // turn. Scoped to the conn's own user; buffersFor enforces it too.
+        if (conn.viewingConvoId && conn.kind === 'client') {
+          for (const b of toolStreams.buffersFor(conn.userId, conn.viewingConvoId)) {
+            conn.ws.send(JSON.stringify({
+              kind: 'ephemeral', convo_id: conn.viewingConvoId, message_ref: b.ref,
+              tool_stream: {
+                event: 'sync', meta: b.meta, offset: b.start,
+                content: b.content, head_truncated: b.headTruncated,
+              },
+            }))
+          }
+        }
         break
+      }
       case 'ack':
         if (!Number.isInteger(msg.cursor) || msg.cursor < 0) return fail('bad_request')
         db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(msg.cursor, conn.deviceId)
