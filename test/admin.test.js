@@ -4,9 +4,10 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { openDb } from '../src/db.js'
+import { openDb, insertBlob } from '../src/db.js'
 import { authToken, createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
+import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin } from '../bin/matron-admin.js'
 
 test('admin CLI: user add, agent add, status', async () => {
@@ -73,6 +74,36 @@ test('admin CLI: offload --days 0 (or negative) refuses instead of offloading ev
 
   db.close()
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('admin CLI: expire-logs deletes old live_log blobs and reports the count', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-expire-logs-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id })
+  const mediaDir = resolveMediaDir(dbPath) // matches what the CLI resolves internally from db.name
+  const blob = writeBlobSync(mediaDir, Buffer.from('log', 'utf8'))
+  insertBlob(db, { id: blob.id, ownerUserId: dan.id, contentType: 'text/plain', size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath })
+  const r0 = append(db, {
+    userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'tool_output',
+    payload: { snippet: 't', blob_ref: blob.id, live_log: true }, blobRef: blob.id,
+  })
+  db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, dan.id, r0.seq)
+
+  const out = await runAdmin(db, ['expire-logs', '--hours', '24'])
+  assert.match(out, /expired 1 live_log blob\(s\) older than 24h/)
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('admin CLI: expire-logs rejects a non-positive --hours', async () => {
+  const db = openDb(':memory:')
+  await assert.rejects(runAdmin(db, ['expire-logs', '--hours', '0']), /positive integer/i)
+  await assert.rejects(runAdmin(db, ['expire-logs', '--hours', '-5']), /positive integer/i)
+  await assert.rejects(runAdmin(db, ['expire-logs', '--hours', 'garbage']), /positive integer/i)
+  db.close()
 })
 
 test('admin CLI: status prints per-device kind/cursor/lag/last_seen_at and db file size (DB-derived only, no socket/APNs counters)', async () => {

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
-import { runOffload } from '../src/retention.js'
+import { runOffload, runExpireLogs } from '../src/retention.js'
 
 const USAGE = `usage:
   matron-admin user add <name> --password <pw>
@@ -13,6 +13,7 @@ const USAGE = `usage:
   matron-admin device list <username>
   matron-admin device revoke <device_id>
   matron-admin offload [--days N]
+  matron-admin expire-logs [--hours N]
   matron-admin status`
 
 function flag(argv, name) {
@@ -80,6 +81,19 @@ export async function runAdmin(db, argv) {
     const mediaDir = resolveMediaDir(db.name)
     const r = runOffload(db, { days, mediaDir })
     return `offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`
+  }
+  if (a === 'expire-logs') {
+    const hoursFlag = flag(argv, '--hours')
+    const hours = hoursFlag != null ? Number(hoursFlag) : 24
+    // Same validation stance as offload's --days above: a non-integer or
+    // <=0 --hours would compute a cutoff of now (or the future), expiring
+    // even brand-new live-log blobs — refuse outright instead.
+    if (!Number.isInteger(hours) || hours <= 0) {
+      throw new Error(`${USAGE}\n\n--hours must be a positive integer (got ${JSON.stringify(hoursFlag)})`)
+    }
+    const mediaDir = resolveMediaDir(db.name)
+    const r = runExpireLogs(db, { hours, mediaDir })
+    return `expired ${r.expired} live_log blob(s) older than ${hours}h`
   }
   if (a === 'status') {
     // DB-derived stats only (this reads the SQLite file directly, no
