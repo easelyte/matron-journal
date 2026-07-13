@@ -71,6 +71,11 @@ export function attachWs({
   // next-frame or ≤ one sweep interval (60s default), whichever comes
   // first. unref'd — never keeps the process alive on its own.
   const sweep = setInterval(() => {
+    // Tool-stream idle sweep piggybacks on this timer: a bridge that died
+    // mid-command never finalizes, so its buffer must expire and any viewer
+    // must learn the stream is dead. Runs before the early-return below —
+    // buffers expire even when no connection is registered.
+    for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
     const conns = hub.allConns()
     if (conns.length === 0) return
     const ids = [...new Set(conns.map((c) => c.deviceId))]

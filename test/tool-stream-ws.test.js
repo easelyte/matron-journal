@@ -129,3 +129,18 @@ test('finalize retires the stream: buffer freed, blob_ref column set, overlay re
   // buffer is gone: a fresh viewing yields no sync frame for tu7
   assert.deepEqual(s.toolStreams.buffersFor(1, 'sess-ts'), [])
 })
+
+test('idle sweep frees stale buffers and notifies viewers with end{stale}', async (t) => {
+  const { agent, client } = await setup(t, {
+    revocationSweepMs: 50,
+    toolStreamOpts: { idleMs: 1 }, // everything is stale immediately
+  })
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:dan')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu8', offset: 0, chunk: 'zzz', meta: { tool: 'Bash', command: 'sleep 999' } })
+  const end = await client.waitFor((f) => f.tool_stream?.event === 'end')
+  assert.equal(end.message_ref, 'tu8')
+  assert.equal(end.tool_stream.reason, 'stale')
+})
