@@ -1,0 +1,77 @@
+{
+  "name": "tool-output streaming: append fan-out to viewers, mid-join sync, resync on gap, finalize retires",
+  "description": "stream_append chunks reach the viewing client as tool_stream append ephemerals and are never journaled. A device that starts viewing mid-command receives a sync frame with full scrollback (sent directly on the viewing conn — no barrier needed). An offset gap draws a stream_resync control frame with the server's high-water mark. finalize with blob_ref appends the durable tool_output completion (payload carries message_ref to retire the overlay) and frees the buffer — proven by a later viewing yielding no sync. Clients may not send stream_append (forbidden); a creating frame without meta is bad_request.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-16" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "mac_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "ipad" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "ipad_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "mac" },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "stream_append", "convo_id": "c1", "message_ref": "tu1", "offset": 0, "chunk": "$ make\n", "meta": { "tool": "Bash", "command": "make" } } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "ephemeral", "convo_id": "c1", "message_ref": "tu1",
+      "tool_stream": { "event": "append", "offset": 0, "chunk": "$ make\n" }
+    } },
+
+    { "kind": "ws_open", "conn": "ipad" },
+    { "kind": "ws_send", "conn": "ipad", "frame": { "op": "hello", "token": { "$ref": "ipad_token" }, "cursor": 1 } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 1 } },
+    { "kind": "ws_send", "conn": "ipad", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": {
+      "kind": "ephemeral", "convo_id": "c1", "message_ref": "tu1",
+      "tool_stream": { "event": "sync", "meta": { "tool": "Bash", "command": "make" }, "offset": 0, "content": "$ make\n", "head_truncated": false }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "stream_append", "convo_id": "c1", "message_ref": "tu1", "offset": 999, "chunk": "lost" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": {
+      "kind": "control", "op": "stream_resync", "convo_id": "c1", "message_ref": "tu1", "have": 7
+    } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "stream_append", "convo_id": "c1", "message_ref": "tu9", "offset": 0, "chunk": "x", "meta": { "tool": "Bash", "command": "x" } } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "error", "code": "forbidden", "ref": "stream_append" } },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "stream_append", "convo_id": "c1", "message_ref": "tu2", "offset": 0, "chunk": "no meta" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "stream_append", "detail": { "$ignore": true } } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": {
+      "op": "finalize", "convo_id": "c1", "message_ref": "tu1", "type": "tool_output", "blob_ref": "blob-fixture",
+      "payload": { "message_ref": "tu1", "command": "make", "exit_code": 0, "denied": false, "truncated": false, "snippet": "$ make", "blob_ref": "blob-fixture", "live_log": true }
+    } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "tool_output",
+      "payload": { "message_ref": "tu1", "command": "make", "exit_code": 0, "denied": false, "truncated": false, "snippet": "$ make", "blob_ref": "blob-fixture", "live_log": true }
+    } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_expect_none", "conn": "mac", "ms": 250 }
+  ]
+}

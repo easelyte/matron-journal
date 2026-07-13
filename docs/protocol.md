@@ -67,11 +67,11 @@ the machine-checkable version of this page.
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
   Client ops: send, prompt_reply, read_marker, ack, viewing.
-  Agent ops: convo_upsert, publish, stream (ephemeral), finalize, activity
-  (ephemeral). `read_marker` is available to both kinds: an agent (bridge)
-  connection may advance its user's read marker too — e.g. after mirroring
-  the user's own message into the journal, so that mirrored round-trip
-  doesn't inflate the unread badge.
+  Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
+  finalize, activity (ephemeral). `read_marker` is available to both kinds:
+  an agent (bridge) connection may advance its user's read marker too —
+  e.g. after mirroring the user's own message into the journal, so that
+  mirrored round-trip doesn't inflate the unread badge.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
@@ -111,6 +111,29 @@ the machine-checkable version of this page.
   activity:{state, detail}}` only to the owning user's client connections
   currently `viewing` that conversation, via the same hub fan-out `stream`
   uses — never written to the journal (no seq, no unread/push effects).
+- Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
+  live tool output (never journaled). `message_ref` is the tool_use_id;
+  `offset` is the UTF-8 byte position of `chunk` in the command's output.
+  The server holds a capped in-memory buffer per stream (1 MiB /
+  `MATRON_TOOL_STREAM_MAX_BYTES`; 64 buffers /
+  `MATRON_TOOL_STREAM_MAX_BUFFERS`; 30 min idle /
+  `MATRON_TOOL_STREAM_IDLE_MS`). `meta {tool, command}` is required on the
+  buffer-creating (offset-0) frame. Offset rules: `== end` appends, `< end`
+  trims the overlap (idempotent retries), `> end` (or unknown buffer at
+  offset > 0) draws `{kind:'control', op:'stream_resync', convo_id,
+  message_ref, have}` — resend from byte `have`. Ownership as `activity`
+  (`forbidden`); agent connections only.
+- Viewing clients receive tool-stream ephemerals distinguished by the
+  `tool_stream` key: `{event:'append', offset, chunk}` live (consecutive
+  appends coalesce by concatenation, not latest-wins); on starting to view,
+  one `{event:'sync', meta, offset, content, head_truncated}` per active
+  stream (full scrollback so far — clients trim any append whose offset
+  precedes their accumulated end); `{event:'end', reason:'stale'}` when the
+  idle sweep frees a buffer whose bridge died. Normal completion sends no
+  ephemeral: the durable `tool_output` event arrives with the same
+  `message_ref` in its payload and retires the live view.
+- `finalize` accepts an optional top-level `blob_ref` (same passthrough as
+  `publish`) and frees the matching live-stream buffer.
 
 ## Device revocation
 
@@ -185,3 +208,11 @@ Unset `MATRON_RETENTION_DAYS` means ENABLED at the 30-day default.
 `MATRON_RETENTION_DAYS=0`, or any value that isn't a non-negative integer,
 disables retention instead (one warn log line at boot). Manual run:
 `matron-admin offload [--days N]` (default 30).
+
+Live-log blobs (`tool_output` payloads with `live_log: true`, uploaded by
+bridges at command completion) are deleted after
+`MATRON_TOOL_LOG_TTL_HOURS` (default 24; 0/invalid disables): the blob file
+and its `blobs` row are removed and the payload is rewritten to
+`{..., blob_ref: null, blob_expired: true}` — the snippet stays forever.
+Offload skips `blob_expired` payloads. Manual run:
+`matron-admin expire-logs [--hours N]`.
