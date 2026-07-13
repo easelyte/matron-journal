@@ -470,8 +470,14 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,
+          blobRef: msg.blob_ref ?? null,
           idemKey: `agent:${conn.deviceId}:fin:${msg.message_ref}`,
         })
+        // Normal end-of-stream for a live tool-output overlay: the durable
+        // event above retires the client's view (same message_ref in its
+        // payload), so the buffer can go — no 'end' ephemeral needed. A no-op
+        // for every finalize that never streamed.
+        toolStreams.free(msg.convo_id, msg.message_ref)
         break
       }
       default:

@@ -103,3 +103,29 @@ test('viewing a convo with no active streams sends no sync frames', async (t) =>
   await new Promise((r) => setTimeout(r, 150))
   assert.equal(client.frames.some((f) => f.tool_stream), false)
 })
+
+test('finalize retires the stream: buffer freed, blob_ref column set, overlay retired by journal frame', async (t) => {
+  const { s, agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:dan')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu7', offset: 0, chunk: 'building...\n', meta: { tool: 'Bash', command: 'make' } })
+  await client.waitFor((f) => f.tool_stream?.event === 'append')
+
+  agent.send({
+    op: 'finalize', convo_id: 'sess-ts', message_ref: 'tu7', type: 'tool_output',
+    blob_ref: 'blob-123',
+    payload: { message_ref: 'tu7', command: 'make', exit_code: 0, denied: false, truncated: false, snippet: 'building...', blob_ref: 'blob-123', live_log: true },
+  })
+  const done = await client.waitFor((f) => f.kind === 'journal' && f.type === 'tool_output')
+  assert.equal(done.payload.message_ref, 'tu7')
+  assert.equal(done.payload.exit_code, 0)
+
+  // the events row carries the blob_ref COLUMN (retention scans key on it)
+  const row = s.db.prepare("SELECT blob_ref FROM events WHERE type='tool_output'").get()
+  assert.equal(row.blob_ref, 'blob-123')
+
+  // buffer is gone: a fresh viewing yields no sync frame for tu7
+  assert.deepEqual(s.toolStreams.buffersFor(1, 'sess-ts'), [])
+})
