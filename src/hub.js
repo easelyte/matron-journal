@@ -1,3 +1,27 @@
+const byteLen = (s) => Buffer.byteLength(s, 'utf8')
+
+// Coalescing rule for one pending slot. Legacy ephemerals (text overlays,
+// activity) keep latest-wins — every frame carries full replacement state.
+// Tool-stream appends are DELTAS, so latest-wins would drop output: a
+// pending append (or sync) absorbs a contiguous next append by
+// concatenation instead. Anything else — end frames, a fresh sync, a
+// non-contiguous append (defensive; the store fans out contiguously) —
+// replaces the slot.
+export function mergeEphemeral(prev, frame) {
+  if (!prev) return frame
+  const p = prev.tool_stream
+  const f = frame.tool_stream
+  if (p && f && f.event === 'append') {
+    if (p.event === 'append' && p.offset + byteLen(p.chunk) === f.offset) {
+      return { ...prev, tool_stream: { ...p, chunk: p.chunk + f.chunk } }
+    }
+    if (p.event === 'sync' && p.offset + byteLen(p.content) === f.offset) {
+      return { ...prev, tool_stream: { ...p, content: p.content + f.chunk } }
+    }
+  }
+  return frame
+}
+
 export function makeHub({ coalesceMs = 200 } = {}) {
   const byUser = new Map() // userId -> Set<conn>
   return {
@@ -55,7 +79,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       for (const c of byUser.get(userId) || []) {
         if (c.viewingConvoId !== convoId || c.ws.readyState !== 1) continue
         const key = `${frame.convo_id}:${frame.message_ref}`
-        c._pending.set(key, frame) // latest wins
+        c._pending.set(key, mergeEphemeral(c._pending.get(key), frame))
         if (!c._flushTimer) {
           c._flushTimer = setTimeout(() => {
             c._flushTimer = null
