@@ -98,8 +98,16 @@ export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
   ({ seq, convo_id, ts, sender, type, payload })
 
 export function snapshot(db, userId) {
+  // last_ts: timestamp of the conversation's newest event, so a client can
+  // show a correct "last activity" time from a snapshot alone. Without it,
+  // a client refreshing via /snapshot after missing frames advanced the
+  // snippet but kept a stale timestamp. NULL when a conversation has no
+  // events (just created, or history pruned by retention) — clients fall
+  // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, last_seq, unread_count, snippet, created_at
+    `SELECT id, title, session_state, last_seq, unread_count, snippet, created_at,
+            (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+             ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
   ).all(userId)
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)

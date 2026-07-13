@@ -72,6 +72,13 @@ test('snapshot, replay, pagination, read markers', async () => {
   const snap = snapshot(db, dan.id)
   assert.equal(snap.seq, 5)
   assert.equal(snap.conversations[0].unread_count, 5)
+  // last_ts mirrors the newest event's ts so clients can render a correct
+  // "last activity" time from a snapshot alone; NULL with no events.
+  const newestTS = db.prepare("SELECT ts FROM events WHERE convo_id='c1' ORDER BY seq DESC LIMIT 1").get().ts
+  assert.equal(snap.conversations[0].last_ts, newestTS)
+  upsertConversation(db, { id: 'c-empty', ownerUserId: dan.id, title: 'no events yet' })
+  const snap2 = snapshot(db, dan.id)
+  assert.equal(snap2.conversations.find((c) => c.id === 'c-empty').last_ts, null)
 
   const replay = eventsAfter(db, dan.id, 2)
   assert.deepEqual(replay.map((e) => e.seq), [3, 4, 5])
