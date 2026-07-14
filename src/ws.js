@@ -4,7 +4,10 @@ import { eventsAfter, append, markRead, upsertConversation, toEventShape } from 
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
-const CLIENT_SEND_TYPES = new Set(['text'])
+// file/image sends carry a blob_ref pointing at a prior POST /media upload;
+// the payload mirrors the agent-publish shape ({blob_ref, name, content_type,
+// size}) so renderers treat both directions identically.
+const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 
 // Exactly what an agent may hand-author via `publish`. `session_status` is
 // server-generated (only reachable via convo_upsert); `read_marker` and
@@ -371,10 +374,16 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const type = msg.type || 'text'
         if (!CLIENT_SEND_TYPES.has(type)) return fail('forbidden')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // Media sends are useless without a blob to fetch — reject early
+        // instead of appending a row no consumer can resolve.
+        if (type !== 'text' && (typeof msg.blob_ref !== 'string' || msg.blob_ref.length === 0)) {
+          return fail('bad_request', 'media send requires blob_ref')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type,
           payload: msg.payload,
+          blobRef: msg.blob_ref ?? null,
           idemKey: msg.local_id ? `client:${conn.deviceId}:${msg.local_id}` : null,
         })
         break
