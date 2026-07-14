@@ -204,9 +204,10 @@ test('runExpireLogs deletes old live_log blobs, rewrites payload, NULLs the colu
   const oldRow = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(userId, old.seq)
   assert.equal(oldRow.blob_ref, null)
   const p = JSON.parse(oldRow.payload)
-  assert.equal(p.blob_ref, null)
-  assert.equal(p.blob_expired, true)
-  assert.equal(p.snippet, 'tail') // rest of the payload preserved
+  assert.deepEqual(p, {
+    message_ref: 'tu-x', command: 'make', exit_code: 0, denied: false,
+    truncated: false, live_log: true, expired: true, blob_ref: null,
+  }) // snippet and blob_expired keys gone, everything else carried verbatim
   assert.equal(getBlob(db, old.blob.id), undefined)
   assert.equal(fs.existsSync(old.blob.diskPath), false)
 
@@ -219,7 +220,7 @@ test('runExpireLogs deletes old live_log blobs, rewrites payload, NULLs the colu
   assert.equal(runExpireLogs(db, { hours: 24, mediaDir }).expired, 0)
 })
 
-test('runOffload skips blob_expired payloads (no pointless re-blob at 30d)', async () => {
+test('runOffload skips expired tombstones (no pointless re-blob at 30d)', async () => {
   const { db, dan } = await setup()
   const userId = dan.id
   const convoId = 'c1'
@@ -229,7 +230,44 @@ test('runOffload skips blob_expired payloads (no pointless re-blob at 30d)', asy
   const r = runOffload(db, { days: 30, mediaDir })
   assert.equal(r.offloaded, 0)
   const row = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(userId, old.seq)
-  assert.equal(JSON.parse(row.payload).blob_expired, true) // untouched
+  assert.equal(JSON.parse(row.payload).expired, true) // untouched tombstone
+})
+
+test('runExpireLogs tombstones a pre-upgrade blob_expired row (snippet purged, no blob to delete)', async () => {
+  const { db, dan } = await setup()
+  const payload = {
+    message_ref: 'tu-pre', command: 'npm ci', exit_code: 1, denied: false,
+    truncated: false, snippet: 'old tail', blob_ref: null, blob_expired: true, live_log: true,
+  }
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'tool_output', payload })
+  db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, dan.id, r.seq)
+
+  assert.equal(runExpireLogs(db, { hours: 24, mediaDir: tmpMediaDir() }).expired, 1)
+  const row = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  assert.deepEqual(JSON.parse(row.payload), {
+    message_ref: 'tu-pre', command: 'npm ci', exit_code: 1, denied: false,
+    truncated: false, live_log: true, expired: true, blob_ref: null,
+  })
+})
+
+test('runExpireLogs scrubs the convo preview when the purged event is the latest', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  seedLiveLog(db, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, 'tail')
+
+  runExpireLogs(db, { hours: 24, mediaDir })
+  assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, '$ make')
+})
+
+test('runExpireLogs leaves the convo preview alone when a newer message exists', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  seedLiveLog(db, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: 'newer message' } })
+
+  runExpireLogs(db, { hours: 24, mediaDir })
+  assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, 'newer message')
 })
 
 test('runExpireLogs never touches offload-created blobs (no live_log flag)', async () => {

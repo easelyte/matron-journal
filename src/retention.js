@@ -48,9 +48,10 @@ export function runOffload(db, { days = 30, mediaDir }) {
     }
     if (looksAlreadyOffloaded(payload)) continue
 
-    // A live-log payload whose blob the TTL pass already deleted: re-blobbing
-    // the retained snippet payload would undo blob_expired for zero value.
-    if (payload && payload.blob_expired) continue
+    // A live-log payload the TTL pass already tombstoned (`expired`), or one
+    // in the pre-purge shape (`blob_expired`) that the next TTL pass will
+    // tombstone: re-blobbing either would undo the purge for zero value.
+    if (payload && (payload.expired || payload.blob_expired)) continue
 
     const blob = writeBlobSync(mediaDir, Buffer.from(row.payload, 'utf8'))
     const snippet = snippetOf(OFFLOAD_TYPE, payload)
@@ -68,33 +69,57 @@ export function runOffload(db, { days = 30, mediaDir }) {
   return { offloaded }
 }
 
-// Deletes full-log blobs attached to live-streamed tool_output events older
-// than `hours` (spec §7 — retention parity with the old 24h viewer links).
-// Only payloads marked live_log:true are touched; offload-created blobs
-// never carry that flag. The payload keeps its snippet/command/exit_code and
-// gains blob_expired:true; the blob_ref column is NULLed in the same
-// transaction so no row ever references a deleted blob. File unlink happens
-// after commit — a crash between the two leaves an orphan file (same stance
-// as runOffload's write-before-commit, in the opposite direction).
+// Purges tool output attached to live-streamed tool_output events older than
+// `hours` (spec: docs/superpowers/specs/2026-07-14-tool-output-purge-design.md).
+// The full-log blob is deleted AND the payload is rewritten to a tombstone —
+// command, exit code, and flags survive forever; the snippet does not. Only
+// payloads marked live_log:true are touched; offload-created blobs and legacy
+// viewer-era rows never carry that flag. json_extract keeps the 6-hourly scan
+// from re-parsing every historical row: already-tombstoned rows (`expired`)
+// and non-live-log rows are excluded in SQL (all payloads are server-written
+// JSON, so json_valid guards nothing real but keeps a hand-edited row from
+// erroring the whole query). Blob-row delete, payload rewrite, and the convo
+// preview scrub share one transaction per row; file unlink happens after
+// commit — a crash between the two leaves an orphan file (same stance as
+// runOffload's write-before-commit, in the opposite direction).
 export function runExpireLogs(db, { hours = 24, mediaDir }) {
   const cutoff = Date.now() - hours * 3600000
   const rows = db.prepare(
-    "SELECT user_id, seq, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NOT NULL"
+    "SELECT user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
+    "AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL"
   ).all(cutoff)
 
   let expired = 0
   const update = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+  const convoLastSeq = db.prepare('SELECT last_seq FROM conversations WHERE id=?')
+  const updateConvoSnippet = db.prepare('UPDATE conversations SET snippet=? WHERE id=?')
 
   for (const row of rows) {
     let payload
     try { payload = JSON.parse(row.payload) } catch { payload = null }
-    if (!payload || payload.live_log !== true) continue
-    const blob = getBlob(db, row.blob_ref)
-    const newPayload = JSON.stringify({ ...payload, blob_ref: null, blob_expired: true })
+    if (!payload || payload.live_log !== true) continue // defense in depth; SQL already filters
+    const blob = row.blob_ref ? getBlob(db, row.blob_ref) : null
+    const tombstone = {
+      message_ref: payload.message_ref,
+      command: payload.command,
+      exit_code: payload.exit_code,
+      denied: payload.denied,
+      truncated: payload.truncated,
+      live_log: true,
+      expired: true,
+      blob_ref: null,
+    }
     db.transaction(() => {
-      deleteBlobRow.run(row.blob_ref)
-      update.run(newPayload, row.user_id, row.seq)
+      if (row.blob_ref) deleteBlobRow.run(row.blob_ref)
+      update.run(JSON.stringify(tombstone), row.user_id, row.seq)
+      // Purged output must not linger in the conversation-list preview: if
+      // this event is still the convo's latest, rewrite the preview from the
+      // tombstone ($ <command>). A newer message owns the preview otherwise.
+      const convo = convoLastSeq.get(row.convo_id)
+      if (convo && convo.last_seq === row.seq) {
+        updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
+      }
     })()
     if (blob) { try { fs.unlinkSync(blob.disk_path) } catch { /* already gone */ } }
     expired += 1
