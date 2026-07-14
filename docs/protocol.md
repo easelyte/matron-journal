@@ -66,7 +66,9 @@ the machine-checkable version of this page.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
-  Client ops: send, prompt_reply, read_marker, ack, viewing.
+  Client ops: send (type text, or file/image with a top-level blob_ref from a
+  prior POST /media — payload mirrors the agent-publish media shape),
+  prompt_reply, read_marker, ack, viewing.
   Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
   finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
   is available to both kinds:

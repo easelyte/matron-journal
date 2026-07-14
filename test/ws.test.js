@@ -142,6 +142,43 @@ test('send type whitelist and ack validation', async (t) => {
   c.close()
 })
 
+test('client file/image sends append with blob_ref; media sends without blob_ref rejected', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const l1 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const l2 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  const mac = await makeWsClient(s.base, { token: l1.json.token, cursor: 0 })
+  const phone = await makeWsClient(s.base, { token: l2.json.token, cursor: 0 })
+
+  // file send with a blob_ref: appended, fanned out, blob_ref lands in the COLUMN
+  mac.send({
+    op: 'send', convo_id: 'c1', type: 'file', blob_ref: 'abc123',
+    payload: { blob_ref: 'abc123', name: 'notes.pdf', content_type: 'application/pdf', size: 5 },
+    local_id: 'f1',
+  })
+  const f = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'file')
+  assert.equal(f.payload.name, 'notes.pdf')
+  assert.equal(f.sender, 'user:dan')
+  assert.equal(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(f.seq).blob_ref, 'abc123')
+
+  // image send works the same way
+  mac.send({
+    op: 'send', convo_id: 'c1', type: 'image', blob_ref: 'img456',
+    payload: { blob_ref: 'img456', name: 'shot.png', content_type: 'image/png', size: 9 },
+  })
+  const img = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'image')
+  assert.equal(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(img.seq).blob_ref, 'img456')
+
+  // media send without blob_ref is rejected and appends nothing
+  const before = s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='c1'").get().n
+  mac.send({ op: 'send', convo_id: 'c1', type: 'file', payload: { name: 'ghost.pdf' } })
+  await mac.waitFor((x) => x.kind === 'control' && x.op === 'error' && x.code === 'bad_request' && x.ref === 'send')
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='c1'").get().n, before)
+  mac.close(); phone.close()
+})
+
 test('send with a missing or non-object payload is rejected as bad_request, not a crash', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
