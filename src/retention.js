@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { writeBlobSync } from './media.js'
 import { insertBlob, getBlob } from './db.js'
-import { snippetOf } from './journal.js'
+import { snippetOf, MESSAGE_TYPES } from './journal.js'
 
 const OFFLOAD_TYPE = 'tool_output'
 
@@ -92,7 +92,16 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
   let expired = 0
   const update = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
-  const convoLastSeq = db.prepare('SELECT last_seq FROM conversations WHERE id=?')
+  // `conversations.last_seq` is bumped by EVERY event append (read_marker,
+  // session_status, ...), not just the ones that own the preview — only
+  // MESSAGE_TYPES events ever write `snippet` (see append() in journal.js).
+  // So "is this row the convo's latest event" (last_seq) is the wrong
+  // ownership test; "is this row the convo's latest MESSAGE_TYPES event" is
+  // the right one. A read_marker/session_status landing after a purged
+  // tool_output — routine within the 24h TTL — must not suppress the scrub.
+  const latestMessageSeq = db.prepare(
+    `SELECT seq FROM events WHERE convo_id=? AND type IN (${MESSAGE_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 1`
+  )
   const updateConvoSnippet = db.prepare('UPDATE conversations SET snippet=? WHERE id=?')
 
   for (const row of rows) {
@@ -114,10 +123,11 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
       if (row.blob_ref) deleteBlobRow.run(row.blob_ref)
       update.run(JSON.stringify(tombstone), row.user_id, row.seq)
       // Purged output must not linger in the conversation-list preview: if
-      // this event is still the convo's latest, rewrite the preview from the
-      // tombstone ($ <command>). A newer message owns the preview otherwise.
-      const convo = convoLastSeq.get(row.convo_id)
-      if (convo && convo.last_seq === row.seq) {
+      // this event is still the convo's latest MESSAGE_TYPES event, rewrite
+      // the preview from the tombstone ($ <command>). A newer message-type
+      // event owns the preview otherwise.
+      const latest = latestMessageSeq.get(row.convo_id, ...MESSAGE_TYPES)
+      if (latest && latest.seq === row.seq) {
         updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
       }
     })()

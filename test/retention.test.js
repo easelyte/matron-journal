@@ -5,7 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser } from '../src/auth.js'
-import { upsertConversation, append } from '../src/journal.js'
+import { upsertConversation, append, markRead } from '../src/journal.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { writeBlobSync } from '../src/media.js'
 
@@ -268,6 +268,20 @@ test('runExpireLogs leaves the convo preview alone when a newer message exists',
 
   runExpireLogs(db, { hours: 24, mediaDir })
   assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, 'newer message')
+})
+
+test('runExpireLogs scrubs the preview even when a read_marker bumped last_seq after the purged event (read_marker never owns the preview)', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  seedLiveLog(db, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  // markRead appends a read_marker event, which bumps conversations.last_seq
+  // but is not a MESSAGE_TYPES type, so it never writes conversations.snippet.
+  // A last_seq-based ownership check would wrongly see the purged tool_output
+  // as "not latest" and skip the scrub, leaving the purged snippet forever.
+  markRead(db, dan.id, 'c1', null, 'user:dan')
+
+  runExpireLogs(db, { hours: 24, mediaDir })
+  assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, '$ make')
 })
 
 test('runExpireLogs never touches offload-created blobs (no live_log flag)', async () => {
