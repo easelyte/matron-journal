@@ -13,6 +13,7 @@ export function snippetOf(type, payload) {
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
   if (p.snippet) return String(p.snippet).slice(0, 120)
+  if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   return `[${type}]`
 }
 

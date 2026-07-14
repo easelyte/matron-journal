@@ -178,3 +178,16 @@ test('append with a MESSAGE_TYPES type and a null/non-object payload does not cr
   assert.equal(c1.snippet, '')
   assert.equal(c1.unread_count, 1)
 })
+
+test('snippetOf tool_output falls back to `$ command` when snippet is absent', () => {
+  assert.equal(snippetOf('tool_output', { command: 'make test', expired: true }), '$ make test')
+  // snippet still wins when present
+  assert.equal(snippetOf('tool_output', { command: 'make', snippet: 'tail line' }), 'tail line')
+  // no command, no snippet -> generic placeholder (unchanged)
+  assert.equal(snippetOf('tool_output', { expired: true }), '[tool_output]')
+  // 120-char cap
+  const long = 'x'.repeat(300)
+  const s = snippetOf('tool_output', { command: long })
+  assert.equal(s.length, 120)
+  assert.ok(s.startsWith('$ x'))
+})
