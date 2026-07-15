@@ -95,6 +95,9 @@ POST /pair/start   {}                          (unauthenticated, rate-limited pe
 POST /pair/approve { pair_code, agent_name }   (Bearer, client devices only)
   -> { status: 'approved' }
 
+POST /pair/preview { pair_code }               (Bearer, client devices only)
+  -> { requester_ip, expires_in }               # pending pairs only — the approval screen's "who is asking"
+
 POST /pair/claim   { poll_token }              (unauthenticated)
   -> { status: 'pending' }
    | { status: 'approved', token, device_id }   # exactly once, then the pair is deleted
@@ -126,6 +129,11 @@ POST /pair/claim   { poll_token }              (unauthenticated)
 - `/pair/start` is rate-limited per IP through the existing `rateLimiter`
   (same budget class as `/login`), and the pending map is capped (e.g. 64
   outstanding pairs) — start returns 429 `rate_limited` beyond either limit.
+- `pair/start` records the requester's IP on the pending pair;
+  `pair/preview` returns it (with the remaining TTL) so the approval screen
+  can show who is asking before the user approves. Unknown, expired, and
+  already-approved codes are indistinguishable 404s — an approved pair can't
+  be approved again, so there is nothing left to preview.
 - `/pair/claim` returns the token exactly once and deletes the pair;
   a second claim is 404. Unknown/expired poll_token: 404.
 
@@ -133,8 +141,9 @@ POST /pair/claim   { poll_token }              (unauthenticated)
 nothing durable exists anywhere until claim. A guessed or phished `pair_code`
 becomes an agent only if a real user approves it in the app, and it becomes an
 agent **of the approving user** — so the approval screen must show the code
-and the requesting IP, and the human types the code they can see on their own
-box's terminal. Token exfiltration requires the 256-bit `poll_token`, which
+and the requesting IP (the app fetches the IP via `pair/preview` before
+approving), and the human types the code they can see on their own box's
+terminal. Token exfiltration requires the 256-bit `poll_token`, which
 transits only TLS responses. The residual risk is the classic device-flow
 phish ("approve this code for me") — mitigated by approval-screen wording
 (agent name + requester IP), acceptable for a first-party population of three.
@@ -168,6 +177,9 @@ Conformance-style tests alongside the existing suite (`:memory:` DBs):
 - approve twice with the same code → second is 409 `conflict`, and exactly
   one device row exists after the eventual claim
 - approve with an **agent**-kind bearer → 403; approve with unknown code → 404
+- preview on a pending pair returns the requester IP recorded at start and
+  the remaining TTL; unknown, expired, and already-approved codes → 404;
+  agent bearer → 403; unauthenticated → 401; bad bodies → 400
 - start beyond the per-IP rate limit / pending-map cap → 429
 - `GET /devices` as agent → 403; roster shows `is_self` correctly
 - revoke: not-owned id → 404; own device → row gone, live socket closed;

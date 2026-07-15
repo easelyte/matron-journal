@@ -109,6 +109,57 @@ test('gating and validation: approve needs a client bearer; bad bodies 400; unkn
   assert.equal((await s.http('/pair/claim', { method: 'POST', body: { poll_token: 'f'.repeat(64) } })).status, 404)
 })
 
+test('pair/preview: the approval screen sees the requester IP and remaining TTL for a pending pair', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const me = await loggedInClient(s)
+
+  const start = await s.http('/pair/start', { method: 'POST', body: {} })
+  assert.equal(start.status, 200)
+
+  // start recorded the test client's IP on the pending pair
+  const v = await s.http('/pair/preview', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code } })
+  assert.equal(v.status, 200)
+  assert.equal(typeof v.json.requester_ip, 'string')
+  assert.ok(v.json.requester_ip.length > 0)
+  assert.ok(v.json.expires_in > 0 && v.json.expires_in <= 600)
+
+  // sloppy human-typed code (lowercase, no hyphen) previews the same pair
+  const sloppy = await s.http('/pair/preview', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code.toLowerCase().replace('-', '') } })
+  assert.equal(sloppy.status, 200)
+  assert.equal(sloppy.json.requester_ip, v.json.requester_ip)
+
+  // preview mutated nothing: the pair is still approvable
+  const approve = await s.http('/pair/approve', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code, agent_name: 'dev-9' } })
+  assert.equal(approve.status, 200)
+})
+
+test('pair/preview gating and validation: client bearer only; bad bodies 400; unknown and approved codes 404', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const me = await loggedInClient(s)
+  const agent = createAgent(s.db, 1, 'existing-agent')
+
+  assert.equal((await s.http('/pair/preview', { method: 'POST', body: { pair_code: 'XXXX-XXXX' } })).status, 401)
+  const asAgent = await s.http('/pair/preview', { method: 'POST', token: agent.token, body: { pair_code: 'XXXX-XXXX' } })
+  assert.equal(asAgent.status, 403)
+
+  for (const body of [{}, { pair_code: 7 }, { pair_code: '' }]) {
+    const r = await s.http('/pair/preview', { method: 'POST', token: me.token, body })
+    assert.equal(r.status, 400, JSON.stringify(body))
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+
+  const unknown = await s.http('/pair/preview', { method: 'POST', token: me.token, body: { pair_code: 'XXXX-XXXX' } })
+  assert.equal(unknown.status, 404)
+
+  // already-approved merges into the same 404: nothing left to preview
+  const start = await s.http('/pair/start', { method: 'POST', body: {} })
+  await s.http('/pair/approve', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code, agent_name: 'dev-9' } })
+  const approved = await s.http('/pair/preview', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code } })
+  assert.equal(approved.status, 404)
+})
+
 test('pair/start is rate-limited per IP (shared /login budget) and capped by the store', async (t) => {
   // rateLimiter default: 5/min per IP. All test-client requests share 127.0.0.1.
   const s = await startTestServer({ pairs: makePairStore({ maxPending: 2 }) })

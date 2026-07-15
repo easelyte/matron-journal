@@ -56,6 +56,36 @@ test('an approved-but-unclaimed pair also expires', async () => {
   assert.deepEqual(store.claim(p.pollToken), { status: 'not_found' })
 })
 
+test('start records requesterIp; preview returns it with the remaining TTL, without mutating', () => {
+  const store = makePairStore()
+  const p = store.start({ requesterIp: '198.51.100.7' })
+  const v = store.preview(p.pairCode)
+  assert.equal(v.requesterIp, '198.51.100.7')
+  assert.ok(v.expiresIn > 0 && v.expiresIn <= 600)
+  // preview normalizes user-typed codes like approve does
+  assert.deepEqual(store.preview(` ${p.pairCode.toLowerCase().replace('-', ' ')} `), v)
+  // no mutation: the pair is still pending and approvable
+  assert.deepEqual(store.claim(p.pollToken), { status: 'pending' })
+  assert.equal(store.approve(p.pairCode, { userId: 1, agentName: 'a' }), 'approved')
+})
+
+test('start without args keeps working; preview then reports a null requesterIp', () => {
+  const store = makePairStore()
+  const p = store.start()
+  assert.equal(store.preview(p.pairCode).requesterIp, null)
+})
+
+test('preview is null for unknown, expired, and already-approved pairs', async () => {
+  const store = makePairStore({ ttlMs: 20 })
+  assert.equal(store.preview('ZZZZ-ZZZZ'), null)
+  const approved = store.start({ requesterIp: '10.0.0.1' })
+  store.approve(approved.pairCode, { userId: 1, agentName: 'a' })
+  assert.equal(store.preview(approved.pairCode), null)
+  const expired = store.start({ requesterIp: '10.0.0.2' })
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(store.preview(expired.pairCode), null)
+})
+
 test('cap: start returns null at maxPending, and expired pairs free slots', async () => {
   const store = makePairStore({ ttlMs: 20, maxPending: 2 })
   assert.ok(store.start())
