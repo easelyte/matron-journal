@@ -92,6 +92,17 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'agent_device_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN agent_device_id INTEGER')
   }
+  // Links a subagent's durable child conversation to its parent conversation
+  // (spec: subagent sub-chats). Set once at creation by convo_upsert and
+  // immutable afterwards (see upsertConversation). NULL for every normal
+  // conversation and every row predating this column. Deliberately NOT a
+  // foreign key — same rationale as agent_device_id, and a child's upsert may
+  // legitimately arrive before its parent's row exists (ordering between the
+  // two is not guaranteed), so a dangling reference must be storable as-is.
+  if (!convoCols.some((c) => c.name === 'parent_convo_id')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
   return db
 }
 

@@ -65,6 +65,44 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
 
+test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations table in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-parent-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c1',1,'legacy',0)"
+  ).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+  assert.ok(cols.includes('parent_convo_id'), 'parent_convo_id column missing after migration')
+  const indexes = db.prepare('PRAGMA index_list(conversations)').all().map((i) => i.name)
+  assert.ok(indexes.includes('idx_conversations_parent'), 'parent index missing after migration')
+  // Pre-existing row survives untouched, with parent_convo_id now NULL.
+  const row = db.prepare("SELECT title, parent_convo_id FROM conversations WHERE id='c1'").get()
+  assert.equal(row.title, 'legacy')
+  assert.equal(row.parent_convo_id, null)
+  db.close()
+
+  // Re-opening (already migrated) is a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 // WAL mitigation, openDb half (docs/wal-checkpoint-profile.md): the WAL file
 // truncates back to <=4MiB on reset for every opener, but the inline
 // auto-checkpoint must stay at SQLite's stock default here — only the server
