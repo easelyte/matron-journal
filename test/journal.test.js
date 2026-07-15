@@ -146,6 +146,51 @@ test('markRead fails closed on a convo the caller does not own', async () => {
   assert.throws(() => markRead(db, pat.id, 'c1', 4), /not authorized/)
 })
 
+test('upsertConversation stores parent_convo_id at creation and defaults it to null', async () => {
+  const { db, dan } = await setup()
+  const child = upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })
+  assert.equal(child.parent_convo_id, 'c1')
+  // c1 was created (in setup) without a parent -> null, not undefined.
+  const c1 = db.prepare("SELECT parent_convo_id FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.parent_convo_id, null)
+})
+
+test('parent_convo_id is immutable: a later upsert cannot clear or change it', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, title: 'sub', parentConvoId: 'c1' })
+  // later upsert WITHOUT the field must not clear it
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, sessionState: 'waiting' })
+  assert.equal(db.prepare("SELECT parent_convo_id FROM conversations WHERE id='child'").get().parent_convo_id, 'c1')
+  // later upsert WITH a different value must not change it
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c2' })
+  assert.equal(db.prepare("SELECT parent_convo_id FROM conversations WHERE id='child'").get().parent_convo_id, 'c1')
+  // a convo created WITHOUT a parent cannot gain one later either
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, parentConvoId: 'child' })
+  assert.equal(db.prepare("SELECT parent_convo_id FROM conversations WHERE id='c1'").get().parent_convo_id, null)
+})
+
+test('snapshot rows carry parent_convo_id (null for normal convos, set for children)', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, title: 'sub', parentConvoId: 'c1' })
+  const snap = snapshot(db, dan.id)
+  assert.equal(snap.conversations.find((c) => c.id === 'c1').parent_convo_id, null)
+  assert.equal(snap.conversations.find((c) => c.id === 'child').parent_convo_id, 'c1')
+})
+
+test('a child convo (parent_convo_id set) never increments unread_count; the same event in a normal convo does', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })
+  append(db, { userId: dan.id, convoId: 'child', sender: 'agent:dev-2', type: 'text', payload: { body: 'sub work' } })
+  const child = db.prepare("SELECT unread_count, last_seq, snippet FROM conversations WHERE id='child'").get()
+  assert.equal(child.unread_count, 0, 'silent child must not bump unread')
+  // last_seq/snippet still track the event — only unread is exempt.
+  assert.ok(child.last_seq > 0)
+  assert.equal(child.snippet, 'sub work')
+  // Control: the identical agent event in a normal convo DOES bump unread.
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'sub work' } })
+  assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 1)
+})
+
 test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
   for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
     assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)
