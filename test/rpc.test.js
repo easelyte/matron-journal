@@ -152,3 +152,111 @@ test('RPC traffic appends nothing to the journal', async (t) => {
   assert.equal(after.json.user.head_seq, before.json.user.head_seq)
   assert.equal(after.json.journal_row_count, before.json.journal_row_count)
 })
+
+test('full round-trip: response reaches the client with stamped agent_device_id', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  const agent = await open(s, ag.token)
+  client.send({ op: 'agent_request', request_id: 'rt1', agent_device_id: ag.deviceId, method: 'recent_folders', params: {} })
+  const req = await agent.waitFor((x) => x.kind === 'rpc')
+  agent.send({
+    op: 'agent_response', request_id: req.request.request_id,
+    to_device_id: req.request.from_device_id, ok: true,
+    result: { folders: [{ path: '/home/dan/yearbook-app', last_used: 1784500000000 }] },
+  })
+  const resp = await client.waitFor((x) => x.kind === 'rpc')
+  assert.deepEqual(resp, {
+    kind: 'rpc',
+    response: {
+      request_id: 'rt1', agent_device_id: ag.deviceId, ok: true,
+      result: { folders: [{ path: '/home/dan/yearbook-app', last_used: 1784500000000 }] },
+    },
+  })
+})
+
+test('error responses require error.code and forward code+detail only', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  const agent = await open(s, ag.token)
+  agent.send({
+    op: 'agent_response', request_id: 'e1', to_device_id: login.json.device_id,
+    ok: false, error: { code: 'bad_workdir', detail: 'no such directory', junk: 'stripped' },
+  })
+  const resp = await client.waitFor((x) => x.kind === 'rpc')
+  assert.deepEqual(resp.response, {
+    request_id: 'e1', agent_device_id: ag.deviceId, ok: false,
+    error: { code: 'bad_workdir', detail: 'no such directory' },
+  })
+})
+
+test('clients cannot send agent_response', async (t) => {
+  const { s, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  client.send({ op: 'agent_response', request_id: 'x', to_device_id: login.json.device_id, ok: true })
+  const err = await client.waitFor((f) => f.op === 'error')
+  assert.equal(err.code, 'forbidden')
+})
+
+test('agent_response to unknown, other-user, or agent-kind devices -> not_found', async (t) => {
+  const { s, ag } = await setup(t)
+  const pat = await createUser(s.db, 'pat', 'password')
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'pat-phone' } })
+  const agent = await open(s, ag.token)
+  for (const target of [99999, patLogin.json.device_id, ag.deviceId]) {
+    agent.frames.length = 0
+    agent.send({ op: 'agent_response', request_id: 'n1', to_device_id: target, ok: true, result: {} })
+    const err = await agent.waitFor((f) => f.op === 'error')
+    assert.equal(err.code, 'not_found')
+    assert.equal(err.request_id, 'n1')
+  }
+})
+
+test('malformed agent_response fields -> bad_request', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const agent = await open(s, ag.token)
+  const to = login.json.device_id
+  const bads = [
+    { op: 'agent_response', to_device_id: to, ok: true },                                       // missing request_id
+    { op: 'agent_response', request_id: 'r', to_device_id: to, ok: 'yes' },                     // non-boolean ok
+    { op: 'agent_response', request_id: 'r', to_device_id: 'five', ok: true },                  // non-integer device id
+    { op: 'agent_response', request_id: 'r', to_device_id: to, ok: false },                     // ok:false without error
+    { op: 'agent_response', request_id: 'r', to_device_id: to, ok: false, error: {} },          // error without code
+    { op: 'agent_response', request_id: 'r', to_device_id: to, ok: false, error: { code: 'c'.repeat(65) } }, // long code
+  ]
+  for (const bad of bads) {
+    agent.frames.length = 0
+    agent.send(bad)
+    const err = await agent.waitFor((f) => f.op === 'error')
+    assert.equal(err.code, 'bad_request')
+  }
+})
+
+test('response multicasts to every live socket of the client device', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const clientA = await open(s, login.json.token)   // same device token twice
+  const clientB = await open(s, login.json.token)   // = two sockets, one device
+  const agent = await open(s, ag.token)
+  agent.send({ op: 'agent_response', request_id: 'm1', to_device_id: login.json.device_id, ok: true, result: 1 })
+  const fa = await clientA.waitFor((x) => x.kind === 'rpc')
+  const fb = await clientB.waitFor((x) => x.kind === 'rpc')
+  assert.equal(fa.response.request_id, 'm1')
+  assert.equal(fb.response.request_id, 'm1')
+})
+
+test('response after the requesting client disconnected is dropped without crashing', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  const agent = await open(s, ag.token)
+  client.send({ op: 'agent_request', request_id: 'd1', agent_device_id: ag.deviceId, method: 'start' })
+  const req = await agent.waitFor((x) => x.kind === 'rpc')
+  client.close()
+  // wait until the server has fully unregistered the client socket
+  await new Promise((r) => setTimeout(r, 100))
+  agent.send({ op: 'agent_response', request_id: 'd1', to_device_id: req.request.from_device_id, ok: true, result: {} })
+  // server must still be alive and the agent socket functional: a second
+  // malformed op still draws its error frame
+  agent.frames.length = 0
+  agent.send({ op: 'agent_response', request_id: 'd2', to_device_id: 'bogus', ok: true })
+  const err = await agent.waitFor((f) => f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+})

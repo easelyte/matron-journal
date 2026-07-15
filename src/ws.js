@@ -438,6 +438,37 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!delivered) return failRpc('agent_unreachable')
         break
       }
+      case 'agent_response': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        const rid = msg.request_id
+        if (typeof rid !== 'string' || rid.length === 0 || rid.length > RPC_ID_MAX_CHARS) return fail('bad_request', 'bad request_id')
+        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, request_id: rid, ...(detail ? { detail } : {}) }))
+        if (typeof msg.ok !== 'boolean') return failRpc('bad_request', 'bad ok')
+        if (!Number.isInteger(msg.to_device_id)) return failRpc('bad_request', 'bad to_device_id')
+        // The only payload shape rule the server enforces: a failure must
+        // carry a machine-usable code. Everything else is bridge-owned.
+        if (!msg.ok && (typeof msg.error !== 'object' || msg.error === null
+            || typeof msg.error.code !== 'string' || msg.error.code.length === 0
+            || msg.error.code.length > RPC_NAME_MAX_CHARS)) {
+          return failRpc('bad_request', 'error.code required when ok is false')
+        }
+        if (Buffer.byteLength(JSON.stringify(msg), 'utf8') > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.to_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'client') return failRpc('not_found')
+        // Multicast (see hub.sendRpcResponse); a fully disconnected client
+        // just misses it — stateless relay, the app re-asks.
+        hub.sendRpcResponse(conn.userId, msg.to_device_id, {
+          kind: 'rpc',
+          response: {
+            request_id: rid, agent_device_id: conn.deviceId, ok: msg.ok,
+            ...(msg.ok
+              ? { result: msg.result ?? null }
+              : { error: { code: msg.error.code, ...(typeof msg.error.detail === 'string' ? { detail: msg.error.detail } : {}) } }),
+          },
+        })
+        break
+      }
       case 'read_marker': {
         // null means "resolve server-side to the conversation head" (see
         // markRead); anything else must be a genuine non-negative seq.
