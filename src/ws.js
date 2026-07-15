@@ -543,8 +543,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         }
         // Other devices learn renames live instead of only via /snapshot.
         // No event when the title is unchanged, absent, or this was a
-        // state-only upsert (see upsertConversation's titleChanged logic).
-        if (convo.titleChanged) {
+        // state-only upsert (see upsertConversation's metaChanged logic).
+        if (convo.metaChanged) {
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'convo_meta',

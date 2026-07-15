@@ -177,6 +177,15 @@ test('snapshot rows carry parent_convo_id (null for normal convos, set for child
   assert.equal(snap.conversations.find((c) => c.id === 'child').parent_convo_id, 'c1')
 })
 
+test('creating a titleless child still reports metaChanged so the linkage rides the journal', async () => {
+  const { db, dan } = await setup()
+  const child = upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })
+  assert.equal(child.metaChanged, true, 'titleless child creation must fan out convo_meta')
+  // Control: a titleless creation WITHOUT a parent stays silent, as before.
+  const plain = upsertConversation(db, { id: 'plain', ownerUserId: dan.id })
+  assert.equal(plain.metaChanged, false)
+})
+
 test('a partial markRead on a child convo cannot resurrect unread_count', async () => {
   const { db, dan } = await setup()
   upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })

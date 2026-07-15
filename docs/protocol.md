@@ -117,10 +117,13 @@ the machine-checkable version of this page.
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
   (`payload:{title, parent_convo_id}`, sender = the agent device, e.g.
-  `agent:dev-2`) whenever it changes an existing conversation's title, or sets
-  a non-empty title at creation — so other devices learn renames live instead
-  of only via `/snapshot`. No event when the title is unchanged or omitted
-  (state-only upserts included).
+  `agent:dev-2`) whenever it changes an existing conversation's title, sets
+  a non-empty title at creation, or creates a child (`parent_convo_id` set,
+  even titleless — the linkage must ride the journal, or a live client would
+  list the child as a normal conversation until its next `/snapshot`) — so
+  other devices learn renames and child linkage live instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
+  upserts on existing conversations).
 - `convo_upsert` accepts an optional `parent_convo_id` linking a durable child
   conversation to its parent (subagent sub-chats). It is a non-empty string
   (id length cap 128; malformed → `bad_request`), **set once at creation and
