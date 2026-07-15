@@ -89,10 +89,14 @@ protocol's envelope vocabulary plus one addition (`agent_unreachable`).
   { kind:'rpc', request: { request_id, from_device_id, method, params } }
   ```
 
-  to **all** of that device's live connections (normally exactly one),
-  bypassing the ephemeral coalescer — RPC frames must never be merged or
-  latest-wins-dropped. `from_device_id` is stamped by the server from the
-  sender's authenticated connection, never taken from the frame.
+  to **exactly one** of them — the most recently registered live connection
+  (single-consumer rule). A device normally has one socket, but reconnect
+  overlap can briefly leave two; multicasting a request there would
+  double-execute non-idempotent methods (`start` spawning two sessions).
+  The newest socket is the one a reconnecting bridge is actually serving.
+  Delivery bypasses the ephemeral coalescer — RPC frames must never be
+  merged or latest-wins-dropped. `from_device_id` is stamped by the server
+  from the sender's authenticated connection, never taken from the frame.
 - If the target has no live connection: reply immediately
   `{op:'error', code:'agent_unreachable', request_id}` — no queueing.
 - At-most-once, fire-and-forget past that point: the server keeps no record.
@@ -125,7 +129,10 @@ protocol's envelope vocabulary plus one addition (`agent_unreachable`).
 
   `agent_device_id` is stamped from the responding connection. If the client
   has meanwhile disconnected, the response is dropped silently — the app
-  re-asks on next need.
+  re-asks on next need. Responses stay multicast deliberately (asymmetric
+  with requests): they carry no side effects, and a client correlating by
+  `request_id` ignores a duplicate; dropping one socket of a
+  mid-reconnect client would instead lose the response entirely.
 
 The relay is **stateless**: validate, stamp the sender's device id, forward.
 No table, no pending map, no sweep. Revocation needs no new handling — a
@@ -214,7 +221,10 @@ pairs as in existing ws tests):
   `ok:false` without `error.code` → `bad_request`
 - frame over 16 KiB → `bad_request`
 - response after requesting client disconnected → dropped, no crash
-- multiple live connections on the target agent device → all receive it
+- two live connections on the target agent device → only the most recently
+  registered one receives the request (single-consumer); two live
+  connections on the responding-to client device → both receive the
+  response (multicast)
 - RPC traffic appends nothing to the journal (`head_seq` unchanged) and
   triggers no push counters
 - `GET /devices`: `connected` true while a WS is open, false after close;
