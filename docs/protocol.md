@@ -12,7 +12,9 @@ the machine-checkable version of this page.
   Brute-force protection: 5 attempts/min per IP (429 `rate_limited`), plus per-username
   lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
-- `GET /snapshot` (Bearer) -> `{conversations, seq}`
+- `GET /snapshot` (Bearer) -> `{conversations, seq}`. Each conversation row
+  carries `parent_convo_id` (`null` for a normal conversation; set for a
+  subagent child — see "Child conversations").
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -113,11 +115,22 @@ the machine-checkable version of this page.
 - Conversation ids are a global primary key across all users, not scoped to a
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
-- `convo_upsert` appends a `convo_meta` journal event (`payload:{title}`,
-  sender = the agent device, e.g. `agent:dev-2`) whenever it changes an
-  existing conversation's title, or sets a non-empty title at creation — so
-  other devices learn renames live instead of only via `/snapshot`. No event
-  when the title is unchanged or omitted (state-only upserts included).
+- `convo_upsert` appends a `convo_meta` journal event
+  (`payload:{title, parent_convo_id}`, sender = the agent device, e.g.
+  `agent:dev-2`) whenever it changes an existing conversation's title, or sets
+  a non-empty title at creation — so other devices learn renames live instead
+  of only via `/snapshot`. No event when the title is unchanged or omitted
+  (state-only upserts included).
+- `convo_upsert` accepts an optional `parent_convo_id` linking a durable child
+  conversation to its parent (subagent sub-chats). It is a non-empty string
+  (id length cap 128; malformed → `bad_request`), **set once at creation and
+  immutable afterwards**: a later upsert that omits it does not clear it, and
+  one carrying a different value does not change it. The referenced parent need
+  not exist yet — ordering between a child's upsert and its parent's is not
+  guaranteed, so the reference is stored as-is. `parent_convo_id` is exposed
+  wherever conversation metadata already flows: the `convo_meta` payload above
+  (so it rides hello replay) and each `/snapshot` conversation row (`null` for
+  normal conversations). See "Child conversations" below.
 - Agent delivery scoping: `convo_upsert` records the upserting agent device
   as the conversation's owner (`agent_device_id`, last writer wins). Journal
   frames for an owned conversation are delivered only to that agent device;
@@ -178,6 +191,30 @@ the machine-checkable version of this page.
   retired by a durable event rather than re-opening a retired overlay.
 - `finalize` accepts an optional top-level `blob_ref` (same passthrough as
   `publish`) and frees the matching live-stream buffer.
+
+## Child conversations
+
+A bridge may link a durable **child conversation** to a parent by sending
+`parent_convo_id` on the child's `convo_upsert` (subagent sub-chats — a
+subagent's turns land in their own conversation instead of interleaving into
+the parent's transcript). The linkage is a fixed structural fact:
+
+- **Immutable.** `parent_convo_id` is set once, at the child's creation. Later
+  upserts can never clear it (omitting the field) or repoint it (a different
+  value); both are ignored. A conversation created without a parent likewise
+  cannot gain one later.
+- **Silent, server-side.** A conversation with `parent_convo_id IS NOT NULL` is
+  exempt from both unread counting and APNs: an agent event in a child never
+  increments the owner's `unread_count` and never pushes a notification (of any
+  kind — alert, coalesced routine, or the read_marker background wake). The
+  short-circuit is enforced by the server, not the client, so stale app
+  versions stay silent for children too. The child's `last_seq`/`snippet` still
+  advance normally; only the unread and push side effects are suppressed.
+- **Delivery is unchanged.** Journal delivery is user-wide and every event is
+  tagged with its `convo_id`, so a child's events ride the same journal as any
+  other conversation's — no separate subscription. Clients discover the
+  parent/child relationship from `parent_convo_id` on the `/snapshot`
+  conversation row and the `convo_meta` payload.
 
 ## Device revocation
 
