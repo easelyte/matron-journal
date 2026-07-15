@@ -174,6 +174,13 @@ therefore **next-frame or ≤60s, whichever comes first**.
 `matron-admin device list <username>` shows each device's kind, cursor,
 and last-seen time.
 
+Owners can also revoke from a client device over HTTP:
+`POST /devices/:id/revoke` (Bearer, client devices only — agents get 403)
+deletes the row exactly like `matron-admin device revoke`; not-owned and
+nonexistent ids are indistinguishable (404 `{error:'not_found'}`).
+Self-revocation is allowed and acts as a logout. WS enforcement is the
+same next-frame-or-≤60s-sweep described above.
+
 ## Push notifications (APNs)
 
 Direct HTTP/2 APNs (ES256 provider JWT, `node:http2` — no sygnal, no extra

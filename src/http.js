@@ -1,5 +1,5 @@
 import fs from 'node:fs'
-import { login, authToken, changePassword } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices } from './db.js'
 import { receiveBlob } from './media.js'
@@ -153,6 +153,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const devices = listDevices(db, who.userId).map((d) => ({ ...d, is_self: d.device_id === who.deviceId }))
         return json(res, 200, { devices })
+      }
+      const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
+      if (req.method === 'POST' && dm) {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        // Deleting the row IS the revocation (docs/protocol.md "Device
+        // revocation"): HTTP 401s on the next call, WS closes next-frame or
+        // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
+        if (!revokeOwnedDevice(db, who.userId, Number(dm[1]))) return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { ok: true })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

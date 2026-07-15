@@ -41,3 +41,38 @@ test('GET /devices lists only the caller user devices, marks is_self, gates agen
   // unauthenticated: 401
   assert.equal((await s.http('/devices', {})).status, 401)
 })
+
+test('POST /devices/:id/revoke: owner-scoped, 404 for not-owned/nonexistent, self-revoke works', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-9')
+  await createUser(s.db, 'pat', 'password')
+  const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'x' } })
+  const dan1 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  // pat cannot revoke dan's agent — 404, indistinguishable from nonexistent
+  const notOwned = await s.http(`/devices/${agent.deviceId}/revoke`, { method: 'POST', token: pat.json.token })
+  assert.equal(notOwned.status, 404)
+  assert.deepEqual(notOwned.json, { error: 'not_found' })
+  const nonexistent = await s.http('/devices/999999/revoke', { method: 'POST', token: dan1.json.token })
+  assert.equal(nonexistent.status, 404)
+  assert.deepEqual(nonexistent.json, { error: 'not_found' })
+
+  // agents cannot revoke anything: 403 before any lookup
+  const asAgent = await s.http(`/devices/${dan1.json.device_id}/revoke`, { method: 'POST', token: agent.token })
+  assert.equal(asAgent.status, 403)
+
+  // owner revokes the agent: row gone, token dead on next use
+  const ok = await s.http(`/devices/${agent.deviceId}/revoke`, { method: 'POST', token: dan1.json.token })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true })
+  assert.equal((await s.http('/snapshot', { token: agent.token })).status, 401)
+  // idempotence surface: revoking again is 404 (row no longer exists)
+  assert.equal((await s.http(`/devices/${agent.deviceId}/revoke`, { method: 'POST', token: dan1.json.token })).status, 404)
+
+  // self-revocation is allowed (it is a logout) — the very token used dies
+  const self = await s.http(`/devices/${dan1.json.device_id}/revoke`, { method: 'POST', token: dan1.json.token })
+  assert.equal(self.status, 200)
+  assert.equal((await s.http('/devices', { token: dan1.json.token })).status, 401)
+})

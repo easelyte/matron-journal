@@ -88,6 +88,13 @@ export function revokeDevice(db, deviceId) {
   db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
 }
 
+// Owner-scoped revocation for POST /devices/:id/revoke. One atomic DELETE
+// (no TOCTOU window): the WHERE clause is the ownership check, and the
+// boolean lets the handler 404 nonexistent and not-owned identically.
+export function revokeOwnedDevice(db, userId, deviceId) {
+  return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
+}
+
 // v1 owner check. Sharing later = extend this + a grants table (spec §7).
 export function authorize(db, userId, convoId) {
   const row = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
