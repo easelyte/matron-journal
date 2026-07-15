@@ -111,6 +111,50 @@ test('POST /login and /push/register reject a non-object JSON body (null, array,
   assert.deepEqual(await r3.json(), { error: 'bad_request' })
 })
 
+test('POST /login rejects structurally invalid bodies with 400 bad_request, never 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // Each attempt gets its own cf-connecting-ip so this test never trips the
+  // 5/min per-IP rate limiter (unrelated to what's under test here).
+  let nextIp = 1
+  const postRaw = (rawBody) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': `10.8.8.${nextIp++}` },
+    body: rawBody,
+  })
+
+  const malformed = [
+    ['{}', 'empty object'],
+    ['{"username":"dan"}', 'missing password'],
+    ['{"password":"hunter22"}', 'missing username'],
+    ['{"username":42,"password":"hunter22"}', 'non-string username'],
+    ['{"username":"dan","password":42}', 'non-string password'],
+    ['{"username":"","password":"hunter22"}', 'empty-string username'],
+    ['{"username":"dan","password":""}', 'empty-string password'],
+    ['{"username":null,"password":null}', 'null fields'],
+    ['{not json', 'unparseable body'],
+    ['', 'empty body'],
+  ]
+  for (const [rawBody, label] of malformed) {
+    const r = await postRaw(rawBody)
+    assert.equal(r.status, 400, `${label} (body=${JSON.stringify(rawBody)}) should be 400`)
+    assert.deepEqual(await r.json(), { error: 'bad_request' }, `${label} body`)
+  }
+
+  // Malformed attempts must not have fed the per-username login guard: a
+  // real login for the username they named still succeeds immediately.
+  const ok = await postRaw(JSON.stringify({ username: 'dan', password: 'hunter22', device_name: 'mac' }))
+  assert.equal(ok.status, 200)
+
+  // Regression: a well-formed body with wrong credentials keeps its existing
+  // semantics — 403 bad_credentials, not 400.
+  const wrong = await postRaw(JSON.stringify({ username: 'dan', password: 'wrong', device_name: 'mac' }))
+  assert.equal(wrong.status, 403)
+  assert.deepEqual(await wrong.json(), { error: 'bad_credentials' })
+})
+
 test('an unexpected internal error responds 500 with a generic body only, no message leak, and the server stays up', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

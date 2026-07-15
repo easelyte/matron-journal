@@ -78,6 +78,22 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
         if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
         const { username, password, device_name } = await readBody(req)
+        // Structural validation BEFORE the login guard and user lookup: a
+        // missing/non-string/empty username or password can never be valid
+        // credentials, so rejecting here leaks nothing about which users
+        // exist (anti-enumeration preserved) and keeps garbage out of the
+        // guard's per-username state. Without this, undefined fields reach
+        // login() and throw deep inside it (argon2/SQLite bind) → a 500
+        // from the generic catch — on an endpoint whose own auth is the
+        // only guard. Note readBody has already consumed the body, so a
+        // plain json() reject is right here (rejectEarly is for pre-body
+        // rejects only); the per-IP rate limiter above has already counted
+        // this request, matching the existing convention for malformed
+        // bodies (readBody's own 400s are counted the same way).
+        if (typeof username !== 'string' || !username ||
+            typeof password !== 'string' || !password) {
+          return json(res, 400, { error: 'bad_request' })
+        }
         const guardKey = String(username ?? '')
         const gate = loginGuard.check(guardKey)
         if (!gate.allowed) {
