@@ -26,22 +26,37 @@ export function normalizeCode(input) {
 // display code instead — bounded by maxPending (≤64) and only reachable
 // with an authenticated client bearer, so the scan is fine.
 export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
-  const pairs = new Map() // pollToken -> { code, userId, agentName, approved, expiresAt }
+  const pairs = new Map() // pollToken -> { code, userId, agentName, approved, requesterIp, expiresAt }
 
   const sweep = (now) => {
     for (const [k, p] of pairs) if (now >= p.expiresAt) pairs.delete(k)
   }
 
   return {
-    start() {
+    start({ requesterIp = null } = {}) {
       const now = Date.now()
       sweep(now)
       if (pairs.size >= maxPending) return null
       let code
       do { code = randomCode() } while ([...pairs.values()].some((p) => p.code === code))
       const pollToken = crypto.randomBytes(32).toString('hex')
-      pairs.set(pollToken, { code, userId: null, agentName: null, approved: false, expiresAt: now + ttlMs })
+      pairs.set(pollToken, { code, userId: null, agentName: null, approved: false, requesterIp, expiresAt: now + ttlMs })
       return { pairCode: `${code.slice(0, 4)}-${code.slice(4)}`, pollToken, expiresIn: Math.floor(ttlMs / 1000) }
+    },
+    // Read-only look at a pending pair so the approval screen can show who
+    // is asking (spec's security analysis: code + requester IP) before the
+    // user commits. Unknown, expired, and already-approved all collapse to
+    // null — an approved pair can't be approved again, so previewing it
+    // serves no purpose and null keeps the surface minimal.
+    preview(codeInput) {
+      const now = Date.now()
+      const code = normalizeCode(codeInput)
+      for (const p of pairs.values()) {
+        if (p.code !== code) continue
+        if (now >= p.expiresAt || p.approved) break
+        return { requesterIp: p.requesterIp, expiresIn: Math.ceil((p.expiresAt - now) / 1000) }
+      }
+      return null
     },
     approve(codeInput, { userId, agentName }) {
       const now = Date.now()

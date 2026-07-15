@@ -120,7 +120,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
         if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
         await readBody(req) // no fields today; still drains/validates the body
-        const p = pairs.start()
+        // The requester IP rides along on the pending pair so /pair/preview
+        // can show the approval screen who is asking.
+        const p = pairs.start({ requesterIp: ip })
         // Pending-map cap: same envelope as the limiter — a caller can't
         // tell which throttle it hit, and shouldn't need to.
         if (!p) return json(res, 429, { error: 'rate_limited' })
@@ -208,6 +210,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (r === 'conflict') return json(res, 409, { error: 'conflict' })
         if (r === 'not_found') return json(res, 404, { error: 'not_found' })
         return json(res, 200, { status: 'approved' })
+      }
+      if (req.method === 'POST' && url.pathname === '/pair/preview') {
+        // The approval screen calls this before /pair/approve to show who is
+        // asking (the spec's security analysis requires the requesting IP on
+        // the screen). Client devices only, same gating as approve.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { pair_code } = await readBody(req)
+        if (typeof pair_code !== 'string' || !pair_code) return json(res, 400, { error: 'bad_request' })
+        // Unknown, expired, and already-approved all merge into 404 —
+        // anti-enumeration as everywhere else, and an approved pair can't be
+        // approved again so there is nothing useful left to preview. Code
+        // enumeration through this endpoint would mean an authenticated
+        // client grinding a 39-bit code space one HTTP round-trip at a time,
+        // for a payoff of one IP address — not a realistic attack.
+        const v = pairs.preview(pair_code)
+        if (!v) return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { requester_ip: v.requesterIp, expires_in: v.expiresIn })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

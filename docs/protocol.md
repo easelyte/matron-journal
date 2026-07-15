@@ -70,6 +70,12 @@ the machine-checkable version of this page.
   user. Exactly once per pair: already-approved is 409 `{error:'conflict'}`;
   unknown and expired are indistinguishable 404s. Codes are normalized
   (case/hyphens/spaces) before lookup.
+- `POST /pair/preview {pair_code}` (Bearer, client devices only) ->
+  `{requester_ip, expires_in}` for a pending pair — the approval screen shows
+  who is asking before the user approves. `requester_ip` is the IP that
+  called `pair/start`; `expires_in` is the pair's remaining TTL in seconds.
+  Read-only. Unknown, expired, and already-approved codes are
+  indistinguishable 404s; codes are normalized as in approve.
 - `POST /pair/claim {poll_token}` (unauthenticated) -> `{status:'pending'}`
   until approval, then exactly once `{status:'approved', token, device_id}`
   — the agent device row is minted at claim, not approve, so an unclaimed
