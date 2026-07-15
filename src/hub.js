@@ -24,10 +24,15 @@ export function mergeEphemeral(prev, frame) {
 
 export function makeHub({ coalesceMs = 200 } = {}) {
   const byUser = new Map() // userId -> Set<conn>
+  let regCounter = 0
   return {
     register(conn) {
       if (!byUser.has(conn.userId)) byUser.set(conn.userId, new Set())
       byUser.get(conn.userId).add(conn)
+      // Monotonic registration stamp — sendRpcRequest's "most recently
+      // registered live socket" rule needs an order that survives Set
+      // deletion/re-insertion (insertion order alone doesn't).
+      conn._regSeq = ++regCounter
       conn._pending = new Map() // ephemeral coalescing: key -> frame
       conn._flushTimer = null
     },
@@ -94,6 +99,34 @@ export function makeHub({ coalesceMs = 200 } = {}) {
             c._pending.clear()
           }, coalesceMs)
         }
+      }
+    },
+    // Agent-RPC request delivery (spec 2026-07-15-agent-rpc-design.md):
+    // exactly ONE socket — the most recently registered live connection of
+    // the target device. A device normally has one socket, but reconnect
+    // overlap can briefly leave two, and multicasting a request there would
+    // double-execute non-idempotent methods (`start` spawning two
+    // sessions). Direct send — RPC frames must never enter the ephemeral
+    // coalescer (latest-wins would drop them). Returns whether a socket
+    // took the frame, so the caller can answer `agent_unreachable`.
+    sendRpcRequest(userId, deviceId, frame) {
+      let newest = null
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId !== deviceId || c.ws.readyState !== 1) continue
+        if (!newest || c._regSeq > newest._regSeq) newest = c
+      }
+      if (!newest) return false
+      newest.ws.send(JSON.stringify(frame))
+      return true
+    },
+    // Agent-RPC response delivery: multicast to every live socket of the
+    // target device — responses carry no side effects and clients dedupe by
+    // request_id, while single-consumer here would lose the response for a
+    // mid-reconnect client. Fire-and-forget: a fully disconnected client
+    // just misses it (stateless relay — the app re-asks).
+    sendRpcResponse(userId, deviceId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },
   }
