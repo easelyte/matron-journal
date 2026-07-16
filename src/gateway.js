@@ -29,6 +29,7 @@ export function makeGatewayClient({ url, fetchImpl = fetch, requestTimeoutMs = 3
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    timer.unref()
     let res
     try {
       res = await fetchImpl(endpoint, {

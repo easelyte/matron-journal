@@ -83,8 +83,18 @@ test('a fetch aborted by the timeout resolves {status: 0, reason: "timeout"}', a
       signal.addEventListener('abort', () => reject(signal.reason))
     }),
   })
-  const result = await client.send(ALERT_OPTS)
-  assert.deepEqual(result, { status: 0, reason: 'timeout' })
+
+  // The per-request timeout is deliberately unref'd (it must never keep the
+  // server process alive), so in a bare test — unlike the real server, whose
+  // listen handles keep the loop running — something ref'd has to hold the
+  // event loop open long enough for it to fire.
+  const keepAlive = setTimeout(() => {}, 5000)
+  try {
+    const result = await client.send(ALERT_OPTS)
+    assert.deepEqual(result, { status: 0, reason: 'timeout' })
+  } finally {
+    clearTimeout(keepAlive)
+  }
 })
 
 test('a non-JSON response body still resolves with the HTTP status and reason null', async () => {
@@ -97,4 +107,28 @@ test('a non-JSON response body still resolves with the HTTP status and reason nu
 test('close() is a no-op that does not throw', () => {
   const client = makeGatewayClient({ url: 'https://push.matron.chat' })
   assert.doesNotThrow(() => client.close())
+})
+
+test('category defaults to "activity" when undefined with pushType "alert"', async () => {
+  const { calls, fetchImpl } = makeFetchStub()
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  await client.send({
+    deviceToken: 'a'.repeat(64), env: 'prod',
+    payload: { aps: {} },
+    priority: 10, pushType: 'alert',
+    // category intentionally omitted
+  })
+  assert.equal(calls[0].body.category, 'activity')
+})
+
+test('category defaults to "wake" when undefined with pushType "background"', async () => {
+  const { calls, fetchImpl } = makeFetchStub()
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  await client.send({
+    deviceToken: 'a'.repeat(64), env: 'prod',
+    payload: { aps: {} },
+    priority: 5, pushType: 'background',
+    // category intentionally omitted
+  })
+  assert.equal(calls[0].body.category, 'wake')
 })
