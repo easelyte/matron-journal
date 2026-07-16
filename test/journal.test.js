@@ -211,6 +211,20 @@ test('a child convo (parent_convo_id set) never increments unread_count; the sam
   assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 1)
 })
 
+test('snippetOf shows a captioned attachment as what the user said, not [image]', () => {
+  assert.equal(
+    snippetOf('image', { blob_ref: 'b1', name: 'shot.png', caption: 'why is this rotated?' }),
+    'why is this rotated?')
+  assert.equal(
+    snippetOf('file', { blob_ref: 'b2', name: 'contract.pdf', caption: 'review before Friday' }),
+    'review before Friday')
+  // No caption: the placeholder is still the best available description.
+  assert.equal(snippetOf('image', { blob_ref: 'b1', name: 'shot.png' }), '[image]')
+  assert.equal(snippetOf('file', { blob_ref: 'b2' }), '[file]')
+  // Long captions are truncated like every other snippet.
+  assert.equal(snippetOf('image', { caption: 'x'.repeat(200) }).length, 120)
+})
+
 test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
   for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
     assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)

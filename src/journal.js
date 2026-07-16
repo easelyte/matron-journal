@@ -12,6 +12,11 @@ export function snippetOf(type, payload) {
   if (type === 'text') return String(p.body || '').slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
+  // A captioned attachment reads better in the chat list as what the user
+  // actually said than as a bare `[image]`. Ahead of the generic `p.snippet`
+  // rule because a caption is the user's own words about this specific
+  // attachment — the most specific description available.
+  if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   return `[${type}]`
