@@ -35,7 +35,11 @@ function classify(type, payload, sender) {
 // `fanOut` choke point in ws.js). `apnsClient` is the makeApnsClient()
 // instance, or undefined when push is disabled (all onAppend calls become a
 // cheap no-op).
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS } = {}) {
+// `classify` is injectable (defaults to the real classifier above) purely
+// as a test seam — production callers never override it — so a test can
+// exercise a hypothetical future `cls.kind` the prefs object doesn't know
+// about without reaching into module internals.
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -164,7 +168,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       return
     }
 
-    const cls = classify(event.type, event.payload, event.sender)
+    const cls = classifyEvent(event.type, event.payload, event.sender)
     if (!cls) return // journal-sync-only type (convo_meta, non-done session_status), or a user's own event (T2)
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
@@ -178,11 +182,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       // uniformly rather than being asymmetrically special-cased.
       if (device.id === originDeviceId) continue
       if (!device.apns_env) continue
-      // Per-device notification prefs: skip the device when its prefs
-      // disable this event's category. Deliberately BEFORE the
+      // Per-device notification prefs: skip the device only when its prefs
+      // explicitly disable this event's category. Deliberately BEFORE the
       // isViewing/cursor checks (cheapest first) and only on the alert path —
       // read_marker wakes above are invisible to the user and never filtered.
-      if (!parsePushPrefs(device.push_prefs)[cls.kind]) continue
+      // A `cls.kind` absent from the prefs object (a future category prefs
+      // hasn't caught up to) fails open rather than muting every device —
+      // matches the module's documented fail-open rule.
+      if (parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({

@@ -131,16 +131,21 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
 }
 
 // Notification prefs, per device (that's where the APNs token lives too).
-// NULL / unparseable / non-object all mean "all on" — prefs must fail open:
-// a corrupt row silencing every push would be far worse than a spurious one.
+// Default: attention and done on, activity off — "buzz me when the agent
+// needs me or finishes; routine activity is opt-in." NULL / unparseable /
+// non-object all fall back to that default wholesale: a corrupt row must
+// fail open on attention/done (the two that matter most), not silence
+// every push. Per key, an explicit boolean in the stored JSON always wins
+// in either direction (on or off); anything else for that key falls back
+// to its default.
 export function parsePushPrefs(text) {
-  const prefs = { attention: true, done: true, activity: true }
+  const prefs = { attention: true, done: true, activity: false }
   if (!text) return prefs
   let parsed
   try { parsed = JSON.parse(text) } catch { return prefs }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return prefs
   for (const k of Object.keys(prefs)) {
-    if (parsed[k] === false) prefs[k] = false
+    if (typeof parsed[k] === 'boolean') prefs[k] = parsed[k]
   }
   return prefs
 }

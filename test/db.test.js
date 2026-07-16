@@ -131,21 +131,27 @@ test('push_prefs: NULL and garbage parse as all-on; setPushPrefs merges partial 
     .run(dan.id, Date.now())
   const deviceId = dev.lastInsertRowid
 
-  // Column exists (migration ran) and NULL = all-on.
-  assert.deepEqual(parsePushPrefs(null), { attention: true, done: true, activity: true })
-  // Garbage stored by a buggy/older writer must fail open, not throw.
-  assert.deepEqual(parsePushPrefs('not json'), { attention: true, done: true, activity: true })
-  assert.deepEqual(parsePushPrefs('[1,2]'), { attention: true, done: true, activity: true })
+  // Column exists (migration ran) and NULL = defaults: attention/done on,
+  // activity off.
+  assert.deepEqual(parsePushPrefs(null), { attention: true, done: true, activity: false })
+  // Garbage stored by a buggy/older writer must fail open to the defaults, not throw.
+  assert.deepEqual(parsePushPrefs('not json'), { attention: true, done: true, activity: false })
+  assert.deepEqual(parsePushPrefs('[1,2]'), { attention: true, done: true, activity: false })
+  // A garbage value for one key falls back to that key's default alone —
+  // the rest of a well-formed blob is still honored.
+  assert.deepEqual(parsePushPrefs('{"attention":"nope","done":false}'), { attention: true, done: false, activity: false })
 
-  // Partial update merges over the current state and returns the full shape.
-  const merged1 = setPushPrefs(db, deviceId, { activity: false })
-  assert.deepEqual(merged1, { attention: true, done: true, activity: false })
+  // Explicit true/false are both honored, including turning the
+  // default-off activity key back on.
+  const merged1 = setPushPrefs(db, deviceId, { activity: true })
+  assert.deepEqual(merged1, { attention: true, done: true, activity: true })
   const merged2 = setPushPrefs(db, deviceId, { done: false })
-  assert.deepEqual(merged2, { attention: true, done: false, activity: false })
+  assert.deepEqual(merged2, { attention: true, done: false, activity: true })
 
-  // The stored row round-trips through parsePushPrefs.
+  // The stored row round-trips through parsePushPrefs — an explicit `true`
+  // for a default-off key survives the round-trip, not just `false`.
   const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
-  assert.deepEqual(parsePushPrefs(row.push_prefs), { attention: true, done: false, activity: false })
+  assert.deepEqual(parsePushPrefs(row.push_prefs), { attention: true, done: false, activity: true })
 })
 
 test('clientDevicesForPush and listDevices expose push_prefs', async () => {
@@ -159,8 +165,8 @@ test('clientDevicesForPush and listDevices expose push_prefs', async () => {
 
   const pushRows = clientDevicesForPush(db, dan.id)
   assert.equal(pushRows.length, 1)
-  assert.deepEqual(parsePushPrefs(pushRows[0].push_prefs), { attention: false, done: true, activity: true })
+  assert.deepEqual(parsePushPrefs(pushRows[0].push_prefs), { attention: false, done: true, activity: false })
 
   const roster = listDevices(db, dan.id)
-  assert.deepEqual(roster[0].push_prefs, { attention: false, done: true, activity: true })
+  assert.deepEqual(roster[0].push_prefs, { attention: false, done: true, activity: false })
 })

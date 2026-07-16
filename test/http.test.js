@@ -424,23 +424,24 @@ test('PUT /push/prefs merges partial updates and echoes everywhere', async (t) =
   const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password1', device_name: 'phone' } })
   const token = login.json.token
 
-  // Defaults echo all-on from GET /devices.
+  // Defaults echo from GET /devices: attention/done on, activity off.
   const before = await s.http('/devices', { token })
-  assert.deepEqual(before.json.devices[0].push_prefs, { attention: true, done: true, activity: true })
+  assert.deepEqual(before.json.devices[0].push_prefs, { attention: true, done: true, activity: false })
 
-  // Partial update merges.
-  const r1 = await s.http('/push/prefs', { method: 'PUT', token, body: { activity: false } })
+  // Partial update merges, including turning the default-off activity key
+  // back on.
+  const r1 = await s.http('/push/prefs', { method: 'PUT', token, body: { activity: true } })
   assert.equal(r1.status, 200)
-  assert.deepEqual(r1.json.push_prefs, { attention: true, done: true, activity: false })
+  assert.deepEqual(r1.json.push_prefs, { attention: true, done: true, activity: true })
   const r2 = await s.http('/push/prefs', { method: 'PUT', token, body: { done: false } })
-  assert.deepEqual(r2.json.push_prefs, { attention: true, done: false, activity: false })
+  assert.deepEqual(r2.json.push_prefs, { attention: true, done: false, activity: true })
 
   // Echoed from /devices and /push/register.
   const after = await s.http('/devices', { token })
-  assert.deepEqual(after.json.devices[0].push_prefs, { attention: true, done: false, activity: false })
+  assert.deepEqual(after.json.devices[0].push_prefs, { attention: true, done: false, activity: true })
   const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'ab'.repeat(32), environment: 'prod' } })
   assert.equal(reg.status, 200)
-  assert.deepEqual(reg.json.push_prefs, { attention: true, done: false, activity: false })
+  assert.deepEqual(reg.json.push_prefs, { attention: true, done: false, activity: true })
 })
 
 test('PUT /push/prefs validation: unknown fields, non-boolean values, agent devices', async (t) => {
