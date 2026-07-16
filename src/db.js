@@ -158,6 +158,12 @@ export function setPushPrefs(db, deviceId, partial) {
   return merged
 }
 
+// Read the current push prefs for a device (the read half of the setPushPrefs pair).
+export function getPushPrefs(db, deviceId) {
+  const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
+  return parsePushPrefs(row ? row.push_prefs : null)
+}
+
 // Called by the push pipeline on a 410 Unregistered response — the token is
 // dead, so stop trying it rather than retrying forever (sygnal lesson).
 export function pruneApnsToken(db, deviceId) {

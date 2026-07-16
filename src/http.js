@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 
@@ -161,12 +161,24 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const { apns_token, environment } = body
         if (apns_token === null) {
           setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
-          return json(res, 200, { ok: true })
+          return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
         }
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
         setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
-        return json(res, 200, { ok: true })
+        return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
+      }
+      if (req.method === 'PUT' && url.pathname === '/push/prefs') {
+        // Prefs live on the device row next to the APNs token they gate —
+        // same client-only surface as /push/register.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        for (const [k, v] of Object.entries(body)) {
+          if (!['attention', 'done', 'activity'].includes(k) || typeof v !== 'boolean') {
+            return json(res, 400, { error: 'bad_request' })
+          }
+        }
+        return json(res, 200, { ok: true, push_prefs: setPushPrefs(db, who.deviceId, body) })
       }
       if (req.method === 'POST' && url.pathname === '/password') {
         // Self-service change, client devices only — an agent (the bridge)
