@@ -1,5 +1,5 @@
 import { snippetOf } from './journal.js'
-import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
+import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } from './db.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
@@ -178,6 +178,11 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       // uniformly rather than being asymmetrically special-cased.
       if (device.id === originDeviceId) continue
       if (!device.apns_env) continue
+      // Per-device notification prefs: skip the device when its prefs
+      // disable this event's category. Deliberately BEFORE the
+      // isViewing/cursor checks (cheapest first) and only on the alert path —
+      // read_marker wakes above are invisible to the user and never filtered.
+      if (!parsePushPrefs(device.push_prefs)[cls.kind]) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({

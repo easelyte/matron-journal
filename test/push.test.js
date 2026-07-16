@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb, setApnsRegistration } from '../src/db.js'
+import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
 import { makePushPipeline } from '../src/push.js'
 import { createUser, createAgent } from '../src/auth.js'
@@ -574,4 +574,40 @@ test('category threading: classify kind reaches apnsClient.send as opts.category
   const wake = stub.calls[stub.calls.length - 1]
   assert.equal(wake.category, 'wake')
   assert.equal(wake.pushType, 'background')
+})
+
+test('push_prefs: a disabled category skips that device only; wake is never filtered', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  const muted = registerDevice(db, dan.id, 'phone')
+  const open = registerDevice(db, dan.id, 'ipad', { token: 'ipad-token' })
+  setPushPrefs(db, muted, { attention: false, activity: false })
+
+  const fire = (type, payload, sender = 'agent:a', origin = null) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender, type, payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, origin)
+  }
+
+  // attention off on `muted`: only `open` gets the prompt push.
+  fire('prompt', { question: 'go?' })
+  await new Promise((res) => setImmediate(res))
+  assert.deepEqual(stub.calls.map((c) => c.deviceToken), ['ipad-token'])
+
+  // done still on for both.
+  fire('session_status', { state: 'done' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 3)
+
+  // activity off on `muted`: routine event reaches only `open`.
+  fire('text', { body: 'hi' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 4)
+  assert.equal(stub.calls[3].deviceToken, 'ipad-token')
+
+  // wake (read_marker from `open`) still reaches `muted` despite its prefs —
+  // badge sync is invisible to the user and never filtered.
+  fire('read_marker', { convo_id: 'c1', up_to_seq: 1 }, 'user:dan', open)
+  await new Promise((res) => setImmediate(res))
+  const wakes = stub.calls.filter((c) => c.category === 'wake')
+  assert.equal(wakes.length, 1)
+  assert.equal(wakes[0].deviceToken, 'phone-token')
 })
