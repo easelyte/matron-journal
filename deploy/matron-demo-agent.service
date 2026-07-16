@@ -1,0 +1,48 @@
+[Unit]
+Description=Matron demo auto-reply agent (App Review account)
+After=matron-journal.service
+Wants=matron-journal.service
+
+[Service]
+Type=simple
+User=matron
+WorkingDirectory=/opt/matron-journal
+Environment=MATRON_WS_URL=ws://127.0.0.1:9810/ws
+# Agent bearer token minted with `matron-admin agent add <user> demo`.
+# Lives in the data dir so the sandbox below can read it (ProtectHome=yes
+# blocks anything under /home). See docs/runbooks/app-review-demo-account.md.
+Environment=MATRON_DEMO_TOKEN_FILE=/opt/matron-journal/data/demo-agent.token
+ExecStart=/usr/bin/node tools/demo-agent.js
+Restart=always
+RestartSec=5
+
+# Same containment stance as matron-journal.service, minus what this process
+# doesn't need: it writes nothing anywhere (no ReadWritePaths at all) and only
+# ever dials loopback.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
