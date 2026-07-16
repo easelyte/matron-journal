@@ -547,3 +547,31 @@ test('end-to-end wiring: a client "send" (own message, sender user:*) never trig
   assert.equal(alerts.length, 0, 'a user\'s own "send" must not alert-push any device, including their own other ones')
   phone.close()
 })
+
+test('category threading: classify kind reaches apnsClient.send as opts.category', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  const deviceId = registerDevice(db, dan.id, 'phone')
+
+  const send = (type, payload, sender = 'agent:a') => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender, type, payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, null)
+    return r
+  }
+
+  send('prompt', { question: 'go?' })                 // attention
+  send('permission_request', { description: 'write' }) // attention
+  send('session_status', { state: 'done' })            // done
+  send('text', { body: 'hi' })                          // activity (leading send)
+  await new Promise((res) => setImmediate(res))
+  assert.deepEqual(stub.calls.map((c) => c.category), ['attention', 'attention', 'done', 'activity'])
+
+  // read_marker background push carries category 'wake'. It must come from a
+  // DIFFERENT device so origin-device exclusion doesn't eat it.
+  const other = registerDevice(db, dan.id, 'ipad')
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 1 } })
+  pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:dan', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 1 } }, other)
+  await new Promise((res) => setImmediate(res))
+  const wake = stub.calls[stub.calls.length - 1]
+  assert.equal(wake.category, 'wake')
+  assert.equal(wake.pushType, 'background')
+})

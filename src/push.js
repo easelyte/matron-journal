@@ -21,14 +21,14 @@ function classify(type, payload, sender) {
   // background-push branch in onAppend, never reaches classify()) and keeps
   // its existing behavior regardless of sender.
   if (typeof sender === 'string' && sender.startsWith('user:')) return null
-  if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false }
+  if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
-    return payload && payload.state === 'done' ? { priority: 10, coalesce: false } : null
+    return payload && payload.state === 'done' ? { priority: 10, coalesce: false, kind: 'done' } : null
   }
   if (type === 'convo_meta') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
-  return { priority: 5, coalesce: true }
+  return { priority: 5, coalesce: true, kind: 'activity' }
 }
 
 // Wired in server.js after a successful journal append fans out (see the
@@ -158,6 +158,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
           payload: { aps: { 'content-available': 1 } },
           priority: 5,
           pushType: 'background',
+          category: 'wake',
         })
       }
       return
@@ -184,6 +185,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
         priority: cls.priority,
         pushType: 'alert',
         collapseId: event.convo_id,
+        category: cls.kind,
       })
       if (cls.coalesce) {
         scheduleRoutine(device, userId, event.convo_id, buildOpts)
