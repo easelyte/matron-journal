@@ -81,6 +81,13 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'apns_env')) {
     db.exec('ALTER TABLE devices ADD COLUMN apns_env TEXT')
   }
+  // Per-device notification prefs (spec: push relay + notification settings).
+  // JSON {"attention":bool,"done":bool,"activity":bool}; NULL (every device
+  // predating this column) means all-on. Same in-place ALTER pattern as
+  // apns_env above.
+  if (!deviceCols.some((c) => c.name === 'push_prefs')) {
+    db.exec('ALTER TABLE devices ADD COLUMN push_prefs TEXT')
+  }
   // Which agent device manages this conversation — recorded by convo_upsert,
   // read by the delivery scoping in ws.js/hub.js. NULL (every row predating
   // this column, or a convo whose bridge hasn't re-upserted yet) means
@@ -123,6 +130,34 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
   db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
 }
 
+// Notification prefs, per device (that's where the APNs token lives too).
+// NULL / unparseable / non-object all mean "all on" — prefs must fail open:
+// a corrupt row silencing every push would be far worse than a spurious one.
+export function parsePushPrefs(text) {
+  const prefs = { attention: true, done: true, activity: true }
+  if (!text) return prefs
+  let parsed
+  try { parsed = JSON.parse(text) } catch { return prefs }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return prefs
+  for (const k of Object.keys(prefs)) {
+    if (parsed[k] === false) prefs[k] = false
+  }
+  return prefs
+}
+
+// Partial update: only boolean fields in `partial` override the stored
+// state; everything else keeps its current value. Always writes the full
+// three-key shape so a stored row never depends on merge-at-read.
+export function setPushPrefs(db, deviceId, partial) {
+  const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
+  const merged = parsePushPrefs(row ? row.push_prefs : null)
+  for (const k of Object.keys(merged)) {
+    if (typeof partial[k] === 'boolean') merged[k] = partial[k]
+  }
+  db.prepare('UPDATE devices SET push_prefs=? WHERE id=?').run(JSON.stringify(merged), deviceId)
+  return merged
+}
+
 // Called by the push pipeline on a 410 Unregistered response — the token is
 // dead, so stop trying it rather than retrying forever (sygnal lesson).
 export function pruneApnsToken(db, deviceId) {
@@ -133,7 +168,7 @@ export function pruneApnsToken(db, deviceId) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, apns_token, apns_env, cursor, push_prefs FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
 }
 
@@ -149,6 +184,6 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
+    'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
 }
