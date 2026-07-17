@@ -14,6 +14,11 @@ on a personal machine:
 Both are loopback-bound and reach the internet only through a cloudflared
 tunnel — the VPS needs **no open inbound ports** except SSH.
 
+> **Note:** Matron's own production box is chef-managed (yearbook-infra's
+> `matron_server` role), which applies this same layout plus fleet-standard
+> hardening and monitoring. `setup.sh` below is the standalone path — use
+> it if you're running your own relay/journal box outside that fleet.
+
 ## Layout on the box
 
 ```
