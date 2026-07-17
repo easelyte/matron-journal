@@ -82,6 +82,7 @@ journal can't pre-register):
 - Device tokens are unguessable 32-byte values known only to the user's own
   journal — possession is the credential.
 - Per-device-token token bucket: burst 20, refill 1 per 10s, 429 when empty.
+- Global (token-independent) ceiling: burst 200, refill 1 per 20ms (50/s sustained), 429 when empty — bounds APNs-bound traffic under a spray of fabricated unique tokens, which the per-token bucket cannot stop.
   Journal-side coalescing keeps legitimate traffic far below this.
 - Body limit 1 KB, JSON only, strict field validation.
 - No logging of tokens beyond a truncated prefix; no request bodies logged.

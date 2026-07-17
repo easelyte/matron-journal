@@ -27,15 +27,34 @@ const REQUIRED = ['device_token', 'env', 'category', 'priority', 'push_type']
 const OPTIONAL = ['badge', 'thread_id', 'collapse_id']
 const KNOWN = new Set([...REQUIRED, ...OPTIONAL])
 
-// Per-device-token token bucket: burst 20, refill 1 per 10s. Sustained
-// activity+wake traffic can reach ~5+/min even with journal-side coalescing
-// — this refill rate covers that with headroom while still capping abuse at
-// ~6/min sustained once the burst is spent. Buckets live in memory only
-// (the relay is stateless by design); a full-capacity bucket is
-// indistinguishable from an absent one, so those are evicted on sweep and
-// the map stays bounded by the number of RECENTLY throttled tokens.
-export function makeRelayLimiter({ burst = 20, refillMs = 10000, now = Date.now } = {}) {
+// Two token buckets gate every send:
+//
+// Per-device-token — burst 20, refill 1 per 10s. Sustained activity+wake
+// traffic can reach ~5+/min even with journal-side coalescing — this refill
+// rate covers that with headroom while still capping abuse at ~6/min
+// sustained once the burst is spent. Buckets live in memory only (the relay
+// is stateless by design); a full-capacity bucket is indistinguishable from
+// an absent one, so those are evicted on sweep and the map stays bounded by
+// the number of RECENTLY throttled tokens.
+//
+// Global — burst 200, refill 1 per 20ms (50/s sustained). The per-token
+// bucket is useless against a spray of unique fabricated tokens (each gets a
+// fresh bucket), and every sprayed send would reach APNs as BadDeviceToken —
+// sustained streams of those get the relay's APNs connection terminated for
+// abuse. The global ceiling bounds what the relay can emit toward APNs no
+// matter the traffic shape; it is far above legit v1 volume.
+export function makeRelayLimiter({ burst = 20, refillMs = 10000, globalBurst = 200, globalRefillMs = 20, now = Date.now } = {}) {
   const buckets = new Map()
+  const global = { tokens: globalBurst, at: now() }
+  let globalDenied = 0
+
+  function refill(b, cap, perMs, t) {
+    const refilled = Math.floor((t - b.at) / perMs)
+    if (refilled > 0) {
+      b.tokens = Math.min(cap, b.tokens + refilled)
+      b.at = b.tokens === cap ? t : b.at + refilled * perMs
+    }
+  }
 
   function allow(token) {
     const t = now()
@@ -44,14 +63,19 @@ export function makeRelayLimiter({ burst = 20, refillMs = 10000, now = Date.now 
       b = { tokens: burst, at: t }
       buckets.set(token, b)
     } else {
-      const refilled = Math.floor((t - b.at) / refillMs)
-      if (refilled > 0) {
-        b.tokens = Math.min(burst, b.tokens + refilled)
-        b.at = b.tokens === burst ? t : b.at + refilled * refillMs
-      }
+      refill(b, burst, refillMs, t)
     }
+    // Per-token check first, and only a fully allowed request consumes the
+    // global budget — a flood against one exhausted token must not starve
+    // everyone else.
     if (b.tokens <= 0) return false
+    refill(global, globalBurst, globalRefillMs, t)
+    if (global.tokens <= 0) {
+      globalDenied += 1
+      return false
+    }
     b.tokens -= 1
+    global.tokens -= 1
     return true
   }
 
@@ -60,6 +84,12 @@ export function makeRelayLimiter({ burst = 20, refillMs = 10000, now = Date.now 
     for (const [token, b] of buckets) {
       const refilled = Math.floor((t - b.at) / refillMs)
       if (b.tokens + refilled >= burst) buckets.delete(token)
+    }
+    // The global ceiling tripping at all is the early-warning signal for a
+    // token-spray attack — surface it, but at sweep cadence, never per hit.
+    if (globalDenied > 0) {
+      console.error(`relay: global rate ceiling denied ${globalDenied} requests since last sweep`)
+      globalDenied = 0
     }
   }
 

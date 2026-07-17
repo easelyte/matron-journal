@@ -148,6 +148,37 @@ test('rate limit: burst then 429 per token, independent tokens unaffected, refil
   assert.equal((await post(GOOD)).status, 429)
 })
 
+test('global ceiling: unique-token spray cannot exceed the global bucket', async (t) => {
+  let clock = 0
+  const limiter = makeRelayLimiter({ burst: 20, refillMs: 10000, globalBurst: 5, globalRefillMs: 1000, now: () => clock })
+  const { post, stub } = await startTestRelay(t, { limiter })
+
+  // 5 distinct tokens, each well under its per-token budget — the global
+  // bucket is the only thing that can stop the 6th.
+  for (let i = 0; i < 5; i++) {
+    const r = await post({ ...GOOD, device_token: String(i).repeat(64) })
+    assert.equal(r.status, 200)
+  }
+  const sprayed = await post({ ...GOOD, device_token: '5'.repeat(64) })
+  assert.equal(sprayed.status, 429)
+  assert.equal(stub.calls.length, 5, 'a globally limited request must not reach APNs')
+
+  // One global refill interval restores exactly one send.
+  clock += 1000
+  assert.equal((await post({ ...GOOD, device_token: '6'.repeat(64) })).status, 200)
+  assert.equal((await post({ ...GOOD, device_token: '7'.repeat(64) })).status, 429)
+})
+
+test('limiter unit: per-token denial does not consume the global budget', () => {
+  let clock = 0
+  const limiter = makeRelayLimiter({ burst: 1, refillMs: 10000, globalBurst: 2, globalRefillMs: 10000, now: () => clock })
+  assert.equal(limiter.allow('aa'), true)
+  // Token 'aa' is now empty; hammering it must not drain the global bucket.
+  for (let i = 0; i < 10; i++) assert.equal(limiter.allow('aa'), false)
+  assert.equal(limiter.allow('bb'), true, 'global budget must still have the 1 remaining send')
+  assert.equal(limiter.allow('cc'), false, 'global budget (2) is now spent')
+})
+
 test('end-to-end against the fake APNs h2 server: real makeApnsClient, real wire payload', async (t) => {
   const { keyFile } = makeTestKey()
   const { server, port, requests } = await makeFakeApnsServer(() => ({ status: 200 }))
