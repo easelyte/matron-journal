@@ -1,0 +1,12 @@
+# /etc/cloudflared/config.yml — Matron shared-infra VPS tunnel.
+# Create the tunnel and DNS routes from a machine with an origin cert
+# (README step 4), scp the credentials JSON here, fill in the UUID.
+tunnel: TUNNEL-UUID-HERE
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: push.matron.chat
+    service: http://127.0.0.1:9821
+  - hostname: demo.matron.chat
+    service: http://127.0.0.1:9810
+  - service: http_status:404

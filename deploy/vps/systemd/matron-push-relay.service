@@ -1,0 +1,31 @@
+[Unit]
+Description=Matron push relay (push.matron.chat)
+After=network-online.target
+Wants=network-online.target
+# Don't flap on a fresh box — the key arrives in README step 3.
+ConditionPathExists=/etc/matron/apns/key.p8
+
+[Service]
+Type=simple
+User=matron-relay
+Group=matron-relay
+EnvironmentFile=/etc/matron/relay.env
+WorkingDirectory=/opt/matron/journal
+ExecStart=/usr/bin/node bin/matron-push-relay.js
+Restart=always
+RestartSec=2
+
+# The relay is stateless: no filesystem writes at all, outbound HTTPS only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
