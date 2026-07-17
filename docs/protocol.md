@@ -33,7 +33,17 @@ the machine-checkable version of this page.
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
-  missing/non-string `apns_token` (unless it's `null`).
+  missing/non-string `apns_token` (unless it's `null`). Response echoes the
+  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
+  /devices` echoes the same per-device `push_prefs` in its roster.
+- `PUT /push/prefs` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
+  booleans — a partial merge, not a replace: only the given keys change, the
+  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
+  field or a non-boolean value for a known field. Response `{ok:true,
+  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
+  never set) are `{attention: true, done: true, activity: false}` — "buzz me
+  when the agent needs me or finishes; routine activity is opt-in."
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -59,8 +69,10 @@ the machine-checkable version of this page.
   `/metrics`-only.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected}]}`. The caller's own user's
-  devices only; `is_self` marks the requesting device. Overlaps `/metrics`'
+  cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
+  caller's own user's devices only; `is_self` marks the requesting device.
+  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
+  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster. `connected` is whether the
   device has a live WebSocket right now — the "can I start a session on
@@ -312,12 +324,20 @@ considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
-  conversation, or when its acked cursor already covers the event's `seq`.
-- `prompt` / `permission_request`, and `session_status` with
-  `payload.state:'done'`, push immediately at priority 10.
-- `convo_meta` and `session_status` with any other state never push at all —
-  a title rename or a running/waiting flip is journal-sync material, not a
-  notification (connected devices learn it from the journal frame).
+  conversation, or when its acked cursor already covers the event's `seq`,
+  or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
+  event's category — `wake` background pushes are never prefs-filtered.
+- `prompt` / `permission_request` push immediately at priority 10
+  (category `attention`).
+- `session_status` pushes on the turn-finished TRANSITION, not the new
+  state alone: previous state `running` moving to `waiting` or `done`
+  pushes immediately at priority 10 (category `done`, body "Session
+  finished"). Every other transition is silent — in particular
+  `waiting` -> `done` (tearing down an already-idle session) and a
+  brand-new conversation's first state.
+- `convo_meta` never pushes at all — a title rename is journal-sync
+  material, not a notification (connected devices learn it from the
+  journal frame).
 - routine content (`text`, `tool_output`, `diff`, ...) pushes at priority 5,
   coalesced per (device, conversation): a leading push when idle, then at
   most one trailing push per 10s window while events keep arriving

@@ -238,6 +238,15 @@ test('snippetOf tolerates null/undefined/non-object payloads for every type, wit
   assert.equal(snippetOf('unknown_type', null), '[unknown_type]')
 })
 
+test('snippetOf session_status reads as the turn-finished alert, matching the relay fixed string', () => {
+  // The only session_status events that ever reach a push body are
+  // turn-finished ones (see push.js classify()), so the state itself
+  // doesn't vary the wording.
+  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Session finished')
+  assert.equal(snippetOf('session_status', { state: 'done' }), 'Session finished')
+  assert.equal(snippetOf('session_status', null), 'Session finished')
+})
+
 test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
   const { db, dan } = await setup()
   for (const badPayload of [null, undefined, {}, 'nope', 42, { state: 42 }]) {

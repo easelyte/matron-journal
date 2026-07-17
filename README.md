@@ -104,12 +104,33 @@ provisioned with `matron-admin agent add`, which prints a token once.
 | `MATRON_MAX_REPLAY` | `50000` | Replay gap above which clients are told to re-snapshot |
 | `MATRON_RETENTION_DAYS` | `30` | Offload `tool_output` payloads older than this (`0` disables) |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
+| `MATRON_PUSH_GATEWAY_URL` | unset | No APNs key? Point at a push relay (`https://push.matron.chat`) — pushes become generic-text alerts built by the relay; your message content never leaves this server |
+| `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
+
+## Push relay (self-hosted journals)
+
+Only the app author holds the APNs key for the `chat.matron.app` bundle id, so a
+self-hosted journal cannot talk to Apple directly. Set
+`MATRON_PUSH_GATEWAY_URL=https://push.matron.chat` and the journal sends each
+push as a content-free event instead: device token, environment, a category
+(`attention` / `done` / `activity` / `wake`), badge count, and conversation-id
+routing fields. The relay maps the category to a fixed generic string ("Your
+agent needs you", "Session finished", …) — your message content, titles, and
+conversation names never leave your server, structurally: the relay protocol
+has no field that could carry them.
+
+Running your own relay (needs an Apple Developer membership and the app's APNs
+key, so this is for the hosted one's operator):
+
+    MATRON_APNS_KEY_FILE=… MATRON_APNS_KEY_ID=… MATRON_APNS_TEAM_ID=… \
+    MATRON_APNS_TOPIC=chat.matron.app npx matron-push-relay
 
 ## Protocol
 
 The wire protocol is small: a handful of Bearer-authenticated HTTP endpoints
 (`/login`, `/snapshot`, `/convo/:id/messages`, `/media`, `/push/register`,
-`/password`, `/metrics`) and one WebSocket (`/ws`) speaking journal frames.
+`/push/prefs`, `/password`, `/metrics`) and one WebSocket (`/ws`) speaking
+journal frames.
 
 - Operational reference: [docs/protocol.md](docs/protocol.md)
 - Design spec (the why): [docs/superpowers/specs/2026-07-10-matron-protocol-design.md](docs/superpowers/specs/2026-07-10-matron-protocol-design.md)

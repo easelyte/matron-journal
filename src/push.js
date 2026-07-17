@@ -1,16 +1,29 @@
 import { snippetOf } from './journal.js'
-import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
+import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } from './db.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
 
 // Returns null for event types that must not push at all. Product call
-// (dispatcher decision): convo_meta (a title rename) and session_status with
-// state != 'done' (running/waiting flips) are journal-sync material — every
-// connected device learns them from the journal frame, and nothing about
-// them warrants buzzing a pocket. prompt/permission_request already cover
-// "the session needs you", and the 'done' alert stays.
-function classify(type, payload, sender) {
+// (dispatcher decision): convo_meta (a title rename) is always journal-sync
+// material — every connected device learns it from the journal frame, and
+// nothing about a rename warrants buzzing a pocket. prompt/permission_request
+// already cover "the session needs you" and always push.
+//
+// session_status is keyed off the TRANSITION, not the new state alone: a
+// 'done' push must fire when the agent FINISHES ITS TURN, not whenever the
+// session table happens to read 'done'. running -> waiting (turn finished)
+// and running -> done (crashed, or stopped mid-work) both push kind 'done'.
+// Every other transition is silent — in particular waiting -> done (the
+// idle-reaper or /stop tearing down a session that was already waiting on
+// the user) and a brand-new conversation's first state; those are
+// journal-sync material other devices pick up from the frame itself.
+// `prevState` is an in-memory-only hint threaded from ws.js's convo_upsert
+// handler through onAppend's `pushHint` param (see below) — it is never
+// stored in the event payload or broadcast on the wire, so the protocol
+// surface is unchanged. Absent (e.g. a call site that doesn't pass one) is
+// treated as "not running" — fails closed for this rule specifically.
+function classify(type, payload, sender, prevState) {
   // A user's own words/actions (sender `user:*`) must never trigger an
   // alert push, to ANY of that user's devices — not just the originating
   // one (that's origin-device exclusion, a separate, narrower rule below).
@@ -21,21 +34,27 @@ function classify(type, payload, sender) {
   // background-push branch in onAppend, never reaches classify()) and keeps
   // its existing behavior regardless of sender.
   if (typeof sender === 'string' && sender.startsWith('user:')) return null
-  if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false }
+  if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
-    return payload && payload.state === 'done' ? { priority: 10, coalesce: false } : null
+    const state = payload && payload.state
+    const turnFinished = prevState === 'running' && (state === 'waiting' || state === 'done')
+    return turnFinished ? { priority: 10, coalesce: false, kind: 'done' } : null
   }
   if (type === 'convo_meta') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
-  return { priority: 5, coalesce: true }
+  return { priority: 5, coalesce: true, kind: 'activity' }
 }
 
 // Wired in server.js after a successful journal append fans out (see the
 // `fanOut` choke point in ws.js). `apnsClient` is the makeApnsClient()
 // instance, or undefined when push is disabled (all onAppend calls become a
 // cheap no-op).
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS } = {}) {
+// `classify` is injectable (defaults to the real classifier above) purely
+// as a test seam — production callers never override it — so a test can
+// exercise a hypothetical future `cls.kind` the prefs object doesn't know
+// about without reaching into module internals.
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -133,7 +152,10 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     state.timer.unref()
   }
 
-  function onAppend(userId, event, originDeviceId) {
+  // `pushHint` is optional, in-memory-only extra context a caller (today:
+  // ws.js's convo_upsert handler, for session_status's prevSessionState)
+  // can pass through to classify(). Every other call site omits it.
+  function onAppend(userId, event, originDeviceId, pushHint) {
     if (!apnsClient) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
@@ -158,13 +180,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
           payload: { aps: { 'content-available': 1 } },
           priority: 5,
           pushType: 'background',
+          category: 'wake',
         })
       }
       return
     }
 
-    const cls = classify(event.type, event.payload, event.sender)
-    if (!cls) return // journal-sync-only type (convo_meta, non-done session_status), or a user's own event (T2)
+    const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
+    if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
     for (const device of devices) {
@@ -177,6 +200,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       // uniformly rather than being asymmetrically special-cased.
       if (device.id === originDeviceId) continue
       if (!device.apns_env) continue
+      // Per-device notification prefs: skip the device only when its prefs
+      // explicitly disable this event's category. Deliberately BEFORE the
+      // isViewing/cursor checks (cheapest first) and only on the alert path —
+      // read_marker wakes above are invisible to the user and never filtered.
+      // A `cls.kind` absent from the prefs object (a future category prefs
+      // hasn't caught up to) fails open rather than muting every device —
+      // matches the module's documented fail-open rule.
+      if (parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({
@@ -184,6 +215,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
         priority: cls.priority,
         pushType: 'alert',
         collapseId: event.convo_id,
+        category: cls.kind,
       })
       if (cls.coalesce) {
         scheduleRoutine(device, userId, event.convo_id, buildOpts)

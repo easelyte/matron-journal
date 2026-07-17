@@ -2,7 +2,7 @@
   "name": "matron-journal",
   "version": "0.1.0",
   "type": "module",
-  "bin": { "matron-admin": "bin/matron-admin.js" },
+  "bin": { "matron-admin": "bin/matron-admin.js", "matron-push-relay": "bin/matron-push-relay.js" },
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test 'test/**/*.js'",

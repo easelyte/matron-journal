@@ -9,6 +9,7 @@ import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
+import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
@@ -154,12 +155,18 @@ function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   return interval
 }
 
-// Direct APNs push is wired ONLY when all four MATRON_APNS_* vars are set
-// (same disabled-by-default pattern as the rest of the server); otherwise a
-// single warn log at boot and the push pipeline is an inert no-op.
-function resolveApnsClient(injected) {
+// Push client selection, in strict priority order:
+//   1. injected (tests) — caller owns its lifecycle.
+//   2. all four MATRON_APNS_* set → direct APNs (Dan's journal: full-content
+//      alerts, exactly the pre-relay behavior).
+//   3. MATRON_PUSH_GATEWAY_URL set → the push.matron.chat relay (self-hosted
+//      journals with no APNs key; generic alert text, content never leaves
+//      the box — see src/gateway.js).
+//   4. neither → push disabled, one warn log at boot, pipeline is inert.
+// Exported for the selection-order tests only.
+export function resolveApnsClient(injected) {
   if (injected) return { client: injected, owned: false }
-  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC } = process.env
+  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC, MATRON_PUSH_GATEWAY_URL } = process.env
   if (MATRON_APNS_KEY_FILE && MATRON_APNS_KEY_ID && MATRON_APNS_TEAM_ID && MATRON_APNS_TOPIC) {
     const client = makeApnsClient({
       keyFile: MATRON_APNS_KEY_FILE, keyId: MATRON_APNS_KEY_ID,
@@ -167,7 +174,17 @@ function resolveApnsClient(injected) {
     })
     return { client, owned: true }
   }
-  console.warn('apns: MATRON_APNS_KEY_FILE/MATRON_APNS_KEY_ID/MATRON_APNS_TEAM_ID/MATRON_APNS_TOPIC not all set — push notifications disabled')
+  if (MATRON_PUSH_GATEWAY_URL) {
+    // A typo'd URL (e.g. missing scheme) degrades to push-disabled like the
+    // other misconfigurations — new URL() in makeGatewayClient would
+    // otherwise throw and take the whole journal down at boot.
+    if (URL.canParse('/push', MATRON_PUSH_GATEWAY_URL)) {
+      return { client: makeGatewayClient({ url: MATRON_PUSH_GATEWAY_URL }), owned: true }
+    }
+    console.warn(`push: disabled — MATRON_PUSH_GATEWAY_URL is not a valid URL: ${MATRON_PUSH_GATEWAY_URL}`)
+    return { client: undefined, owned: false }
+  }
+  console.warn('push: disabled — set all four MATRON_APNS_* vars (direct APNs) or MATRON_PUSH_GATEWAY_URL (relay) to enable')
   return { client: undefined, owned: false }
 }
 

@@ -75,7 +75,7 @@ const REPLAY_BACKPRESSURE_BYTES = 4 * 1024 * 1024 // 4 MB
 // is never a data-loss boundary — just a "go get a snapshot instead" nudge.
 const DEFAULT_MAX_REPLAY = 50000
 
-const noopPushPipeline = { onAppend() {} }
+const noopPushPipeline = { onAppend(userId, event, originDeviceId, pushHint) {} }
 
 // Polls ws.bufferedAmount until it drains below thresholdBytes, or the
 // socket stops being open (no point waiting on a dead connection — the
@@ -328,14 +328,18 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
   // it is a server-side delivery concern only — swallow and log rather than
   // letting it bubble up and surface as a spurious {op:'error'} frame for an
   // op that, from the client's perspective, already succeeded.
-  const fanOut = (frame) => {
+  // `pushHint` is an in-memory-only extra for the push pipeline (e.g.
+  // session_status's prevSessionState, for turn-finished detection in
+  // push.js classify()) — it never touches the frame, so it can't leak onto
+  // the wire or into the stored event payload.
+  const fanOut = (frame, pushHint) => {
     // Delivery scoping (see hub.broadcastJournal): agent connections only
     // receive frames for conversations they own. Looked up per frame — the
     // convo row is already hot from append()'s own authorization read.
     const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)
     hub.broadcastJournal(conn.userId, frame, owner ? owner.agent_device_id : null)
     try {
-      pushPipeline.onAppend(conn.userId, frame, conn.deviceId)
+      pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
       console.error('push pipeline onAppend failed (append/broadcast already succeeded)', err)
     }
@@ -346,7 +350,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       fanOut(journalFrame({
         seq: r.seq, convo_id: args.convoId, ts: r.ts,
         sender: args.sender, type: args.type, payload: args.payload,
-      }))
+      }), args.pushHint)
     }
     return r
   }
@@ -535,10 +539,16 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           parentConvoId: msg.parent_convo_id ?? null,
         })
         if (msg.session_state) {
+          // prevSessionState is upsertConversation's read of the row BEFORE
+          // this update — an in-memory hint only, so push.js can tell a
+          // turn-finished transition (running -> waiting/done) from a
+          // teardown of an already-idle session (waiting -> done). Never
+          // stored or broadcast.
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'session_status',
             payload: { state: msg.session_state },
+            pushHint: { prevSessionState: convo.prevSessionState },
           })
         }
         // Other devices learn renames live instead of only via /snapshot.

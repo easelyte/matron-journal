@@ -416,3 +416,45 @@ test('server stops consuming an oversized streaming body', async (t) => {
   })
   assert.ok(bytesWritten < 16e6, `client managed to write ${bytesWritten} bytes — server still consuming`)
 })
+
+test('PUT /push/prefs merges partial updates and echoes everywhere', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'password1')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password1', device_name: 'phone' } })
+  const token = login.json.token
+
+  // Defaults echo from GET /devices: attention/done on, activity off.
+  const before = await s.http('/devices', { token })
+  assert.deepEqual(before.json.devices[0].push_prefs, { attention: true, done: true, activity: false })
+
+  // Partial update merges, including turning the default-off activity key
+  // back on.
+  const r1 = await s.http('/push/prefs', { method: 'PUT', token, body: { activity: true } })
+  assert.equal(r1.status, 200)
+  assert.deepEqual(r1.json.push_prefs, { attention: true, done: true, activity: true })
+  const r2 = await s.http('/push/prefs', { method: 'PUT', token, body: { done: false } })
+  assert.deepEqual(r2.json.push_prefs, { attention: true, done: false, activity: true })
+
+  // Echoed from /devices and /push/register.
+  const after = await s.http('/devices', { token })
+  assert.deepEqual(after.json.devices[0].push_prefs, { attention: true, done: false, activity: true })
+  const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'ab'.repeat(32), environment: 'prod' } })
+  assert.equal(reg.status, 200)
+  assert.deepEqual(reg.json.push_prefs, { attention: true, done: false, activity: true })
+})
+
+test('PUT /push/prefs validation: unknown fields, non-boolean values, agent devices', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'password1')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password1' } })
+  const token = login.json.token
+
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: { wake: false } })).status, 400)
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: { attention: 'no' } })).status, 400)
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: {} })).status, 200, 'an empty body is a valid no-op')
+
+  const agent = createAgent(s.db, login.json.user_id, 'bridge')
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token: agent.token, body: { attention: false } })).status, 403)
+})

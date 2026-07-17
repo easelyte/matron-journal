@@ -1,0 +1,29 @@
+[Unit]
+Description=Matron demo journal (demo.matron.chat)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matron-demo
+Group=matron-demo
+EnvironmentFile=/etc/matron/demo.env
+WorkingDirectory=/opt/matron/journal
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/matron-demo
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

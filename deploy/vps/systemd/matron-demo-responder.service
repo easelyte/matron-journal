@@ -1,0 +1,29 @@
+[Unit]
+Description=Matron demo responder (keeps demo agents connected, answers RPCs)
+After=matron-demo-journal.service
+Wants=matron-demo-journal.service
+ConditionPathExists=/var/lib/matron-demo/tokens.env
+
+[Service]
+Type=simple
+User=matron-demo
+Group=matron-demo
+EnvironmentFile=/var/lib/matron-demo/tokens.env
+WorkingDirectory=/opt/matron/journal
+ExecStart=/usr/bin/node deploy/vps/demo/responder.mjs
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

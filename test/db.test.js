@@ -4,7 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { openDb } from '../src/db.js'
+import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs } from '../src/db.js'
+import { createUser } from '../src/auth.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')
@@ -121,4 +122,51 @@ test('openDb bounds the WAL file but keeps the stock auto-checkpoint', () => {
     db.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('push_prefs: NULL and garbage parse as all-on; setPushPrefs merges partial updates', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const dev = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','phone','h1',?)")
+    .run(dan.id, Date.now())
+  const deviceId = dev.lastInsertRowid
+
+  // Column exists (migration ran) and NULL = defaults: attention/done on,
+  // activity off.
+  assert.deepEqual(parsePushPrefs(null), { attention: true, done: true, activity: false })
+  // Garbage stored by a buggy/older writer must fail open to the defaults, not throw.
+  assert.deepEqual(parsePushPrefs('not json'), { attention: true, done: true, activity: false })
+  assert.deepEqual(parsePushPrefs('[1,2]'), { attention: true, done: true, activity: false })
+  // A garbage value for one key falls back to that key's default alone —
+  // the rest of a well-formed blob is still honored.
+  assert.deepEqual(parsePushPrefs('{"attention":"nope","done":false}'), { attention: true, done: false, activity: false })
+
+  // Explicit true/false are both honored, including turning the
+  // default-off activity key back on.
+  const merged1 = setPushPrefs(db, deviceId, { activity: true })
+  assert.deepEqual(merged1, { attention: true, done: true, activity: true })
+  const merged2 = setPushPrefs(db, deviceId, { done: false })
+  assert.deepEqual(merged2, { attention: true, done: false, activity: true })
+
+  // The stored row round-trips through parsePushPrefs — an explicit `true`
+  // for a default-off key survives the round-trip, not just `false`.
+  const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
+  assert.deepEqual(parsePushPrefs(row.push_prefs), { attention: true, done: false, activity: true })
+})
+
+test('clientDevicesForPush and listDevices expose push_prefs', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const dev = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','phone','h2',?)")
+    .run(dan.id, Date.now())
+  const deviceId = dev.lastInsertRowid
+  setApnsRegistration(db, deviceId, { apnsToken: 'tok', apnsEnv: 'prod' })
+  setPushPrefs(db, deviceId, { attention: false })
+
+  const pushRows = clientDevicesForPush(db, dan.id)
+  assert.equal(pushRows.length, 1)
+  assert.deepEqual(parsePushPrefs(pushRows[0].push_prefs), { attention: false, done: true, activity: false })
+
+  const roster = listDevices(db, dan.id)
+  assert.deepEqual(roster[0].push_prefs, { attention: false, done: true, activity: false })
 })

@@ -19,19 +19,30 @@ export function snippetOf(type, payload) {
   if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
+  // Matches the relay's fixed 'done'-category string (see relay.js
+  // APS_ALERTS) — push.js's classify() only ever pushes a session_status
+  // event for a turn-finished transition (running -> waiting or -> done),
+  // so this reads right regardless of which of those two states it is.
+  if (type === 'session_status') return 'Session finished'
   return `[${type}]`
 }
 
-// Returns the conversation row plus `metaChanged`: true when this call set
-// metadata other devices must learn live — an existing convo's title actually
-// changed, a brand-new convo was created with a non-empty title, or a child
-// was created (parent_convo_id set: the linkage must ride the journal even
-// titleless, or a live client would list the child as a normal conversation
-// until its next /snapshot). Callers (ws.js) use the flag to decide whether
-// to fan out a `convo_meta` journal event; no event on an unchanged title,
-// an absent title, or a state-only upsert.
+// Returns the conversation row plus `metaChanged` and `prevSessionState`.
+// `metaChanged`: true when this call set metadata other devices must learn
+// live — an existing convo's title actually changed, a brand-new convo was
+// created with a non-empty title, or a child was created (parent_convo_id
+// set: the linkage must ride the journal even titleless, or a live client
+// would list the child as a normal conversation until its next /snapshot).
+// Callers (ws.js) use the flag to decide whether to fan out a `convo_meta`
+// journal event; no event on an unchanged title, an absent title, or a
+// state-only upsert.
+// `prevSessionState`: the session_state as it stood BEFORE this call
+// (undefined for a brand-new convo). Purely an in-memory hint for the push
+// pipeline's turn-finished detection (see push.js classify()) — never
+// stored or broadcast, so it carries no wire/protocol weight.
 export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
@@ -54,7 +65,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
-  return { ...convo, metaChanged }
+  return { ...convo, metaChanged, prevSessionState }
 }
 
 const nextSeq = (db, userId) =>
