@@ -1,4 +1,6 @@
 import http from 'node:http'
+import { makeRendezvousStore } from './rendezvous.js'
+import { CODE_ALPHABET, normalizeCode } from './pairing.js'
 
 // The push.matron.chat relay: the one piece of shared infrastructure Matron
 // runs. Holds the APNs key for the chat.matron.app bundle id and forwards
@@ -79,6 +81,20 @@ export function makeRelayLimiter({ burst = 20, refillMs = 10000, globalBurst = 2
     return true
   }
 
+  // Global-bucket-only gate, for surfaces that must not carry a per-key
+  // bucket (rendezvous offers/polls: a poller hits every 2 s for minutes,
+  // and rid existence already bounds what a request can do).
+  function allowGlobal() {
+    const t = now()
+    refill(global, globalBurst, globalRefillMs, t)
+    if (global.tokens <= 0) {
+      globalDenied += 1
+      return false
+    }
+    global.tokens -= 1
+    return true
+  }
+
   function sweep() {
     const t = now()
     for (const [token, b] of buckets) {
@@ -93,7 +109,33 @@ export function makeRelayLimiter({ burst = 20, refillMs = 10000, globalBurst = 2
     }
   }
 
-  return { allow, sweep, _buckets: buckets }
+  return { allow, allowGlobal, sweep, _buckets: buckets }
+}
+
+// Rendezvous creation is the relay's second unauthenticated surface. One
+// sign-in needs exactly one creation, so the per-IP budget is tiny; the
+// global ceiling (10/s sustained) is far above legitimate volume and
+// bounds offers/polls too (spec §1).
+export const makeRendezvousLimiter = (opts = {}) =>
+  makeRelayLimiter({ burst: 10, refillMs: 30000, globalBurst: 100, globalRefillMs: 100, ...opts })
+
+const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{8}$`)
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+// null = valid; otherwise a machine reason (relay convention: never echoes
+// caller values). Mirrors the apps' server-URL stance: https from any
+// host, http only to localhost-ish dev hosts.
+function validateOffer(body) {
+  for (const k of Object.keys(body)) {
+    if (k !== 'server' && k !== 'code') return 'unknown_field'
+  }
+  if (body.server === undefined || body.code === undefined) return 'missing_field'
+  if (typeof body.server !== 'string' || body.server.length > 200) return 'bad_server'
+  let u
+  try { u = new URL(body.server) } catch { return 'bad_server' }
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))) return 'bad_server'
+  if (typeof body.code !== 'string' || !CODE_RE.test(normalizeCode(body.code))) return 'bad_code'
+  return null
 }
 
 // null = valid; otherwise a short machine reason (never echoes field VALUES —
@@ -137,15 +179,20 @@ function buildPayload({ category, badge, thread_id }) {
 // token, 400 → env-mismatch warning) works against the relay unchanged. An
 // APNs-side transport failure has status 0, which is not an HTTP status —
 // surfaced as 502 with the true {status: 0, reason} in the body.
-export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter() }) {
+export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), rendezvous = makeRendezvousStore(), rendezvousLimiter = makeRendezvousLimiter() }) {
   const respond = (res, httpStatus, obj) => {
     res.writeHead(httpStatus, { 'content-type': 'application/json' })
     res.end(JSON.stringify(obj))
   }
+  const empty = (res, httpStatus) => {
+    res.writeHead(httpStatus)
+    res.end()
+  }
 
-  return (req, res) => {
-    if (req.method !== 'POST' || req.url !== '/push') return respond(res, 404, { status: 404, reason: 'not_found' })
-
+  // Streaming JSON body read under BODY_LIMIT. Resolves the parsed object,
+  // or null after having already responded (413/400). An empty body
+  // resolves {} (creation POSTs carry no fields).
+  const readJsonBody = (req, res) => new Promise((resolve) => {
     let data = ''
     let overflowed = false
     req.setEncoding('utf8')
@@ -155,59 +202,121 @@ export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter() }) {
         overflowed = true
         req.removeAllListeners('data')
         req.pause()
-        // Partially-unconsumed body: never reuse this socket (same keep-alive
-        // desync concern as the journal's readBody 413 path).
+        // Partially-unconsumed body: never reuse this socket (same
+        // keep-alive desync concern as the journal's readBody 413 path).
         res.setHeader('Connection', 'close')
         respond(res, 413, { status: 413, reason: 'too_large' })
+        resolve(null)
       }
     })
-    req.on('error', () => { /* peer went away: nothing to respond to */ })
-    req.on('end', async () => {
+    req.on('error', () => resolve(null)) // peer went away: nothing to respond to
+    req.on('end', () => {
       if (overflowed) return
+      if (!data) { resolve({}); return }
       let body
       try {
         body = JSON.parse(data)
       } catch {
-        return respond(res, 400, { status: 400, reason: 'bad_json' })
+        respond(res, 400, { status: 400, reason: 'bad_json' })
+        resolve(null)
+        return
       }
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-        return respond(res, 400, { status: 400, reason: 'bad_json' })
+        respond(res, 400, { status: 400, reason: 'bad_json' })
+        resolve(null)
+        return
       }
-      const invalid = validate(body)
-      if (invalid) return respond(res, 400, { status: 400, reason: invalid })
-      if (!limiter.allow(body.device_token)) return respond(res, 429, { status: 429, reason: 'rate_limited' })
-
-      // apnsClient.send never rejects (contract) — the catch is a backstop so
-      // a bug there can never crash the relay or hang the response.
-      let result
-      try {
-        result = await apnsClient.send({
-          deviceToken: body.device_token,
-          env: body.env,
-          payload: buildPayload(body),
-          collapseId: body.collapse_id,
-          priority: body.priority,
-          pushType: body.push_type,
-        })
-      } catch (err) {
-        console.error('relay: apns send threw unexpectedly', err)
-        result = { status: 0, reason: 'internal' }
-      }
-      if (result.status < 200) {
-        // Truncated token prefix only — a full token is a push credential.
-        console.error(`relay: apns transport failure for token ${body.device_token.slice(0, 8)}… (${result.reason})`)
-        return respond(res, 502, { status: result.status, reason: result.reason ?? null })
-      }
-      return respond(res, result.status, { status: result.status, reason: result.reason ?? null })
+      resolve(body)
     })
+  })
+
+  async function handlePush(req, res) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    const invalid = validate(body)
+    if (invalid) return respond(res, 400, { status: 400, reason: invalid })
+    if (!limiter.allow(body.device_token)) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+
+    // apnsClient.send never rejects (contract) — the catch is a backstop so
+    // a bug there can never crash the relay or hang the response.
+    let result
+    try {
+      result = await apnsClient.send({
+        deviceToken: body.device_token,
+        env: body.env,
+        payload: buildPayload(body),
+        collapseId: body.collapse_id,
+        priority: body.priority,
+        pushType: body.push_type,
+      })
+    } catch (err) {
+      console.error('relay: apns send threw unexpectedly', err)
+      result = { status: 0, reason: 'internal' }
+    }
+    if (result.status < 200) {
+      // Truncated token prefix only — a full token is a push credential.
+      console.error(`relay: apns transport failure for token ${body.device_token.slice(0, 8)}… (${result.reason})`)
+      return respond(res, 502, { status: result.status, reason: result.reason ?? null })
+    }
+    return respond(res, result.status, { status: result.status, reason: result.reason ?? null })
+  }
+
+  async function handleRendezvousCreate(req, res) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    if (Object.keys(body).length > 0) return respond(res, 400, { status: 400, reason: 'unknown_field' })
+    const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
+    if (!rendezvousLimiter.allow(ip)) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const r = rendezvous.create()
+    // Pending-map cap: same envelope as the limiter — a caller can't tell
+    // which throttle it hit, and shouldn't need to.
+    if (!r) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    return respond(res, 201, { rid: r.rid, secret: r.secret, expires_in: r.expiresIn })
+  }
+
+  async function handleOffer(req, res, rid) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    const invalid = validateOffer(body)
+    if (invalid) return respond(res, 400, { status: 400, reason: invalid })
+    if (!rendezvousLimiter.allowGlobal()) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const code = normalizeCode(body.code)
+    const r = rendezvous.offer(rid, { server: body.server, code: `${code.slice(0, 4)}-${code.slice(4)}` })
+    if (r === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
+    if (r === 'conflict') return respond(res, 409, { status: 409, reason: 'conflict' })
+    return empty(res, 204)
+  }
+
+  function handlePoll(req, res, rid, secret) {
+    if (!rendezvousLimiter.allowGlobal()) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const p = rendezvous.poll(rid, secret)
+    if (p.status === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
+    if (p.status === 'forbidden') return respond(res, 403, { status: 403, reason: 'forbidden' })
+    if (p.status === 'waiting') return empty(res, 204)
+    return respond(res, 200, { server: p.server, code: p.code })
+  }
+
+  return (req, res) => {
+    const url = new URL(req.url, 'http://relay')
+    if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res)
+    if (req.method === 'POST' && url.pathname === '/link/rendezvous') return handleRendezvousCreate(req, res)
+    const om = url.pathname.match(/^\/link\/rendezvous\/([0-9A-Z]{26})\/offer$/)
+    if (req.method === 'POST' && om) return handleOffer(req, res, om[1])
+    const pm = url.pathname.match(/^\/link\/rendezvous\/([0-9A-Z]{26})$/)
+    if (req.method === 'GET' && pm) return handlePoll(req, res, pm[1], url.searchParams.get('secret'))
+    return respond(res, 404, { status: 404, reason: 'not_found' })
   }
 }
 
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000
 
-export function startRelay({ apnsClient, port = 0, bind = '127.0.0.1', limiter = makeRelayLimiter() } = {}) {
-  const server = http.createServer(makeRelayHandler({ apnsClient, limiter }))
-  const sweepTimer = setInterval(() => limiter.sweep(), SWEEP_INTERVAL_MS)
+export function startRelay({ apnsClient, port = 0, bind = '127.0.0.1', limiter = makeRelayLimiter(), rendezvous = makeRendezvousStore(), rendezvousLimiter = makeRendezvousLimiter() } = {}) {
+  const server = http.createServer(makeRelayHandler({ apnsClient, limiter, rendezvous, rendezvousLimiter }))
+  const sweepTimer = setInterval(() => {
+    limiter.sweep()
+    rendezvousLimiter.sweep()
+    rendezvous.sweep()
+  }, SWEEP_INTERVAL_MS)
   sweepTimer.unref()
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
