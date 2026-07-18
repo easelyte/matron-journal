@@ -96,6 +96,33 @@ the machine-checkable version of this page.
   until approval, then exactly once `{status:'approved', token, device_id}`
   — the agent device row is minted at claim, not approve, so an unclaimed
   pair leaves no DB residue. Second claim / unknown / expired: 404.
+- `POST /link/start` (Bearer, client devices only) -> `{link_code, expires_in}`.
+  Starts a device-link session for QR sign-in (TTL 120s). One active session
+  per starter device: a new start replaces the previous one. Store cap 64
+  pending -> 429 `{error:'rate_limited'}`.
+- `POST /link/claim {link_code, device_name}` (unauthenticated; shares
+  /login's per-IP rate limit) -> `{status:'claimed', claim_token, expires_in}`.
+  First claim wins: already-claimed is 409 `{error:'conflict'}`; unknown and
+  expired merge into 404. `device_name` is trimmed, non-empty, max 64 chars.
+  A successful claim extends the session TTL to at least 60s remaining.
+- `POST /link/poll {claim_token}` (unauthenticated, not rate-limited) ->
+  `{status:'pending'}` until the starter acts, then exactly once
+  `{status:'approved', token, device_id, user_id, username}` (the `client`
+  device is minted at this poll; the session is deleted first) or
+  `{status:'denied'}` (observed once, then the session is deleted). Unknown /
+  expired / already-observed: 404. `username` is included because link
+  claimants never type one.
+- `POST /link/status` (Bearer, client devices only; starter device only) ->
+  `{status:'waiting', expires_in}` or
+  `{status:'claimed', device_name, requester_ip, expires_in}`. 404 when the
+  device has no active session (none started, expired, or already resolved).
+- `POST /link/approve {link_code}` (Bearer, client devices only; starter
+  device only, and the code must match its active session) ->
+  `{status:'approved'}`. 409 `{error:'conflict'}` when the session is not in
+  the `claimed` state (nothing to approve yet, or already resolved); 404 for
+  unknown/expired/other-device.
+- `POST /link/deny {link_code}` (Bearer, same binding as approve) ->
+  `{status:'denied'}`. 404 for unknown/expired/other-device/already-resolved.
 
 ## WebSocket
 
@@ -268,6 +295,28 @@ claim: approve only flips the in-memory pair's state, and the `devices`
 row is created by the claim response itself. The approve→claim regret
 window (≤ TTL) is accepted in v1; once claimed, the agent appears in
 `GET /devices` and is revocable instantly.
+
+## Device link (QR sign-in)
+
+The reverse of agent pairing: here the *signed-in* side starts. A signed-in
+client ("starter") calls `link/start` and renders the `link_code` as a QR
+(`matron://link?v=1&server=<url-encoded base URL>&code=XXXX-XXXX`) plus the
+code as text. The new device ("claimant") scans or types the code and calls
+`link/claim` with its device name, then polls `link/poll` with its secret
+`claim_token` (32 random bytes hex). The starter polls `link/status`, sees
+`claimed` with the claimant's name and IP, and the user taps Approve
+(`link/approve`) or Deny (`link/deny`). Scanning alone never signs anything
+in: only the approve tap — from the starter device itself, holding a live
+bearer — releases an identity.
+
+Like pairing, no `devices` row exists before the final step: approve only
+flips the in-memory session's state, and the `kind='client'` row is minted
+at the claimant's next `link/poll`, exactly once (the session is deleted
+before the token is returned). Sessions live 120s (extended to ≥60s
+remaining on claim so a last-second scan still leaves time for the tap),
+are in-memory only, and die with a restart or with the starter's token —
+`link/approve` requires a live starter bearer at tap time, so a revoked or
+signed-out starter can never complete a link.
 
 ## Agent RPC (client->agent request/response)
 
