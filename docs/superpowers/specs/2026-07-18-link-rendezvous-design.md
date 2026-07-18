@@ -104,6 +104,16 @@ Two deliberate deviations from the letter of this spec, both in the shipped
   re-normalized — the scanning phone already sends its session's normalized
   homeserver URL, so re-normalizing on the relay would only risk disagreeing
   with the value the phone itself is using.
+- Bugbot hardening (PR #29, 2026-07-18): `POST /link/preapprove`'s loopback
+  + no-forwarding-header guard alone is defeated by a headerless reverse
+  proxy (a default nginx `proxy_pass` with no `proxy_set_header` lines adds
+  none of those headers, so external traffic can look identical to a local
+  call). Added a second, independent factor: a 64-hex-char key the journal
+  auto-mints next to its DB file on first boot (`preapprove-key.js`) and
+  requires as `x-preapprove-key` on every call; `matron-admin link-code`
+  reads the same file and sends it. This spec's "no new secret to
+  provision" still holds — the key is minted automatically, never
+  operator-configured.
 
 ## 2. App flows
 

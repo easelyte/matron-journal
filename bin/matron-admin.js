@@ -5,6 +5,7 @@ import qrcode from 'qrcode-terminal'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
+import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 
 const USAGE = `usage:
@@ -90,20 +91,52 @@ export async function runAdmin(db, argv) {
     }
     const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
     if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
+    // Finding 1 hardening (Bugbot, PR #29): /link/preapprove now also
+    // requires the auto-minted key that lives next to the journal's DB
+    // file (src/preapprove-key.js) — the same file the running server
+    // read/created at boot. `db.name` is the actual path this CLI process
+    // opened (openDb(process.env.MATRON_DB || './matron.db') at the
+    // entrypoint below, or whatever a caller/test passed in), so deriving
+    // the key path from it — rather than re-reading MATRON_DB — stays
+    // correct even when `db` was opened against a non-default path. Only
+    // the server ever mints this file; the CLI is read-only here and must
+    // fail loudly (not silently mint a fresh, non-matching key) if it
+    // can't read it.
+    const keyPath = resolvePreapproveKeyPath(db.name)
+    let key
+    try {
+      key = fs.readFileSync(keyPath, 'utf8').trim()
+    } catch (e) {
+      throw new Error(
+        `cannot read the pre-approve key at ${keyPath} (${e.code || e.message}) — ` +
+        'this command must run on the journal host, as the journal service user (or root)'
+      )
+    }
     // The pre-approved session lives in the RUNNING server's memory — the
     // admin CLI is a separate process, so this must be an HTTP call, and
-    // /link/preapprove only answers loopback callers with no proxy headers.
+    // /link/preapprove only answers loopback callers with no proxy headers
+    // and the correct x-preapprove-key.
     let r
     try {
       r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-preapprove-key': key },
         body: JSON.stringify({ username }),
       })
     } catch {
       throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
     }
-    if (r.status === 404) throw new Error(`no such user: ${username}`)
+    // A guard failure and an unknown username are indistinguishable on the
+    // wire (both a plain 404) — say so rather than claim confidently that
+    // the user doesn't exist (Bugbot finding 2, PR #29). With the key
+    // above in place a guard-404 for a genuinely local caller should be
+    // rare, but the message stays honest either way.
+    if (r.status === 404) {
+      throw new Error(
+        `no such user "${username}" — or the journal refused the request as non-local ` +
+        '(run this on the journal host itself)'
+      )
+    }
     if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
     const { link_code, expires_in } = await r.json()
     const uri = `matron://link?v=1&server=${encodeURIComponent(serverUrl)}&code=${link_code}`

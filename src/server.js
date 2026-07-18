@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
+import { ensurePreapproveKey } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
 import { makeLinkStore } from './link.js'
 import { makeHub } from './hub.js'
@@ -192,7 +193,7 @@ export function resolveApnsClient(injected) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, pairs, links,
+  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -214,6 +215,15 @@ export function startServer({
   const resolvedPairs = pairs || makePairStore()
   const resolvedLinks = links || makeLinkStore()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
+  // Finding 1 hardening (Bugbot, PR #29): /link/preapprove's loopback +
+  // no-forwarding-header guard alone is defeated by a headerless reverse
+  // proxy (default nginx `proxy_pass` adds nothing). This key is the
+  // second, independent factor — auto-minted next to the DB, never
+  // operator-provisioned (see src/preapprove-key.js). `preapproveKey` lets
+  // a caller (tests) inject a known value directly with zero disk I/O;
+  // otherwise it's read from (or minted into) the file at `preapproveKeyPath`
+  // (or its default, derived from resolvedDbPath).
+  const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
@@ -228,6 +238,7 @@ export function startServer({
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    preapproveKey: resolvedPreapproveKey,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -247,6 +258,7 @@ export function startServer({
         hub,
         toolStreams,
         pushPipeline,
+        preapproveKey: resolvedPreapproveKey,
         close: () => new Promise((r) => {
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)

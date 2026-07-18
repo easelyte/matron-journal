@@ -197,6 +197,85 @@ test('link-code: unknown user and unreachable journal produce actionable errors'
   await assert.rejects(() => runAdmin(s.db, ['link-code']), /usage/)
 })
 
+test('link-code: 404 message is honest about covering both "unknown user" and "guard refused" (indistinguishable on the wire)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'nobody', '--server-url', 'https://x.example.com', '--port', String(s.port)]),
+    (e) => {
+      assert.match(e.message, /no such user "nobody"/)
+      assert.match(e.message, /refused the request as non-local/)
+      assert.match(e.message, /journal host itself/)
+      return true
+    }
+  )
+})
+
+test('link-code: reads the preapprove key file next to the DB and sends it as x-preapprove-key', async (t) => {
+  // Stand-in journal that just records the header it received, rather than
+  // exercising the real guard — isolates "did the CLI read the right file
+  // and send the right header" from the server-side guard logic (already
+  // covered by test/link-http.test.js).
+  let seenKey
+  const fake = http.createServer((req, res) => {
+    seenKey = req.headers['x-preapprove-key']
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ link_code: 'ABCD-EFGH', expires_in: 600 }))
+  })
+  await new Promise((resolve) => fake.listen(0, '127.0.0.1', resolve))
+  t.after(() => fake.close())
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-preapprove-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const keyPath = path.join(dir, 'preapprove.key')
+  fs.writeFileSync(keyPath, 'a'.repeat(64), { mode: 0o600 })
+
+  const out = await runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(fake.address().port)])
+  assert.match(out, /code:\s+ABCD-EFGH/)
+  assert.equal(seenKey, 'a'.repeat(64))
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('link-code: an unreadable preapprove key file (missing, or wrong permissions) fails with a friendly, actionable error', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-preapprove-unreadable-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const keyPath = path.join(dir, 'preapprove.key')
+
+  // Missing entirely (ENOENT) — no server has ever booted against this DB.
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', '9810']),
+    (e) => {
+      assert.match(e.message, /cannot read the pre-approve key/)
+      assert.ok(e.message.includes(keyPath), `expected the path ${keyPath} to be named in:\n${e.message}`)
+      assert.match(e.message, /journal host/)
+      return true
+    }
+  )
+
+  // Present but unreadable (EACCES) — wrong owner/permissions, e.g. the CLI
+  // running as a different user than the journal service. Deliberately no
+  // permission restore before cleanup: unlink is governed by the parent
+  // directory's write permission, not the file's own mode, so rmSync above
+  // (in the first-registered t.after) can still remove it.
+  fs.writeFileSync(keyPath, 'a'.repeat(64), { mode: 0o000 })
+  if (process.getuid && process.getuid() === 0) {
+    // root ignores file permissions — nothing meaningful to assert here.
+  } else {
+    await assert.rejects(
+      () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', '9810']),
+      /cannot read the pre-approve key/
+    )
+  }
+
+  db.close()
+})
+
 test('link-code: --port abc (non-integer) hits the --port guard', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

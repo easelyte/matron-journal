@@ -327,9 +327,22 @@ provisioning time there is no other device to tap on). The granting
 authority is root on the box: the endpoint answers only loopback sockets
 carrying no `X-Forwarded-*`/`Forwarded`/`CF-Connecting-IP` header (external
 traffic always arrives via the reverse proxy, which adds one), and 404s
-for everyone else. Codes live 10 minutes, are one-shot, and count toward
-the same in-memory cap as normal link sessions. `matron-admin link-code
-<username> --server-url <url>` wraps this and prints the
+for everyone else.
+
+That header check alone is defeated by a headerless reverse proxy (a
+default-config nginx `proxy_pass` with no `proxy_set_header` lines forwards
+none of them), so the endpoint additionally requires the header
+`x-preapprove-key` to match a 64-hex-char secret the journal auto-mints on
+first boot at `<dirname(db path)>/preapprove.key` (mode 0600, compared with
+`crypto.timingSafeEqual`) — no operator provisioning step, nothing to
+configure. Missing or wrong key gets the same 404 as every other guard
+failure. `matron-admin link-code` reads that file itself (it must run on
+the journal host, as the journal's service user or root) and sends the
+header automatically.
+
+Codes live 10 minutes, are one-shot, and count toward the same in-memory
+cap as normal link sessions. `matron-admin link-code <username>
+--server-url <url>` wraps this and prints the
 `matron://link?v=1&server=…&code=XXXX-XXXX` QR on the terminal.
 
 ## Link rendezvous (relay)
