@@ -196,6 +196,43 @@ test('link-code: unknown user and unreachable journal produce actionable errors'
   await assert.rejects(() => runAdmin(s.db, ['link-code']), /usage/)
 })
 
+test('link-code: --port abc (non-integer) hits the --port guard', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', 'abc']),
+    /--port/
+  )
+})
+
+test('link-code: --server-url validation matches the apps\' stance (https any host, http localhost-only, max 200 chars)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // http to localhost-ish hosts is accepted and proceeds to the HTTP call
+  const outLocalhost = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://localhost:9810', '--port', String(s.port)])
+  assert.match(outLocalhost, /server:\s+http:\/\/localhost:9810/)
+
+  const outLoopback = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://127.0.0.1:9810', '--port', String(s.port)])
+  assert.match(outLoopback, /server:\s+http:\/\/127\.0\.0\.1:9810/)
+
+  // http to a non-loopback host is rejected
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://evil.example.com', '--port', String(s.port)]),
+    /--server-url/
+  )
+
+  // an overlong https URL is rejected even though the protocol is fine
+  const longUrl = `https://chat.example.com/${'a'.repeat(200)}`
+  assert.ok(longUrl.length > 200)
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', longUrl, '--port', String(s.port)]),
+    /--server-url/
+  )
+})
+
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-'))
   const dbPath = path.join(dir, 'cli.db')

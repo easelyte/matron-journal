@@ -23,6 +23,19 @@ function flag(argv, name) {
   return i >= 0 ? argv[i + 1] : null
 }
 
+// Mirrors the apps'/relay's server-URL stance (src/relay.js validateOffer,
+// LOCALHOST_HOSTS): https from any host, http only to localhost-ish dev
+// hosts, and capped at 200 chars. Not imported from relay.js because it
+// isn't exported there — kept in sync by hand instead.
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+function isValidServerUrl(serverUrl) {
+  if (typeof serverUrl !== 'string' || serverUrl.length > 200) return false
+  let u
+  try { u = new URL(serverUrl) } catch { return false }
+  return u.protocol === 'https:' || (u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))
+}
+
 export async function runAdmin(db, argv) {
   const [a, b] = argv
   if (a === 'user' && b === 'add') {
@@ -72,10 +85,8 @@ export async function runAdmin(db, argv) {
     const username = argv[1]
     const serverUrl = flag(argv, '--server-url')
     if (!username || !serverUrl) throw new Error(USAGE)
-    let parsed
-    try { parsed = new URL(serverUrl) } catch { parsed = null }
-    if (!parsed || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
-      throw new Error(`${USAGE}\n\n--server-url must be an http(s) URL (got ${JSON.stringify(serverUrl)})`)
+    if (!isValidServerUrl(serverUrl)) {
+      throw new Error(`${USAGE}\n\ninvalid --server-url: must be https://, or http:// to localhost only, max 200 chars (got ${JSON.stringify(serverUrl)})`)
     }
     const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
     if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
