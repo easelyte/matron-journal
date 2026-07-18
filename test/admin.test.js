@@ -9,6 +9,7 @@ import { authToken, createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin } from '../bin/matron-admin.js'
+import { startTestServer } from './helpers.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -155,6 +156,44 @@ test('admin CLI: device list and device revoke', async () => {
   assert.match(noneOut, /no devices/i)
 
   db.close()
+})
+
+test('link-code: prints a QR + manual fallback whose code signs a claimant in with no tap', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port)])
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  assert.match(out, /server:\s+https:\/\/chat\.example\.com/)
+  assert.ok(out.includes(`matron://link?v=1&server=${encodeURIComponent('https://chat.example.com')}&code=${code}`))
+  assert.match(out, /▄|█/) // an ANSI QR actually rendered
+
+  // the printed code really is pre-approved: claim → first poll mints the device
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'First Phone' } })
+  assert.equal(claim.status, 200)
+  const poll = await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })
+  assert.equal(poll.json.status, 'approved')
+  assert.equal(poll.json.username, 'dan')
+})
+
+test('link-code: unknown user and unreachable journal produce actionable errors', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'nobody', '--server-url', 'https://x.example.com', '--port', String(s.port)]),
+    /no such user/
+  )
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1']),
+    /not reachable/
+  )
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'not a url', '--port', String(s.port)]),
+    /--server-url/
+  )
+  await assert.rejects(() => runAdmin(s.db, ['link-code']), /usage/)
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {

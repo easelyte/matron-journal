@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs, { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import qrcode from 'qrcode-terminal'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
@@ -12,6 +13,7 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
+  matron-admin link-code <username> --server-url <url> [--port <n>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
   matron-admin status`
@@ -65,6 +67,45 @@ export async function runAdmin(db, argv) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     revokeDevice(db, deviceId)
     return `device ${deviceId} revoked`
+  }
+  if (a === 'link-code') {
+    const username = argv[1]
+    const serverUrl = flag(argv, '--server-url')
+    if (!username || !serverUrl) throw new Error(USAGE)
+    let parsed
+    try { parsed = new URL(serverUrl) } catch { parsed = null }
+    if (!parsed || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
+      throw new Error(`${USAGE}\n\n--server-url must be an http(s) URL (got ${JSON.stringify(serverUrl)})`)
+    }
+    const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
+    if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
+    // The pre-approved session lives in the RUNNING server's memory — the
+    // admin CLI is a separate process, so this must be an HTTP call, and
+    // /link/preapprove only answers loopback callers with no proxy headers.
+    let r
+    try {
+      r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username }),
+      })
+    } catch {
+      throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
+    }
+    if (r.status === 404) throw new Error(`no such user: ${username}`)
+    if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
+    const { link_code, expires_in } = await r.json()
+    const uri = `matron://link?v=1&server=${encodeURIComponent(serverUrl)}&code=${link_code}`
+    const qr = await new Promise((resolve) => qrcode.generate(uri, { small: true }, resolve))
+    return [
+      qr,
+      `Scan with the Matron app to sign in as ${username}.`,
+      'Or enter it manually on the sign-in screen:',
+      `  server: ${serverUrl}`,
+      `  code:   ${link_code}`,
+      `(${uri})`,
+      `The code expires in ${Math.round(expires_in / 60)} minutes and works once.`,
+    ].join('\n')
   }
   if (a === 'offload') {
     const daysFlag = flag(argv, '--days')

@@ -318,6 +318,50 @@ are in-memory only, and die with a restart or with the starter's token —
 `link/approve` requires a live starter bearer at tap time, so a revoked or
 signed-out starter can never complete a link.
 
+### Pre-approved link codes (provisioning)
+
+`POST /link/preapprove {username}` mints a link session that is born
+approved: the claimant runs the ordinary `link/claim` → `link/poll` flow
+and the FIRST poll returns the device token — no approve tap (at
+provisioning time there is no other device to tap on). The granting
+authority is root on the box: the endpoint answers only loopback sockets
+carrying no `X-Forwarded-*`/`Forwarded`/`CF-Connecting-IP` header (external
+traffic always arrives via the reverse proxy, which adds one), and 404s
+for everyone else. Codes live 10 minutes, are one-shot, and count toward
+the same in-memory cap as normal link sessions. `matron-admin link-code
+<username> --server-url <url>` wraps this and prints the
+`matron://link?v=1&server=…&code=XXXX-XXXX` QR on the terminal.
+
+## Link rendezvous (relay)
+
+The reverse direction, for signed-out devices that can't scan (spec:
+`docs/superpowers/specs/2026-07-18-link-rendezvous-design.md`). Served by
+the push relay (`push.matron.chat`), NOT the journal — a brand-new install
+has no configuration, and the shared relay is the one address every Matron
+app knows. The relay never carries a token: only `{server, code}`, the
+same two values the shipped QR displays on screen. The confirm-tap on the
+signed-in phone remains the only credential-granting gate.
+
+- `POST /link/rendezvous` (empty body) → `201 {rid, secret, expires_in}`.
+  `rid`: 26 chars of the pairing alphabet (~128 bits), shown in the QR as
+  `matron://rlink?v=1&rid=<rid>`. `secret`: 256-bit hex poll gate, never
+  in the QR. TTL 3 minutes, in-memory only, `maxPending` 256. Per-IP
+  token bucket (burst 10, refill 1/30 s) plus a global ceiling (burst
+  100, refill 1/100 ms) that also bounds offers and polls.
+- `POST /link/rendezvous/:rid/offer {server, code}` — the scanning
+  phone's move, after calling `link/start` on its own journal. First
+  offer wins → 204; later offers 409; unknown/expired rid 404. `server`
+  must be https (http allowed to localhost-ish dev hosts only), ≤ 200
+  chars; `code` is normalized to `XXXX-XXXX`. Validation reasons are
+  machine strings that never echo caller values.
+- `GET /link/rendezvous/:rid?secret=<hex>` — the creator's 2 s poll.
+  204 waiting; `200 {server, code}` once offered (NOT one-shot — the
+  entry survives to TTL so a dropped response is retryable; it releases
+  no credential); 403 on secret mismatch (constant-time); 404 after TTL.
+
+A relay restart forgets pending rendezvous; the signed-out device
+regenerates its QR, mirroring link-session behavior.
+
 ## Agent RPC (client->agent request/response)
 
 Structured app->bridge calls (spec:
