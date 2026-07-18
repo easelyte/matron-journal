@@ -7,12 +7,13 @@ export async function startTestServer(opts = {}) {
   return {
     ...s,
     base,
-    async http(path, { method = 'GET', token = null, body = null } = {}) {
+    async http(path, { method = 'GET', token = null, body = null, headers = {} } = {}) {
       const r = await fetch(base + path, {
         method,
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body ? { 'content-type': 'application/json' } : {}),
+          ...headers,
         },
         body: body ? JSON.stringify(body) : undefined,
       })

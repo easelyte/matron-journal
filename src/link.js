@@ -10,8 +10,8 @@ import { normalizeCode, randomCode } from './pairing.js'
 // store invariant — the Map key enforces it structurally, and start() is a
 // plain replace. claim() scans for the low-entropy code and poll() scans
 // for the 256-bit claimToken; both scans are bounded by maxPending (≤64).
-export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPending = 64 } = {}) {
-  const sessions = new Map() // starterDeviceId -> { code, userId, status, claimToken, deviceName, requesterIp, expiresAt }
+export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPending = 64, preapprovedTtlMs = 600000 } = {}) {
+  const sessions = new Map() // starterDeviceId (or 'preapproved:<random>') -> { code, userId, status, preapproved, claimToken, deviceName, requesterIp, expiresAt }
 
   const sweep = (now) => {
     for (const [k, s] of sessions) if (now >= s.expiresAt) sessions.delete(k)
@@ -32,6 +32,23 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
       })
       return { linkCode: `${code.slice(0, 4)}-${code.slice(4)}`, expiresIn: Math.floor(ttlMs / 1000) }
     },
+    // Root-on-the-box provisioning (spec §3): the session is born approved —
+    // claim() jumps straight to 'approved', so the claimant's first poll
+    // returns the device token with no approve tap (at provisioning time
+    // there is no other device to tap on). Synthetic starter key: numeric
+    // device ids can never collide with the 'preapproved:' string form, and
+    // status/approve/deny key on real device ids so they can't touch these.
+    startPreapproved(userId) {
+      const now = Date.now()
+      sweep(now)
+      if (sessions.size >= maxPending) return null
+      let code
+      do { code = randomCode() } while ([...sessions.values()].some((s) => s.code === code))
+      sessions.set(`preapproved:${crypto.randomBytes(8).toString('hex')}`, {
+        code, userId, status: 'waiting', preapproved: true, claimToken: null, deviceName: null, requesterIp: null, expiresAt: now + preapprovedTtlMs,
+      })
+      return { linkCode: `${code.slice(0, 4)}-${code.slice(4)}`, expiresIn: Math.floor(preapprovedTtlMs / 1000) }
+    },
     claim(codeInput, { deviceName, requesterIp = null }) {
       const now = Date.now()
       sweep(now)
@@ -41,7 +58,7 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         // First claim wins; any later claim of a used code learns only that
         // it was used (spec §6: telling the truth here leaks nothing useful).
         if (s.status !== 'waiting') return { status: 'conflict' }
-        s.status = 'claimed'
+        s.status = s.preapproved ? 'approved' : 'claimed'
         s.claimToken = crypto.randomBytes(32).toString('hex')
         s.deviceName = deviceName
         s.requesterIp = requesterIp

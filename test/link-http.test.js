@@ -232,3 +232,96 @@ test('store cap surfaces as the limiter 429 shape on start', async (t) => {
   // the first starter can still refresh its own session (replacement is cap-exempt)
   assert.equal((await s.http('/link/start', { method: 'POST', token: me.token, body: {} })).status, 200)
 })
+
+test('preapprove: mints a code that signs a claimant in with no approve tap', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  const pre = await s.http('/link/preapprove', {
+    method: 'POST', body: { username: 'dan' }, headers: { 'x-preapprove-key': s.preapproveKey },
+  })
+  assert.equal(pre.status, 200)
+  assert.match(pre.json.link_code, /^[0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4}$/)
+  assert.equal(pre.json.expires_in, 600)
+
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: pre.json.link_code, device_name: 'First Phone' } })
+  assert.equal(claim.status, 200)
+  // no /link/approve happens — the very first poll mints the device
+  const poll = await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })
+  assert.equal(poll.status, 200)
+  assert.equal(poll.json.status, 'approved')
+  assert.match(poll.json.token, /^[0-9a-f]{64}$/)
+  assert.equal(poll.json.username, 'dan')
+  // one-shot: second poll 404
+  assert.equal((await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })).status, 404)
+  // the minted device is a working client bearer
+  assert.equal((await s.http('/devices', { token: poll.json.token })).status, 200)
+})
+
+test('preapprove guard: any proxy-forwarding header (or unknown user, or bad body) is rejected', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // Loopback without forwarding headers (and with the right key) is the
+  // accept path (covered above). Each forwarding header alone must still
+  // 404 even with a correct key — external traffic always arrives via the
+  // reverse proxy, which adds one of these.
+  for (const headers of [
+    { 'x-forwarded-for': '203.0.113.9' },
+    { 'x-forwarded-proto': 'https' },
+    { forwarded: 'for=203.0.113.9' },
+    { 'cf-connecting-ip': '203.0.113.9' },
+    { 'x-real-ip': '203.0.113.9' },
+  ]) {
+    const r = await fetch(`${s.base}/link/preapprove`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-preapprove-key': s.preapproveKey, ...headers },
+      body: JSON.stringify({ username: 'dan' }),
+    })
+    assert.equal(r.status, 404, JSON.stringify(headers))
+    assert.deepEqual(await r.json(), { error: 'not_found' })
+  }
+
+  const keyHeaders = { 'x-preapprove-key': s.preapproveKey }
+  assert.equal((await s.http('/link/preapprove', { method: 'POST', body: { username: 'nobody' }, headers: keyHeaders })).status, 404)
+  for (const body of [{}, { username: 7 }, { username: '' }]) {
+    assert.equal((await s.http('/link/preapprove', { method: 'POST', body, headers: keyHeaders })).status, 400, JSON.stringify(body))
+  }
+})
+
+test('preapprove guard: missing or wrong x-preapprove-key is rejected even from a clean loopback caller', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // No key header at all — a headerless reverse proxy (default nginx
+  // `proxy_pass` with no `proxy_set_header` lines) adds none of the
+  // forwarding headers either, so this is exactly what that traffic looks
+  // like on the wire: loopback socket, zero forwarding headers, no key.
+  const missing = await s.http('/link/preapprove', { method: 'POST', body: { username: 'dan' } })
+  assert.equal(missing.status, 404)
+  assert.deepEqual(missing.json, { error: 'not_found' })
+
+  // Wrong key, same length as the real one (64 hex chars) — still 404.
+  const wrongSameLength = await s.http('/link/preapprove', {
+    method: 'POST', body: { username: 'dan' }, headers: { 'x-preapprove-key': 'f'.repeat(64) },
+  })
+  assert.equal(wrongSameLength.status, 404)
+  assert.deepEqual(wrongSameLength.json, { error: 'not_found' })
+
+  // Wrong key, different length — the length-mismatch branch of the
+  // constant-time compare.
+  const wrongLength = await s.http('/link/preapprove', {
+    method: 'POST', body: { username: 'dan' }, headers: { 'x-preapprove-key': 'short' },
+  })
+  assert.equal(wrongLength.status, 404)
+  assert.deepEqual(wrongLength.json, { error: 'not_found' })
+
+  // The correct key from a clean loopback caller is the accept path.
+  const ok = await s.http('/link/preapprove', {
+    method: 'POST', body: { username: 'dan' }, headers: { 'x-preapprove-key': s.preapproveKey },
+  })
+  assert.equal(ok.status, 200)
+})

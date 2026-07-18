@@ -2,16 +2,22 @@
   "name": "matron-journal",
   "version": "0.1.0",
   "type": "module",
-  "bin": { "matron-admin": "bin/matron-admin.js", "matron-push-relay": "bin/matron-push-relay.js" },
+  "bin": {
+    "matron-admin": "bin/matron-admin.js",
+    "matron-push-relay": "bin/matron-push-relay.js"
+  },
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test 'test/**/*.js'",
     "loadtest": "node tools/load-test.js"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "argon2": "^0.41.0",
     "better-sqlite3": "^11.0.0",
+    "qrcode-terminal": "^0.12.0",
     "ws": "^8.18.0"
   }
 }

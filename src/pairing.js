@@ -4,12 +4,14 @@ import crypto from 'node:crypto'
 // remaining vowels A/E so codes can't spell words. 30 chars; 8 chars ≈ 39
 // bits — plenty for a code that grants nothing without an authenticated
 // approval and dies in ttlMs anyway.
-const ALPHABET = '0123456789BCDFGHJKMNPQRSTVWXYZ'
+export const CODE_ALPHABET = '0123456789BCDFGHJKMNPQRSTVWXYZ'
 const CODE_LEN = 8
 
 // crypto.randomInt is unbiased (rejection sampling), unlike bytes % 30.
-// Exported for src/link.js: link codes share the pairing alphabet exactly.
-export const randomCode = () => Array.from({ length: CODE_LEN }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('')
+// randomChars is exported for src/rendezvous.js (26-char rids) and
+// randomCode for src/link.js (link codes share the pairing alphabet).
+export const randomChars = (len) => Array.from({ length: len }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('')
+export const randomCode = () => randomChars(CODE_LEN)
 
 // Boxes display XXXX-XXXX; humans type variations. Comparison happens on
 // this normal form only.

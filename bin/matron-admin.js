@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import fs, { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import qrcode from 'qrcode-terminal'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
+import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 
 const USAGE = `usage:
@@ -12,6 +14,7 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
+  matron-admin link-code <username> --server-url <url> [--port <n>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
   matron-admin status`
@@ -19,6 +22,19 @@ const USAGE = `usage:
 function flag(argv, name) {
   const i = argv.indexOf(name)
   return i >= 0 ? argv[i + 1] : null
+}
+
+// Mirrors the apps'/relay's server-URL stance (src/relay.js validateOffer,
+// LOCALHOST_HOSTS): https from any host, http only to localhost-ish dev
+// hosts, and capped at 200 chars. Not imported from relay.js because it
+// isn't exported there — kept in sync by hand instead.
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+function isValidServerUrl(serverUrl) {
+  if (typeof serverUrl !== 'string' || serverUrl.length > 200) return false
+  let u
+  try { u = new URL(serverUrl) } catch { return false }
+  return u.protocol === 'https:' || (u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))
 }
 
 export async function runAdmin(db, argv) {
@@ -65,6 +81,77 @@ export async function runAdmin(db, argv) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     revokeDevice(db, deviceId)
     return `device ${deviceId} revoked`
+  }
+  if (a === 'link-code') {
+    const username = argv[1]
+    const serverUrl = flag(argv, '--server-url')
+    if (!username || !serverUrl) throw new Error(USAGE)
+    if (!isValidServerUrl(serverUrl)) {
+      throw new Error(`${USAGE}\n\ninvalid --server-url: must be https://, or http:// to localhost only, max 200 chars (got ${JSON.stringify(serverUrl)})`)
+    }
+    const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
+    if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
+    // Finding 1 hardening (Bugbot, PR #29): /link/preapprove now also
+    // requires the auto-minted key that lives next to the journal's DB
+    // file (src/preapprove-key.js) — the same file the running server
+    // read/created at boot. `db.name` is the actual path this CLI process
+    // opened (openDb(process.env.MATRON_DB || './matron.db') at the
+    // entrypoint below, or whatever a caller/test passed in), so deriving
+    // the key path from it — rather than re-reading MATRON_DB — stays
+    // correct even when `db` was opened against a non-default path. Only
+    // the server ever mints this file; the CLI is read-only here and must
+    // fail loudly (not silently mint a fresh, non-matching key) if it
+    // can't read it.
+    const keyPath = resolvePreapproveKeyPath(db.name)
+    let key
+    try {
+      key = fs.readFileSync(keyPath, 'utf8').trim()
+    } catch (e) {
+      throw new Error(
+        `cannot read the pre-approve key at ${keyPath} (${e.code || e.message}) — ` +
+        'this command must run on the journal host, as the journal service user (or root)'
+      )
+    }
+    // The pre-approved session lives in the RUNNING server's memory — the
+    // admin CLI is a separate process, so this must be an HTTP call, and
+    // /link/preapprove only answers loopback callers with no proxy headers
+    // and the correct x-preapprove-key.
+    let r
+    try {
+      r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-preapprove-key': key },
+        body: JSON.stringify({ username }),
+      })
+    } catch {
+      throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
+    }
+    // A guard failure and an unknown username are indistinguishable on the
+    // wire (both a plain 404) — say so rather than claim confidently that
+    // the user doesn't exist (Bugbot finding 2, PR #29). With the key
+    // above in place a guard-404 for a genuinely local caller should be
+    // rare, but the message stays honest either way.
+    if (r.status === 404) {
+      throw new Error(
+        `no such user "${username}" — or the journal refused the request as non-local ` +
+        '(run this on the journal host itself)'
+      )
+    }
+    if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
+    const { link_code, expires_in } = await r.json()
+    const uri = `matron://link?v=1&server=${encodeURIComponent(serverUrl)}&code=${link_code}`
+    const qr = await new Promise((resolve) => qrcode.generate(uri, { small: true }, resolve))
+    return [
+      qr,
+      `Scan with the Matron app to sign in as ${username}.`,
+      'Or enter it manually on the sign-in screen:',
+      `  server: ${serverUrl}`,
+      `  code:   ${link_code}`,
+      `(${uri})`,
+      // expires_in may be absent from an older/nonstandard journal response;
+      // print the code either way rather than "expires in NaN minutes".
+      Number.isFinite(expires_in) ? `The code expires in ${Math.round(expires_in / 60)} minutes and works once.` : 'The code works once.',
+    ].join('\n')
   }
   if (a === 'offload') {
     const daysFlag = flag(argv, '--days')

@@ -146,3 +146,38 @@ test('cap: start returns null at maxPending; expired sessions free slots; replac
   await new Promise((r) => setTimeout(r, 40))
   assert.ok(store.start(3, 7)) // sweep reclaimed the expired slots
 })
+
+test('preapproved: claim jumps straight to approved — first poll releases the identity, once', () => {
+  const links = makeLinkStore()
+  const r = links.startPreapproved(42)
+  assert.match(r.linkCode, /^[0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4}$/)
+  assert.equal(r.expiresIn, 600) // pairing-store pacing, not the 120 s link TTL
+
+  const c = links.claim(r.linkCode, { deviceName: 'First Phone' })
+  assert.equal(c.status, 'claimed') // same shape the claimant flow already handles
+  const p = links.poll(c.claimToken)
+  assert.deepEqual(p, { status: 'approved', userId: 42, deviceName: 'First Phone' })
+  assert.deepEqual(links.poll(c.claimToken), { status: 'not_found' }) // one-shot
+})
+
+test('preapproved: first claim wins; a later claim of the used code conflicts', () => {
+  const links = makeLinkStore()
+  const r = links.startPreapproved(42)
+  links.claim(r.linkCode, { deviceName: 'x' })
+  assert.deepEqual(links.claim(r.linkCode, { deviceName: 'y' }), { status: 'conflict' })
+})
+
+test('preapproved: expires on its own 10-minute clock', async () => {
+  const links = makeLinkStore({ preapprovedTtlMs: 30 })
+  const r = links.startPreapproved(42)
+  await new Promise((res) => setTimeout(res, 60))
+  assert.deepEqual(links.claim(r.linkCode, { deviceName: 'x' }), { status: 'not_found' })
+})
+
+test('preapproved sessions count toward maxPending and coexist with normal ones', () => {
+  const links = makeLinkStore({ maxPending: 2 })
+  assert.ok(links.startPreapproved(1))
+  assert.ok(links.start(7, 1)) // normal session, starter device 7
+  assert.equal(links.startPreapproved(1), null) // capped
+  assert.equal(links.size(), 2)
+})

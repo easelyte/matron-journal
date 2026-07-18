@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb, insertBlob } from '../src/db.js'
@@ -9,6 +10,7 @@ import { authToken, createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin } from '../bin/matron-admin.js'
+import { startTestServer } from './helpers.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -155,6 +157,176 @@ test('admin CLI: device list and device revoke', async () => {
   assert.match(noneOut, /no devices/i)
 
   db.close()
+})
+
+test('link-code: prints a QR + manual fallback whose code signs a claimant in with no tap', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port)])
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  assert.match(out, /server:\s+https:\/\/chat\.example\.com/)
+  assert.ok(out.includes(`matron://link?v=1&server=${encodeURIComponent('https://chat.example.com')}&code=${code}`))
+  assert.match(out, /▄|█/) // an ANSI QR actually rendered
+
+  // the printed code really is pre-approved: claim → first poll mints the device
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'First Phone' } })
+  assert.equal(claim.status, 200)
+  const poll = await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })
+  assert.equal(poll.json.status, 'approved')
+  assert.equal(poll.json.username, 'dan')
+})
+
+test('link-code: unknown user and unreachable journal produce actionable errors', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'nobody', '--server-url', 'https://x.example.com', '--port', String(s.port)]),
+    /no such user/
+  )
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1']),
+    /not reachable/
+  )
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'not a url', '--port', String(s.port)]),
+    /--server-url/
+  )
+  await assert.rejects(() => runAdmin(s.db, ['link-code']), /usage/)
+})
+
+test('link-code: 404 message is honest about covering both "unknown user" and "guard refused" (indistinguishable on the wire)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'nobody', '--server-url', 'https://x.example.com', '--port', String(s.port)]),
+    (e) => {
+      assert.match(e.message, /no such user "nobody"/)
+      assert.match(e.message, /refused the request as non-local/)
+      assert.match(e.message, /journal host itself/)
+      return true
+    }
+  )
+})
+
+test('link-code: reads the preapprove key file next to the DB and sends it as x-preapprove-key', async (t) => {
+  // Stand-in journal that just records the header it received, rather than
+  // exercising the real guard — isolates "did the CLI read the right file
+  // and send the right header" from the server-side guard logic (already
+  // covered by test/link-http.test.js).
+  let seenKey
+  const fake = http.createServer((req, res) => {
+    seenKey = req.headers['x-preapprove-key']
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ link_code: 'ABCD-EFGH', expires_in: 600 }))
+  })
+  await new Promise((resolve) => fake.listen(0, '127.0.0.1', resolve))
+  t.after(() => fake.close())
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-preapprove-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const keyPath = path.join(dir, 'preapprove.key')
+  fs.writeFileSync(keyPath, 'a'.repeat(64), { mode: 0o600 })
+
+  const out = await runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(fake.address().port)])
+  assert.match(out, /code:\s+ABCD-EFGH/)
+  assert.equal(seenKey, 'a'.repeat(64))
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('link-code: an unreadable preapprove key file (missing, or wrong permissions) fails with a friendly, actionable error', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-preapprove-unreadable-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const keyPath = path.join(dir, 'preapprove.key')
+
+  // Missing entirely (ENOENT) — no server has ever booted against this DB.
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', '9810']),
+    (e) => {
+      assert.match(e.message, /cannot read the pre-approve key/)
+      assert.ok(e.message.includes(keyPath), `expected the path ${keyPath} to be named in:\n${e.message}`)
+      assert.match(e.message, /journal host/)
+      return true
+    }
+  )
+
+  // Present but unreadable (EACCES) — wrong owner/permissions, e.g. the CLI
+  // running as a different user than the journal service. Deliberately no
+  // permission restore before cleanup: unlink is governed by the parent
+  // directory's write permission, not the file's own mode, so rmSync above
+  // (in the first-registered t.after) can still remove it.
+  fs.writeFileSync(keyPath, 'a'.repeat(64), { mode: 0o000 })
+  if (process.getuid && process.getuid() === 0) {
+    // root ignores file permissions — nothing meaningful to assert here.
+  } else {
+    await assert.rejects(
+      () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', '9810']),
+      /cannot read the pre-approve key/
+    )
+  }
+
+  db.close()
+})
+
+test('link-code: --port abc (non-integer) hits the --port guard', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', 'abc']),
+    /--port/
+  )
+})
+
+test('link-code: --server-url validation matches the apps\' stance (https any host, http localhost-only, max 200 chars)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // http to localhost-ish hosts is accepted and proceeds to the HTTP call
+  const outLocalhost = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://localhost:9810', '--port', String(s.port)])
+  assert.match(outLocalhost, /server:\s+http:\/\/localhost:9810/)
+
+  const outLoopback = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://127.0.0.1:9810', '--port', String(s.port)])
+  assert.match(outLoopback, /server:\s+http:\/\/127\.0\.0\.1:9810/)
+
+  // http to a non-loopback host is rejected
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', 'http://evil.example.com', '--port', String(s.port)]),
+    /--server-url/
+  )
+
+  // an overlong https URL is rejected even though the protocol is fine
+  const longUrl = `https://chat.example.com/${'a'.repeat(200)}`
+  assert.ok(longUrl.length > 200)
+  await assert.rejects(
+    () => runAdmin(s.db, ['link-code', 'dan', '--server-url', longUrl, '--port', String(s.port)]),
+    /--server-url/
+  )
+})
+
+test('link-code: missing expires_in in the journal response is not printed as "NaN minutes"', async (t) => {
+  // A stand-in for the journal that answers /link/preapprove without an
+  // expires_in field, e.g. an older or nonstandard journal build.
+  const fake = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ link_code: 'ABCD-EFGH' }))
+  })
+  await new Promise((resolve) => fake.listen(0, '127.0.0.1', resolve))
+  t.after(() => fake.close())
+
+  const db = openDb(':memory:')
+  const out = await runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(fake.address().port)])
+  assert.ok(!/NaN/.test(out), `expected no "NaN" in output:\n${out}`)
+  assert.match(out, /code:\s+ABCD-EFGH/)
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
