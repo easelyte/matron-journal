@@ -354,6 +354,20 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     }
     return r
   }
+  // Sub-chats (child convos, parent_convo_id set) mirror a subagent's transcript
+  // for durability and are READ-ONLY to clients (sub-chat contract, loop #453): a
+  // user write injects an orphan message no session is reading, and a send can
+  // race a mid-upload media reclassification. The client hides the composer, but
+  // an old tab or a direct WS caller could still reach a client-write op — this
+  // is the authoritative guard, applied to EVERY client write path (send,
+  // prompt_reply). Scoped to the sender's own user; a missing/foreign convo (row
+  // null) is NOT treated as a child here, so it still falls through to append()'s
+  // own not-authorized throw, preserving the foreign-convo anti-enumeration path.
+  // Agents keep writing children freely via publish/convo_upsert.
+  const isReadOnlyChild = (convoId) => {
+    const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
+    return !!row && row.parent_convo_id != null
+  }
   try {
     switch (msg.op) {
       case 'viewing': {
@@ -399,17 +413,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (type !== 'text' && (typeof msg.blob_ref !== 'string' || msg.blob_ref.length === 0)) {
           return fail('bad_request', 'media send requires blob_ref')
         }
-        // Sub-chats (child convos, parent_convo_id set) mirror a subagent's
-        // transcript for durability and are READ-ONLY to clients (sub-chat
-        // contract, loop #453): a user send would inject an orphan message no
-        // session is reading, and can race a mid-upload media reclassification.
-        // The client hides the composer, but an old tab or a direct WS caller
-        // could still reach here — this is the authoritative guard. Agents keep
-        // writing children freely via publish/convo_upsert. A missing/foreign
-        // convo (row null) falls through to append()'s own not-authorized throw,
-        // preserving the anti-enumeration behavior of the foreign-convo path.
-        const target = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
-        if (target && target.parent_convo_id != null) return fail('forbidden', 'sub-chat is read-only')
+        // Read-only sub-chat guard (see isReadOnlyChild above).
+        if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type,
@@ -422,6 +427,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'prompt_reply': {
         if (conn.kind !== 'client') return fail('forbidden')
         if (!Number.isInteger(msg.target_seq)) return fail('bad_request')
+        // Read-only sub-chat guard (see isReadOnlyChild above).
+        if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type: 'prompt_reply',
