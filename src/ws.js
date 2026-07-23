@@ -399,6 +399,17 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (type !== 'text' && (typeof msg.blob_ref !== 'string' || msg.blob_ref.length === 0)) {
           return fail('bad_request', 'media send requires blob_ref')
         }
+        // Sub-chats (child convos, parent_convo_id set) mirror a subagent's
+        // transcript for durability and are READ-ONLY to clients (sub-chat
+        // contract, loop #453): a user send would inject an orphan message no
+        // session is reading, and can race a mid-upload media reclassification.
+        // The client hides the composer, but an old tab or a direct WS caller
+        // could still reach here — this is the authoritative guard. Agents keep
+        // writing children freely via publish/convo_upsert. A missing/foreign
+        // convo (row null) falls through to append()'s own not-authorized throw,
+        // preserving the anti-enumeration behavior of the foreign-convo path.
+        const target = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
+        if (target && target.parent_convo_id != null) return fail('forbidden', 'sub-chat is read-only')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type,
