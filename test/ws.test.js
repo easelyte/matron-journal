@@ -179,6 +179,34 @@ test('client file/image sends append with blob_ref; media sends without blob_ref
   mac.close(); phone.close()
 })
 
+test('client send into a child (sub-chat) convo is rejected and appends nothing; parent still writable', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  // A normal parent convo and a child sub-chat (parent_convo_id set): the child
+  // mirrors a subagent transcript for durability and is read-only to clients per
+  // the sub-chat contract (loop #453). The composer is hidden client-side, but an
+  // old tab or a direct WS caller can still emit op:send here — the server is the
+  // authoritative guard.
+  upsertConversation(s.db, { id: 'parent', ownerUserId: dan.id })
+  upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'parent' })
+  const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: l.json.token, cursor: 0 })
+  await c.waitFor((f) => f.op === 'hello_ok')
+
+  c.send({ op: 'send', convo_id: 'child', payload: { body: 'sneaky' }, local_id: 'x1' })
+  await c.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden' && f.ref === 'send')
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='child'").get().n, 0)
+
+  // the read-only guard is scoped to children only — the parent (non-child) convo
+  // still accepts a normal client send
+  c.send({ op: 'send', convo_id: 'parent', payload: { body: 'allowed' }, local_id: 'x2' })
+  const f = await c.waitFor((x) => x.kind === 'journal' && x.type === 'text' && x.convo_id === 'parent')
+  assert.equal(f.payload.body, 'allowed')
+  assert.equal(f.sender, 'user:dan')
+  c.close()
+})
+
 test('send with a missing or non-object payload is rejected as bad_request, not a crash', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
