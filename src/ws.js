@@ -34,6 +34,14 @@ const ACTIVITY_DETAIL_MAX_CHARS = 200
 const STATUS_MAX_BYTES = 4096
 const STATUS_CACHE_MAX = 2048
 
+// host_vitals op (host-global machine sample — cpu/ram/sampled_at_ms): a
+// pure ephemeral like status, but NOT convo-scoped. The bridge emits it
+// without a convo_id at a slow cadence (~5s); the server relays it to every
+// one of the user's clients and caches the LAST sample per user so a fresh
+// client paints immediately on connect. Size-capped (same ceiling as status)
+// because it's held in server memory. Never journaled.
+const VITALS_CACHE_MAX = 2048
+
 // Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
 // request/response relay, never journaled. Whole-frame byte cap — larger
 // payloads belong in POST /media with a blob_ref inside params.
@@ -59,6 +67,24 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
     },
     get(userId, convoId) {
       return map.get(`${userId}:${convoId}`)
+    },
+  }
+}
+
+// Last host_vitals per user. In-memory only and bounded (oldest-written
+// evicted first): host-global, so a single value per user, not per convo. A
+// lost entry just means a reconnecting client waits up to one sample interval
+// for the next tick. Exported for direct unit testing.
+export function makeVitalsCache(max = VITALS_CACHE_MAX) {
+  const map = new Map()
+  return {
+    set(userId, vitals) {
+      if (map.has(userId)) map.delete(userId)
+      map.set(userId, vitals)
+      if (map.size > max) map.delete(map.keys().next().value)
+    },
+    get(userId) {
+      return map.get(userId)
     },
   }
 }
@@ -94,6 +120,7 @@ export function attachWs({
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
+  const vitalsCache = makeVitalsCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
@@ -261,6 +288,17 @@ export function attachWs({
           if (conn.closed) return
           hub.register(conn)
           conn.registered = true
+          // Host-vitals paint-on-connect: a fresh client gets the last host
+          // sample immediately. host_vitals is host-global and never
+          // journaled, so it is not part of the cursor replay above — without
+          // this a reconnecting client would show a blank vitals gauge until
+          // the bridge's next ~5s tick.
+          if (conn.kind === 'client') {
+            const cachedVitals = vitalsCache.get(conn.userId)
+            if (cachedVitals) {
+              ws.send(JSON.stringify({ kind: 'ephemeral', host_vitals: cachedVitals }))
+            }
+          }
           return
         }
         // Spec §8 close-on-next-frame: revocation is just deleting the
@@ -279,7 +317,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length })
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -318,7 +356,7 @@ export function notifyStale(hub, entry) {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
@@ -665,6 +703,26 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         })
+        break
+      }
+      case 'host_vitals': {
+        // Host-global machine vitals (cpu/ram/sampled_at_ms) sampled by the
+        // bridge and relayed to EVERY one of the user's clients. Same
+        // agent-only stance as status, but deliberately NOT convo-scoped: the
+        // frame carries no convo_id, there is no authorize() ownership check
+        // (host vitals belong to the machine, not a conversation), and the
+        // broadcast bypasses the viewingConvoId filter that sendEphemeral
+        // applies. Never journaled — pure ephemeral, so no appendAndFan. The
+        // last sample is cached per user and replayed on client connect.
+        // Payload is opaque to the server, validated only as a size-capped
+        // non-null object so the bridge can evolve the shape without a deploy.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.vitals !== 'object' || msg.vitals === null) return fail('bad_request')
+        let encoded
+        try { encoded = JSON.stringify(msg.vitals) } catch { return fail('bad_request') }
+        if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'vitals too large')
+        vitalsCache.set(conn.userId, msg.vitals)
+        hub.broadcastVitals(conn.userId, { kind: 'ephemeral', host_vitals: msg.vitals })
         break
       }
       case 'finalize': {

@@ -80,6 +80,20 @@ export function makeHub({ coalesceMs = 200 } = {}) {
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },
+    // Host-global vitals fan-out (host_vitals op): the bridge samples the
+    // machine (cpu/ram) with no convo scope, so this deliberately bypasses
+    // the viewingConvoId filter that sendEphemeral applies — every one of the
+    // user's CLIENT connections receives it regardless of what convo (if any)
+    // they're viewing. Agent connections are excluded (nothing to render).
+    // Direct send, no coalescer: the cadence is slow (~5s) and the frame
+    // carries full replacement state, so a pending slot would add latency for
+    // no dedup benefit.
+    broadcastVitals(userId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.kind !== 'client' || c.ws.readyState !== 1) continue
+        c.ws.send(JSON.stringify(frame))
+      }
+    },
     sendEphemeral(userId, convoId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.viewingConvoId !== convoId || c.ws.readyState !== 1) continue
