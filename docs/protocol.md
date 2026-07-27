@@ -138,7 +138,8 @@ the machine-checkable version of this page.
   prior POST /media — payload mirrors the agent-publish media shape),
   prompt_reply, read_marker, ack, viewing.
   Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
-  finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
+  finalize, activity (ephemeral), status (ephemeral, cached), host_vitals
+  (ephemeral, cached, host-global — no convo_id). `read_marker`
   is available to both kinds:
   an agent (bridge) connection may advance its user's read marker too —
   e.g. after mirroring the user's own message into the journal, so that
@@ -206,6 +207,23 @@ the machine-checkable version of this page.
   last status per conversation (in-memory, bounded) and replays it to a
   client immediately after it sends `viewing`, so headers populate on open
   instead of waiting for the next turn end.
+- Agent `host_vitals {vitals}` publishes a host-global machine sample
+  (`vitals` = `{cpu, ram, sampled_at_ms}`, shape owned opaquely by the
+  bridge). Unlike every other agent op it carries **no `convo_id`** and has
+  **no ownership check** — vitals belong to the machine, not a conversation.
+  Agent connections only (a client gets `forbidden`); `vitals` validated only
+  as a non-null object whose JSON encoding is ≤ 4096 bytes (else
+  `bad_request`). Delivered as `{kind:'ephemeral', host_vitals:{...}}` to
+  **all** of the user's client connections regardless of what (if anything)
+  they are `viewing` — the one ephemeral that bypasses the viewing filter.
+  Never journaled. The server caches the last sample per user (in-memory,
+  bounded) and replays it to a client immediately on connect (after
+  `hello_ok`), so a fresh client paints its vitals gauge without waiting for
+  the next sample. Rate-limited server-side to one accepted frame per second
+  per agent connection (excess dropped silently); a backed-up client is
+  skipped for a sample rather than queued (latest-wins telemetry). Keyed by
+  user, so it assumes one host per user — see `makeVitalsCache` in
+  `src/ws.js` (multi-host is deferred to matron loop #542).
 - Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
   live tool output (never journaled). `message_ref` is the tool_use_id;
   `offset` is the UTF-8 byte position of `chunk` in the command's output.

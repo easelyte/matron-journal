@@ -103,6 +103,9 @@ test('an oversized vitals is bad_request, not cached or broadcast', async (t) =>
 test('the last host_vitals is cached and replayed to a client on connect', async (t) => {
   const { s, login, agent } = await setup(t)
   agent.send({ op: 'host_vitals', vitals: { cpu: 1, ram: 2, sampled_at_ms: 1 } })
+  // >1s gap so the second sample clears the min-interval throttle and becomes
+  // the cached latest (a sub-second second frame would be dropped).
+  await new Promise((r) => setTimeout(r, 1100))
   agent.send({ op: 'host_vitals', vitals: VITALS })
   await new Promise((r) => setTimeout(r, 50))
 
@@ -115,4 +118,52 @@ test('the last host_vitals is cached and replayed to a client on connect', async
   await new Promise((r) => setTimeout(r, 50))
   assert.equal(late.frames.filter((f) => f.kind === 'ephemeral' && f.host_vitals).length, 1)
   agent.close(); late.close()
+})
+
+test('a sub-interval flood is throttled: only the first frame is broadcast', async (t) => {
+  const { agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'anything' }) // proves it's not a viewing effect
+  await new Promise((r) => setTimeout(r, 50))
+
+  // Five frames fired back-to-back, all inside the 1s floor.
+  for (let i = 0; i < 5; i++) agent.send({ op: 'host_vitals', vitals: { cpu: i, ram: i, sampled_at_ms: i } })
+  await client.waitFor((f) => f.kind === 'ephemeral' && f.host_vitals)
+  await new Promise((r) => setTimeout(r, 200))
+
+  // Exactly one reached the client — the first; the rest were dropped silently
+  // (no error frame back to the agent either).
+  const got = client.frames.filter((f) => f.kind === 'ephemeral' && f.host_vitals)
+  assert.equal(got.length, 1)
+  assert.deepEqual(got[0].host_vitals, { cpu: 0, ram: 0, sampled_at_ms: 0 })
+  assert.equal(agent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
+  agent.close(); client.close()
+})
+
+test('broadcastVitals skips a backed-up (slow) client instead of buffering unbounded', async (t) => {
+  // Direct hub-level test: a client whose bufferedAmount exceeds the bound is
+  // skipped for the sample (latest-wins telemetry never queues behind a slow
+  // reader). Uses fake conns so we can drive bufferedAmount deterministically.
+  const { makeHub } = await import('../src/hub.js')
+  const hub = makeHub()
+  const mkConn = (id, buffered) => {
+    const sent = []
+    return {
+      conn: { userId: 1, deviceId: id, kind: 'client', viewingConvoId: null,
+        ws: { readyState: 1, get bufferedAmount() { return buffered }, send: (p) => sent.push(p) } },
+      sent,
+    }
+  }
+  const fast = mkConn('fast', 0)
+  const slow = mkConn('slow', 2 * 1024 * 1024) // 2 MB backlog — over the 256 KB bound
+  hub.register(fast.conn)
+  hub.register(slow.conn)
+
+  hub.broadcastVitals(1, { kind: 'ephemeral', host_vitals: VITALS })
+  assert.equal(fast.sent.length, 1) // healthy reader gets it
+  assert.equal(slow.sent.length, 0) // backed-up reader is skipped, not queued
+
+  // With an explicit high bound the same slow conn is no longer skipped —
+  // confirms the skip is driven by the threshold, not some other filter.
+  hub.broadcastVitals(1, { kind: 'ephemeral', host_vitals: VITALS }, 4 * 1024 * 1024)
+  assert.equal(slow.sent.length, 1)
 })

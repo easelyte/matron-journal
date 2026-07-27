@@ -41,6 +41,11 @@ const STATUS_CACHE_MAX = 2048
 // client paints immediately on connect. Size-capped (same ceiling as status)
 // because it's held in server memory. Never journaled.
 const VITALS_CACHE_MAX = 2048
+// Server-side floor between accepted host_vitals frames from one agent
+// connection. Our bridge samples at ~5s so this never trips in normal
+// operation — it's a defense against a runaway/buggy agent flooding the op;
+// excess frames are dropped silently (telemetry, not a protocol error).
+const VITALS_MIN_INTERVAL_MS = 1000
 
 // Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
 // request/response relay, never journaled. Whole-frame byte cap — larger
@@ -75,6 +80,14 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
 // evicted first): host-global, so a single value per user, not per convo. A
 // lost entry just means a reconnecting client waits up to one sample interval
 // for the next tick. Exported for direct unit testing.
+//
+// KNOWN LIMITATION (single-host): keyed by userId alone, so if one user ran
+// TWO bridges on different machines their samples would collapse onto one
+// cache slot (last writer wins) and clients could not tell them apart. Our
+// deployment is single-VPS / single-bridge per user, so this does not bite.
+// True multi-bridge / multi-VPS per-host telemetry (device-keyed cache +
+// client host-selection UX) is deferred to matron loop #542 (the
+// multi-account / multi-VPS dashboard). Do NOT add device-keying here now.
 export function makeVitalsCache(max = VITALS_CACHE_MAX) {
   const map = new Map()
   return {
@@ -721,6 +734,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         let encoded
         try { encoded = JSON.stringify(msg.vitals) } catch { return fail('bad_request') }
         if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'vitals too large')
+        // Min-interval throttle: drop (silently) frames arriving faster than
+        // the floor from this connection. Checked AFTER validation so a
+        // rejected frame never consumes the interval, and BEFORE the cache
+        // write/broadcast so a flood can neither churn the cache nor fan out.
+        const nowMs = Date.now()
+        if (conn._lastVitalsMs != null && nowMs - conn._lastVitalsMs < VITALS_MIN_INTERVAL_MS) break
+        conn._lastVitalsMs = nowMs
         vitalsCache.set(conn.userId, msg.vitals)
         hub.broadcastVitals(conn.userId, { kind: 'ephemeral', host_vitals: msg.vitals })
         break
