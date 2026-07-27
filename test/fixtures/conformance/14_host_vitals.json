@@ -1,0 +1,53 @@
+{
+  "name": "agent host_vitals: host-global ephemeral delivered to every client regardless of viewing, cached + replayed on connect, never journaled; client-sent is forbidden",
+  "description": "host_vitals is a host-global machine sample (cpu/ram/sampled_at_ms) with NO convo_id. Unlike activity/status it reaches ALL of the user's client connections even though neither mac nor ipad ever sends `viewing` — it bypasses the viewing filter. The server caches the last sample per user and replays it to a client immediately on connect (late), so a fresh client paints without waiting for the next tick. It is never journaled (no seq frame). Only agents may send it — a client gets forbidden. No wall-clock waits: an empty-journal hello registers the connection synchronously before hello_ok is observed by the runner, so once mac and ipad have their hello_ok the agent's broadcast reaches both deterministically; per-connection FIFO orders each socket's frames.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-16" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "mac_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "ipad" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "ipad_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "phone" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "late_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "mac" },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "ipad" },
+    { "kind": "ws_send", "conn": "ipad", "frame": { "op": "hello", "token": { "$ref": "ipad_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "host_vitals", "vitals": { "cpu": 37.5, "ram": 61.2, "sampled_at_ms": 1721990000000 } } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "ephemeral", "host_vitals": { "cpu": 37.5, "ram": 61.2, "sampled_at_ms": 1721990000000 }
+    } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": {
+      "kind": "ephemeral", "host_vitals": { "cpu": 37.5, "ram": 61.2, "sampled_at_ms": 1721990000000 }
+    } },
+
+    { "kind": "ws_open", "conn": "late" },
+    { "kind": "ws_send", "conn": "late", "frame": { "op": "hello", "token": { "$ref": "late_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "late", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "late", "frame": {
+      "kind": "ephemeral", "host_vitals": { "cpu": 37.5, "ram": 61.2, "sampled_at_ms": 1721990000000 }
+    } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "host_vitals", "vitals": { "cpu": 1, "ram": 1, "sampled_at_ms": 1 } } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "error", "code": "forbidden", "ref": "host_vitals" } }
+  ]
+}

@@ -1,5 +1,13 @@
 const byteLen = (s) => Buffer.byteLength(s, 'utf8')
 
+// Backpressure bound for host_vitals fan-out (broadcastVitals). A client
+// whose outbound socket buffer already exceeds this is a paused/slow reader —
+// vitals are latest-wins telemetry, so we SKIP it for this sample rather than
+// queue another (queuing would grow the buffer unbounded; a stale sample is
+// worthless anyway). 64× a max-size sample (STATUS_MAX_BYTES = 4096) — a
+// backlog this deep means the reader is genuinely stuck, not merely bursty.
+const VITALS_BACKPRESSURE_BYTES = 256 * 1024
+
 // Coalescing rule for one pending slot. Legacy ephemerals (text overlays,
 // activity) keep latest-wins — every frame carries full replacement state.
 // Tool-stream appends are DELTAS, so latest-wins would drop output: a
@@ -78,6 +86,24 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       for (const c of byUser.get(userId) || []) {
         if (c.kind === 'agent' && agentDeviceId != null && c.deviceId !== agentDeviceId) continue
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
+    // Host-global vitals fan-out (host_vitals op): the bridge samples the
+    // machine (cpu/ram) with no convo scope, so this deliberately bypasses
+    // the viewingConvoId filter that sendEphemeral applies — every one of the
+    // user's CLIENT connections receives it regardless of what convo (if any)
+    // they're viewing. Agent connections are excluded (nothing to render).
+    // Direct send, no coalescer: the cadence is slow (~5s) and the frame
+    // carries full replacement state, so a pending slot would add latency for
+    // no dedup benefit. A backed-up client (bufferedAmount over the bound) is
+    // SKIPPED for this sample — latest-wins telemetry must never queue behind
+    // a slow reader (unbounded buffer growth); it catches up on the next tick.
+    broadcastVitals(userId, frame, backpressureBytes = VITALS_BACKPRESSURE_BYTES) {
+      const payload = JSON.stringify(frame)
+      for (const c of byUser.get(userId) || []) {
+        if (c.kind !== 'client' || c.ws.readyState !== 1) continue
+        if (c.ws.bufferedAmount > backpressureBytes) continue
+        c.ws.send(payload)
       }
     },
     sendEphemeral(userId, convoId, frame) {
