@@ -111,6 +111,8 @@ Actor recorded as a **stable numeric id** (not the mutable `name`). Append-only 
 ### 4.6 Migration — one transaction, one-shot promotion, idempotent
 `openDb` in-place: create the two tables + `AUTOINCREMENT` rebuild; add `users.tools_tier` **and in the same absent-column branch** set existing users `'full'`; backfill one `role='owner',backfill_state='complete'` member per existing convo (`ON CONFLICT DO NOTHING`). Whole migration in one transaction. Rerun-idempotent (column-absent guard prevents re-promotion; `ON CONFLICT` prevents re-backfill). **A pre-migration DB backup is a mandatory deploy gate** (§10 rollback).
 
+> **Implementation revision (2026-07-30, plan-review round 1):** "whole migration in one transaction" holds for the table-creation + `tools_tier` promotion + owner backfill, but the `AUTOINCREMENT` rebuild **cannot** share that transaction — `PRAGMA foreign_keys` (which must be toggled OFF/ON around an FK-referenced table rebuild) is a no-op inside an active transaction. The rebuild therefore runs as its own guarded, idempotent step **with `PRAGMA foreign_key_check` INSIDE its own rebuild transaction** (so a violation rolls back before the destructive swap commits) and `foreign_keys=ON` restored in a `finally`. Net: two adjacent transactions, each individually atomic, both guarded/idempotent, both behind the mandatory backup gate. See plan T-1.2 / T-1.3.
+
 ---
 
 ## 5. Authorization — every §2.1/§2.4 site → `isMember` or agent-device
