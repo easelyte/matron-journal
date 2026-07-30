@@ -1,60 +1,68 @@
-# Shared-Agent Collaboration Backbone — Design
+# Shared-Agent Collaboration Backbone — Design (v2)
 
-- **Status:** draft (pre-spec-review)
+- **Status:** draft, revision 2 (post spec-review round 1)
 - **Date:** 2026-07-30
 - **Loop:** #458
-- **Repos touched:** `easelyte/matron-journal` (server, primary), `easelyte/claude-matrix-bridge` (`/opt/matron/bridge-journal`), `easelyte/matron-web` (client)
-- **Scope:** collaboration BACKBONE only. The per-user *curated toolset/permissions* layer and the *simplified ChatGPT-like client* are separate sub-projects (see §9 Out of Scope) and get their own spec → review.
+- **Repos:** `easelyte/matron-journal` (server, primary), `easelyte/claude-matrix-bridge` (`/opt/matron/bridge-journal`), `easelyte/matron-web` (client)
+- **Scope:** collaboration BACKBONE only. The curated per-user *toolset enforcement* and the *simplified ChatGPT-like client* are separate sub-projects (§9); this spec delivers the membership model, the authorization change across all consumers, 2a fan-out with an explicit canonical copy, and the membership→tool-tier *signal* (not the enforcement).
+- **v2 changes:** full `owner_user_id` call-site audit (round-1 root miss); explicit canonical-copy model; `users.tools_tier` schema; tier re-eval on membership change; identity-lifecycle fix; whole-call idempotency; atomic creation; `appendShared` authenticated actor; agent authorization via `agent_device_id`; bounded/chunked backfill; membership audit log; rollback stance. Round-1 findings mapped in §14.
 
 ---
 
 ## 1. Problem & Goal
 
-Today the journal server is **single-tenant-per-conversation**: `conversations.owner_user_id` is a single owner, `events` has `PRIMARY KEY(user_id, seq)` with a per-user monotonic `user_seq` counter, and `append()` (`src/journal.js:76`) hard-throws if the writer is not the owner (`journal.js:79`). One human, one Claude session, one sequence space per conversation.
+The journal server is **single-tenant-per-conversation**: `conversations.owner_user_id` is a single owner, `events` is `PRIMARY KEY(user_id, seq)` with a per-user monotonic `user_seq`, and `append()` throws if the writer ≠ owner (`journal.js:79`). One human, one Claude session, one sequence space per conversation.
 
-We want **two (later N) humans talking to the SAME Claude agent conversation, each seeing the other's turns**, with:
+Goal: **two (later N) humans share one Claude conversation**, each seeing the other's turns, with:
 
-- **Full parity.** Nastia is a first-class journal user (her own `users` row, id 2) with her own devices, read-state, and `sender` attribution — not a shared login.
-- **Solo-or-group at creation.** When either human starts a conversation, the default is **both on it**; a modal lets the creator choose **solo** (just them) or **group** (with the other). (The modal is a client concern; the backbone just accepts an explicit initial member set.)
-- **Add-back + shared history.** A member can be added to an existing conversation later and receives the **full prior history**.
-- **Membership-derived tool tier.** The conversation's effective tool capability is a pure function of its membership (see §7). The backbone exposes this; the *toolset wiring* is sub-project 2.
+- **Full parity.** Nastia is a first-class user (own `users` row, id 2), own devices, own read-state, own `sender` attribution.
+- **Solo-or-group at creation.** The client offers a modal; the server receives an **explicit** initial member set (§7). No server-side guessing.
+- **Add-back + shared history.** A member added later receives full prior history.
+- **Membership-derived tool tier.** The conversation's effective tool capability is a function of its membership; the backbone stores the per-user tier and exposes + re-evaluates the conversation tier (enforcement wiring is sub-project 2).
 
-Non-goal (explicitly): human-to-human general chat / federation. This is shared-agent collaboration, not a second Matrix. If a pure human-to-human room is ever wanted, keep a separate channel.
-
----
-
-## 2. Grounding: current schema & write path (HEAD, grep-confirmed 2026-07-30)
-
-- `conversations(id TEXT PK, owner_user_id, title, session_state, last_seq, unread_count, snippet, created_at, agent_device_id, parent_convo_id)` — `src/db.js:21`.
-- `events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key, PRIMARY KEY(user_id, seq))`; `idx_events_convo ON (convo_id, seq)`; `idx_events_idem UNIQUE ON (user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL` — `src/db.js:32`.
-- `user_seq(user_id PK, seq)` — per-user monotonic counter, `nextSeq()` at `src/journal.js:71`.
-- `devices(user_id, kind IN ('client','agent'), cursor, ...)` — `cursor` is **per-device, user-wide** (one cursor across all that user's convos), `src/db.js:10`. Ack advances it at `ws.js:455`.
-- `append()` (`journal.js:76`): loads convo, **throws if `owner_user_id !== userId`** (`:79`), idem-dedups, `nextSeq(userId)`, inserts ONE event row, updates the single `conversations` row's `last_seq`/`unread_count`/`snippet`. Unread predicate: a `user:*` sender does not bump the owner's own unread (`:114`).
-- `appendAndFan()` (`ws.js:398`): after append, WS-broadcasts one frame via `hub.broadcastJournal(conn.userId, frame, agent_device_id)`. Fan-out today is **WS-only** — there is no DB fan-out; a non-owner has no row and no cursor path to the event.
-- Client `send`/`prompt_reply` (`ws.js:457`, `:478`) always call `appendAndFan({ userId: conn.userId, ... })` — a client can only write to convos it owns, enforced by append()'s throw.
-
-**Implication:** the backbone changes exactly three surfaces — the conversation/membership model, the authorization check on write & read, and event fan-out (WS-only → DB-level).
+Non-goal: human-to-human federation. This is shared-*agent* collaboration.
 
 ---
 
-## 3. Chosen approach: 2a fan-out-write (per-member seq space)
+## 2. Grounding: full authorization surface (grep-confirmed HEAD, 2026-07-30)
 
-Two candidate shared-event models were considered (loop #458):
+Schema (`src/db.js`): `conversations(id TEXT PK, owner_user_id, title, session_state, last_seq, unread_count, snippet, created_at, agent_device_id, parent_convo_id)`; `events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key, PRIMARY KEY(user_id, seq))` + `idx_events_convo ON (convo_id, seq)` + `idx_events_idem UNIQUE ON (user_id, convo_id, idem_key)`; `user_seq(user_id PK, seq)`; `users(id INTEGER PRIMARY KEY /* NO AUTOINCREMENT */, name, password_hash, created_at)`; `devices(user_id, kind, cursor, ...)`; `blobs(id, owner_user_id, ...)`.
 
-- **2a — fan-out-write (CHOSEN).** A shared event is written once into **each member's own `(user_id, seq)` space** (each member's own `nextSeq`). Each member's existing **user-wide device cursor** then picks up their copy with zero client sync-protocol change. Per-member conversation state (unread, membership) lives in a new `conversation_members` table.
-- **2b — re-key per-conversation.** Events keyed by `convo_id` + a per-conversation seq, with per-(member, convo) cursors. One physical row per event, canonically cleaner (P2). **Rejected** because it reworks the cursor model from user-wide to per-conversation for *every* conversation and *every* client/device — a global sync-protocol change to serve a 2-user feature. 2a reuses the model that already exists.
+**Every `owner_user_id`-gated site (the round-1 root miss — v1 addressed only #3):**
 
-**Why 2a despite the row duplication (right-sizing):** the journal's entire read/sync model is already "per-user seq + user-wide cursor + per-user read-state." 2a is additive to that model; 2b replaces it. Duplication cost is N copies of an event body for an N-member convo (N=2 in practice), against a full-stack cursor rework for 2b. The pragmatic path wins here and the loop concurs.
+| # | Site | Role | v2 change |
+|---|---|---|---|
+| 1 | `journal.js:143` snapshot/list `WHERE owner_user_id=?` | which convos a user sees | JOIN `conversation_members`; per-member state |
+| 2 | `journal.js:48` `upsertConversation` update owner check | convo metadata update auth | membership-aware (owner/creator only for title) |
+| 3 | `journal.js:79` `append()` owner throw | write auth | `isMember(authUserId)` (§5) |
+| 4 | `journal.js:176` `markRead()` owner throw | clear unread | membership; operate on **reader's own** copy |
+| 5 | `auth.js:107` `authorize()` owner check → `messagesBefore()`/`GET /convo/:id/messages` (`http.js`) | pagination | membership |
+| 6 | `ws.js:419` `isReadOnlyChild` `WHERE id=? AND owner_user_id=?` | sub-chat write guard | drop owner filter; check membership |
+| 7 | `db.js:188` `unreadBadge()` `SUM(unread_count) WHERE owner_user_id=?` | APNs badge | SUM over `conversation_members.unread_count WHERE user_id=?` |
+| 8 | `push.js:160` `onAppend()` `WHERE id=? AND owner_user_id=?` | push decision | look up membership, not ownership |
+| 9 | `http.js:439` blob fetch `blob.owner_user_id !== who.userId` | media access | allow if requester is a member of a convo referencing the blob |
+| 10 | `ws.js:662` agent ops `authorize(conn.userId, convo)` (owner) | agent write/stream auth | authorize by `conversations.agent_device_id == conn.deviceId` (§8a) |
 
-### 2a canonical-copy rule
+Blob *ownership* (`db.js:53/118`) stays as uploader provenance; only *access* (#9) widens to members.
 
-With 2a there is no single canonical event row, but there **is** a canonical *sequence anchor*: the conversation's `owner_user_id` (its creator) remains the **agent-facing** space. The bridge's Claude session reads the conversation **convo-scoped** (via `idx_events_convo`) so it sees every member's messages regardless of `user_id`, and writes its replies through the same fan-out so every member receives them. `agent_device_id` (already on `conversations`) continues to bind the session to its bridge.
+---
+
+## 3. Chosen approach: 2a fan-out with an explicit canonical copy
+
+**2a (chosen):** each shared event is written once into **every member's own `(user_id, seq)` space**, so each member's existing user-wide device cursor syncs their copy with **zero client sync-protocol change**. (2b — per-conversation seq + per-member per-convo cursors — was rejected: it reworks the cursor model for *every* conversation across server + both clients to serve a 2-member feature. Operator confirmed 2a, 2026-07-30.)
+
+**Canonical-copy rule (the round-1 core fix).** Under 2a the SAME logical event exists as N physical rows (one per member). A naïve `WHERE convo_id=?` read therefore returns it N times. Two distinct read intents, each with its own predicate:
+
+- **Member-facing reads** (a member paginating/snapshotting *their* view): read **that member's own copy** — `WHERE convo_id=? AND user_id=<the requesting member>`. Their space holds every event via fan-out, exactly once.
+- **Canonical/agent-facing reads** (the bridge reading the conversation; add-member backfill sourcing history): read the **owner's copy** — `WHERE convo_id=? AND user_id=<owner_user_id>` — declared the single canonical sequence. Never `WHERE convo_id=?` alone.
+
+No convo-scoped consumer may read across `user_id`. The `idx_events_convo (convo_id, seq)` index is retained for range scans but every query adds the `user_id` predicate.
 
 ---
 
 ## 4. Data model changes
 
-### 4.1 New table: `conversation_members`
+### 4.1 `conversation_members` (per-member state — sole authoritative unread)
 
 ```sql
 CREATE TABLE IF NOT EXISTS conversation_members(
@@ -62,156 +70,219 @@ CREATE TABLE IF NOT EXISTS conversation_members(
   user_id      INTEGER NOT NULL,
   role         TEXT    NOT NULL DEFAULT 'member' CHECK(role IN ('owner','member')),
   unread_count INTEGER NOT NULL DEFAULT 0,
-  added_by     INTEGER,               -- user_id who added them; NULL for the creator
+  added_by     INTEGER,
   joined_at    INTEGER NOT NULL,
   PRIMARY KEY(convo_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_convo_members_user ON conversation_members(user_id);
 ```
 
-- The conversation **creator** gets a `role='owner'` row at creation; every other member a `role='member'` row.
-- **Per-member unread** moves here. `conversations.unread_count` is retained but becomes the **owner's** mirror (kept in sync for the owner's row so existing single-member reads/snapshots don't regress); the authoritative per-member unread is `conversation_members.unread_count`. (See §8 migration for the backfill that seeds an owner row for every existing conversation.)
-- Deliberately **not** a foreign key on `convo_id`/`user_id` — consistent with the existing `agent_device_id`/`parent_convo_id` no-FK rationale (`db.js:95`): device/user deletion is a bare DELETE and must never be blocked by a dangling membership row; a dangling row simply matches no live participant.
+`conversation_members.unread_count` is the **sole authoritative** per-member unread. `conversations.unread_count` is **deprecated** as an authority: `unreadBadge()` and the snapshot/list now read from `conversation_members` (§5 sites 1,7). `conversations.unread_count` is left in place but no longer read for badges (removing the column is deferred to avoid a wider migration); the append path stops maintaining it as authoritative to eliminate the P2 dual-source. This resolves round-1 B2/dual-unread.
 
-### 4.2 `conversations`
+### 4.2 `users.tools_tier` (the missing flag — round-1 B5/Codex-B3)
 
-No column changes. `owner_user_id` stays (creator / agent-facing seq anchor + `sender` default). `unread_count`/`last_seq`/`snippet` continue to track the **owner's** view (mirror). New per-member state lives in `conversation_members`.
+```sql
+ALTER TABLE users ADD COLUMN tools_tier TEXT NOT NULL DEFAULT 'restricted'
+  CHECK(tools_tier IN ('full','restricted'));
+```
+Fresh SCHEMA includes it. In-place `openDb` migration adds it and **sets every pre-existing user to `'full'`** (today only the operator exists and has full tools); new users (Nastia) default `'restricted'`. `effectiveToolTier` (§8) reads this column — it is now defined by the data model, satisfying P38.
 
-### 4.3 `events`
+### 4.3 `conversation_member_audit` (append-only — Codex-M5)
 
-No schema change. 2a stores one row per member in each member's `(user_id, seq)` space; `convo_id`, `idx_events_convo`, and `idx_events_idem` (already per-`user_id`) all work unchanged. A member's idem key stays `client:${deviceId}:${localId}` and is naturally scoped to their own `user_id`.
+```sql
+CREATE TABLE IF NOT EXISTS conversation_member_audit(
+  id         INTEGER PRIMARY KEY,
+  convo_id   TEXT    NOT NULL,
+  target_user INTEGER NOT NULL,
+  actor      TEXT    NOT NULL,          -- 'cli:admin' or 'user:<name>'
+  action     TEXT    NOT NULL CHECK(action IN ('add','remove')),
+  prev_tier  TEXT,                       -- convo effective tier before
+  new_tier   TEXT,                       -- after
+  backfilled INTEGER,                    -- events copied on add, NULL on remove
+  ts         INTEGER NOT NULL
+);
+```
+Append-only (P30/P34); removal writes an `action='remove'` row rather than deleting evidence. Records who granted/revoked access, when, and the tier transition.
 
-### 4.4 Migration mechanics
+### 4.4 `conversations`
 
-Follow the in-place pattern already in `openDb` (`db.js:80–112`): add `conversation_members` (+ index) to the `SCHEMA` const for fresh installs, and an idempotent create + one-time backfill in `openDb` for the live DB (seed a `role='owner'` member row for every existing conversation from its `owner_user_id`, `unread_count`, `created_at`). Backfill is idempotent (`INSERT ... ON CONFLICT(convo_id,user_id) DO NOTHING`).
+No column additions. `owner_user_id` stays (creator = canonical seq anchor + agent binding + `sender` default). `agent_device_id`/`parent_convo_id` unchanged.
+
+### 4.5 `events`
+
+No schema change. 2a stores one row per member per event; `idx_events_idem` is already per-`user_id`.
+
+### 4.6 Migration mechanics
+
+In-place `openDb` pattern (`db.js:80–112`): add the two tables + `users.tools_tier`; **backfill** one `role='owner'` member row per existing conversation (from `owner_user_id`, current `unread_count`, `created_at`), idempotent `INSERT ... ON CONFLICT(convo_id,user_id) DO NOTHING`; set existing users `tools_tier='full'`. Migration wrapped in one transaction (Codex/atomicity).
+
+### 4.7 Identity lifecycle (round-1 Codex-B2, ROWID reuse)
+
+`users.id` has no `AUTOINCREMENT`, so a deleted id can be reused. **User deletion MUST delete that user's `conversation_members` rows in the same transaction** (and write `action='remove'` audit rows). No membership row may outlive its user. This closes the "dangling membership authorizes a reused id" vector without an FK (kept FK-free per the existing `agent_device_id`/`parent_convo_id` rationale). A ratchet test asserts no `conversation_members.user_id` lacks a live `users` row.
 
 ---
 
-## 5. Authorization changes (the access check)
+## 5. Authorization change — every site (round-1 root fix)
 
-Introduce one helper, used by every write and read path:
-
+One helper:
 ```js
-// journal.js
 export const isMember = (db, convoId, userId) =>
   !!db.prepare('SELECT 1 FROM conversation_members WHERE convo_id=? AND user_id=?').get(convoId, userId)
 ```
 
-- **`append()` (`journal.js:79`)** — replace `convo.owner_user_id !== userId` throw with `!isMember(db, convoId, userId)` throw. A member (owner or added) may write; a non-member still gets the same "not authorized" throw (preserves the anti-enumeration behavior for foreign convos, which have no membership row).
-- **Read paths** — `snapshot()`, sync/backfill queries, and the `viewing` op must return a conversation's events to any member. Today reads are scoped by `conn.userId`'s own seq space; under 2a each member already has their own copy in their own space, so **most reads need no change** — a member reads their own fan-out copy via their user-wide cursor exactly like today. The change is that `conversation_members` (not just owned `conversations`) drives which convos appear in a member's conversation list / snapshot.
-- **`isReadOnlyChild` guard (`ws.js:418`)** stays; sub-chats remain read-only regardless of membership.
+Applied per §2 table:
+- **Write** (`append()` 79): `!isMember(db, convoId, authUserId)` throw (authUserId = the authenticated actor, §6). Non-member/foreign convo → same "not authorized" (anti-enumeration preserved).
+- **markRead** (176): `isMember` gate; recompute unread on the **caller's own** `conversation_members` row and their own event copy — not the owner's.
+- **authorize()/pagination** (`auth.js:107`, `messagesBefore`): `isMember`; `messagesBefore` reads the **requesting member's own copy** (`WHERE convo_id=? AND user_id=<requester>`), never convo-wide.
+- **snapshot/list** (143): a user's conversation list = `conversation_members JOIN conversations` for their memberships; metadata (title/session_state) from `conversations`, per-member `unread_count`/read-state from `conversation_members`.
+- **isReadOnlyChild** (`ws.js:419`): drop the `owner_user_id` filter — `SELECT parent_convo_id FROM conversations WHERE id=?` — so the read-only-sub-chat guard holds for **every** member, not just the owner (round-1 M2).
+- **unreadBadge** (`db.js:188`): `SUM(unread_count) FROM conversation_members WHERE user_id=?`.
+- **push.onAppend** (`push.js:160`): resolve the target by membership; a fanned-out non-owner member now receives push (round-1 B2).
+- **blob fetch** (`http.js:439`): allow if `blob.owner_user_id == requester` **or** the requester is a member of a conversation whose events reference the blob (media in shared convos).
+- **agent ops** (`ws.js:662`): authorize by `agent_device_id` (§8a), decoupled from owner identity.
 
 ---
 
-## 6. Event fan-out (2a): the core change
-
-`appendAndFan` becomes a **DB fan-out + WS fan-out** over the member set.
+## 6. Fan-out primitive (`appendShared`) — authenticated actor, atomic, whole-call idempotent
 
 ```
-appendShared(db, { convoId, sender, type, payload, blobRef, idemKey, originUserId }):
-  members = SELECT user_id FROM conversation_members WHERE convo_id = convoId   // stable order
-  within ONE db.transaction():
-    for each member m:
+appendShared(db, { convoId, authUserId, sender, type, payload, blobRef, idemKey }):
+  if not isMember(db, convoId, authUserId): throw 'not authorized'      // actor ≠ sender ≠ member set
+  members = SELECT user_id FROM conversation_members WHERE convo_id=convoId ORDER BY user_id
+  db.transaction(() => {
+    // whole-call idempotency: if ANY member already has this idem_key, the
+    // entire logical send already fanned out — return the existing result,
+    // insert nothing (round-1 B4). Checked against the canonical (owner) copy.
+    if idemKey and exists(events WHERE user_id=owner AND convo_id AND idem_key):
+        return { duplicate: true }
+    for m in members:
       seq_m = nextSeq(db, m)
       INSERT events(user_id=m, seq=seq_m, convo_id, ts, sender, type, payload, blob_ref, idem_key)
-      update per-member conversation state:
-        unread bump on conversation_members(m) UNLESS sender is m's own (sender == `user:${m.username}`)
-          or the convo is a silent child (parent_convo_id != null)
-        keep conversations.last_seq/snippet in sync for the owner row (mirror)
-    return { perMember: { m: {seq_m, ts} }, duplicate }
+      // per-member unread: bump conversation_members(m).unread_count UNLESS
+      // sender is m's own (user:<m.name>) or convo is a silent child (parent_convo_id)
+      // canonical mirror: if m == owner, also advance conversations.last_seq/snippet
+  })
   after commit, for each member m:
-    hub.broadcastJournal(m, journalFrame({ seq: seq_m, convo_id, ... }), agent_device_id)
+    hub.broadcastJournal(m, journalFrame(seq_m, convo_id, ...))
     pushPipeline.onAppend(m, frame, ...)
 ```
 
-Design points the review must scrutinize:
-
-- **Atomicity.** All per-member inserts + seq bumps happen in one `db.transaction()` so a shared event is all-or-nothing across members (no half-fanned event). `nextSeq` is already an atomic upsert-returning.
-- **Idempotency under fan-out.** The idem key is per-member (`user_id` scoped). A client retry from member X re-dedups only X's copy — correct, because a retry only re-sends X's own message. The agent's own replies carry no client idem key (unchanged).
-- **Unread attribution.** Under 2a a member does not bump their **own** unread (their own `user:${username}` send), but **does** bump for the other member's messages and for agent output — this generalizes the current single-owner predicate (`journal.js:114`) to per-member. `markRead` recompute (referenced at `journal.js:108`) moves to `conversation_members`.
-- **WS delivery.** `hub.broadcastJournal(userId, ...)` is already per-user; we call it once per member with that member's framed copy. The agent device still receives frames for convos it owns (`agent_device_id`) — unchanged, and sufficient because the agent reads convo-scoped.
-- **Ordering across members.** Each member's copy gets its own seq in its own space; there is no cross-member ordering guarantee needed (each client only ever reads its own space). The `ts` is shared, so relative ordering by `ts` is consistent across members.
+- **Authenticated actor** (Codex-M1): `authUserId` is the connection's identity, distinct from `sender` (attribution, forgeable content) and the member set (destinations). The membership check uses `authUserId`. WS `send`/`prompt_reply` pass `conn.userId`.
+- **Atomicity:** all per-member inserts + seq bumps in one `db.transaction()` — no half-fanned event.
+- **Idempotency (whole-call):** a retry from any member matches the canonical copy's idem key and short-circuits the entire fan-out (no per-member re-insert → no duplicate delivery to others). Round-1 B4 resolved.
+- **Ordering:** each member's copy gets its own seq in its own space; clients only read their own space; shared `ts` gives consistent cross-member ordering.
 
 ---
 
 ## 7. Membership operations
 
-- **Create (solo/group).** Conversation creation accepts an explicit **initial member set** (creator always included). Solo = `{creator}`; group = `{creator, other}`. The client modal chooses; the backbone just writes the member rows at creation. Default when unspecified = both known humans (product default), but the wire contract requires an explicit set so the server never guesses.
-- **Add-member (+ history backfill).** Adding member M to convo C:
-  1. Insert `conversation_members(C, M, role='member', added_by=..., joined_at=now)`.
-  2. **Backfill history via 2a replay:** read C's existing event log convo-scoped (owner's copy, `idx_events_convo`), and for each historical event allocate `nextSeq(M)` and insert an M-space copy (preserving original `ts`, `sender`, `type`, `payload`). This gives M full prior history in their own space, consistent with how live events arrive. Backfill runs in one transaction; it is bounded by conversation length. `unread_count` for M is set to 0 on join (they are "caught up" by choice — or set to the count of non-M messages; default 0, review to confirm).
-  3. Idempotent: re-adding an existing member is a no-op (PK conflict → skip, no re-backfill).
-- **Remove / re-add.** Removal deletes the member row (their event copies may be retained or GC'd — default retain, since they're in the member's own space and harmless; a future cleanup can prune). Re-add backfills again from the canonical (owner) log, so "add someone back and share history" works by construction.
-- **v1 grant surface = CLI/admin**, not in-app invite UX. A small admin command (`node scripts/members.js add <convo_id> <user>` or equivalent) performs the add + backfill. In-app invite/membership UX is deferred to the simplified-client sub-project. (Right-sized: for a known 2-person team, invite flows are disproportionate surface.)
+- **Create (atomic, explicit member set).** Conversation creation takes an **explicit** `members` array (creator always included). The wire contract **requires** it; an omitted/empty set is a `bad_request` — the server never defaults (round-1 Codex-M3 contradiction resolved: "default both" is a *client* UX default, filled in before the request). Creation writes the `conversations` row + all `conversation_members` rows in **one transaction** (Codex-M2): a crash cannot leave a convo with no creator membership.
+- **Add-member (bounded backfill + audit).**
+  1. Insert `conversation_members(C, M, 'member', added_by, now)`.
+  2. **Backfill from the canonical (owner) copy only:** `SELECT ... FROM events WHERE convo_id=C AND user_id=<owner> ORDER BY seq` — never convo-wide (round-1 B3 duplicate fix). Replay each into M's space via `nextSeq(M)`, preserving `ts`/`sender`/`type`/`payload`.
+  3. **Bounded/chunked:** backfill runs in **chunks of ≤500 events per transaction** (better-sqlite3 is synchronous — an unbounded transaction blocks the whole process, round-1 B6). A hard ceiling `MEMBER_BACKFILL_MAX_EVENTS` (default 50 000) aborts with a clear error rather than blocking pathologically; today's conversation lengths are far below this (chunking keeps each transaction short regardless).
+  4. `unread_count` for M = 0 on join (caught-up). Write an `add` audit row with `backfilled=<count>`.
+  5. Idempotent: re-adding an existing member is a no-op (PK conflict, no re-backfill).
+- **Remove-member.** Delete M's `conversation_members` row; write a `remove` audit row. M's event copies are retained (harmless in M's own space; a later GC may prune). If removal changes the convo's effective tier, trigger §8 re-evaluation.
+- **User deletion.** Deletes all of that user's `conversation_members` rows in the same transaction (§4.7) — no dangling authorization.
+- **v1 grant surface = CLI/admin** (`node scripts/members.js add|remove <convo> <user>`), not in-app UX. Right-sized for a known 2-person team; in-app invite is sub-project 3.
 
 ---
 
-## 8. Membership → tool tier (interface only; wiring is sub-project 2)
-
-The backbone exposes a **pure function** the bridge consumes:
+## 8. Membership → tool tier: storage, signal, and re-evaluation (enforcement = sub-project 2)
 
 ```
 effectiveToolTier(convoId) =
-  'restricted'  if ANY member is a restricted user (e.g. Nastia)   // worst-privilege-wins (V9)
-  'full'        only if every member is a full-tools user (e.g. a Fantin-solo convo)
+  'restricted' if ANY member has users.tools_tier='restricted'   // worst-privilege-wins (V9)
+  'full'       only if every member is 'full'
 ```
+**Operator-locked:** a GROUP convo (≥2 members) is always `restricted`; `full` only in a full-user solo convo. `tools_tier` is now a real column (§4.2).
 
-**Rule (operator-locked 2026-07-30): a GROUP convo is ALWAYS `restricted`.** Tool capability follows membership, worst-privilege-wins: any convo containing a restricted member runs the curated integration-only toolset; full dev tools only in a full-tools user's solo convo. This keeps the blast-radius boundary intact during collaboration.
+**Re-evaluation on membership change (round-1 Codex-B3).** Tier is not only computed at spawn. Any membership mutation that changes `effectiveToolTier(convoId)` (e.g. adding a restricted member to a live full-tools solo session) MUST **terminate the conversation's live agent session** so the bridge respawns it at the new (restricted) tier. The backbone emits a `tier_changed` signal on the conversation (a journal control event the bridge consumes, or a direct session-kill via the existing `agent_device_id` binding); the running session cannot continue at a stale tier. The audit row records `prev_tier`/`new_tier`.
 
-The backbone's only responsibility here is to expose membership + a per-user "is full-tools" flag so the bridge can compute the tier at session spawn. The **actual curated toolset** (which MCP integration tools Nastia's Claude gets, and the hard exclusion of Bash/Edit/system tools) is **sub-project 2** and is where the real safety enforcement lives. This spec must not be read as delivering the toolset restriction — only the membership signal that drives it.
+The backbone's deliverable here is: the `tools_tier` column, `effectiveToolTier`, and the re-evaluation/kill signal. The **actual curated toolset** (which integration MCP tools a restricted session gets, and the hard exclusion of Bash/Edit/system tools) is **sub-project 2** — the real enforcement. This spec delivers the *signal*, not the *sandbox*.
 
----
+### 8a. Agent identity / authorization (round-1 M1)
 
-## 9. Out of scope (separate sub-projects, own spec → review)
-
-1. **Curated toolset / per-user permissions (sub-project 2).** The actual restricted MCP toolset for restricted users, exclusion of dangerous tools, and enforcement at session spawn. This is the real blast-radius safety layer; the backbone only signals the tier.
-2. **Simplified ChatGPT-like client (sub-project 3).** No commands / no code / no picker cards, in-app solo/group modal + invite UX. A matron-web front-end project.
-3. **Separate-server isolation.** Same-server is the decision; a later lift-and-shift to a physically separate box (defense-in-depth) is possible without backbone rework because the tool tier — not the server — is the boundary.
+An agent connection authenticates as a registered agent device (`devices.kind='agent'`, bound to one `user_id`). Rather than require the bridge to switch identities per conversation owner, **agent-op authorization keys on `conversations.agent_device_id`**: an agent op (`stream_append`/`activity`/`status`, `ws.js:662`) is authorized iff `conversations.agent_device_id == conn.deviceId` for the target convo. This is already the delivery-scoping key (`ws.js:390`); §5 site 10 extends it to the write/stream authorization, decoupling the agent from `owner_user_id`. One bridge agent device can thus serve a convo regardless of which human owns it. The agent writes replies via `appendShared` with `authUserId = owner_user_id` (canonical) and `sender = 'agent:<name>'`.
 
 ---
 
-## 10. Error handling & edge cases
+## 9. Out of scope (own spec → review)
 
-- **Non-member write** → same "not authorized" throw as today (anti-enumeration preserved).
-- **Add-member to a convo the actor doesn't own** → rejected (only an existing owner/member with grant rights, per §7 v1 = admin CLI, sidesteps this for now).
-- **Partial fan-out crash** → whole `db.transaction()` rolls back; no half-fanned event (§6).
-- **Backfill on a long convo** → bounded single transaction; acceptable at current scale (review to set a ceiling / chunking if a convo is pathologically long).
-- **Agent reads a shared convo** → convo-scoped read (`idx_events_convo`), sees all members; writes fan out to all. Unchanged `agent_device_id` binding.
-- **A member with no live device** → their event copies persist; they sync on next connect via their user-wide cursor (identical to today's offline path).
+1. **Curated toolset enforcement (sub-project 2)** — the restricted MCP toolset, exclusion of dangerous tools, spawn-time + kill-on-tier-change enforcement. The real blast-radius layer; backbone only signals.
+2. **Simplified ChatGPT-like client (sub-project 3)** — no commands/code/picker-cards, in-app solo/group modal + invite UX.
+3. **Separate-server isolation** — same-server decided; a later lift-and-shift is possible because the tool tier, not the server, is the boundary.
+
+---
+
+## 10. Rollback & failure modes
+
+- **Rollback stance (Codex-M4):** the first fan-out write is a **declared point of no return** — after it, the DB holds multi-copy events that old (pre-migration) code would mis-read. Binary rollback is therefore **not** supported; the rollback path is **restore from the pre-migration DB backup** (a mandatory backup is taken before the migration runs, same as the 2026-07-28 snafu prod pattern). Documented as a deploy gate.
+- **Non-member write** → "not authorized" (anti-enumeration).
+- **Partial fan-out crash** → whole `db.transaction()` rolls back.
+- **Backfill on a long convo** → chunked ≤500/txn + hard ceiling (§7).
+- **Tier change on live session** → session terminated + respawned (§8).
+- **Offline member** → copies persist; sync on reconnect via user-wide cursor.
 
 ---
 
 ## 11. Testing
 
-Server (`node --test`, existing harness in `test/`):
+Server (`node --test`):
+1. Migration: fresh SCHEMA has both tables + `users.tools_tier`; in-place `openDb` backfills one `owner` member per convo + sets existing users `'full'`, idempotent on re-run, all in one transaction.
+2. `isMember` gate across **all** §2 sites: owner + added member write/paginate/markRead/see-in-list/get-pushed OK; non-member rejected identically to foreign convo at each site.
+3. Canonical-copy: a member's pagination returns each event **exactly once** (assert row-count parity), not N times; the agent-facing/canonical read returns the owner copy once.
+4. 2a fan-out: a member `send` writes one row **per member**; **exact** per-member row-count parity (guards B3/B4 duplication); sender's own unread does not bump, others' do.
+5. Fan-out atomicity: forced insert failure on member 2 rolls back member 1.
+6. **Whole-call idempotency:** a retry (same member, same `local_id`) inserts **zero** new rows for **every** member (assert counts unchanged for all), not just the sender.
+7. Add-member backfill: exact row-count parity in M's space (no duplicates even with a 3rd pre-existing member — sourced from owner copy only); chunking exercised on a >500-event convo; audit row written; re-add is a no-op.
+8. Identity lifecycle: deleting a user removes their membership rows (same txn); ratchet test — no `conversation_members.user_id` without a live `users` row.
+9. `effectiveToolTier`: group→restricted; full-solo→full; **adding a restricted member to a live full session emits the tier-change/kill signal** (prev/new tier audited).
+10. Atomic creation: forced failure after the convo insert rolls back the convo (no orphan); omitted member set → `bad_request`.
+11. unreadBadge/snapshot read from `conversation_members`, not `conversations.unread_count`.
+12. Blob access: a member can fetch a blob referenced by a shared convo they're in but didn't upload.
 
-1. `conversation_members` migration: fresh SCHEMA has the table; in-place `openDb` on a pre-existing DB backfills one `owner` row per conversation, idempotent on re-run.
-2. `isMember` gate: owner writes OK; added member writes OK; non-member write throws "not authorized"; foreign/missing convo throws (anti-enumeration).
-3. 2a fan-out: a member's `send` produces one event row **per member** in each member's seq space, one WS broadcast per member; the sender's own unread does not bump, the other member's does.
-4. Fan-out atomicity: a forced insert failure on member 2 rolls back member 1's insert and seq bump (no orphaned partial event).
-5. Idempotency: same member re-sends same `local_id` → dedup in that member's space only, no seq burned, other members unaffected.
-6. Add-member backfill: after add, M's space contains a copy of every prior event (same `ts`/`sender`/`type`), M's conversation list shows the convo; re-add is a no-op (no double-backfill).
-7. `effectiveToolTier`: group convo → `restricted`; full-user solo → `full`; convo with a restricted member → `restricted`.
-8. Read/snapshot: a member's snapshot includes shared convos they're a member of (via `conversation_members`), not only owned ones.
-
-Bridge + web changes (member awareness in delivery scoping; conversation list driven by membership) get their own test additions in their repos; this spec's acceptance is the server backbone.
+Bridge/web changes (membership-driven lists, agent-device authorization, tier-change consumption) get tests in their repos; this spec's acceptance is the server backbone.
 
 ---
 
 ## 12. Acceptance criteria
 
-- **AC1** Two distinct journal users can both `send` into the same conversation and each receives the other's messages and the agent's replies live, with correct `sender` attribution and correct per-member unread.
-- **AC2** Creating a conversation with an explicit member set of one (solo) vs two (group) produces the corresponding `conversation_members` rows; a solo convo behaves exactly as today.
-- **AC3** Adding a member to an existing conversation backfills full prior history into that member's space; the operation is idempotent.
-- **AC4** A non-member's write is rejected identically to today's foreign-convo rejection.
-- **AC5** `effectiveToolTier` returns `restricted` for any convo containing a restricted member and `full` only for a full-user solo convo; a group convo is always `restricted`.
-- **AC6** All existing single-owner conversations continue to function unchanged after migration (owner row backfilled; owner's reads/unread/snapshots identical).
+- **AC1** Two users both `send` into one convo; each receives the other's + the agent's messages live, correct `sender`, correct **per-member** unread, and pagination/markRead/push all work for the non-owner.
+- **AC2** Create with an explicit 1-member (solo) vs 2-member (group) set produces the right `conversation_members` rows; omitted set → `bad_request`; solo behaves exactly as today.
+- **AC3** Add-member backfills full history into the new member's space with **exact row-count parity** (no duplicates, incl. a 3-member case), chunked, audited; idempotent.
+- **AC4** Non-member writes/reads rejected identically to foreign-convo at every audited site.
+- **AC5** `effectiveToolTier` returns `restricted` for any convo with a restricted member and `full` only for a full-user solo; adding a restricted member to a live full session terminates/respawns it at `restricted`.
+- **AC6** Migration backfills owner rows + `tools_tier='full'` for existing users; all pre-existing single-owner conversations behave unchanged.
+- **AC7** Deleting a user leaves no `conversation_members` row referencing it (no reused-id authorization).
 
 ---
 
-## 13. Open questions for review
+## 13. Open questions for review (v2)
 
-- **Backfill unread on join:** 0 (caught-up) vs count-of-others' messages. Default 0; confirm.
-- **Grant rights in v1:** admin CLI only (no in-app add). Confirm no per-member "can add others" flag is needed yet.
-- **Event-copy retention on member removal:** retain vs prune. Default retain (harmless, in their own space). Confirm.
-- **`conversations.unread_count`/`last_seq` mirror vs deprecate:** kept as owner mirror for read-path compatibility. Confirm we don't instead migrate all owner reads to `conversation_members` in this pass (larger blast radius).
+- **Blob-access predicate cost:** membership-of-a-convo-referencing-the-blob may need an index on events(blob_ref) or a blob→convo link; confirm the query shape.
+- **`tier_changed` transport:** journal control event vs direct session-kill via `agent_device_id`. Leaning journal control event (observable, P34); confirm.
+- **`conversations.unread_count` deprecation:** left in place unread-authority-removed vs fully dropped this pass (dropping widens migration). Default: leave, stop reading. Confirm.
+
+---
+
+## 14. Round-1 findings → v2 resolution map
+
+- Canonical-copy multiplies events (Codex-B1/Claude-B3) → §3 canonical-copy rule + §5 per-site `user_id` predicate + §11.3/11.4 row-count-parity tests.
+- Incomplete call-site audit (Claude-B1) → §2 full table (10 sites) + §5.
+- Push/badge skip non-owner (Claude-B2) → §4.1 (auth unread in members) + §5 sites 7,8.
+- Backfill duplicates for 3+ members (Claude-B3) → §7 owner-copy-only source + §11.7.
+- Idempotency ambiguous (Claude-B4) → §6 whole-call short-circuit + §11.6.
+- `is_full_tools` never in schema (Claude-B5/Codex-B3) → §4.2 `users.tools_tier`.
+- Unbounded backfill (Claude-B6) → §7 chunked + ceiling.
+- ROWID reuse (Codex-B2) → §4.7 delete membership on user-deletion + §11.8.
+- Tier stale on membership change (Codex-B3) → §8 re-evaluation/kill.
+- `appendShared` no actor (Codex-M1) → §6 `authUserId`.
+- Creation not atomic (Codex-M2) → §7 one-transaction create + §11.10.
+- Missing-member-set contradiction (Codex-M3) → §7 explicit required, `bad_request` on omit.
+- Agent identity (Claude-M1) → §8a `agent_device_id` authorization.
+- `isReadOnlyChild` bypass (Claude-M2) → §5 site 6.
+- Rollback unsound (Codex-M4) → §10 point-of-no-return + backup-restore.
+- Audit trail (Codex-M5) → §4.3 append-only audit table.
+- Stale in-app edge case (Claude minor) → §7 CLI-only, edge dropped.
