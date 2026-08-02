@@ -622,7 +622,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'session_status',
             payload: {
-              state: msg.session_state,
+              state: convo.session_state,
               ...(convo.session_outcome != null ? { session_outcome: convo.session_outcome } : {}),
             },
             pushHint: { prevSessionState: convo.prevSessionState },

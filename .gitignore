@@ -4,3 +4,5 @@ node_modules/
 *.db-shm
 /media/
 preapprove.key
+.codex-session-tmp/
+node_modules

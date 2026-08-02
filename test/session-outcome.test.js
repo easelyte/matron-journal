@@ -51,7 +51,7 @@ test('session outcome is set once and child state never regresses through either
     op: 'convo_upsert', convo_id: 'child', parent_convo_id: 'parent',
     session_state: 'done', session_outcome: 'completed',
   })
-  await agent.waitFor((frame) => frame.kind === 'journal'
+  const completedStatus = await agent.waitFor((frame) => frame.kind === 'journal'
     && frame.convo_id === 'child'
     && frame.type === 'session_status'
     && frame.payload.session_outcome === 'completed')
@@ -63,7 +63,8 @@ test('session outcome is set once and child state never regresses through either
   await agent.waitFor((frame) => frame.kind === 'journal'
     && frame.convo_id === 'child'
     && frame.type === 'session_status'
-    && frame.payload.state === 'running')
+    && frame.seq > completedStatus.seq
+    && frame.payload.state === 'done')
 
   let child = s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get()
   assert.deepEqual(child, { session_state: 'done', session_outcome: 'completed' })
