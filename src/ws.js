@@ -57,6 +57,7 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // RPC request ids. Convo ids are conventionally Claude session UUIDs (36
 // chars); this is a defensive upper bound, not a format assertion.
 const CONVO_ID_MAX_CHARS = 128
+const SESSION_OUTCOMES = new Set(['completed', 'interrupted', 'failed'])
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -601,9 +602,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         )) {
           return fail('bad_request', 'bad parent_convo_id')
         }
+        if (msg.session_outcome != null && !SESSION_OUTCOMES.has(msg.session_outcome)) {
+          return fail('bad_request', 'bad session_outcome')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
+          sessionOutcome: msg.session_outcome,
           agentDeviceId: conn.deviceId,
           parentConvoId: msg.parent_convo_id ?? null,
         })
@@ -616,7 +621,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'session_status',
-            payload: { state: msg.session_state },
+            payload: {
+              state: msg.session_state,
+              ...(convo.session_outcome != null ? { session_outcome: convo.session_outcome } : {}),
+            },
             pushHint: { prevSessionState: convo.prevSessionState },
           })
         }

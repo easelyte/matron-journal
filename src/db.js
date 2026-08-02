@@ -109,6 +109,12 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'parent_convo_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
   }
+  // Terminal outcome for child worker conversations. Nullable for normal
+  // conversations and rows written by older bridges; journal.js enforces
+  // first-write-wins so a later lifecycle signal cannot rewrite history.
+  if (!convoCols.some((c) => c.name === 'session_outcome')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
   return db
 }

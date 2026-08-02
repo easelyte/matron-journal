@@ -40,7 +40,16 @@ export function snippetOf(type, payload) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId }) {
+function nextSessionState(existingRow, incoming) {
+  if (
+    existingRow.parent_convo_id != null
+    && existingRow.session_state === 'done'
+    && incoming === 'running'
+  ) return 'done'
+  return incoming
+}
+
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, sessionOutcome, agentDeviceId, parentConvoId }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
@@ -55,13 +64,13 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // omits it does not clear it and one carrying a different value does not
     // change it (child linkage is a fixed structural fact of the conversation).
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), session_outcome=COALESCE(session_outcome, ?), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
+    ).run(title ?? null, nextSessionState(existing, sessionState) ?? null, sessionOutcome ?? null, agentDeviceId ?? null, id)
   } else {
     const initialTitle = title || ''
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, created_at) VALUES(?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, session_outcome, agent_device_id, parent_convo_id, created_at) VALUES(?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', sessionOutcome ?? null, agentDeviceId ?? null, parentConvoId ?? null, Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
@@ -75,7 +84,7 @@ const nextSeq = (db, userId) =>
 
 export function append(db, { userId, convoId, sender, type, payload, blobRef = null, idemKey = null }) {
   return db.transaction(() => {
-    const convo = db.prepare('SELECT owner_user_id, parent_convo_id FROM conversations WHERE id=?').get(convoId)
+    const convo = db.prepare('SELECT owner_user_id, parent_convo_id, session_state FROM conversations WHERE id=?').get(convoId)
     if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
     if (idemKey) {
       const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND convo_id=? AND idem_key=?').get(userId, convoId, idemKey)
@@ -100,7 +109,7 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
       const state = payload && typeof payload === 'object' ? payload.state : undefined
       if (typeof state !== 'string') throw new Error('invalid session_status payload: state must be a string')
       db.prepare('UPDATE conversations SET last_seq=?, session_state=? WHERE id=?')
-        .run(seq, state, convoId)
+        .run(seq, nextSessionState(convo, state), convoId)
     } else if (MESSAGE_TYPES.includes(type)) {
       // A user's own message (sender `user:*`) never inflates their own unread
       // badge — only content from someone/something else (an agent, mirroring
@@ -137,11 +146,15 @@ export function snapshot(db, userId) {
   // events (just created, or history pruned by retention) — clients fall
   // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, last_seq, unread_count, snippet, parent_convo_id, created_at,
+    `SELECT id, title, session_state, session_outcome, last_seq, unread_count, snippet, parent_convo_id, created_at,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
-  ).all(userId)
+  ).all(userId).map(({ session_outcome: sessionOutcome, ...convo }) => (
+    // Preserve the legacy snapshot key set until an outcome actually exists;
+    // upgraded clients treat an absent field the same as a nullable one.
+    sessionOutcome == null ? convo : { ...convo, session_outcome: sessionOutcome }
+  ))
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   return { conversations, seq: head ? head.seq : 0 }
 }
