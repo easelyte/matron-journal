@@ -351,19 +351,36 @@ export function attachWs({
       // replay path from registering a dead conn afterwards.
       conn.closed = true
       hub.unregister(conn)
+      // Producer-disconnect teardown (the THIRD tool-stream teardown trigger,
+      // alongside explicit `finalize` and the 30-min idle sweep): a producer
+      // that dies mid-command never finalizes, stranding its live buffers as a
+      // "Running …" overlay until the idle sweep clears it up to 30 min later.
+      // Cascade-close exactly the streams THIS connection opened and emit the
+      // terminal `end{disconnected}` frame the web client already understands.
+      // Scoped to this producer only (closeForProducer keys on the conn), so
+      // other producers' streams are untouched; a producer with no open
+      // streams is a clean no-op; a stream already finalized/swept is gone from
+      // the store and can't double-emit. Only agent connections ever open
+      // buffers, so a client close returns [] harmlessly.
+      for (const ev of toolStreams.closeForProducer(conn)) {
+        notifyStale(hub, ev, 'disconnected')
+      }
     })
   })
   return wss
 }
 
 // A buffer freed WITHOUT a durable completion event (idle sweep, count-cap
-// eviction) — tell anyone watching so the client doesn't render a live
-// terminal forever. Normal completion needs no ephemeral: the finalized
-// tool_output journal frame retires the overlay by message_ref.
-export function notifyStale(hub, entry) {
+// eviction, or producer disconnect) — tell anyone watching so the client
+// doesn't render a live terminal forever. Normal completion needs no
+// ephemeral: the finalized tool_output journal frame retires the overlay by
+// message_ref. `reason` distinguishes the teardown trigger for the client
+// ('stale' = idle sweep/eviction, 'disconnected' = producer connection drop);
+// the client treats any `end` frame as terminal regardless.
+export function notifyStale(hub, entry, reason = 'stale') {
   hub.sendEphemeral(entry.userId, entry.convoId, {
     kind: 'ephemeral', convo_id: entry.convoId, message_ref: entry.ref,
-    tool_stream: { event: 'end', reason: 'stale' },
+    tool_stream: { event: 'end', reason },
   })
 }
 
@@ -695,6 +712,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const r = toolStreams.append({
           userId: conn.userId, convoId: msg.convo_id, ref: msg.message_ref,
           offset: msg.offset, chunk: msg.chunk, meta: msg.meta,
+          // Tag the buffer with this producer connection so a producer
+          // disconnect (ws 'close' above) can cascade-close exactly the streams
+          // it opened, emitting the terminal end{disconnected} frame.
+          producer: conn,
         })
         if (r.status === 'need_meta') return fail('bad_request', 'meta required on buffer-creating frame')
         if (r.status === 'resync') {
