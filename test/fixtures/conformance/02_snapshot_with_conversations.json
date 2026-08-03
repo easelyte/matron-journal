@@ -34,7 +34,8 @@
             "parent_convo_id": null,
             "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           }
-        ]
+        ],
+        "capabilities": ["session_outcome"]
       } } }
   ]
 }

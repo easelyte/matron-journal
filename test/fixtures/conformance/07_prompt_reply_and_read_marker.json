@@ -30,7 +30,7 @@
       "expect": { "status": 200, "body": { "seq": { "$ref": "prompt_seq" }, "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "last_seq": { "$ref": "prompt_seq" },
           "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
-      ] } } },
+      ], "capabilities": ["session_outcome"] } } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
@@ -70,6 +70,6 @@
       "expect": { "status": 200, "body": { "seq": 7, "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "last_seq": 7,
           "unread_count": 0, "snippet": "done", "parent_convo_id": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
-      ] } } }
+      ], "capabilities": ["session_outcome"] } } }
   ]
 }

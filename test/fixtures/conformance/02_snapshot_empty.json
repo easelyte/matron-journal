@@ -13,6 +13,6 @@
         "user_id": { "$ref": "dan.user_id" }
       } } },
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
-      "expect": { "status": 200, "body": { "conversations": [], "seq": 0 } } }
+      "expect": { "status": 200, "body": { "conversations": [], "seq": 0, "capabilities": ["session_outcome"] } } }
   ]
 }
