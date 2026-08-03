@@ -37,6 +37,10 @@ test('openDb adds session_outcome to an existing database idempotently', () => {
     () => db.prepare("UPDATE conversations SET session_outcome='malformed' WHERE id='legacy'").run(),
     /CHECK constraint failed/
   )
+  assert.throws(
+    () => db.prepare("UPDATE conversations SET session_state='running', session_outcome='completed' WHERE id='legacy'").run(),
+    /CHECK constraint failed/
+  )
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
   fs.rmSync(dir, { recursive: true, force: true })
@@ -110,6 +114,33 @@ test('a done top-level conversation can reopen to running', async () => {
     type: 'session_status', payload: { state: 'running' },
   })
   assert.equal(db.prepare("SELECT session_state FROM conversations WHERE id='top'").get().session_state, 'running')
+  db.close()
+})
+
+test('an outcome locks a top-level conversation at done through both writers', async () => {
+  const db = openDb(':memory:')
+  const user = await createUser(db, 'top-level-outcome-user', 'pw')
+  upsertConversation(db, {
+    id: 'top-outcome', ownerUserId: user.id,
+    sessionState: 'done', sessionOutcome: 'completed',
+  })
+
+  upsertConversation(db, {
+    id: 'top-outcome', ownerUserId: user.id, sessionState: 'running',
+  })
+  assert.deepEqual(
+    db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='top-outcome'").get(),
+    { session_state: 'done', session_outcome: 'completed' },
+  )
+
+  append(db, {
+    userId: user.id, convoId: 'top-outcome', sender: 'agent:test',
+    type: 'session_status', payload: { state: 'running' },
+  })
+  assert.deepEqual(
+    db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='top-outcome'").get(),
+    { session_state: 'done', session_outcome: 'completed' },
+  )
   db.close()
 })
 
@@ -264,6 +295,13 @@ test('the persistence primitive rejects malformed outcomes and non-terminal life
       id: 'bad-tuple', ownerUserId: user.id, sessionState: 'running', sessionOutcome: 'completed',
     }),
     /requires terminal session_state/
+  )
+  assert.throws(
+    () => db.prepare(`
+      INSERT INTO conversations(id, owner_user_id, session_state, session_outcome, created_at)
+      VALUES('direct-bad-tuple', ?, 'running', 'completed', 0)
+    `).run(user.id),
+    /CHECK constraint failed/
   )
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 0)
   db.close()

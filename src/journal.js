@@ -51,6 +51,12 @@ const CHILD_SESSION_TRANSITIONS = {
 
 function nextSessionState(existingRow, incoming) {
   if (incoming == null) return incoming
+  // An outcome is terminal regardless of whether this is a child session.
+  // The database CHECK enforces the same row invariant, while this guard
+  // keeps both journal writers from attempting a regressive transition.
+  if (existingRow.session_outcome != null && incoming !== 'done') {
+    return existingRow.session_state
+  }
   if (existingRow.parent_convo_id != null) {
     const allowed = CHILD_SESSION_TRANSITIONS[existingRow.session_state]
     if (allowed && !allowed.has(incoming)) return existingRow.session_state
@@ -108,7 +114,7 @@ const nextSeq = (db, userId) =>
 
 export function append(db, { userId, convoId, sender, type, payload, blobRef = null, idemKey = null }) {
   return db.transaction(() => {
-    const convo = db.prepare('SELECT owner_user_id, parent_convo_id, session_state FROM conversations WHERE id=?').get(convoId)
+    const convo = db.prepare('SELECT owner_user_id, parent_convo_id, session_state, session_outcome FROM conversations WHERE id=?').get(convoId)
     if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
     if (idemKey) {
       const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND convo_id=? AND idem_key=?').get(userId, convoId, idemKey)
