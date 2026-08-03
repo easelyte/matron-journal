@@ -102,3 +102,50 @@ test('empty accepted remainder is a duplicate, never a zero-byte fan-out', () =>
   s.append({ userId: 1, convoId: 'c1', ref: 'r1', offset: 0, chunk: 'abc', meta: META })
   assert.equal(s.append({ userId: 1, convoId: 'c1', ref: 'r1', offset: 3, chunk: '' }).status, 'duplicate')
 })
+
+test('closeForProducer retires only the given producer\'s buffers; null/unknown is a no-op; idempotent', () => {
+  const s = makeToolStreamStore()
+  const p1 = { id: 'conn-1' }
+  const p2 = { id: 'conn-2' }
+  s.append({ userId: 1, convoId: 'c1', ref: 'a', offset: 0, chunk: 'x', meta: META, producer: p1 })
+  s.append({ userId: 1, convoId: 'c1', ref: 'b', offset: 0, chunk: 'y', meta: META, producer: p1 })
+  s.append({ userId: 1, convoId: 'c2', ref: 'c', offset: 0, chunk: 'z', meta: META, producer: p2 })
+  assert.equal(s.size(), 3)
+
+  // null/undefined producer, or one that owns nothing → clean no-op, nothing dropped
+  assert.deepEqual(s.closeForProducer(null), [])
+  assert.deepEqual(s.closeForProducer(undefined), [])
+  assert.deepEqual(s.closeForProducer({ id: 'stranger' }), [])
+  assert.equal(s.size(), 3)
+
+  // closes exactly p1's two buffers; returned views carry what notifyStale needs
+  const closed = s.closeForProducer(p1).sort((x, y) => (x.ref < y.ref ? -1 : 1))
+  assert.deepEqual(closed.map((e) => ({ userId: e.userId, convoId: e.convoId, ref: e.ref })),
+    [{ userId: 1, convoId: 'c1', ref: 'a' }, { userId: 1, convoId: 'c1', ref: 'b' }])
+  // p2's buffer is untouched
+  assert.equal(s.size(), 1)
+  assert.deepEqual(s.buffersFor(1, 'c2').map((b) => b.ref), ['c'])
+
+  // idempotent: re-closing an already-retired producer can't double-emit
+  assert.deepEqual(s.closeForProducer(p1), [])
+})
+
+test('a resumed stream re-homes to the last producer to append (closeForProducer follows it)', () => {
+  const s = makeToolStreamStore()
+  const p1 = {}
+  const p2 = {}
+  s.append({ userId: 1, convoId: 'c1', ref: 'r', offset: 0, chunk: 'ab', meta: META, producer: p1 })
+  // a NEW producer resumes the same buffer after a resync
+  assert.equal(s.append({ userId: 1, convoId: 'c1', ref: 'r', offset: 2, chunk: 'cd', producer: p2 }).status, 'appended')
+  assert.deepEqual(s.closeForProducer(p1), []) // old producer no longer owns it
+  assert.deepEqual(s.closeForProducer(p2).map((e) => e.ref), ['r'])
+})
+
+test('a finalized (freed) buffer is gone from closeForProducer — no double-emit', () => {
+  const s = makeToolStreamStore()
+  const p1 = {}
+  s.append({ userId: 1, convoId: 'c1', ref: 'a', offset: 0, chunk: 'x', meta: META, producer: p1 })
+  s.free('c1', 'a') // explicit finalize path frees the buffer
+  assert.deepEqual(s.closeForProducer(p1), [])
+  assert.equal(s.size(), 0)
+})

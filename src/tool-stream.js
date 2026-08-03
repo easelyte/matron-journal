@@ -58,7 +58,7 @@ export function makeToolStreamStore({
   }
 
   return {
-    append({ userId, convoId, ref, offset, chunk, meta }) {
+    append({ userId, convoId, ref, offset, chunk, meta, producer }) {
       const key = keyOf(convoId, ref)
       let e = buffers.get(key)
       if (!e) {
@@ -72,6 +72,12 @@ export function makeToolStreamStore({
             tool: String(meta.tool ?? '').slice(0, TOOL_MAX_CHARS),
             command: String(meta.command ?? '').slice(0, COMMAND_MAX_CHARS),
           },
+          // Producer identity (the agent WS connection streaming this buffer),
+          // opaque here — used only for identity comparison by closeForProducer
+          // so a producer-disconnect can cascade-close exactly the buffers it
+          // opened. undefined when no producer is threaded (e.g. unit tests of
+          // the store alone); closeForProducer treats null/undefined as a no-op.
+          producer,
           start: 0, end: 0, chunks: [], lastAppendAt: now(),
         }
         buffers.set(key, e)
@@ -92,6 +98,11 @@ export function makeToolStreamStore({
       e.chunks.push(accepted)
       e.end += accepted.length
       e.lastAppendAt = now()
+      // Re-home to the currently-streaming producer: after a producer drop +
+      // client-driven resync a NEW connection can resume the same buffer, so
+      // the live writer always owns it (and a cascade-close targets the right
+      // one). Only when a producer is threaded — never clobber with undefined.
+      if (producer !== undefined) e.producer = producer
       dropHead(e)
       return { status: 'appended', offset: acceptedOffset, accepted: accepted.toString('utf8'), evicted: [] }
     },
@@ -127,6 +138,27 @@ export function makeToolStreamStore({
         }
       }
       return swept
+    },
+
+    // Third teardown trigger (alongside explicit `finalize` and the idle
+    // sweep): a producer connection dropped, so every buffer it still owns is
+    // stranded — no finalize will ever arrive. Retire exactly THAT producer's
+    // open buffers and return their views so the caller can emit the terminal
+    // `end` frame to viewers (mirrors sweepIdle's teardown, keyed by producer
+    // identity instead of by age). Scoped strictly to the given producer:
+    // other producers' buffers are untouched. A null/undefined producer, or
+    // one with no open buffers, is a clean no-op (returns []). An already-freed
+    // buffer (finalize / sweep) is gone from the map, so it can never
+    // double-emit here.
+    closeForProducer(producer) {
+      if (producer == null) return []
+      const closed = []
+      for (const [key, e] of buffers) {
+        if (e.producer !== producer) continue
+        buffers.delete(key)
+        closed.push(entryView(e))
+      }
+      return closed
     },
 
     size() {

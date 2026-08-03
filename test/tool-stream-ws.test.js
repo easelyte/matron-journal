@@ -144,3 +144,69 @@ test('idle sweep frees stale buffers and notifies viewers with end{stale}', asyn
   assert.equal(end.message_ref, 'tu8')
   assert.equal(end.tool_stream.reason, 'stale')
 })
+
+test('producer disconnect cascade-closes ITS open streams with end{disconnected} + frees buffers; other producers untouched', async (t) => {
+  const { s, dan, agent, client } = await setup(t)
+  // A second producer connection (own convo) — the "untouched" control.
+  const ag2 = createAgent(s.db, dan.id, 'dev-3')
+  const agent2 = await makeWsClient(s.base, { token: ag2.token, cursor: null })
+  await agent2.waitFor((f) => f.op === 'hello_ok')
+  agent2.send({ op: 'convo_upsert', convo_id: 'sess-ts2' })
+  agent2.send({ op: 'read_marker', convo_id: 'sess-ts2', up_to_seq: null })
+  await agent2.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:dan')
+
+  // Producer 1 opens TWO live streams; producer 2 opens one on its own convo.
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuA', offset: 0, chunk: 'aaa', meta: { tool: 'Bash', command: 'sleep 1' } })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuB', offset: 0, chunk: 'bbb', meta: { tool: 'Bash', command: 'sleep 2' } })
+  agent2.send({ op: 'stream_append', convo_id: 'sess-ts2', message_ref: 'tuC', offset: 0, chunk: 'ccc', meta: { tool: 'Bash', command: 'sleep 3' } })
+  // Barrier: producer 1's second stream round-trips to the viewing client → both applied.
+  await client.waitFor((f) => f.tool_stream?.event === 'append' && f.message_ref === 'tuB')
+  await new Promise((r) => setTimeout(r, 50)) // let producer 2's frame settle too
+  assert.equal(s.toolStreams.buffersFor(dan.id, 'sess-ts').length, 2)
+  assert.equal(s.toolStreams.buffersFor(dan.id, 'sess-ts2').length, 1)
+
+  agent.close() // producer 1 drops — no finalize ever arrives
+
+  // The viewing client gets an end{disconnected} for EACH of producer 1's streams.
+  const endA = await client.waitFor((f) => f.tool_stream?.event === 'end' && f.message_ref === 'tuA')
+  const endB = await client.waitFor((f) => f.tool_stream?.event === 'end' && f.message_ref === 'tuB')
+  assert.equal(endA.tool_stream.reason, 'disconnected')
+  assert.equal(endB.tool_stream.reason, 'disconnected')
+
+  // Producer 1's buffers are freed; producer 2's buffer is untouched.
+  assert.deepEqual(s.toolStreams.buffersFor(dan.id, 'sess-ts'), [])
+  assert.equal(s.toolStreams.buffersFor(dan.id, 'sess-ts2').length, 1)
+})
+
+test('a producer with no open tool streams closing is a clean no-op (no end frame)', async (t) => {
+  const { agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:dan')
+
+  agent.close()
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(client.frames.some((f) => f.tool_stream), false)
+})
+
+test('a stream finalized before producer close does not double-emit an end frame', async (t) => {
+  const { s, dan, agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:dan')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuF', offset: 0, chunk: 'work\n', meta: { tool: 'Bash', command: 'make' } })
+  await client.waitFor((f) => f.tool_stream?.event === 'append')
+  agent.send({ op: 'finalize', convo_id: 'sess-ts', message_ref: 'tuF', type: 'tool_output', payload: { message_ref: 'tuF', exit_code: 0 } })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'tool_output')
+  assert.deepEqual(s.toolStreams.buffersFor(dan.id, 'sess-ts'), []) // finalize freed it
+
+  agent.close() // producer drops AFTER finalize
+  await new Promise((r) => setTimeout(r, 120))
+  // The only stream retirement was the finalize journal frame — no end ephemeral, and none now.
+  assert.equal(client.frames.some((f) => f.tool_stream?.event === 'end'), false)
+})
