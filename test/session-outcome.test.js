@@ -6,7 +6,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { createAgent, createUser } from '../src/auth.js'
-import { append, upsertConversation } from '../src/journal.js'
+import { append, eventsAfter, snapshot, upsertConversation } from '../src/journal.js'
 import { makeWsClient, startTestServer } from './helpers.js'
 
 test('openDb adds session_outcome to an existing database idempotently', () => {
@@ -33,12 +33,16 @@ test('openDb adds session_outcome to an existing database idempotently', () => {
     .filter((column) => column.name === 'session_outcome')
   assert.equal(columns.length, 1)
   assert.equal(db.prepare("SELECT session_outcome FROM conversations WHERE id='legacy'").get().session_outcome, null)
+  assert.throws(
+    () => db.prepare("UPDATE conversations SET session_outcome='malformed' WHERE id='legacy'").run(),
+    /CHECK constraint failed/
+  )
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('session outcome is set once and child state never regresses through either writer', async (t) => {
+test('session outcome is set once and every done child regression is blocked through either writer', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
   const user = await createUser(s.db, 'outcome-user', 'pw')
@@ -56,25 +60,38 @@ test('session outcome is set once and child state never regresses through either
     && frame.type === 'session_status'
     && frame.payload.session_outcome === 'completed')
 
+  let lastStatusSeq = completedStatus.seq
+  for (const state of ['running', 'waiting', 'archived']) {
+    agent.send({ op: 'convo_upsert', convo_id: 'child', session_state: state })
+    const status = await agent.waitFor((frame) => frame.kind === 'journal'
+      && frame.convo_id === 'child'
+      && frame.type === 'session_status'
+      && frame.seq > lastStatusSeq
+      && frame.payload.state === 'done')
+    lastStatusSeq = status.seq
+    let child = s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get()
+    assert.deepEqual(child, { session_state: 'done', session_outcome: 'completed' })
+
+    append(s.db, {
+      userId: user.id, convoId: 'child', sender: 'agent:outcome-agent',
+      type: 'session_status', payload: { state },
+    })
+    child = s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get()
+    assert.deepEqual(child, { session_state: 'done', session_outcome: 'completed' })
+  }
+
   agent.send({
     op: 'convo_upsert', convo_id: 'child',
-    session_state: 'running', session_outcome: 'failed',
+    session_state: 'done', session_outcome: 'failed',
   })
   await agent.waitFor((frame) => frame.kind === 'journal'
     && frame.convo_id === 'child'
     && frame.type === 'session_status'
-    && frame.seq > completedStatus.seq
-    && frame.payload.state === 'done')
-
-  let child = s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get()
-  assert.deepEqual(child, { session_state: 'done', session_outcome: 'completed' })
-
-  append(s.db, {
-    userId: user.id, convoId: 'child', sender: 'agent:outcome-agent',
-    type: 'session_status', payload: { state: 'running' },
-  })
-  child = s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get()
-  assert.deepEqual(child, { session_state: 'done', session_outcome: 'completed' })
+    && frame.seq > lastStatusSeq)
+  assert.deepEqual(
+    s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='child'").get(),
+    { session_state: 'done', session_outcome: 'completed' }
+  )
 })
 
 test('a done top-level conversation can reopen to running', async () => {
@@ -145,4 +162,109 @@ test('convo_upsert validates outcome, broadcasts the persisted value, and snapsh
 
   const snapshot = await s.http('/snapshot', { token: login.json.token })
   assert.equal(snapshot.json.conversations.find((convo) => convo.id === 'wire-child').session_outcome, 'interrupted')
+  assert.deepEqual(snapshot.json.capabilities, ['session_outcome'])
+})
+
+test('a non-terminal outcome is rejected without latching and the later terminal outcome wins', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const user = await createUser(s.db, 'lifecycle-user', 'pw')
+  const credentials = createAgent(s.db, user.id, 'lifecycle-agent')
+  upsertConversation(s.db, {
+    id: 'running-child', ownerUserId: user.id, parentConvoId: 'parent', sessionState: 'running',
+  })
+  const agent = await makeWsClient(s.base, { token: credentials.token, cursor: null })
+  t.after(() => agent.close())
+  await agent.waitFor((frame) => frame.op === 'hello_ok')
+
+  agent.send({
+    op: 'convo_upsert', convo_id: 'running-child',
+    session_state: 'running', session_outcome: 'completed',
+  })
+  const error = await agent.waitFor((frame) => frame.kind === 'control'
+    && frame.op === 'error'
+    && frame.ref === 'convo_upsert')
+  assert.equal(error.detail, 'session_outcome requires terminal session_state')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='running-child'").get().session_outcome, null)
+
+  agent.send({
+    op: 'convo_upsert', convo_id: 'running-child',
+    session_state: 'done', session_outcome: 'failed',
+  })
+  await agent.waitFor((frame) => frame.kind === 'journal'
+    && frame.convo_id === 'running-child'
+    && frame.type === 'session_status'
+    && frame.payload.session_outcome === 'failed')
+  assert.deepEqual(
+    s.db.prepare("SELECT session_state, session_outcome FROM conversations WHERE id='running-child'").get(),
+    { session_state: 'done', session_outcome: 'failed' }
+  )
+})
+
+test('an outcome-only update on a done child is durable and advances replay sequence', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const user = await createUser(s.db, 'outcome-only-user', 'pw')
+  const credentials = createAgent(s.db, user.id, 'outcome-only-agent')
+  upsertConversation(s.db, {
+    id: 'done-child', ownerUserId: user.id, parentConvoId: 'parent', sessionState: 'done',
+  })
+  const before = snapshot(s.db, user.id).seq
+  const agent = await makeWsClient(s.base, { token: credentials.token, cursor: null })
+  t.after(() => agent.close())
+  await agent.waitFor((frame) => frame.op === 'hello_ok')
+
+  agent.send({ op: 'convo_upsert', convo_id: 'done-child', session_outcome: 'interrupted' })
+  const status = await agent.waitFor((frame) => frame.kind === 'journal'
+    && frame.convo_id === 'done-child'
+    && frame.type === 'session_status'
+    && frame.payload.session_outcome === 'interrupted')
+  assert.ok(status.seq > before)
+  const replay = eventsAfter(s.db, user.id, before)
+  assert.equal(replay.length, 1)
+  assert.equal(replay[0].seq, status.seq)
+  assert.deepEqual(replay[0].payload, { state: 'done', session_outcome: 'interrupted' })
+})
+
+test('convo_upsert rolls back lifecycle metadata when its generated event cannot commit', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const user = await createUser(s.db, 'atomic-user', 'pw')
+  const credentials = createAgent(s.db, user.id, 'atomic-agent')
+  const agent = await makeWsClient(s.base, { token: credentials.token, cursor: null })
+  t.after(() => agent.close())
+  await agent.waitFor((frame) => frame.op === 'hello_ok')
+  s.db.exec(`
+    CREATE TRIGGER reject_session_status BEFORE INSERT ON events
+    WHEN NEW.type='session_status'
+    BEGIN SELECT RAISE(ABORT, 'forced event failure'); END;
+  `)
+
+  agent.send({
+    op: 'convo_upsert', convo_id: 'atomic-child', parent_convo_id: 'parent',
+    session_state: 'done', session_outcome: 'completed',
+  })
+  await agent.waitFor((frame) => frame.kind === 'control' && frame.op === 'error')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM conversations WHERE id='atomic-child'").get().n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 0)
+  assert.equal(snapshot(s.db, user.id).seq, 0)
+})
+
+test('the persistence primitive rejects malformed outcomes and non-terminal lifecycle tuples', async () => {
+  const db = openDb(':memory:')
+  const user = await createUser(db, 'primitive-user', 'pw')
+  assert.throws(
+    () => upsertConversation(db, {
+      id: 'bad-enum', ownerUserId: user.id, sessionState: 'done', sessionOutcome: 'malformed',
+    }),
+    /invalid session_outcome/
+  )
+  assert.throws(
+    () => upsertConversation(db, {
+      id: 'bad-tuple', ownerUserId: user.id, sessionState: 'running', sessionOutcome: 'completed',
+    }),
+    /requires terminal session_state/
+  )
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 0)
+  db.close()
 })

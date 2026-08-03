@@ -4,6 +4,8 @@ export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
 
+export const SESSION_OUTCOMES = new Set(['completed', 'interrupted', 'failed'])
+
 export function snippetOf(type, payload) {
   // Tolerate whatever an agent hands us — null/undefined/a bare string or
   // number — rather than crashing on `payload.body` etc. A malformed
@@ -40,18 +42,35 @@ export function snippetOf(type, payload) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
+const CHILD_SESSION_TRANSITIONS = {
+  running: new Set(['running', 'waiting', 'done', 'archived']),
+  waiting: new Set(['running', 'waiting', 'done', 'archived']),
+  done: new Set(['done']),
+  archived: new Set(['running', 'waiting', 'done', 'archived']),
+}
+
 function nextSessionState(existingRow, incoming) {
-  if (
-    existingRow.parent_convo_id != null
-    && existingRow.session_state === 'done'
-    && incoming === 'running'
-  ) return 'done'
+  if (incoming == null) return incoming
+  if (existingRow.parent_convo_id != null) {
+    const allowed = CHILD_SESSION_TRANSITIONS[existingRow.session_state]
+    if (allowed && !allowed.has(incoming)) return existingRow.session_state
+  }
   return incoming
 }
 
 export function upsertConversation(db, { id, ownerUserId, title, sessionState, sessionOutcome, agentDeviceId, parentConvoId }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
+  const prevSessionOutcome = existing ? existing.session_outcome : undefined
+  if (sessionOutcome != null && !SESSION_OUTCOMES.has(sessionOutcome)) {
+    throw new Error('invalid session_outcome')
+  }
+  const effectiveSessionState = existing
+    ? nextSessionState(existing, sessionState) ?? existing.session_state
+    : sessionState || 'running'
+  if (sessionOutcome != null && effectiveSessionState !== 'done') {
+    throw new Error('session_outcome requires terminal session_state')
+  }
   let metaChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
@@ -74,7 +93,12 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, s
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
-  return { ...convo, metaChanged, prevSessionState }
+  return {
+    ...convo,
+    metaChanged,
+    prevSessionState,
+    outcomeChanged: convo.session_outcome != null && convo.session_outcome !== prevSessionOutcome,
+  }
 }
 
 const nextSeq = (db, userId) =>
@@ -156,7 +180,7 @@ export function snapshot(db, userId) {
     sessionOutcome == null ? convo : { ...convo, session_outcome: sessionOutcome }
   ))
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
-  return { conversations, seq: head ? head.seq : 0 }
+  return { conversations, seq: head ? head.seq : 0, capabilities: ['session_outcome'] }
 }
 
 export function eventsAfter(db, userId, cursor, limit = 500) {
