@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS conversations(
   title TEXT NOT NULL DEFAULT '',
   session_state TEXT NOT NULL DEFAULT 'running'
     CHECK(session_state IN ('running','waiting','done','archived')),
+  session_outcome TEXT
+    CHECK(session_outcome IS NULL OR (session_outcome IN ('completed','interrupted','failed') AND session_state = 'done')),
   last_seq INTEGER NOT NULL DEFAULT 0,
   unread_count INTEGER NOT NULL DEFAULT 0,
   snippet TEXT NOT NULL DEFAULT '',
@@ -108,6 +110,12 @@ export function openDb(path) {
   // two is not guaranteed), so a dangling reference must be storable as-is.
   if (!convoCols.some((c) => c.name === 'parent_convo_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
+  }
+  // Terminal outcome for child worker conversations. Nullable for normal
+  // conversations and rows written by older bridges; journal.js enforces
+  // first-write-wins so a later lifecycle signal cannot rewrite history.
+  if (!convoCols.some((c) => c.name === 'session_outcome')) {
+    db.exec("ALTER TABLE conversations ADD COLUMN session_outcome TEXT CHECK(session_outcome IS NULL OR (session_outcome IN ('completed','interrupted','failed') AND session_state = 'done'))")
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
   return db

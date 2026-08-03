@@ -1,6 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorize } from './auth.js'
-import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
+import { eventsAfter, append, markRead, SESSION_OUTCOMES, upsertConversation, toEventShape } from './journal.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -57,7 +57,6 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // RPC request ids. Convo ids are conventionally Claude session UUIDs (36
 // chars); this is a defensive upper bound, not a format assertion.
 const CONVO_ID_MAX_CHARS = 128
-
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
 // next turn end repaints it. Exported for direct unit testing.
@@ -601,34 +600,65 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         )) {
           return fail('bad_request', 'bad parent_convo_id')
         }
-        const convo = upsertConversation(db, {
-          id: msg.convo_id, ownerUserId: conn.userId,
-          title: msg.title, sessionState: msg.session_state,
-          agentDeviceId: conn.deviceId,
-          parentConvoId: msg.parent_convo_id ?? null,
-        })
-        if (msg.session_state) {
-          // prevSessionState is upsertConversation's read of the row BEFORE
-          // this update — an in-memory hint only, so push.js can tell a
-          // turn-finished transition (running -> waiting/done) from a
-          // teardown of an already-idle session (waiting -> done). Never
-          // stored or broadcast.
-          appendAndFan({
-            userId: conn.userId, convoId: msg.convo_id,
-            sender: `agent:${conn.name}`, type: 'session_status',
-            payload: { state: msg.session_state },
-            pushHint: { prevSessionState: convo.prevSessionState },
-          })
+        if (msg.session_outcome != null && !SESSION_OUTCOMES.has(msg.session_outcome)) {
+          return fail('bad_request', 'bad session_outcome')
         }
-        // Other devices learn renames live instead of only via /snapshot.
-        // No event when the title is unchanged, absent, or this was a
-        // state-only upsert (see upsertConversation's metaChanged logic).
-        if (convo.metaChanged) {
-          appendAndFan({
-            userId: conn.userId, convoId: msg.convo_id,
-            sender: `agent:${conn.name}`, type: 'convo_meta',
-            payload: { title: convo.title, parent_convo_id: convo.parent_convo_id ?? null },
+        if (msg.session_outcome != null) {
+          const existing = db.prepare(
+            'SELECT session_state FROM conversations WHERE id=? AND owner_user_id=?'
+          ).get(msg.convo_id, conn.userId)
+          const effectiveState = msg.session_state ?? existing?.session_state ?? 'running'
+          if (effectiveState !== 'done') {
+            return fail('bad_request', 'session_outcome requires terminal session_state')
+          }
+        }
+        // The lifecycle row and every event derived from this frame commit as
+        // one unit. Frames are collected in the transaction and delivered
+        // only after commit, so clients can never observe an event that rolls
+        // back or miss an event for a committed outcome.
+        const pending = db.transaction(() => {
+          const convo = upsertConversation(db, {
+            id: msg.convo_id, ownerUserId: conn.userId,
+            title: msg.title, sessionState: msg.session_state,
+            sessionOutcome: msg.session_outcome,
+            agentDeviceId: conn.deviceId,
+            parentConvoId: msg.parent_convo_id ?? null,
           })
+          const events = []
+          if (msg.session_state || convo.outcomeChanged) {
+            // prevSessionState is an in-memory hint for turn-finished push
+            // classification only; it is never persisted or broadcast.
+            const args = {
+              userId: conn.userId, convoId: msg.convo_id,
+              sender: `agent:${conn.name}`, type: 'session_status',
+              payload: {
+                state: convo.session_state,
+                ...(convo.session_outcome != null ? { session_outcome: convo.session_outcome } : {}),
+              },
+              pushHint: { prevSessionState: convo.prevSessionState },
+            }
+            const r = append(db, args)
+            events.push({ args, r })
+          }
+          // Other devices learn renames and child linkage live instead of
+          // only via /snapshot (see upsertConversation's metaChanged flag).
+          if (convo.metaChanged) {
+            const args = {
+              userId: conn.userId, convoId: msg.convo_id,
+              sender: `agent:${conn.name}`, type: 'convo_meta',
+              payload: { title: convo.title, parent_convo_id: convo.parent_convo_id ?? null },
+            }
+            const r = append(db, args)
+            events.push({ args, r })
+          }
+          return events
+        })()
+        for (const { args, r } of pending) {
+          if (r.duplicate) continue
+          fanOut(journalFrame({
+            seq: r.seq, convo_id: args.convoId, ts: r.ts,
+            sender: args.sender, type: args.type, payload: args.payload,
+          }), args.pushHint)
         }
         break
       }
