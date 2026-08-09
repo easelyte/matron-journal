@@ -6,3 +6,5 @@ node_modules/
 preapprove.key
 .codex-session-tmp/
 node_modules
+memory/
+data/
