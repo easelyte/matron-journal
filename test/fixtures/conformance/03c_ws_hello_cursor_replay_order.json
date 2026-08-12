@@ -21,7 +21,7 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 2 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 5 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 5, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:dev-2", "type": "text", "payload": { "body": "m2" }

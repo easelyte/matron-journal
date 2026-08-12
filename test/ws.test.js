@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
-import { waitForDrain } from '../src/ws.js'
+import { waitForDrain, shouldSkipPing } from '../src/ws.js'
 
 test('hello replays from cursor, then streams live appends', async (t) => {
   const s = await startTestServer()
@@ -24,6 +24,29 @@ test('hello replays from cursor, then streams live appends', async (t) => {
   s.hub.broadcastJournal(dan.id, { kind: 'journal', seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'live' } })
   await c.waitFor((f) => f.kind === 'journal' && f.seq === 4)
   c.close()
+})
+
+test('hello_ok carries the authenticated device identity (id + name)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const bridge = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  const agent = await makeWsClient(s.base, { token: bridge.token, cursor: null })
+  const aHello = await agent.waitFor((f) => f.op === 'hello_ok')
+  assert.ok(Number.isInteger(aHello.device_id), `agent hello_ok device_id must be an integer, got ${JSON.stringify(aHello.device_id)}`)
+  assert.equal(aHello.device_id, bridge.deviceId)
+  assert.equal(aHello.name, 'dev-2')
+
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: null })
+  const cHello = await client.waitFor((f) => f.op === 'hello_ok')
+  assert.ok(Number.isInteger(cHello.device_id), `client hello_ok device_id must be an integer, got ${JSON.stringify(cHello.device_id)}`)
+  assert.equal(cHello.device_id, login.json.device_id)
+  assert.equal(cHello.name, 'mac')
+
+  agent.close()
+  client.close()
 })
 
 test('bad token gets error control frame', async (t) => {
@@ -184,10 +207,9 @@ test('client send into a child (sub-chat) convo is rejected and appends nothing;
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   // A normal parent convo and a child sub-chat (parent_convo_id set): the child
-  // mirrors a subagent transcript for durability and is read-only to clients per
-  // the sub-chat contract (loop #453). The composer is hidden client-side, but an
-  // old tab or a direct WS caller can still emit op:send here — the server is the
-  // authoritative guard.
+  // mirrors a subagent transcript for durability and is read-only to clients.
+  // The composer is hidden client-side, but an old tab or a direct WS caller can
+  // still emit op:send here — the server is the authoritative guard.
   upsertConversation(s.db, { id: 'parent', ownerUserId: dan.id })
   upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'parent' })
   const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
@@ -362,6 +384,29 @@ test('waitForDrain gives up once the socket is no longer open, rather than hangi
   assert.ok(Date.now() - t0 < 500, 'must not hang forever waiting on a dead socket')
 })
 
+test('shouldSkipPing skips the heartbeat for a client that chatted recently and is drained', () => {
+  const now = 1_000_000
+  const fakeWs = { bufferedAmount: 0, _lastInbound: now - 1000 }
+  assert.equal(shouldSkipPing(fakeWs, now, 55000), true)
+})
+
+test('shouldSkipPing pings a client that has gone quiet', () => {
+  const now = 1_000_000
+  assert.equal(shouldSkipPing({ bufferedAmount: 0, _lastInbound: now - 60000 }, now, 55000), false)
+  // A socket that has never sent an inbound frame must be pinged, not skipped.
+  assert.equal(shouldSkipPing({ bufferedAmount: 0 }, now, 55000), false)
+})
+
+test('shouldSkipPing pings a chatty client that is not draining, so the replay stall bound still applies', () => {
+  // The replay-backpressure case: the peer keeps sending cheap inbound ops
+  // while never reading, so `_lastInbound` is always fresh. Skipping here
+  // would let it renew its own liveness forever and park the replay loop in
+  // waitForDrain past the documented ~2×pingMs bound.
+  const now = 1_000_000
+  const fakeWs = { bufferedAmount: 4 * 1024 * 1024, _lastInbound: now - 10 }
+  assert.equal(shouldSkipPing(fakeWs, now, 55000), false)
+})
+
 test('replay backpressure wait-loop is wired into a real connection: even at a tiny threshold, replay stays complete and in order', async (t) => {
   // A threshold this small means the drain-wait loop is exercised at every
   // batch boundary (ws.bufferedAmount is essentially always "over" 1 byte
@@ -493,6 +538,32 @@ test('revocation sweep: a silently-listening revoked device is closed (error fra
   assert.equal(f.payload.body, 'still here')
   assert.equal(mac.ws.readyState, 1)
   mac.close()
+})
+
+test("sweep tick catches a DB error instead of throwing (uncaught exception on an unref'd timer would kill the process)", async (t) => {
+  const s = await startTestServer({ revocationSweepMs: 60 })
+  t.after(() => s.close())
+
+  const logged = []
+  const originalConsoleError = console.error
+  console.error = (...args) => { logged.push(args) }
+  t.after(() => { console.error = originalConsoleError })
+
+  // Shutdown-race / SQLITE_BUSY stand-in: closing the db makes every query
+  // inside the sweep body (expireInvites, the per-row owner lookup, the
+  // revocation scan) throw "database connection is not open". Before this
+  // fix that exception was uncaught on the sweep's setInterval callback —
+  // fatal to the whole process, since the timer is unref'd and nothing else
+  // observes it. This test simply running to its assertion (instead of
+  // crashing the whole `node --test` run) is half the proof; the explicit
+  // log check below is the other half.
+  s.db.close()
+  await new Promise((r) => setTimeout(r, 200))
+
+  assert.ok(
+    logged.some(([label]) => label === 'sweep failed'),
+    'the sweep must catch and log a DB error inside its body, not throw'
+  )
 })
 
 test('a socket that closes mid-replay is never left registered in the hub', async (t) => {

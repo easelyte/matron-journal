@@ -1,6 +1,5 @@
 import http from 'node:http'
 import { makeRendezvousStore } from './rendezvous.js'
-import { CODE_ALPHABET, normalizeCode } from './pairing.js'
 
 // The push.matron.chat relay: the one piece of shared infrastructure Matron
 // runs. Holds the APNs key for the chat.matron.app bundle id and forwards
@@ -17,11 +16,19 @@ import { CODE_ALPHABET, normalizeCode } from './pairing.js'
 // known only to that user's own journal — is the credential, and the
 // per-token bucket below bounds what a stolen token is worth.
 
-const BODY_LIMIT = 1024
+// Must stay >= the largest valid offer body: a 1024-char box plus its JSON
+// envelope (`{"box":""}`, ~10 bytes) is ~1034 bytes, so a 1024-char box (the
+// cap validateOffer accepts) must fit under this to reach validation and 204
+// rather than being 413'd first. Do NOT drop this back to 1024. A 2000-char
+// box (~2010 bytes) still 413s, so oversized bodies are bounded as before.
+const BODY_LIMIT = 1100
 
 const APS_ALERTS = {
   attention: { title: 'Matron', body: 'Your agent needs you' },
-  done: { title: 'Matron', body: 'Session finished' },
+  // "Turn", not "session": push.js classifies a 'done' push for every
+  // turn-finished transition (running -> waiting or -> done), and the
+  // session usually lives on after it (Dan, 2026-08-02).
+  done: { title: 'Matron', body: 'Your agent finished its turn' },
   activity: { title: 'Matron', body: 'New activity from your agent' },
 }
 
@@ -119,22 +126,15 @@ export function makeRelayLimiter({ burst = 20, refillMs = 10000, globalBurst = 2
 export const makeRendezvousLimiter = (opts = {}) =>
   makeRelayLimiter({ burst: 10, refillMs: 30000, globalBurst: 100, globalRefillMs: 100, ...opts })
 
-const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{8}$`)
-const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
-
 // null = valid; otherwise a machine reason (relay convention: never echoes
-// caller values). Mirrors the apps' server-URL stance: https from any
-// host, http only to localhost-ish dev hosts.
+// caller values). The box is opaque app ciphertext — the relay checks only
+// that it is a non-empty, length-capped string and never inspects it.
 function validateOffer(body) {
   for (const k of Object.keys(body)) {
-    if (k !== 'server' && k !== 'code') return 'unknown_field'
+    if (k !== 'box') return 'unknown_field'
   }
-  if (body.server === undefined || body.code === undefined) return 'missing_field'
-  if (typeof body.server !== 'string' || body.server.length > 200) return 'bad_server'
-  let u
-  try { u = new URL(body.server) } catch { return 'bad_server' }
-  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))) return 'bad_server'
-  if (typeof body.code !== 'string' || !CODE_RE.test(normalizeCode(body.code))) return 'bad_code'
+  if (body.box === undefined) return 'missing_field'
+  if (typeof body.box !== 'string' || body.box.length < 1 || body.box.length > 1024) return 'bad_box'
   return null
 }
 
@@ -280,8 +280,7 @@ export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), ren
     const invalid = validateOffer(body)
     if (invalid) return respond(res, 400, { status: 400, reason: invalid })
     if (!rendezvousLimiter.allowGlobal()) return respond(res, 429, { status: 429, reason: 'rate_limited' })
-    const code = normalizeCode(body.code)
-    const r = rendezvous.offer(rid, { server: body.server, code: `${code.slice(0, 4)}-${code.slice(4)}` })
+    const r = rendezvous.offer(rid, body.box)
     if (r === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
     if (r === 'conflict') return respond(res, 409, { status: 409, reason: 'conflict' })
     return empty(res, 204)
@@ -293,7 +292,7 @@ export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), ren
     if (p.status === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
     if (p.status === 'forbidden') return respond(res, 403, { status: 403, reason: 'forbidden' })
     if (p.status === 'waiting') return empty(res, 204)
-    return respond(res, 200, { server: p.server, code: p.code })
+    return respond(res, 200, { box: p.box })
   }
 
   return (req, res) => {

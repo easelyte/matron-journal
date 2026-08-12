@@ -1,19 +1,36 @@
-# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
-language: "en-US"
+# CodeRabbit review configuration.
+#   docs:   https://docs.coderabbit.ai/guides/configure-coderabbit
+#   schema: https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Cursor's Bugbot already reviews the commits written in-house. CodeRabbit is
+# here for the pull requests nobody here wrote — on a public repo, the set that
+# actually needs a second reader.
+
+language: en-GB
+
 reviews:
-  profile: "chill"
-  request_changes_workflow: false
-  high_level_summary: true
+  profile: chill
   poem: false
+  review_status: false
+
   auto_review:
     enabled: true
     drafts: false
+
+    # Listed rather than left empty. An empty list means "the repository's
+    # default branch", and these repos disagree about what that is: five are on
+    # main, matron-bridge and matron-journal on master. One shared config
+    # cannot lean on it.
+    base_branches:
+      - main
+      - master
+
+    # Dependency bumps land in bulk and read identically every time. Reviewing
+    # them buries the pull requests a person wrote.
+    ignore_usernames:
+      - dependabot[bot]
+      - renovate[bot]
+
+  # Generated — the diff is machine output, not a decision.
   path_filters:
-    - "!node_modules/**"
-    - "!dist/**"
-    - "!build/**"
-    - "!**/*.min.js"
-    - "!**/*.lock"
-    - "!package-lock.json"
-chat:
-  auto_reply: true
+    - '!package-lock.json'

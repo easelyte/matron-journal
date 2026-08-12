@@ -164,6 +164,29 @@ test('convo_meta and non-turn-finished session_status never push at all (no aler
   assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
 })
 
+test('summary events never push', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, dan.id, 'phone')
+
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+  }
+
+  send('summary', { toc: 'x', detail: 'y', model: 'm' })
+  // Long enough for both an immediate send AND a would-be trailing
+  // coalesced push to have fired if this were (wrongly) classified routine.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'summary events are journal-sync material, not notifications')
+
+  // ...and they must not have claimed the coalescing slot either: a real
+  // routine event right after still gets its immediate leading push.
+  send('text', { body: 'actual content' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
+})
+
 test('a client "send" (sender user:*) never triggers an alert push, not even to the user\'s OTHER devices', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
   const originDeviceId = registerDevice(db, dan.id, 'origin-phone')
@@ -708,7 +731,7 @@ test('session_status pushes on the turn-finished TRANSITION, not the state alone
   assert.equal(stub.calls.length, 1)
   assert.equal(stub.calls[0].category, 'done')
   assert.equal(stub.calls[0].priority, 10)
-  assert.equal(stub.calls[0].payload.aps.alert.body, 'Session finished')
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'Turn finished')
 
   // running -> done (crash/stop mid-work): also a turn ending — push.
   fire('done', 'running')
@@ -752,7 +775,7 @@ test('end-to-end wiring: convo_upsert threads the previous session state into th
   await new Promise((res) => setTimeout(res, 30))
   const doneCalls = stub.calls.filter((c) => c.category === 'done')
   assert.equal(doneCalls.length, 1, 'running -> waiting must push through the real convo_upsert path')
-  assert.equal(doneCalls[0].payload.aps.alert.body, 'Session finished')
+  assert.equal(doneCalls[0].payload.aps.alert.body, 'Turn finished')
 
   // waiting -> done: already-idle teardown, still exactly one.
   await upsert('done')

@@ -80,6 +80,25 @@ test('resolveNumericEnv: non-integer, zero, negative, or non-numeric garbage all
   }
 })
 
+test('startServer warns at boot when bound to a non-loopback address (cf-connecting-ip becomes spoofable), and stays quiet on loopback', async (t) => {
+  const isBindWarn = (c) => /MATRON_BIND/.test(c.arguments[0]) && /loopback/.test(c.arguments[0])
+
+  // Non-loopback bind: exactly the config that makes the cf-connecting-ip
+  // trust unsafe — must emit the SECURITY warning.
+  const warnNon = t.mock.method(console, 'warn', () => {})
+  const sNon = await startTestServer({ bind: '0.0.0.0' })
+  t.after(() => sNon.close())
+  assert.ok(warnNon.mock.calls.some(isBindWarn), 'expected a SECURITY warning naming MATRON_BIND for a non-loopback bind')
+  warnNon.mock.restore()
+
+  // Loopback bind (the default deployment): no bind warning.
+  const warnLoop = t.mock.method(console, 'warn', () => {})
+  const sLoop = await startTestServer({ bind: '127.0.0.1' })
+  t.after(() => sLoop.close())
+  assert.ok(!warnLoop.mock.calls.some(isBindWarn), 'a loopback bind must not emit the bind warning')
+  warnLoop.mock.restore()
+})
+
 test('MATRON_MEDIA_MAX_BYTES garbage in the env does not silently disable the upload size cap (regression: NaN made `size > maxBytes` always false)', async (t) => {
   const prevEnv = process.env.MATRON_MEDIA_MAX_BYTES
   process.env.MATRON_MEDIA_MAX_BYTES = 'not-a-number'

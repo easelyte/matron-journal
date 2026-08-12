@@ -9,19 +9,19 @@
   "steps": [
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "hello" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "text", "payload": { "body": "hello" }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "hello" }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
       "payload": { "question": "proceed?", "options": ["yes", "no"], "allows_free_text": false } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "prompt",
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "prompt",
       "payload": { "question": "proceed?", "options": ["yes", "no"], "allows_free_text": false }
     } },
 
@@ -29,7 +29,7 @@
       "payload": { "snippet": "build ok", "truncated": false, "tool_name": "bash" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "tool_output",
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "tool_output",
       "payload": { "snippet": "build ok", "truncated": false, "tool_name": "bash" }
     } },
 
@@ -37,7 +37,7 @@
       "payload": { "blob_ref": "deadbeef00", "content_type": "image/png" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "file",
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "file",
       "payload": { "blob_ref": "deadbeef00", "content_type": "image/png" }
     } },
 
@@ -47,7 +47,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "after the reject" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 5, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "text", "payload": { "body": "after the reject" }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "after the reject" }
     } }
   ]
 }

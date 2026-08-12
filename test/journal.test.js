@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
-import { createUser } from '../src/auth.js'
-import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf } from '../src/journal.js'
+import { createUser, createAgent } from '../src/auth.js'
+import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf, isClientOnlyEvent } from '../src/journal.js'
+import { inviteParticipant } from '../src/participants.js'
 
 async function setup() {
   const db = openDb(':memory:')
@@ -242,9 +243,9 @@ test('snippetOf session_status reads as the turn-finished alert, matching the re
   // The only session_status events that ever reach a push body are
   // turn-finished ones (see push.js classify()), so the state itself
   // doesn't vary the wording.
-  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Session finished')
-  assert.equal(snippetOf('session_status', { state: 'done' }), 'Session finished')
-  assert.equal(snippetOf('session_status', null), 'Session finished')
+  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Turn finished')
+  assert.equal(snippetOf('session_status', { state: 'done' }), 'Turn finished')
+  assert.equal(snippetOf('session_status', null), 'Turn finished')
 })
 
 test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
@@ -285,4 +286,50 @@ test('snippetOf tool_output falls back to `$ command` when snippet is absent', (
   const s = snippetOf('tool_output', { command: long })
   assert.equal(s.length, 120)
   assert.ok(s.startsWith('$ x'))
+})
+
+test('a participant upsert never steals agent_device_id; a non-participant still takes over', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'dev-a')
+  const guest = createAgent(db, dan.id, 'dev-b')
+  const fresh = createAgent(db, dan.id, 'dev-c')
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, title: 'room', sessionState: 'running', agentDeviceId: owner.deviceId })
+  // Guest is a participant in ANY state (invited is enough — being invited
+  // makes you categorically a guest).
+  inviteParticipant(db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId, justification: 'x' })
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: guest.deviceId })
+  assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('room').agent_device_id, owner.deviceId)
+  // A device with no participant row keeps the last-writer-wins takeover
+  // (bridge re-pair reclaiming its own sessions under a new device id).
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: fresh.deviceId })
+  assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('room').agent_device_id, fresh.deviceId)
+})
+
+test('summary: set via upsert, kept when omitted, returned by snapshot', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't', sessionState: 'running', agentDeviceId: ag.deviceId, summary: 'debugging CI' })
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, 'debugging CI')
+  // Don't-clobber: an upsert without summary keeps the stored one (July
+  // title-revert discipline).
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: ag.deviceId })
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, 'debugging CI')
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: 'fixed CI, now on tests' })
+  const snap = snapshot(db, dan.id)
+  assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
+})
+
+test('agent_chat permission_request is client-only; everything else is not', () => {
+  assert.equal(isClientOnlyEvent('permission_request', { kind: 'agent_chat' }), true)
+  assert.equal(isClientOnlyEvent('permission_request', { kind: 'tool_use' }), false)
+  assert.equal(isClientOnlyEvent('permission_request', null), false)
+  assert.equal(isClientOnlyEvent('text', { kind: 'agent_chat' }), false)
+})
+
+test('agent_chat card snippet is fixed — never the justification', () => {
+  const s = snippetOf('permission_request', { kind: 'agent_chat', justification: 'SECRET-DO-NOT-LEAK' })
+  assert.equal(s, '🤝 Agent chat request')
+  assert.ok(!s.includes('SECRET'))
 })

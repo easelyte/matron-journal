@@ -8,10 +8,50 @@ User=matron
 WorkingDirectory=/opt/matron-journal
 Environment=MATRON_DB=/opt/matron-journal/data/matron.db
 Environment=MATRON_PORT=9810
+# Loopback bind is a SECURITY INVARIANT, not just a default: the server trusts
+# the cf-connecting-ip header (per-IP rate limiter, pairing requester IP), which
+# is only safe when the sole ingress is a trusted proxy (cloudflared) to a
+# loopback bind. On a directly-reachable bind that header is client-spoofable.
+# The server logs a loud warning at boot if this is not a loopback address.
 Environment=MATRON_BIND=127.0.0.1
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=2
+
+# --- Sandbox / blast-radius containment ---------------------------------------
+# A public-facing service should not be able to reach anything it doesn't need,
+# so a hypothetical code-execution bug can't pivot into the host. These are safe
+# for a Node service; the one notable omission is MemoryDenyWriteExecute, which
+# would break V8's JIT.
+NoNewPrivileges=yes
+# Whole filesystem read-only except the writable data dir below (DB + WAL/shm +
+# media live here; nothing else is written at runtime).
+ProtectSystem=strict
+ReadWritePaths=/opt/matron-journal/data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+# No listening on privileged ports (9810 > 1024) and no other capability is
+# needed, so drop them all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

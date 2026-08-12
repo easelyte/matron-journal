@@ -10,7 +10,7 @@
     { "kind": "http", "method": "POST", "path": "/login",
       "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "mac" },
       "expect": { "status": 200, "body": {
-        "token": { "$bind": "mac_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+        "token": { "$bind": "mac_token" }, "device_id": { "$bind": "mac_device_id" }, "user_id": { "$ref": "dan.user_id" }
       } } },
     { "kind": "http", "method": "POST", "path": "/login",
       "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "ipad" },
@@ -20,27 +20,27 @@
 
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
     { "kind": "ws_open", "conn": "mac" },
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_open", "conn": "ipad" },
     { "kind": "ws_send", "conn": "ipad", "frame": { "op": "hello", "token": { "$ref": "ipad_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "ipad", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "ipad" } },
 
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+      "sender": "user:dan", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "barrier: viewing applied" }
     } },
     { "kind": "ws_expect", "conn": "mac", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+      "sender": "user:dan", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "barrier: viewing applied" }
     } },
     { "kind": "ws_expect", "conn": "ipad", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: viewing applied" }
+      "sender": "user:dan", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "barrier: viewing applied" }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c1", "state": "thinking", "detail": "analyzing files" } },

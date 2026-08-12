@@ -76,15 +76,16 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       }
       return false
     },
-    // agentDeviceId scopes delivery to agent connections: client devices
+    // agentTargets scopes delivery to agent connections: client devices
     // always receive every frame, but an agent device only receives frames
-    // for conversations it owns (multi-bridge fleets: a bridge getting
-    // another bridge's user input treats it as an unknown convo and bounces
-    // it into the chat). null means "owner unknown" — legacy rows and
-    // convo-less frames keep the old broadcast-to-everyone behavior.
-    broadcastJournal(userId, frame, agentDeviceId = null) {
+    // for conversations it manages or has joined (spec: agent chat phase 2
+    // room fan-out). null means "owner unknown" — legacy rows and
+    // convo-less frames keep the old broadcast-to-everyone behavior. The
+    // caller (ws.js fanOut / hello replay) computes the set: recorded
+    // owner + joined participants.
+    broadcastJournal(userId, frame, agentTargets = null) {
       for (const c of byUser.get(userId) || []) {
-        if (c.kind === 'agent' && agentDeviceId != null && c.deviceId !== agentDeviceId) continue
+        if (c.kind === 'agent' && agentTargets != null && !agentTargets.has(c.deviceId)) continue
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },
@@ -145,15 +146,17 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       newest.ws.send(JSON.stringify(frame))
       return true
     },
-    // Agent-RPC response delivery: multicast to every live socket of the
-    // target device — responses carry no side effects and clients dedupe by
-    // request_id, while single-consumer here would lose the response for a
-    // mid-reconnect client. Fire-and-forget: a fully disconnected client
-    // just misses it (stateless relay — the app re-asks).
-    sendRpcResponse(userId, deviceId, frame) {
+    // Multicast to every live socket of one device — the generic form of
+    // what sendRpcResponse has always done (responses carry no side
+    // effects; a mid-reconnect device briefly has two sockets and both may
+    // hear). Also carries invite-lifecycle frames (agent chat phase 2).
+    sendToDevice(userId, deviceId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.deviceId === deviceId && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
+    },
+    sendRpcResponse(userId, deviceId, frame) {
+      this.sendToDevice(userId, deviceId, frame)
     },
   }
 }

@@ -1,10 +1,26 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice } from './auth.js'
-import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, setPushPrefs, getPushPrefs } from './db.js'
+import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
+import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { deliverPendingInvites } from './invite-delivery.js'
+import { searchMessages, indexableBody } from './search.js'
+import { getSpawn, denySpawn, claimApprove, approveSpawn } from './spawns.js'
+
+// A device name on its way to a client: same sieve and cap the live consent
+// card's `from_name` gets. NULL stays null rather than collapsing to '' —
+// "this device is gone" and "this device is named the empty string" are
+// different facts, and the apps render the id instead for the former.
+const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAME_CAP))
+
+// User-facing device-name cap. Deliberately tighter than PEER_NAME_CAP (80,
+// the sanitiser's bound for peer-written text): a device name is a chip
+// label in the apps, and 40 chars is already more than a chip can show.
+const DEVICE_NAME_MAX = 40
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -77,7 +93,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -219,11 +235,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const keyOk = typeof suppliedKey === 'string' && suppliedKey.length > 0 &&
           preapproveKeyMatches(preapproveKey, suppliedKey)
         if (!loopback || forwarded || !keyOk) return rejectEarly(req, res, 404, { error: 'not_found' })
-        const { username } = await readBody(req)
+        const { username, ttl_seconds } = await readBody(req)
         if (typeof username !== 'string' || !username) return json(res, 400, { error: 'bad_request' })
+        // Optional hand-off TTL (spec §3): bounded here so the store clamp
+        // is belt-and-braces, not the operator's error report.
+        if (ttl_seconds !== undefined &&
+            (!Number.isInteger(ttl_seconds) || ttl_seconds < 60 || ttl_seconds > 86400)) {
+          return json(res, 400, { error: 'bad_request' })
+        }
         const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
         if (!user) return json(res, 404, { error: 'not_found' })
-        const l = links.startPreapproved(user.id)
+        const l = links.startPreapproved(user.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
         // Pending-map cap: same envelope as the limiter — a caller can't
         // tell which throttle it hit, and shouldn't need to.
         if (!l) return json(res, 429, { error: 'rate_limited' })
@@ -232,12 +254,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
-        return json(res, 200, snapshot(db, who.userId))
+        // Two independent rules layered on top of the client shape (spec:
+        // agent visibility & privacy, task 8):
+        //   - snippet omitted for EVERY agent caller, private or not — it can
+        //     carry tool_output text (credentials), same reason /roster omits
+        //     it. A managing agent losing its own convo's snippet is
+        //     acceptable: no agent consumer of /snapshot exists.
+        //   - private-owned conversations excluded for a FILTERED (ordinary)
+        //     agent only — same one-caller-rule predicate as /roster and
+        //     /search, so /snapshot can't be used as an end-run around them.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
         // Scoping (no cross-user leakage) is enforced inside buildMetrics.
-        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId }))
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate as /roster and /search — an ORDINARY
+        // agent caller's device list omits private devices; a client or a
+        // private agent caller sees the full list, unchanged.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box
@@ -289,14 +326,203 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         }))
         return json(res, 200, { devices })
       }
+      if (req.method === 'GET' && url.pathname === '/roster') {
+        // Targeting surface for agent chat (spec: phase 2 roster) — unlike
+        // /devices (management, client-gated) this is deliberately open to
+        // agent tokens, and deliberately NARROWER: agent devices only
+        // (an agent still has no business enumerating its user's client
+        // devices), no cursor/lag/push_prefs, and only top-level
+        // conversations (children are silenced sub-chats, never chat
+        // targets). Same owner_user_id scoping as every other read.
+        const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // Privacy filter (spec: agent visibility & privacy): applies only to
+        // an ORDINARY agent caller. Clients always see everything; a private
+        // agent is invisible, not blinded (one-directional, deliberately) —
+        // which also resolves "can two private agents see each other" as yes.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const agents = db.prepare(
+          `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
+           WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
+        ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        const conversations = db.prepare(
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+                  (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+                   ORDER BY e.seq DESC LIMIT 1) AS last_ts
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
+             ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+             : ''}
+           ORDER BY last_seq DESC`
+        ).all(who.userId)
+        return json(res, 200, { agents, conversations })
+      }
+      if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {
+        // The consent-card surface for clients that missed the live card (or
+        // want a durable inbox of asks) — client-gated like every other
+        // decision-making endpoint here; an agent has no business reading
+        // its own or another agent's pending asks over HTTP.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        // Device names go out through the same sieve the live card's
+        // `from_name` does: they land in a card in the user's app, and a
+        // newline in a device name is line forgery there just as it is in the
+        // journal's own voice.
+        const pending = listAwaiting(db, who.userId).map((r) => ({
+          ...r,
+          initiator_name: deviceName(r.initiator_name),
+          agent_name: deviceName(r.agent_name),
+        }))
+        return json(res, 200, { pending })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
+        // Client-gated: an agent must never answer a consent ask, including
+        // one addressed to itself — the whole point of parking is that only
+        // the human decides.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { room_id, target_device_id, decision } = body
+        if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
+        if (typeof room_id !== 'string' || !Number.isInteger(target_device_id)) return json(res, 400, { error: 'bad_request' })
+        // `always_allow` was the standing-consent grant. It is gone, and a
+        // body still carrying it is rejected rather than ignored: a caller
+        // that believes it granted standing consent which does not exist is
+        // worse off than one told plainly that the field is not accepted.
+        if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
+        const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
+        // Unknown room and a room owned by someone else are indistinguishable
+        // (404, never 403) — same anti-enumeration stance as
+        // GET /convo/:id/messages.
+        if (!room || room.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        const row = getParticipant(db, room_id, target_device_id)
+        if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
+        if (decision === 'deny') {
+          answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
+          // Indistinguishable from a peer refusal — reason 'refused', never
+          // 'denied' (a requester must never learn the human said no).
+          hub.sendToDevice(who.userId, row.initiator_device_id, {
+            kind: 'invite', event: 'answer', room_id, peer_device_id: target_device_id, accept: false, reason: 'refused',
+          })
+          return json(res, 200, { ok: true })
+        }
+        answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        // Join requests self-target (row.initiator_device_id ===
+        // target_device_id, the joiner) — the recipient of THIS row's relay
+        // (and, below, the directed-pair target) is the room owner, not the
+        // joiner itself.
+        const isJoin = row.initiator_device_id === target_device_id
+        // Scoped to this row's own recipient: the unscoped pump sweeps every
+        // undelivered row system-wide, so an unrelated row's successful
+        // delivery could otherwise make `sent > 0` true while THIS row's
+        // target is still offline. Even scoped, `sent` could reflect a
+        // different row addressed to the same recipient device — so the
+        // response flag is read back off the answered row itself, which is
+        // exact.
+        deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
+        const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
+        return json(res, 200, { ok: true, delivered })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
+        // Client-gated: an agent must never answer a consent ask, including
+        // one addressed to itself — the whole point of parking is that only
+        // the human decides. Same stance as /agent-chat/answer.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { request_id, decision } = body
+        if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
+        if (typeof request_id !== 'string' || !request_id) return json(res, 400, { error: 'bad_request' })
+        // No standing consent exists for spawns and never has — but reject
+        // the field rather than ignore it, exactly as /agent-chat/answer
+        // does: a caller that believes it granted something must be told.
+        if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
+        const row = getSpawn(db, request_id)
+        // Unknown id and another user's row are indistinguishable.
+        if (!row || row.user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        if (decision === 'deny') {
+          if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
+          // Reported plainly (spec: no peer to hide behind) — 'declined',
+          // never a fabricated box-side failure.
+          hub.sendToDevice(who.userId, row.from_device_id, { kind: 'spawn', event: 'outcome', request_id, outcome: 'declined' })
+          return json(res, 200, { ok: true })
+        }
+        // The tap CLAIMS the row; a zero row-count means another tap already
+        // won — 409, and nothing expensive has started (spec failure table:
+        // two approve taps spawn once).
+        if (!claimApprove(db, request_id)) return json(res, 409, { error: 'conflict' })
+        // Everything after the claim is expensive and externally visible;
+        // it runs off the request cycle — the app needs its 200 now, the
+        // outcome reaches the parent as a turn. Errors are contained: the
+        // broker timeout guarantees approveSpawn itself always settles.
+        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs }, getSpawn(db, request_id))
+          .catch((err) => console.error('agent-spawn approve orchestration failed', err))
+        return json(res, 200, { ok: true })
+      }
+      if (req.method === 'GET' && url.pathname === '/search') {
+        // User-scoped full-text search (spec: agent journal search). Open to
+        // both device kinds: agents are the design's audience, clients may
+        // ride it later; scoping is by the authenticated user either way.
+        const q = url.searchParams.get('q')
+        if (typeof q !== 'string' || !q.trim() || q.length > 256) return json(res, 400, { error: 'bad_request' })
+        const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 20
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
+        const limit = Math.min(rawLimit, 50)
+        // convo_id narrows results; an id the user can't see yields the same
+        // empty set an unmatched query does (user scoping already guarantees
+        // it) — no existence oracle, nothing extra to check.
+        const convoId = url.searchParams.get('convo_id') || null
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate the roster uses — applies only to an
+        // ORDINARY agent caller, never to clients or private agents.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered })
+        if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+        return json(res, 200, { hits: r.hits })
+      }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         // Deleting the row IS the revocation (docs/protocol.md "Device
         // revocation"): HTTP 401s on the next call, WS closes next-frame or
         // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
-        if (!revokeOwnedDevice(db, who.userId, Number(dm[1]))) return json(res, 404, { error: 'not_found' })
+        const revokedId = Number(dm[1])
+        if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        // Room membership goes with it, via the convo_agents cascade in
+        // db.js — not a call here. This route used to do the cleanup itself,
+        // which left `matron-admin device revoke` quietly not doing it.
         return json(res, 200, { ok: true })
+      }
+      const rn = url.pathname.match(/^\/devices\/(\d+)\/rename$/)
+      if (req.method === 'POST' && rn) {
+        // Client-gated like /devices and /password: an agent has no business
+        // renaming its user's devices (or itself — the name is the user's
+        // label for the box, not the box's self-description).
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { name } = await readBody(req)
+        if (typeof name !== 'string') return json(res, 400, { error: 'bad_request' })
+        // Sanitise BEFORE measuring: the cap is on what we store, and the
+        // sieve (control chars -> space, whitespace collapsed, trimmed) is
+        // the same one every peer-written name goes through.
+        const clean = deviceName(name)
+        if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
+        const renamedId = Number(rn[1])
+        if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        for (const c of hub.connsOf(who.userId)) {
+          // A live socket carries the device name it authenticated with
+          // (ws.js hello: `conn = { ws, ...who }`), and everything that
+          // names the producing device reads it from there — journal
+          // `sender` strings (`agent:dev-2`), and the `from_name` baked into
+          // an agent-chat/agent-spawn consent card. Leave it and a connected
+          // bridge keeps minting the pre-rename name until it reconnects,
+          // which for a long-lived box is days. Patch the connection, not
+          // just the row.
+          if (c.deviceId === renamedId) c.name = clean
+          // Live roster patch for the user's other apps. Transient (not a
+          // journal event): a device name is not conversation history, and a
+          // client that was offline picks the new name up from its next
+          // /snapshot `agents` list. Clients only — an agent keeps no roster.
+          if (c.kind === 'client' && c.ws.readyState === 1) {
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean }))
+          }
+        }
+        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean } })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
@@ -384,12 +610,77 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           beforeSeq = Number(url.searchParams.get('before_seq'))
           if (!Number.isInteger(beforeSeq)) return json(res, 400, { error: 'bad_request' })
         }
+        let aroundSeq = null
+        if (url.searchParams.has('around_seq')) {
+          aroundSeq = Number(url.searchParams.get('around_seq'))
+          if (!Number.isInteger(aroundSeq)) return json(res, 400, { error: 'bad_request' })
+        }
+        // The two paging modes are mutually exclusive by design — a request
+        // carrying both has a confused caller, and picking one silently
+        // would hide the bug.
+        if (aroundSeq != null && beforeSeq != null) return json(res, 400, { error: 'bad_request' })
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Two agent read regimes (locked decision, search spec fold-in):
+        //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
+        //    reads full transcripts only for conversations it manages or has
+        //    joined (authorizeAgentWrite) — 404 otherwise, same as ever.
+        //  - around_seq on a conversation OUTSIDE that set is the search
+        //    context surface: allowed (it is the feature /search exists to
+        //    serve), but windowed over exactly what the index can see
+        //    (search_messages: text + diff prose) rather than over every
+        //    event with a post-hoc filter, so a limited window is never
+        //    starved down to a few rows by interleaved tool_output. The
+        //    limit is clamped to 30 (a search-hit-orientation read, not bulk
+        //    extraction) and every read is logged server-side. tool_output —
+        //    the credential surface — and every other type never appear,
+        //    which also covers the client-only consent card (indexableBody
+        //    is null for permission_request).
+        const agentForeign = who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)
+        if (agentForeign && aroundSeq == null) {
+          return json(res, 404, { error: 'not_found' })
+        }
         try {
-          const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
-          return json(res, 200, { events })
+          let events
+          if (agentForeign && aroundSeq != null) {
+            // Privacy gate (spec: agent visibility & privacy): a conversation
+            // owned by a private device does not exist for an ordinary
+            // agent's context reads — same 404 as missing/unauthorized, and
+            // it must fire before the audit log line below so a refused read
+            // is never logged as a successful foreign read. A private caller
+            // bypasses this, same one-directional rule as everywhere else.
+            const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
+            if (owner != null && isPrivateDevice(db, owner) && !isPrivateDevice(db, who.deviceId)) {
+              return json(res, 404, { error: 'not_found' })
+            }
+            // Window over the indexed (prose) set directly, not over every
+            // event with a post-hoc filter — in a tool_output-heavy convo,
+            // filtering after windowing can starve a small limit down to a
+            // couple of rows before the caller ever sees them (final
+            // review). The limit is also clamped: a foreign agent's context
+            // read is meant to orient around one search hit, not extract a
+            // conversation wholesale.
+            const clampedLimit = Math.min(limit, 30)
+            events = messagesAroundIndexed(db, who.userId, convoId, { aroundSeq, limit: clampedLimit })
+            console.log(`journal: foreign-agent context read convo=${convoId} device=${who.deviceId} anchor=${aroundSeq}`)
+          } else if (aroundSeq != null) {
+            events = messagesAround(db, who.userId, convoId, { aroundSeq, limit })
+          } else {
+            events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          }
+          if (agentForeign) {
+            // Belt-and-braces against drift between the index and the rule:
+            // messagesAroundIndexed already returns only indexable rows, so
+            // this should be a no-op in practice.
+            events = events.filter((e) => indexableBody(e.type, e.payload) != null)
+          } else if (who.kind !== 'client') {
+            // Client-only events (the agent-chat approval card) never reach an
+            // agent device by any read path — this is the HTTP-pagination half
+            // of the guarantee ws.js's fanOut and hello replay also enforce.
+            events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          }
+          return json(res, 200, { events: events.map(toEventShape) })
         } catch (e) {
           // Unauthorized and missing are indistinguishable: both 404, same
           // body as GET /media/:id's unknown-id response — never 403 (that
@@ -399,6 +690,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         }
       }
       if (req.method === 'POST' && url.pathname === '/media') {
+        // Per-user disk quota (finding: media has no TTL, so unbounded uploads
+        // fill the disk). Read the user's current footprint once, up front:
+        // if it's already at/over quota, reject BEFORE streaming a body we'd
+        // only delete (rejectEarly closes the socket since the body is unread).
+        // The precise `used + size` check comes after receiveBlob knows the
+        // size — a single upload can overshoot by at most mediaMaxBytes, which
+        // is fine (the ceiling is a safety valve, not a byte-exact accountant),
+        // and concurrent same-user uploads can each pass this snapshot read, a
+        // bounded soft-overrun we accept rather than serializing uploads.
+        const usedBytes = userBlobBytes(db, who.userId)
+        if (usedBytes >= mediaUserQuotaBytes) return rejectEarly(req, res, 413, { error: 'quota_exceeded' })
         let received
         try {
           received = await receiveBlob(req, { root: mediaDir, maxBytes: mediaMaxBytes })
@@ -406,6 +708,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (e.code === 'empty') return json(res, 400, { error: 'empty' })
           if (e.code === 'too_large') throw Object.assign(new Error('too large'), { statusCode: 413 })
           throw e
+        }
+        if (usedBytes + received.size > mediaUserQuotaBytes) {
+          // Body is fully consumed by now (receiveBlob resolved), so a plain
+          // json() reject is right — no keep-alive desync concern. Delete the
+          // just-written blob file so a rejected upload leaves nothing behind.
+          await fs.promises.unlink(received.diskPath).catch(() => {})
+          return json(res, 413, { error: 'quota_exceeded' })
         }
         const contentType = req.headers['content-type'] || 'application/octet-stream'
         try {
@@ -458,6 +767,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           'content-type': blob.content_type,
           'content-length': String(blob.size),
           'cache-control': 'private, max-age=31536000, immutable',
+          // The content-type is uploader-chosen and echoed verbatim, on the
+          // same origin as the API. nosniff stops a browser from re-sniffing a
+          // mislabeled blob into active content, and attachment forces a
+          // download rather than inline rendering — so a blob can never execute
+          // as script/HTML in this origin even though media is owner-scoped.
+          'x-content-type-options': 'nosniff',
+          'content-disposition': 'attachment',
         })
         await new Promise((resolve) => {
           const stream = fs.createReadStream(blob.disk_path)

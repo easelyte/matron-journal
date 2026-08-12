@@ -6,11 +6,12 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb, insertBlob } from '../src/db.js'
-import { authToken, createUser, createAgent, login } from '../src/auth.js'
+import { authToken, createUser, createAgent, login, authorizeAgentWrite } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
-import { runAdmin } from '../bin/matron-admin.js'
+import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
+import { parkInvite, answerParkedInvite, answerInvite, getParticipant } from '../src/participants.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -29,6 +30,43 @@ test('admin CLI: user add, agent add, status', async () => {
   assert.match(status, /dan devices=0 agents=1 head_seq=0/)
 
   await assert.rejects(runAdmin(db, ['bogus']), /usage/i)
+})
+
+test('admin CLI: user add/passwd take the password off argv (--password-stdin, MATRON_PASSWORD)', async () => {
+  const db = openDb(':memory:')
+
+  // --password-stdin: the password arrives on stdin, never in argv
+  const addOut = await runAdmin(db, ['user', 'add', 'ann', '--password-stdin'],
+    { readStdin: async () => 'stdin-secret\n' })
+  assert.match(addOut, /user ann created/)
+  // the exact value logs in; the single trailing newline (from `echo`) was
+  // stripped, so it is NOT part of the stored password
+  assert.ok(await login(db, { username: 'ann', password: 'stdin-secret', deviceName: 'm' }))
+  assert.equal(await login(db, { username: 'ann', password: 'stdin-secret\n', deviceName: 'm2' }), null)
+
+  // MATRON_PASSWORD env fallback (deps.env keeps it out of the real process env)
+  const bobOut = await runAdmin(db, ['user', 'add', 'bob'], { env: { MATRON_PASSWORD: 'env-secret' } })
+  assert.match(bobOut, /user bob created/)
+  assert.ok(await login(db, { username: 'bob', password: 'env-secret', deviceName: 'm' }))
+
+  // user passwd via stdin rotates the password
+  const pwOut = await runAdmin(db, ['user', 'passwd', 'ann', '--password-stdin'],
+    { readStdin: async () => 'rotated\n' })
+  assert.match(pwOut, /password updated for ann/)
+  assert.ok(await login(db, { username: 'ann', password: 'rotated', deviceName: 'm3' }))
+
+  // precedence: --password-stdin wins over a --password flag on argv
+  const carolOut = await runAdmin(db, ['user', 'add', 'carol', '--password', 'FROM-ARGV', '--password-stdin'],
+    { readStdin: async () => 'FROM-STDIN' })
+  assert.match(carolOut, /user carol created/)
+  assert.ok(await login(db, { username: 'carol', password: 'FROM-STDIN', deviceName: 'm' }))
+  assert.equal(await login(db, { username: 'carol', password: 'FROM-ARGV', deviceName: 'm2' }), null)
+
+  // no password source at all → usage (unchanged behavior)
+  await assert.rejects(runAdmin(db, ['user', 'add', 'nopw']), /usage/i)
+  await assert.rejects(runAdmin(db, ['user', 'passwd', 'ann']), /usage/i)
+
+  db.close()
 })
 
 test('admin CLI: offload runs runOffload with --days (default 30), second run no-ops, bad --days rejected', async () => {
@@ -156,6 +194,150 @@ test('admin CLI: device list and device revoke', async () => {
   const noneOut = await runAdmin(db, ['device', 'list', 'lonely'])
   assert.match(noneOut, /no devices/i)
 
+  db.close()
+})
+
+// The CLI revoke used to be a bare DELETE on devices while the HTTP route
+// cleaned up convo_agents alongside it, so the same command by a different
+// door left the membership row standing — and `devices.id` is a plain INTEGER
+// PRIMARY KEY, so the next agent created lands on exactly the revoked id and
+// inherited its room. "Retire an agent, register its replacement" is the
+// ordinary sequence that hits this.
+test('admin CLI: device revoke clears room membership, so a reused id inherits nothing', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const doomed = createAgent(db, dan.id, 'doomed-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, initiatorDeviceId: owner.deviceId })
+  answerParkedInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, approve: true })
+  answerInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, accept: true })
+  assert.equal(authorizeAgentWrite(db, dan.id, doomed.deviceId, 'room1'), true, 'precondition: it could write')
+
+  await runAdmin(db, ['device', 'revoke', String(doomed.deviceId)])
+  assert.equal(getParticipant(db, 'room1', doomed.deviceId), null, 'the membership row goes with the device')
+
+  const fresh = createAgent(db, dan.id, 'replacement-agent')
+  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.equal(authorizeAgentWrite(db, dan.id, fresh.deviceId, 'room1'), false, 'the replacement starts from nothing')
+
+  db.close()
+})
+
+test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-delivery note', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent') // room owner, and the invite's initiator
+  const target = createAgent(db, dan.id, 'target-agent') // the invited device
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  const pendingOut = await runAdmin(db, ['agent-chat', 'pending', 'dan'])
+  assert.match(pendingOut, /room1/)
+  assert.match(pendingOut, /topic: deploy/)
+  assert.match(pendingOut, /need a hand/)
+  assert.match(pendingOut, new RegExp(`device ${target.deviceId} \\(target-agent\\)`))
+
+  const approveOut = await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId)])
+  assert.match(approveOut, /invited/)
+  // Both facts the CLI cannot make happen itself must be said, per the brief.
+  assert.match(approveOut, /sweep/i)
+  assert.match(approveOut, /hub/i)
+
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'invited')
+  assert.equal(row.delivered_at, null) // delivery is the pump's job, not this command's
+
+  db.close()
+})
+
+test('admin CLI: agent-chat approve rejects --always-allow rather than silently approving (the flag no longer exists)', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  await assert.rejects(
+    runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow']),
+    /--always-allow/
+  )
+
+  // rejected outright — not silently approved, and not left in some
+  // half-applied state.
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'awaiting_user')
+
+  db.close()
+})
+
+test('admin CLI: agent-chat deny flips to denied and says the requester cannot be told directly', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  const denyOut = await runAdmin(db, ['agent-chat', 'deny', 'dan', 'room1', String(target.deviceId)])
+  assert.match(denyOut, /denied/)
+  assert.match(denyOut, /times out to pending/)
+
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'denied')
+
+  db.close()
+})
+
+test('admin CLI: agent-chat approve/deny reject a row that belongs to another user\'s room', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const eve = await createUser(db, 'eve', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  await assert.rejects(runAdmin(db, ['agent-chat', 'approve', 'eve', 'room1', String(target.deviceId)]), /no agent-chat request/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'deny', 'eve', 'room1', String(target.deviceId)]), /no agent-chat request/)
+  // untouched by the rejected attempts
+  assert.equal(getParticipant(db, 'room1', target.deviceId).state, 'awaiting_user')
+
+  db.close()
+})
+
+test('admin CLI: the agent-chat allowances subcommand is gone', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'pw')
+  await assert.rejects(runAdmin(db, ['agent-chat', 'allowances', 'dan']))
+})
+
+test('admin CLI: agent-chat pending/approve/deny with an unknown username exits non-zero', async () => {
+  const db = openDb(':memory:')
+  await assert.rejects(runAdmin(db, ['agent-chat', 'pending', 'ghost']), /no such user: ghost/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'approve', 'ghost', 'room1', '2']), /no such user: ghost/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'deny', 'ghost', 'room1', '2']), /no such user: ghost/)
+  db.close()
+})
+
+test('admin CLI: agent-chat pending says so when nothing is awaiting', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'pw')
+  const out = await runAdmin(db, ['agent-chat', 'pending', 'dan'])
+  assert.match(out, /no agent-chat requests awaiting approval/)
   db.close()
 })
 
@@ -329,6 +511,42 @@ test('link-code: missing expires_in in the journal response is not printed as "N
   assert.match(out, /code:\s+ABCD-EFGH/)
 })
 
+test('parseExpiresSeconds: Nm/Nh within 1m-24h, null otherwise', () => {
+  assert.equal(parseExpiresSeconds('30m'), 1800)
+  assert.equal(parseExpiresSeconds('1m'), 60)
+  assert.equal(parseExpiresSeconds('24h'), 86400)
+  assert.equal(parseExpiresSeconds('2h'), 7200)
+  for (const bad of ['0m', '25h', '1441m', 'bananas', '90', 'h', '', null, '1d', '-5m', '1.5h']) {
+    assert.equal(parseExpiresSeconds(bad), null, JSON.stringify(bad))
+  }
+})
+
+test('link-code --expires: sends ttl_seconds and prints the expiry in hours', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--expires', '24h'])
+  assert.match(out, /expires in 24 hours and works once/)
+  // the minted code really carries the long TTL
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
+test('link-code --expires: invalid duration fails with usage before any network call', async (t) => {
+  const db = openDb(':memory:')
+  // port 1 is unreachable — if the CLI tried the network first we would see
+  // "not reachable" instead of the --expires usage error
+  for (const bad of ['25h', '0m', 'bananas']) {
+    await assert.rejects(
+      () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--expires', bad]),
+      /--expires/
+    )
+  }
+  db.close()
+})
+
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-'))
   const dbPath = path.join(dir, 'cli.db')
@@ -344,4 +562,120 @@ test('CLI entrypoint works directly and via symlink (npx-style)', () => {
   assert.match(viaLink, /total events: 0/)
 
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('link-code --png: writes a 0600 PNG, prints scp+rm hints, suppresses the ANSI QR', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--expires', '24h', '--png', pngPath])
+
+  const buf = fs.readFileSync(pngPath)
+  assert.deepEqual([...buf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]) // PNG magic
+  assert.equal(fs.statSync(pngPath).mode & 0o777, 0o600)
+  assert.match(out, /scp .*link\.png/)
+  assert.match(out, /rm .*link\.png/)
+  assert.match(out, /treat it like a password/)
+  assert.match(out, /expires in 24 hours/)
+  assert.doesNotMatch(out, /▄|█/) // no ANSI QR in file mode
+
+  // the manual-entry fallback still carries a working code
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
+test('link-code --png: pre-mint failure removes the truncated file and leaks no fd', async (t) => {
+  const db = openDb(':memory:')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+  fs.writeFileSync(pngPath, 'stale contents from a previous run')
+
+  // port 1: fd opens (truncating the file) but the mint never succeeds.
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png', pngPath]),
+    /journal not reachable/
+  )
+
+  assert.equal(fs.existsSync(pngPath), false, 'truncated PNG file should be removed on failure')
+  db.close()
+})
+
+test('link-code --png: post-mint render failure still prints the manual-entry code', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+
+  const out = await runAdmin(
+    s.db,
+    ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--png', pngPath],
+    { renderPng: async () => { throw new Error('encoder exploded') } }
+  )
+
+  // The code is already live and single-use — it must reach the operator.
+  assert.match(out, /could not write the qr png/i)
+  assert.match(out, /server: https:\/\/chat\.example\.com/)
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  assert.equal(fs.existsSync(pngPath), false, 'failed PNG should not leave an empty file behind')
+
+  // ...and the printed code actually works.
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
+test('link-code --png: unwritable path fails before minting (unreachable port never contacted)', async (t) => {
+  const db = openDb(':memory:')
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png', '/nonexistent-dir/never/link.png']),
+    /cannot write --png file/
+  )
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png']),
+    /--png needs a file path/
+  )
+  db.close()
+})
+
+test('device private: on pins private, off pins visible, auto releases the pin', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  const out = await runAdmin(db, ['device', 'private', String(a.deviceId), 'on'])
+  assert.match(out, /private/)
+  assert.deepEqual(db.prepare('SELECT private, private_pinned FROM devices WHERE id=?').get(a.deviceId), { private: 1, private_pinned: 1 })
+  await runAdmin(db, ['device', 'private', String(a.deviceId), 'off'])
+  assert.deepEqual(db.prepare('SELECT private, private_pinned FROM devices WHERE id=?').get(a.deviceId), { private: 0, private_pinned: 1 })
+  const auto = await runAdmin(db, ['device', 'private', String(a.deviceId), 'auto'])
+  assert.match(auto, /bridge|hello|env/i, 'output explains the flag now follows the bridge')
+  assert.equal(db.prepare('SELECT private_pinned FROM devices WHERE id=?').get(a.deviceId).private_pinned, 0)
+  db.close()
+})
+
+test('device private: unknown device and bad mode are refused', async () => {
+  const db = openDb(':memory:')
+  await assert.rejects(() => runAdmin(db, ['device', 'private', '999', 'on']), /no such device/)
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  await assert.rejects(() => runAdmin(db, ['device', 'private', String(a.deviceId), 'maybe']), /usage/i)
+  db.close()
+})
+
+test('device list: shows the private flag and its pin state', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  await runAdmin(db, ['device', 'private', String(a.deviceId), 'on'])
+  const out = await runAdmin(db, ['device', 'list', 'dan'])
+  assert.match(out, /private=yes \(pinned\)/)
+  db.close()
 })

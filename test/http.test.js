@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
+import { inviteParticipant, answerInvite } from '../src/participants.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
   const s = await startTestServer()
@@ -74,6 +75,45 @@ test('GET /convo/:id/messages validates limit, before_seq, and percent-encoding'
   const badEncoding = await fetch(s.base + '/convo/%zz/messages', { headers: { authorization: `Bearer ${token}` } })
   assert.equal(badEncoding.status, 400)
   assert.deepEqual(await badEncoding.json(), { error: 'bad_request' })
+})
+
+test('GET /convo/:id/messages: agent tokens are gated by authorizeAgentWrite (owner/joined only), never a bare same-user check; client tokens are unchanged', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const owner = createAgent(s.db, dan.id, 'owner')
+  const stranger = createAgent(s.db, dan.id, 'stranger')
+  const guest = createAgent(s.db, dan.id, 'guest')
+  upsertConversation(s.db, { id: 'room', ownerUserId: dan.id, title: 'room', sessionState: 'running', agentDeviceId: owner.deviceId })
+  append(s.db, { userId: dan.id, convoId: 'room', sender: 'agent:owner', type: 'text', payload: { body: 'hi' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  // A same-user agent that is neither the owner nor a joined participant is
+  // rejected — this is the whole point of the fix: pre-fix, any agent token
+  // of the user could read any other agent's conversation transcript.
+  const foreign = await s.http('/convo/room/messages', { token: stranger.token })
+  assert.equal(foreign.status, 404)
+  assert.deepEqual(foreign.json, { error: 'not_found' })
+
+  // The recorded owner reads fine.
+  const ownerRes = await s.http('/convo/room/messages', { token: owner.token })
+  assert.equal(ownerRes.status, 200)
+  assert.equal(ownerRes.json.events.length, 1)
+  assert.equal(ownerRes.json.events[0].payload.body, 'hi')
+
+  // A joined participant reads fine too (this is what agent_chat_read's
+  // "allowed for joined agents" needs).
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, accept: true })
+  const guestRes = await s.http('/convo/room/messages', { token: guest.token })
+  assert.equal(guestRes.status, 200)
+  assert.equal(guestRes.json.events.length, 1)
+
+  // A client token of the same user is unaffected — still just user-scoped
+  // ownership, same as before this fix.
+  const clientRes = await s.http('/convo/room/messages', { token: login.json.token })
+  assert.equal(clientRes.status, 200)
+  assert.equal(clientRes.json.events.length, 1)
 })
 
 test('POST /login and /push/register reject a non-object JSON body (null, array, bare primitive) with 400, not 500', async (t) => {
@@ -457,4 +497,64 @@ test('PUT /push/prefs validation: unknown fields, non-boolean values, agent devi
 
   const agent = createAgent(s.db, login.json.user_id, 'bridge')
   assert.equal((await s.http('/push/prefs', { method: 'PUT', token: agent.token, body: { attention: false } })).status, 403)
+})
+
+test('GET /roster: agent token gets agent devices + top-level conversation metadata', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const eve = await createUser(s.db, 'eve', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  createAgent(s.db, eve.id, 'dev-eve')
+  await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  upsertConversation(s.db, { id: 'top', ownerUserId: dan.id, title: 'work', sessionState: 'running', agentDeviceId: agA.deviceId, summary: 'fixing CI' })
+  upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, title: 'sub', sessionState: 'running', agentDeviceId: agA.deviceId, parentConvoId: 'top' })
+  upsertConversation(s.db, { id: 'evetop', ownerUserId: eve.id, title: 'secret', sessionState: 'running' })
+
+  const r = await s.http('/roster', { token: agB.token })
+  assert.equal(r.status, 200)
+  // Agent devices only — client devices are management surface (/devices,
+  // client-gated) and never enumerable by an agent.
+  assert.deepEqual(r.json.agents.map((d) => d.name).sort(), ['dev-a', 'dev-b'])
+  const ids = r.json.conversations.map((c) => c.id)
+  assert.ok(ids.includes('top'))
+  assert.ok(!ids.includes('child'), 'sub-chats are not roster targets')
+  assert.ok(!ids.includes('evetop'), 'other users invisible')
+  const top = r.json.conversations.find((c) => c.id === 'top')
+  assert.equal(top.summary, 'fixing CI')
+  assert.equal(top.agent_device_id, agA.deviceId)
+})
+
+test('GET /roster works for client tokens too and requires auth', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const ok = await s.http('/roster', { token: login.json.token })
+  assert.equal(ok.status, 200)
+  const anon = await s.http('/roster')
+  assert.equal(anon.status, 401)
+})
+
+test('GET /snapshot exposes each convo agent_device_id and the agents id->name list', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-y')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at, agent_device_id) VALUES(?,?,?,?,?)')
+    .run('c-owned', dan.id, 'Fix the parser', Date.now(), agent.deviceId)
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES(?,?,?,?)')
+    .run('c-orphan', dan.id, 'No box yet', Date.now())
+
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 200)
+  const owned = r.json.conversations.find((c) => c.id === 'c-owned')
+  const orphan = r.json.conversations.find((c) => c.id === 'c-orphan')
+  assert.equal(owned.agent_device_id, agent.deviceId)
+  assert.equal(orphan.agent_device_id, null)
+  // agents: agent devices only — the client device is not a box
+  assert.deepEqual(r.json.agents, [{ device_id: agent.deviceId, name: 'dev-y' }])
 })

@@ -7,11 +7,17 @@ import fs from 'node:fs'
 // `db_file_size_bytes` and `push` are global aggregates (bare numbers/
 // counters, no identity attached), safe to return to any authenticated
 // caller regardless of whose device asked.
-export function buildMetrics(db, { hub, pushPipeline, dbPath, userId }) {
+export function buildMetrics(db, { hub, pushPipeline, dbPath, userId, excludePrivateDevices = false }) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
+  // Privacy filter (spec: agent visibility & privacy), same one-caller-rule
+  // predicate /roster and /search apply — an ORDINARY agent caller's device
+  // list must not enumerate private devices (id, kind, cursor, last_seen_at
+  // is enough to identify and fingerprint activity on a device the caller
+  // has no business seeing at all). Clients and private-agent callers pass
+  // `excludePrivateDevices: false` and get the unfiltered list, unchanged.
   const devices = db.prepare(
-    'SELECT id AS device_id, kind, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
+    `SELECT id AS device_id, kind, cursor, last_seen_at FROM devices WHERE user_id=?${excludePrivateDevices ? ' AND private=0' : ''} ORDER BY id`
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
 
   const journalRowCount = db.prepare('SELECT COUNT(*) n FROM events').get().n

@@ -18,17 +18,17 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 1 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 1, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_expect_none", "conn": "client", "ms": 150 },
 
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 1 } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 1, "device_id": { "$type": "integer" }, "name": "dev-2" } },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "live now" } } },
 
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "text", "payload": { "body": "live now" }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "live now" }
     } }
   ]
 }

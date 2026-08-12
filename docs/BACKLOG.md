@@ -69,5 +69,8 @@ snapshot recovers); buildOpts-throw could strand a coalesce entry
 dbPath (same file by construction); offload scan concurrency (see README
 follow-up above); raw SqliteError on duplicate admin user; per-call
 db.prepare rebuilds; password on admin argv (single-user boxes); utf8 cap
-counting chars not bytes; edit events don't update snippet/unread
-(MESSAGE_TYPES) — by design, an edit is not new activity.
+counting chars not bytes; edit/summary events don't update snippet/unread
+(MESSAGE_TYPES) — by design, neither is new activity. `summary` additionally
+opts out of APNs push (like `convo_meta`), whereas `edit` pushes normally —
+a known inconsistency in scope (edit's push inclusion predates the push-opt-out
+pattern) and never replicated to other event kinds.

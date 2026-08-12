@@ -193,11 +193,16 @@ the DB). First claim wins; later claimants learn only that the code is gone.
 1. **QRLjacking** (victim scans an attacker's rendezvous QR): the victim's
    approve card shows the attacker's device name and IP with the sharpened
    copy; codes are one-shot with short TTLs. The tap remains the gate.
-2. **Compromised relay** could hand the desktop `{server, code}` for an
-   attacker's journal, signing the desktop into the wrong account. No
-   structural fix exists (the relay is trusted for exactly this datum);
-   mitigation is transparency — the desktop shows the server host before
-   claiming and keeps it visible while waiting.
+2. **Compromised relay** (offer confidentiality/integrity): closed by the
+   rendezvous-offer-encryption change. The relay now stores and returns only
+   an opaque, app-encrypted `box` — never `{server, code}` — sealed under a
+   key that lives solely in the QR and the two legitimate devices. The relay
+   cannot **read** the offer (interception is closed) and cannot **forge or
+   substitute** one (a tampered box fails AES-GCM authentication on the
+   desktop and is rejected before any claim). The residual is **denial of
+   service only** — a hostile relay can drop or refuse offers, not read or
+   redirect them. Defence-in-depth is retained: the desktop still shows the
+   decrypted server host before claiming and keeps it visible while waiting.
 3. **Relay abuse** (flood of rendezvous creation): two-bucket rate
    limiting, maxPending cap, tiny bodies, memory-only state.
 

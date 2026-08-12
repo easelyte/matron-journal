@@ -27,7 +27,7 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 10 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 10, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "snapshot_required" } },
     { "kind": "ws_expect_close", "conn": "client", "code": 4009 }
   ]

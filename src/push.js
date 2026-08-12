@@ -41,6 +41,8 @@ function classify(type, payload, sender, prevState) {
     return turnFinished ? { priority: 10, coalesce: false, kind: 'done' } : null
   }
   if (type === 'convo_meta') return null
+  // TOC summary events are derived metadata, not new activity — journal-sync only.
+  if (type === 'summary') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }

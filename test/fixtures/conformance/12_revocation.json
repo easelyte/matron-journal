@@ -14,12 +14,12 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "pre-revocation" }, "local_id": "p1" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "user:dan", "type": "text", "payload": { "body": "pre-revocation" }
+      "sender": "user:dan", "sender_device_id": { "$ref": "dan_device_id" }, "type": "text", "payload": { "body": "pre-revocation" }
     } },
 
     { "kind": "admin_revoke_device", "device_id": { "$ref": "dan_device_id" } },

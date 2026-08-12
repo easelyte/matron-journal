@@ -30,12 +30,12 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 3 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 3, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "ack", "cursor": 3 } },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: ack applied" }, "local_id": "b1" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: ack applied" }
+      "sender": "user:dan", "sender_device_id": { "$ref": "dan_device_id" }, "type": "text", "payload": { "body": "barrier: ack applied" }
     } },
 
     { "kind": "http", "method": "GET", "path": "/metrics", "token": { "$ref": "dan_token" },

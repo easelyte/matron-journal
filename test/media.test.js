@@ -135,6 +135,80 @@ test('POST /media over the size cap -> 413 too_large, nothing persisted, tmp fil
   assert.deepEqual(listMediaFiles(mediaDir), [], 'files were left behind on disk after a rejected oversized upload')
 })
 
+test('GET /media/:id sets nosniff + attachment so an uploader-chosen content-type cannot render inline', async (t) => {
+  const dbPath = tmpDbPath()
+  const s = await startTestServer({ dbPath })
+  t.after(() => s.close())
+  const token = await loginToken(s, 'dan', 'pw')
+
+  const up = await fetch(s.base + '/media', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'text/html' },
+    body: Buffer.from('<script>alert(1)</script>'),
+  })
+  const { media_id } = await up.json()
+
+  const down = await fetch(s.base + `/media/${media_id}`, { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(down.status, 200)
+  assert.equal(down.headers.get('content-type'), 'text/html', 'content-type is still echoed verbatim')
+  assert.equal(down.headers.get('x-content-type-options'), 'nosniff')
+  assert.equal(down.headers.get('content-disposition'), 'attachment')
+})
+
+test('POST /media quota: an upload that would overshoot is rejected after receive (413), file cleaned up', async (t) => {
+  const dbPath = tmpDbPath()
+  const s = await startTestServer({ dbPath, mediaUserQuotaBytes: 6000 })
+  t.after(() => s.close())
+  const token = await loginToken(s, 'dan', 'pw')
+  const mediaDir = path.join(path.dirname(dbPath), 'media')
+
+  const first = await fetch(s.base + '/media', {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, body: crypto.randomBytes(4000),
+  })
+  assert.equal(first.status, 200, 'a within-quota upload should succeed')
+
+  // usedBytes (4000) is below quota so the body streams, but 4000 + 4000 > 6000,
+  // so it's rejected once the size is known — and the just-written file deleted.
+  const over = await fetch(s.base + '/media', {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, body: crypto.randomBytes(4000),
+  })
+  assert.equal(over.status, 413)
+  assert.deepEqual(await over.json(), { error: 'quota_exceeded' })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 1, 'over-quota upload was persisted')
+  assert.equal(listMediaFiles(mediaDir).length, 1, 'over-quota upload left a stray file on disk')
+})
+
+test('POST /media quota: once a user is at quota, further uploads are rejected up front (before the body streams)', async (t) => {
+  const dbPath = tmpDbPath()
+  const s = await startTestServer({ dbPath, mediaUserQuotaBytes: 8000 })
+  t.after(() => s.close())
+  const token = await loginToken(s, 'dan', 'pw')
+  const mediaDir = path.join(path.dirname(dbPath), 'media')
+
+  // Fill exactly to quota (0 + 8000 <= 8000) so usedBytes reaches the ceiling.
+  const fill = await fetch(s.base + '/media', {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, body: crypto.randomBytes(8000),
+  })
+  assert.equal(fill.status, 200)
+
+  // usedBytes (8000) >= quota (8000): rejected before receiveBlob runs, so no
+  // second file is ever written.
+  const blocked = await fetch(s.base + '/media', {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, body: crypto.randomBytes(16),
+  })
+  assert.equal(blocked.status, 413)
+  assert.deepEqual(await blocked.json(), { error: 'quota_exceeded' })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 1)
+  assert.equal(listMediaFiles(mediaDir).length, 1, 'a pre-rejected upload should never touch disk')
+
+  // Quota is per-user: a different user is unaffected by dan hitting his ceiling.
+  const patToken = await loginToken(s, 'pat', 'pw2')
+  const patUp = await fetch(s.base + '/media', {
+    method: 'POST', headers: { authorization: `Bearer ${patToken}` }, body: crypto.randomBytes(4000),
+  })
+  assert.equal(patUp.status, 200, 'quota must be scoped per user, not global')
+})
+
 test('POST /media with an empty body -> 400 empty, nothing persisted', async (t) => {
   const dbPath = tmpDbPath()
   const s = await startTestServer({ dbPath })

@@ -36,7 +36,8 @@ async function startTestRelay(t, opts = {}) {
   }
 }
 
-const OFFER = { server: 'https://j.example.com', code: '2345-6789' }
+const BOX = 'q4Jc0FZKpQ2example_opaque_base64url_box_value'
+const OFFER = { box: BOX }
 
 test('happy path: create → poll 204 → offer 204 → poll 200 (retryable) → second offer 409', async (t) => {
   const s = await startTestRelay(t)
@@ -52,14 +53,14 @@ test('happy path: create → poll 204 → offer 204 → poll 200 (retryable) →
 
   const got = await s.poll(c.json.rid, c.json.secret)
   assert.equal(got.status, 200)
-  assert.deepEqual(got.json, { server: 'https://j.example.com', code: '2345-6789' })
-  // dropped-response retry: still 200 with the same offer
+  assert.deepEqual(got.json, { box: BOX })
+  // dropped-response retry: still 200 with the same box
   assert.deepEqual((await s.poll(c.json.rid, c.json.secret)).json, got.json)
 
-  const second = await s.offer(c.json.rid, { server: 'https://evil.example.com', code: '9999-9999' })
+  const second = await s.offer(c.json.rid, { box: 'a-different-box' })
   assert.equal(second.status, 409)
   assert.deepEqual(second.json, { status: 409, reason: 'conflict' })
-  assert.equal((await s.poll(c.json.rid, c.json.secret)).json.server, 'https://j.example.com')
+  assert.equal((await s.poll(c.json.rid, c.json.secret)).json.box, BOX)
 })
 
 test('secret gating: wrong or missing secret → 403; the rid alone reads nothing back', async (t) => {
@@ -73,38 +74,25 @@ test('secret gating: wrong or missing secret → 403; the rid alone reads nothin
   assert.equal(missing.status, 403)
 })
 
-test('unknown and malformed rids: offer/poll 404; the code is normalized before storage', async (t) => {
+test('unknown and malformed rids: offer/poll 404', async (t) => {
   const s = await startTestRelay(t)
   assert.equal((await s.offer('Z'.repeat(26), OFFER)).status, 404)
   assert.equal((await s.poll('Z'.repeat(26), 'f'.repeat(64))).status, 404)
   // wrong-shape rid never matches the route
   assert.equal((await s.offer('short', OFFER)).status, 404)
   assert.equal((await s.poll('short', 'f'.repeat(64))).status, 404)
-
-  const c = await s.create()
-  // lowercase + odd separators normalize to the canonical dashed form
-  assert.equal((await s.offer(c.json.rid, { server: 'https://j.example.com', code: '2345 6789' })).status, 204)
-  assert.equal((await s.poll(c.json.rid, c.json.secret)).json.code, '2345-6789')
 })
 
 test('offer validation 400s with machine reasons that never echo values', async (t) => {
-  // This test spends 12 rendezvous creates on the same IP (10 bad cases +
-  // 2 more below) to exercise offer validation, not creation limiting —
-  // that's covered separately by the per-IP-limit test. The default
-  // rendezvousLimiter's per-IP burst (10) is deliberately tiny for
-  // production, so it would otherwise starve this test's own creates.
+  // Spends several creates on the same IP to exercise offer validation, not
+  // creation limiting — raise the per-IP burst so it doesn't starve.
   const s = await startTestRelay(t, { rendezvousLimiter: makeRendezvousLimiter({ burst: 20 }) })
   const bad = [
-    [{ ...OFFER, extra: 'x' }, 'unknown_field'],
-    [{ server: OFFER.server }, 'missing_field'],
-    [{ code: OFFER.code }, 'missing_field'],
-    [{ server: 'http://j.example.com', code: OFFER.code }, 'bad_server'], // http to a non-local host
-    [{ server: 'not a url', code: OFFER.code }, 'bad_server'],
-    [{ server: 7, code: OFFER.code }, 'bad_server'],
-    [{ server: `https://j.example.com/${'x'.repeat(200)}`, code: OFFER.code }, 'bad_server'],
-    [{ server: OFFER.server, code: '2345-678' }, 'bad_code'],   // 7 chars
-    [{ server: OFFER.server, code: '2345-678A' }, 'bad_code'],  // A not in alphabet
-    [{ server: OFFER.server, code: 7 }, 'bad_code'],
+    [{ box: BOX, extra: 'x' }, 'unknown_field'],
+    [{}, 'missing_field'],
+    [{ box: '' }, 'bad_box'],
+    [{ box: 7 }, 'bad_box'],
+    [{ box: 'x'.repeat(1025) }, 'bad_box'], // over the 1024 cap
   ]
   for (const [body, reason] of bad) {
     const c = await s.create()
@@ -112,14 +100,14 @@ test('offer validation 400s with machine reasons that never echo values', async 
     assert.equal(r.status, 400, JSON.stringify(body))
     assert.deepEqual(r.json, { status: 400, reason })
   }
-  // dev carve-out: http to localhost is a valid server (mirrors the apps)
-  const c = await s.create()
-  assert.equal((await s.offer(c.json.rid, { server: 'http://localhost:9810', code: OFFER.code })).status, 204)
+  // a box exactly at the 1024 cap is accepted
+  const cap = await s.create()
+  assert.equal((await s.offer(cap.json.rid, { box: 'x'.repeat(1024) })).status, 204)
   // bad JSON / non-object / oversized bodies
   const c2 = await s.create()
   assert.equal((await s.offer(c2.json.rid, null, { raw: 'not json' })).status, 400)
   assert.equal((await s.offer(c2.json.rid, null, { raw: '[1]' })).status, 400)
-  assert.equal((await s.offer(c2.json.rid, null, { raw: JSON.stringify({ ...OFFER, server: 'x'.repeat(2000) }) })).status, 413)
+  assert.equal((await s.offer(c2.json.rid, null, { raw: JSON.stringify({ box: 'x'.repeat(2000) }) })).status, 413)
 })
 
 test('create validation: a non-empty body is rejected, an empty one accepted', async (t) => {

@@ -15,8 +15,15 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
+import { backfillSearchIndex } from './search.js'
+import { makeRpcBroker } from './rpc-broker.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+// Per-user total blob budget (all uploads + retention-offloaded payloads for a
+// user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
+// a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the
+// busiest user's current footprint on dev-2 — generous headroom, not a squeeze.
+export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
@@ -190,11 +197,33 @@ export function resolveApnsClient(injected) {
   return { client: undefined, owned: false }
 }
 
+// The per-IP rate limiter and the pairing "who's asking" IP both trust the
+// `cf-connecting-ip` header (see http.js). That is only sound because the sole
+// route to this process is the cloudflared tunnel to a LOOPBACK bind —
+// Cloudflare overwrites the header, so it can't be spoofed. If the process is
+// ever bound to a non-loopback address, that header becomes attacker-supplied
+// and both defenses are defeated. Warn loudly at boot rather than silently
+// weakening them. Not a hard refuse — a deliberate reverse-proxy setup that
+// sets cf-connecting-ip itself is legitimate — but it must be a conscious choice.
+function warnIfBindTrustsSpoofableIp(bind) {
+  const loopback = bind === '127.0.0.1' || bind === '::1' || bind === 'localhost'
+  if (!loopback) {
+    console.warn(
+      `SECURITY: MATRON_BIND=${JSON.stringify(bind)} is not loopback. The cf-connecting-ip ` +
+      'header is only trustworthy when the sole ingress is the cloudflared tunnel; on a ' +
+      'directly-reachable bind a client can spoof it, defeating the per-IP rate limiter and ' +
+      'the pairing requester-IP display. Ensure a trusted proxy sets cf-connecting-ip and the ' +
+      'port is firewalled off from untrusted networks.'
+    )
+  }
+}
+
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
 } = {}) {
+  warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
   // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
@@ -213,7 +242,7 @@ export function startServer({
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
   const resolvedPairs = pairs || makePairStore()
-  const resolvedLinks = links || makeLinkStore()
+  const resolvedLinks = links || makeLinkStore({ db })
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   // Finding 1 hardening (Bugbot, PR #29): /link/preapprove's loopback +
   // no-forwarding-header guard alone is defeated by a headerless reverse
@@ -225,8 +254,10 @@ export function startServer({
   // (or its default, derived from resolvedDbPath).
   const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
+  const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
+  const broker = makeRpcBroker()
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -237,36 +268,55 @@ export function startServer({
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
+    // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
+    pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
+    ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
+    // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
+    // undercut a configured start timeout (attachWs derives the TTL).
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Fire-and-forget: search serves partial results until this finishes
+      // (self-healing — spec). shouldStop lets close() end the walk cleanly
+      // instead of racing a closed DB handle.
+      const searchBackfill = backfillSearchIndex(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('search backfill failed', err) })
       resolve({
         port: server.address().port,
         db,
         server,
         hub,
+        broker,
         toolStreams,
         pushPipeline,
         preapproveKey: resolvedPreapproveKey,
+        searchBackfill,
         close: () => new Promise((r) => {
+          closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
           if (ownsApnsClient) resolvedApnsClient.close()
-          server.close(() => { db.close(); r() })
+          server.close(() => { searchBackfill.then(() => { db.close(); r() }) })
         }),
       })
     })

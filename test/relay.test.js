@@ -48,7 +48,7 @@ test('category → fixed-string payload table, with mutable-content on every ale
 
   const [attention, done, activity, wake] = stub.calls
   assert.deepEqual(attention.payload.aps.alert, { title: 'Matron', body: 'Your agent needs you' })
-  assert.deepEqual(done.payload.aps.alert, { title: 'Matron', body: 'Session finished' })
+  assert.deepEqual(done.payload.aps.alert, { title: 'Matron', body: 'Your agent finished its turn' })
   assert.deepEqual(activity.payload.aps.alert, { title: 'Matron', body: 'New activity from your agent' })
   for (const call of [attention, done, activity]) {
     assert.equal(call.payload.aps['mutable-content'], 1)

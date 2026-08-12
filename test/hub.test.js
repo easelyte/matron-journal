@@ -101,3 +101,38 @@ test('sendRpcResponse multicasts to every live socket of the device, skipping cl
   assert.equal(closed.sent.length, 0)
   assert.equal(otherDevice.sent.length, 0)
 })
+
+test('broadcastJournal with a target set delivers to clients and only the named agents', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (kind, deviceId) => ({ userId: 1, kind, deviceId, ws: { readyState: 1, send: (d) => sent.push([deviceId, JSON.parse(d)]) } })
+  const client = conn('client', 10)
+  const agentA = conn('agent', 1)
+  const agentB = conn('agent', 2)
+  const agentC = conn('agent', 3)
+  for (const c of [client, agentA, agentB, agentC]) hub.register(c)
+  hub.broadcastJournal(1, { kind: 'journal', seq: 1 }, new Set([1, 3]))
+  const got = sent.map(([id]) => id).sort((a, b) => a - b)
+  assert.deepEqual(got, [1, 3, 10])
+})
+
+test('broadcastJournal with null targets keeps legacy broadcast to every agent', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (kind, deviceId) => ({ userId: 1, kind, deviceId, ws: { readyState: 1, send: (d) => sent.push(deviceId) } })
+  for (const c of [conn('client', 10), conn('agent', 1), conn('agent', 2)]) hub.register(c)
+  hub.broadcastJournal(1, { kind: 'journal', seq: 1 }, null)
+  assert.deepEqual(sent.sort((a, b) => a - b), [1, 2, 10])
+})
+
+test('sendToDevice multicasts to every live socket of exactly that device', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (deviceId, ready = 1) => ({ userId: 1, kind: 'agent', deviceId, ws: { readyState: ready, send: (d) => sent.push(deviceId) } })
+  hub.register(conn(1))
+  hub.register(conn(1))
+  hub.register(conn(2))
+  hub.register(conn(1, 3)) // closed socket — skipped
+  hub.sendToDevice(1, 1, { kind: 'invite' })
+  assert.deepEqual(sent, [1, 1])
+})

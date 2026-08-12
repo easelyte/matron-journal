@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { makeLinkStore } from '../src/link.js'
@@ -324,4 +327,51 @@ test('preapprove guard: missing or wrong x-preapprove-key is rejected even from 
     method: 'POST', body: { username: 'dan' }, headers: { 'x-preapprove-key': s.preapproveKey },
   })
   assert.equal(ok.status, 200)
+})
+
+test('preapprove: ttl_seconds is honoured, and the code survives a server restart', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-pre-restart-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'j.db')
+
+  const s1 = await startTestServer({ dbPath })
+  await createUser(s1.db, 'dan', 'hunter22')
+  const pre = await s1.http('/link/preapprove', {
+    method: 'POST', body: { username: 'dan', ttl_seconds: 86400 }, headers: { 'x-preapprove-key': s1.preapproveKey },
+  })
+  assert.equal(pre.status, 200)
+  assert.equal(pre.json.expires_in, 86400)
+  await s1.close()
+
+  const s2 = await startTestServer({ dbPath })
+  t.after(() => s2.close())
+  const claim = await s2.http('/link/claim', {
+    method: 'POST', body: { link_code: pre.json.link_code, device_name: 'Handed-off Phone' },
+  })
+  assert.equal(claim.status, 200)
+  const poll = await s2.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })
+  assert.equal(poll.json.status, 'approved')
+  assert.equal(poll.json.username, 'dan')
+
+  // single-use across the wire too
+  const again = await s2.http('/link/claim', {
+    method: 'POST', body: { link_code: pre.json.link_code, device_name: 'Replay' },
+  })
+  assert.equal(again.status, 404)
+})
+
+test('preapprove: invalid ttl_seconds is a 400, valid boundaries pass', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const keyHeaders = { 'x-preapprove-key': s.preapproveKey }
+  for (const ttl_seconds of ['abc', 99999, 59, 0, -5, 3.5]) {
+    const r = await s.http('/link/preapprove', { method: 'POST', body: { username: 'dan', ttl_seconds }, headers: keyHeaders })
+    assert.equal(r.status, 400, `ttl_seconds=${JSON.stringify(ttl_seconds)}`)
+  }
+  for (const [ttl_seconds, expected] of [[60, 60], [86400, 86400], [undefined, 600]]) {
+    const r = await s.http('/link/preapprove', { method: 'POST', body: { username: 'dan', ttl_seconds }, headers: keyHeaders })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.expires_in, expected)
+  }
 })

@@ -9,7 +9,7 @@
   "steps": [
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": {
       "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "x" }, "idem_key": "fin:sneaky"
@@ -21,7 +21,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "text", "payload": { "body": "done" }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "done" }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
@@ -30,7 +30,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m2", "payload": { "body": "another" } } },
     { "kind": "ws_expect", "conn": "agent", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "text", "payload": { "body": "another" }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "another" }
     } }
   ]
 }
