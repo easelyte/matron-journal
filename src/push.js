@@ -23,7 +23,7 @@ const ROUTINE_COALESCE_MS = 10000
 // stored in the event payload or broadcast on the wire, so the protocol
 // surface is unchanged. Absent (e.g. a call site that doesn't pass one) is
 // treated as "not running" — fails closed for this rule specifically.
-function classify(type, payload, sender, prevState) {
+export function classify(type, payload, sender, prevState) {
   // A user's own words/actions (sender `user:*`) must never trigger an
   // alert push, to ANY of that user's devices — not just the originating
   // one (that's origin-device exclusion, a separate, narrower rule below).
