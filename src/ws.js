@@ -94,6 +94,7 @@ const SPAWN_WORKDIR_MAX_CHARS = 1024
 // sanitising; the cap is tighter than a topic's because these are rendered
 // as identity on one line, not as body copy.
 const CARD_TITLE_MAX_CHARS = 120
+const PEER_IDEM_KEY_MAX_CHARS = 128
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
 // the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
@@ -1512,6 +1513,51 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             },
           })
         }
+        break
+      }
+      case 'peer_message': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.target_convo !== 'string' || !msg.target_convo
+          || typeof msg.from_convo !== 'string' || !msg.from_convo
+          || msg.target_convo === msg.from_convo) {
+          return fail('bad_request')
+        }
+        if (typeof msg.idem_key !== 'string' || !msg.idem_key
+          || msg.idem_key.length > PEER_IDEM_KEY_MAX_CHARS) {
+          return fail('bad_request')
+        }
+        const body = sanitizePeerText(msg.body)
+        if (!body) return fail('bad_request')
+
+        // Attribution comes only from the conversation row. Requiring both
+        // account and managing-device ownership prevents one same-account
+        // agent from borrowing another session's title or kind.
+        const fromConvo = db.prepare(
+          'SELECT owner_user_id, agent_device_id, title, agent_kind FROM conversations WHERE id=?'
+        ).get(msg.from_convo)
+        if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+          || fromConvo.agent_device_id !== conn.deviceId) {
+          return fail('forbidden')
+        }
+
+        const targetConvo = db.prepare(
+          'SELECT owner_user_id FROM conversations WHERE id=?'
+        ).get(msg.target_convo)
+        if (!targetConvo) return fail('bad_request', 'bad target_convo')
+        if (targetConvo.owner_user_id !== conn.userId) {
+          return fail('forbidden', 'cross-user peer messaging not enabled yet')
+        }
+
+        appendAndFan({
+          userId: conn.userId, convoId: msg.target_convo,
+          sender: `agent:${conn.name}`, type: 'peer_message',
+          payload: {
+            from_convo: msg.from_convo,
+            from_name: sanitizePeerText(fromConvo.title, PEER_NAME_CAP),
+            from_kind: fromConvo.agent_kind,
+            body,
+          },
+        })
         break
       }
       case 'publish': {
