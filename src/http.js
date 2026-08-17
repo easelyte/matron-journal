@@ -345,7 +345,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
         ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
         const conversations = db.prepare(
-          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    ORDER BY e.seq DESC LIMIT 1) AS last_ts
            FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
