@@ -22,7 +22,7 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
 const AGENT_PUBLISH_TYPES = new Set([
-  'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
+  'text', 'peer_message', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
 ])
 
