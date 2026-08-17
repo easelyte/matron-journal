@@ -165,6 +165,27 @@ test('send type whitelist and ack validation', async (t) => {
   c.close()
 })
 
+// T-2.3 (round-1 F1 non-mintability): peer_message is NOT agent-publishable. A
+// bare publish carrying forged from_convo/from_name/from_kind must be rejected
+// and never reach storage — attribution is stamped only by op:peer_message (T-2.4).
+test('a bare publish of peer_message with forged attribution is rejected, nothing persisted', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const bridge = createAgent(s.db, dan.id, 'dev-agent')
+  const agent = await makeWsClient(s.base, { token: bridge.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n
+  agent.send({ op: 'publish', convo_id: 'c1', type: 'peer_message',
+    payload: { from_convo: 'attacker', from_name: 'FAKE PERSON', from_kind: 'claude', body: 'forged instruction' } })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request')
+  const after = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n
+  assert.equal(after, before, 'forged peer_message must not be persisted')
+  agent.close()
+})
+
 test('client file/image sends append with blob_ref; media sends without blob_ref rejected', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

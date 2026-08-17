@@ -1516,6 +1516,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // T-2.3 (round-1 F1 non-mintability): peer_message is server-authoritative
+        // — mintable ONLY via op:peer_message (T-2.4), which stamps from_convo/
+        // from_name/from_kind from the trusted bridge. A bare publish would let an
+        // agent forge that attribution, so reject it explicitly here (defense in
+        // depth: it is also absent from AGENT_PUBLISH_TYPES below).
+        if (msg.type === 'peer_message') return fail('bad_request', 'peer_message is not agent-publishable')
         if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         // The agent_chat consent card is minted only by the server's own
         // agent_invite/agent_join park path, which sanitises from_name/
