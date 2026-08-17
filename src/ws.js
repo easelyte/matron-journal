@@ -781,10 +781,32 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!Number.isInteger(msg.target_seq)) return fail('bad_request')
         // Read-only sub-chat guard (see isReadOnlyChild above).
         if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
+        const replyPayload = { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null }
+        // #538: stamp queued_release provenance onto the reply, resolved from
+        // the stored target prompt's own kind. A tap on a queued_release card
+        // is a control action, not a chat message, so clients suppress its raw
+        // "send"/"cancel:N" echo. Clients can only derive that from the card
+        // being in their loaded page; when it has paginated out of view the
+        // echo leaks into the thread until the card scrolls back in (#538).
+        // This makes the marker authoritative and page-independent. Keyed on
+        // the target prompt's kind, NEVER the reply's value shape — so a
+        // genuine answer that merely reads like a control token is never
+        // suppressed (the #493b regression that value-shape matching caused).
+        // Scoped to conn.userId: append() stores every convo event under the
+        // owner's user_id, so this resolves the same prompt append() will
+        // authorize the reply against, and can't read another user's rows.
+        const targetPrompt = db.prepare(
+          'SELECT type, payload FROM events WHERE user_id=? AND convo_id=? AND seq=?'
+        ).get(conn.userId, msg.convo_id, msg.target_seq)
+        if (targetPrompt && targetPrompt.type === 'prompt') {
+          let targetKind
+          try { targetKind = JSON.parse(targetPrompt.payload)?.kind } catch { targetKind = undefined }
+          if (targetKind === 'queued_release') replyPayload.kind = 'queued_release'
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type: 'prompt_reply',
-          payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
+          payload: replyPayload,
         })
         break
       }
