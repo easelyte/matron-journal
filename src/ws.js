@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
+import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -1548,7 +1549,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           return fail('forbidden', 'cross-user peer messaging not enabled yet')
         }
 
-        appendAndFan({
+        const appendArgs = {
           userId: conn.userId, convoId: msg.target_convo,
           sender: `agent:${conn.name}`, type: 'peer_message',
           payload: {
@@ -1557,8 +1558,18 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             from_kind: fromConvo.agent_kind,
             body,
           },
+        }
+        const result = appendAgentIdempotent(db, {
+          key: `agent:${conn.deviceId}:${msg.idem_key}`,
+          appendArgs,
         })
-        break
+        if (!result.duplicate) {
+          fanOut(journalFrame({
+            seq: result.seq, convo_id: appendArgs.convoId, ts: result.ts,
+            sender: appendArgs.sender, type: appendArgs.type, payload: appendArgs.payload,
+          }))
+        }
+        return result
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
