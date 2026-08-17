@@ -21,13 +21,13 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" } }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" } }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
@@ -42,7 +42,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" } }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null }
     } }
   ]
 }

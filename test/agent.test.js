@@ -211,6 +211,67 @@ test('convo_upsert accepts session_outcome: session_status payload and snapshot 
   agent.close(); client.close()
 })
 
+test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it; mutable and sticky', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+
+  // A codex-backed top-level conversation, created with a title -> convo_meta carries the kind.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', title: 'review run', session_state: 'running', agent_kind: 'codex' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'convo_meta')
+  assert.equal(meta.payload.agent_kind, 'codex')
+  assert.equal(s.db.prepare("SELECT agent_kind FROM conversations WHERE id='codex-1'").get().agent_kind, 'codex')
+
+  // Sticky: a later upsert that omits the kind must not clear it.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', title: 'renamed run' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'convo_meta' && f.payload.title === 'renamed run')
+  assert.equal(s.db.prepare("SELECT agent_kind FROM conversations WHERE id='codex-1'").get().agent_kind, 'codex')
+
+  // Mutable (unlike parent_convo_id): a claude<->codex switch re-emits a different kind and it wins.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', title: 'now claude', agent_kind: 'claude' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'convo_meta' && f.payload.agent_kind === 'claude')
+  assert.equal(s.db.prepare("SELECT agent_kind FROM conversations WHERE id='codex-1'").get().agent_kind, 'claude')
+
+  // A plain conversation reads null, so clients tell "no kind" from any value.
+  agent.send({ op: 'convo_upsert', convo_id: 'plain-1', title: 'normal', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'plain-1' && f.type === 'convo_meta')
+
+  const snap = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(snap.json.conversations.find((c) => c.id === 'codex-1').agent_kind, 'claude')
+  assert.equal(snap.json.conversations.find((c) => c.id === 'plain-1').agent_kind, null)
+
+  agent.close(); client.close()
+})
+
+test('convo_upsert rejects a malformed agent_kind with bad_request, connection survives', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  for (const bad of [42, '', 'x'.repeat(17), {}, []]) {
+    agent.send({ op: 'convo_upsert', convo_id: `bad-${Math.random()}`, agent_kind: bad })
+    await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'convo_upsert')
+  }
+  assert.equal(agent.ws.readyState, 1)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM conversations').get().n, 0)
+
+  // A valid null/omitted kind still works (normal convo).
+  agent.send({ op: 'convo_upsert', convo_id: 'ok-1', agent_kind: null })
+  agent.send({ op: 'convo_upsert', convo_id: 'ok-1', session_state: 'running' })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  assert.equal(s.db.prepare("SELECT agent_kind FROM conversations WHERE id='ok-1'").get().agent_kind, null)
+  agent.close()
+})
+
 test('convo_upsert stores an unenumerated session_outcome verbatim so a newer bridge is not rejected', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

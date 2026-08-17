@@ -29,7 +29,7 @@
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": { "seq": { "$ref": "prompt_seq" }, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2" }], "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": { "$ref": "prompt_seq" },
-          "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "summary": "", "agent_device_id": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+          "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "summary": "", "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
@@ -69,7 +69,7 @@
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": { "seq": 7, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2" }], "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": 7,
-          "unread_count": 0, "snippet": "done", "parent_convo_id": null, "summary": "", "agent_device_id": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+          "unread_count": 0, "snippet": "done", "parent_convo_id": null, "summary": "", "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }
   ]
 }
