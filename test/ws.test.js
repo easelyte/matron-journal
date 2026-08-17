@@ -296,6 +296,47 @@ test('prompt_reply requires an integer target_seq (the ref it answers)', async (
   c.close()
 })
 
+test('prompt_reply to a queued_release card is stamped kind=queued_release; other targets are not (#538)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  // Seed the two prompts the reply can target: a queued_release card and an
+  // ordinary prompt whose option value merely reads like a control token.
+  const release = append(s.db, {
+    userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt',
+    payload: { kind: 'queued_release', question: '3 queued', options: [{ id: 'send', value: 'send' }, { id: 'cancel', value: 'cancel:3' }] },
+  })
+  const ordinary = append(s.db, {
+    userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt',
+    payload: { question: 'which?', options: [{ id: 'a', value: 'send' }] },
+  })
+  const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: l.json.token, cursor: 0 })
+  await c.waitFor((f) => f.op === 'hello_ok')
+
+  // Tap on the queued_release card → the persisted reply carries the marker,
+  // so clients suppress the raw echo without needing the card in their page.
+  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: release.seq, choice: 'send' })
+  const tap = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply')
+  assert.equal(tap.payload.kind, 'queued_release')
+  // Broadcast frame must match the persisted row byte-for-byte.
+  assert.equal(JSON.parse(s.db.prepare('SELECT payload FROM events WHERE seq=?').get(tap.seq).payload).kind, 'queued_release')
+
+  // A genuine answer to an ordinary prompt whose value shape looks like a
+  // control token is NOT stamped — provenance is the target prompt's kind,
+  // never the reply's value shape (guards against the #493b regression).
+  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: ordinary.seq, choice: 'send' })
+  const answer = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > tap.seq)
+  assert.equal(answer.payload.kind, undefined)
+
+  // A reply targeting a non-existent seq still appends, unmarked.
+  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: 9999, choice: 'send' })
+  const orphan = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > answer.seq)
+  assert.equal(orphan.payload.kind, undefined)
+  c.close()
+})
+
 test('read_marker requires up_to_seq to be null or a non-negative integer', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
