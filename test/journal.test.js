@@ -226,6 +226,18 @@ test('snippetOf shows a captioned attachment as what the user said, not [image]'
   assert.equal(snippetOf('image', { caption: 'x'.repeat(200) }).length, 120)
 })
 
+// T-2.2: a peer_message snippet renders the sanitized BODY (💬-prefixed), never
+// the literal [peer_message] placeholder — the operator sees the coordination
+// line in the convo list.
+test('snippetOf renders a peer_message as its sanitized body, never [peer_message]', () => {
+  assert.equal(snippetOf('peer_message', { body: 'ship the invoice fix' }), '💬 ship the invoice fix')
+  assert.notEqual(snippetOf('peer_message', { body: 'x' }), '[peer_message]')
+  // newline/control flattened by sanitizePeerText before prefixing
+  assert.equal(snippetOf('peer_message', { body: 'a\nb' }), '💬 a b')
+  // capped like every other snippet
+  assert.ok(snippetOf('peer_message', { body: 'y'.repeat(300) }).length <= 120)
+})
+
 test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
   for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
     assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)
