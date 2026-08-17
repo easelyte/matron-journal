@@ -21,8 +21,14 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
+// peer_message is DELIBERATELY NOT here (T-2.2/T-2.3): its attribution is
+// server-authoritative (bridge-stamped from_convo/from_name/from_kind), so it is
+// mintable ONLY via the dedicated agent-gated op:peer_message (T-2.4), never a
+// bare publish. Adding it here would let an agent forge attribution — an R501
+// non-mintability violation. It IS in journal.js MESSAGE_TYPES (snippet/last_seq
+// only), which is a distinct storage/snippet concern, not a publish gate.
 const AGENT_PUBLISH_TYPES = new Set([
-  'text', 'peer_message', 'prompt', 'prompt_reply', 'tool_output', 'diff',
+  'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
 ])
 
