@@ -6,6 +6,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs } from '../src/db.js'
 import { createUser } from '../src/auth.js'
+import { upsertConversation } from '../src/journal.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')
@@ -146,6 +147,47 @@ test('openDb adds session_outcome to a pre-existing conversations table in place
   // Re-opening (already migrated) is a no-op, not an error.
   assert.doesNotThrow(() => openDb(dbPath).close())
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('openDb adds agent_kind to legacy conversations and codex upserts round-trip', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-agent-kind-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('legacy',1,'pre-stamp',0)"
+  ).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  try {
+    const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.ok(cols.includes('agent_kind'), 'agent_kind column missing after migration')
+
+    const legacy = db.prepare("SELECT agent_kind FROM conversations WHERE id='legacy'").get()
+    assert.equal(legacy.agent_kind, null)
+    assert.ok(['claude', 'codex', null].includes(legacy.agent_kind))
+
+    upsertConversation(db, { id: 'codex', ownerUserId: 1, title: 'review', agentKind: 'codex' })
+    const codex = db.prepare("SELECT agent_kind FROM conversations WHERE id='codex'").get()
+    assert.equal(codex.agent_kind, 'codex')
+    assert.ok(['claude', 'codex', null].includes(codex.agent_kind))
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // WAL mitigation, openDb half (docs/wal-checkpoint-profile.md): the WAL file
