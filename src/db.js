@@ -240,6 +240,25 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'session_outcome')) {
     db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
   }
+  // Which KIND of agent backs this conversation — e.g. 'claude' or 'codex' —
+  // recorded by convo_upsert (spec: codex forwarder icon). Distinct from
+  // agent_device_id: one agent device (a bridge) hosts BOTH claude and codex
+  // sessions and stamps the same agent_device_id on every conversation it owns,
+  // so the owning device cannot distinguish the backend — the kind is a
+  // per-conversation fact. NULL for every normal conversation and every row
+  // predating this column, which clients render as "no agent-kind marker".
+  //
+  // Deliberately NOT a CHECK constraint, mirroring session_outcome: the
+  // vocabulary is the writing bridge's, not the journal's. A bridge that grows
+  // a third backend must not start failing writes against an older server.
+  // Shape is validated at the ws boundary (non-empty bounded string) and
+  // clients render an unrecognised value as no marker, so an unknown kind
+  // degrades instead of breaking. Mutable last-write-wins (COALESCE) like
+  // session_outcome — a conversation can switch backend (a claude<->codex
+  // agent switch) and an upsert that omits it leaves the recorded kind alone.
+  if (!convoCols.some((c) => c.name === 'agent_kind')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN agent_kind TEXT')
+  }
   // Rolling 2-3 sentence conversation summary, maintained by the owning
   // bridge's title pass (spec: agent chat phase 2) — roster targeting
   // metadata. Same don't-clobber discipline as title: only an upsert that

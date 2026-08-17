@@ -66,6 +66,11 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // (today 'completed' | 'interrupted' | 'failed'), and the journal deliberately
 // does not enumerate it — see the session_outcome column comment in db.js.
 const SESSION_OUTCOME_MAX_CHARS = 32
+// Cap for an agent_kind sent by a bridge. Shape-only, same discipline as
+// session_outcome: the backend vocabulary belongs to the writing bridge (today
+// 'claude' | 'codex') and the journal does not enumerate it — see the
+// agent_kind column comment in db.js.
+const AGENT_KIND_MAX_CHARS = 16
 
 // Invite lifecycle (spec: agent chat phase 2). Topic is a title fragment;
 // justification/reason are one-paragraph human text — capped so a row/frame
@@ -1374,6 +1379,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         )) {
           return fail('bad_request', 'bad session_outcome')
         }
+        // agent_kind is optional and shape-only, like session_outcome — an
+        // omitted kind leaves any previously recorded one untouched (COALESCE in
+        // upsertConversation).
+        if (msg.agent_kind != null && (
+          typeof msg.agent_kind !== 'string'
+          || msg.agent_kind.length === 0
+          || msg.agent_kind.length > AGENT_KIND_MAX_CHARS
+        )) {
+          return fail('bad_request', 'bad agent_kind')
+        }
         if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
           return fail('bad_request', 'bad summary')
         }
@@ -1421,6 +1436,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           parentConvoId: msg.parent_convo_id ?? null,
           sessionOutcome: msg.session_outcome ?? null,
           summary: msg.summary ?? null,
+          agentKind: msg.agent_kind ?? null,
         })
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE
@@ -1459,6 +1475,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               title: convo.title,
               parent_convo_id: convo.parent_convo_id ?? null,
               agent_device_id: conn.deviceId,
+              // agent_kind rides the meta event so a live client marks a new
+              // codex/claude conversation the moment it appears, without waiting
+              // for the next /snapshot. Read back from the stored row (like
+              // session_outcome on session_status) so it agrees with the
+              // snapshot; omitted-null when the bridge sent no kind.
+              agent_kind: convo.agent_kind ?? null,
             },
           })
         }
