@@ -26,6 +26,14 @@ function peerAppendArgs(body = 'coordinate') {
   }
 }
 
+function structuredLogCapture() {
+  const entries = []
+  return {
+    entries,
+    log: (line) => entries.push(JSON.parse(line)),
+  }
+}
+
 test('agent idem dedupes inside 120s without populating permanent events.idem_key', () => {
   const db = openDb(':memory:')
   seed(db)
@@ -67,8 +75,12 @@ test('op:peer_message namespaces the key and returns the original seq without a 
     op: 'peer_message', target_convo: 'target', from_convo: 'from',
     idem_key: 'same-content-hash', body: 'coordinate once',
   }
-  const first = await handleOp({ db, hub, conn, msg })
-  const duplicate = await handleOp({ db, hub, conn, msg })
+  let first
+  let duplicate
+  const capture = structuredLogCapture()
+  first = await handleOp({ db, hub, conn, msg, log: capture.log })
+  duplicate = await handleOp({ db, hub, conn, msg, log: capture.log })
+  const logs = capture.entries
 
   assert.deepEqual(duplicate, { seq: first.seq, duplicate: true })
   assert.equal(frames.length, 1)
@@ -79,6 +91,76 @@ test('op:peer_message namespaces the key and returns the original seq without a 
     db.prepare('SELECT key, seq FROM agent_idem').get(),
     { key: 'agent:7:same-content-hash', seq: first.seq },
   )
+  assert.deepEqual(logs.map(({ ts, ...entry }) => entry), [
+    {
+      type: 'peer_message_decision', decision: 'accept', reason: null,
+      correlation_id: 'agent:7:same-content-hash', convo_id: 'target', seq: first.seq,
+    },
+    {
+      type: 'peer_message_decision', decision: 'reject', reason: 'duplicate',
+      correlation_id: 'agent:7:same-content-hash', convo_id: 'target', seq: first.seq,
+    },
+  ])
+  assert.equal(logs.every(({ ts }) => !Number.isNaN(Date.parse(ts))), true)
+  assert.equal(JSON.stringify(logs).includes(msg.body), false, 'info logs must not contain the body')
+  db.close()
+})
+
+test('op:peer_message logs pre-append rejection reasons with correlation ids and no seq', async () => {
+  const db = openDb(':memory:')
+  seed(db)
+  upsertConversation(db, {
+    id: 'from', ownerUserId: 1, agentDeviceId: 7,
+    title: 'Sender Session', agentKind: 'codex',
+  })
+
+  const frames = []
+  const conn = {
+    kind: 'agent', userId: 1, deviceId: 7, name: 'dev-a',
+    ws: { send: (frame) => frames.push(JSON.parse(frame)) },
+  }
+  const body = 'BODY-MUST-NOT-APPEAR-IN-INFO-LOGS'
+  const rejected = [
+    {
+      msg: {
+        op: 'peer_message', target_convo: 'from', from_convo: 'from',
+        idem_key: 'bad-request-hash', body,
+      },
+      reason: 'bad_request', correlation_id: 'agent:7:bad-request-hash', convo_id: 'from',
+    },
+    {
+      msg: {
+        op: 'peer_message', target_convo: 'target', from_convo: 'not-owned',
+        idem_key: 'forbidden-hash', body,
+      },
+      reason: 'forbidden', correlation_id: 'agent:7:forbidden-hash', convo_id: 'target',
+    },
+    {
+      msg: {
+        op: 'peer_message', target_convo: 'missing', from_convo: 'from',
+        idem_key: 'not-found-hash', body,
+      },
+      reason: 'not_found', correlation_id: 'agent:7:not-found-hash', convo_id: 'missing',
+    },
+  ]
+
+  const capture = structuredLogCapture()
+  for (const { msg } of rejected) {
+    await handleOp({ db, hub: {}, conn, msg, log: capture.log })
+  }
+  const logs = capture.entries
+
+  assert.deepEqual(
+    logs.map(({ ts, ...entry }) => entry),
+    rejected.map(({ reason, correlation_id, convo_id }) => ({
+      type: 'peer_message_decision', decision: 'reject', reason, correlation_id, convo_id,
+    })),
+  )
+  assert.equal(logs.every(({ ts }) => !Number.isNaN(Date.parse(ts))), true)
+  assert.equal(logs.every((entry) => !Object.hasOwn(entry, 'seq')), true)
+  assert.equal(JSON.stringify(logs).includes(body), false, 'info logs must not contain the body')
+  assert.deepEqual(frames.map(({ code }) => code), rejected.map(({ reason }) => reason))
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, 0)
   db.close()
 })
 

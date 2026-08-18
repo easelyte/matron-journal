@@ -96,6 +96,26 @@ const SPAWN_WORKDIR_MAX_CHARS = 1024
 // as identity on one line, not as body copy.
 const CARD_TITLE_MAX_CHARS = 120
 const PEER_IDEM_KEY_MAX_CHARS = 128
+
+function logPeerMessageDecision(log, {
+  decision, reason = null, correlationId, convoId, seq,
+}) {
+  const entry = {
+    type: 'peer_message_decision',
+    ts: new Date().toISOString(),
+    decision,
+    reason,
+    correlation_id: correlationId,
+    convo_id: convoId,
+  }
+  if (seq != null) entry.seq = seq
+  try {
+    log(JSON.stringify(entry))
+  } catch (err) {
+    // Observability must not turn a committed append into a protocol failure.
+    console.error('peer_message decision log failed', err)
+  }
+}
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
 // the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
@@ -623,7 +643,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1517,18 +1537,29 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         break
       }
       case 'peer_message': {
-        if (conn.kind !== 'agent') return fail('forbidden')
+        const validIdemKey = typeof msg.idem_key === 'string' && msg.idem_key
+          && msg.idem_key.length <= PEER_IDEM_KEY_MAX_CHARS
+        const correlationId = Number.isInteger(conn.deviceId) && validIdemKey
+          ? `agent:${conn.deviceId}:${msg.idem_key}` : null
+        const convoId = typeof msg.target_convo === 'string' && msg.target_convo
+          && msg.target_convo.length <= CONVO_ID_MAX_CHARS
+          ? msg.target_convo : null
+        const reject = (reason, detail, seq) => {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason, correlationId, convoId, seq,
+          })
+          return fail(reason, detail)
+        }
+
+        if (conn.kind !== 'agent') return reject('forbidden')
         if (typeof msg.target_convo !== 'string' || !msg.target_convo
           || typeof msg.from_convo !== 'string' || !msg.from_convo
           || msg.target_convo === msg.from_convo) {
-          return fail('bad_request')
+          return reject('bad_request')
         }
-        if (typeof msg.idem_key !== 'string' || !msg.idem_key
-          || msg.idem_key.length > PEER_IDEM_KEY_MAX_CHARS) {
-          return fail('bad_request')
-        }
+        if (!validIdemKey) return reject('bad_request')
         const body = sanitizePeerText(msg.body)
-        if (!body) return fail('bad_request')
+        if (!body) return reject('bad_request')
 
         // Attribution comes only from the conversation row. Requiring both
         // account and managing-device ownership prevents one same-account
@@ -1538,7 +1569,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         ).get(msg.from_convo)
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId) {
-          return fail('forbidden')
+          return reject('forbidden')
         }
 
         // A peer message is targeted at a live agent-owned conversation.
@@ -1553,9 +1584,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                           AND d.kind='agent'
            WHERE c.id=?
         `).get(msg.target_convo)
-        if (!targetConvo) return fail('not_found')
+        if (!targetConvo) return reject('not_found')
         if (targetConvo.owner_user_id !== conn.userId) {
-          return fail('forbidden', 'cross-user peer messaging not enabled yet')
+          return reject('forbidden', 'cross-user peer messaging not enabled yet')
         }
         // Same private-owner visibility rule as read_marker/loadRoom. A
         // private caller or an ordinary caller with known standing in the
@@ -1564,7 +1595,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (isPrivateDevice(db, targetConvo.agent_device_id)
           && !isPrivateDevice(db, conn.deviceId)
           && !isKnownParticipant(db, msg.target_convo, conn.deviceId)) {
-          return fail('not_found')
+          return reject('not_found')
         }
 
         const appendArgs = {
@@ -1579,15 +1610,23 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const result = appendAgentIdempotent(db, {
           deviceId: conn.deviceId,
-          key: `agent:${conn.deviceId}:${msg.idem_key}`,
+          key: correlationId,
           appendArgs,
         })
-        if (!result.duplicate) {
-          fanOut(journalFrame({
-            seq: result.seq, convo_id: appendArgs.convoId, ts: result.ts,
-            sender: appendArgs.sender, type: appendArgs.type, payload: appendArgs.payload,
-          }))
+        if (result.duplicate) {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason: 'duplicate', correlationId, convoId,
+            seq: result.seq,
+          })
+          return result
         }
+        logPeerMessageDecision(log, {
+          decision: 'accept', correlationId, convoId, seq: result.seq,
+        })
+        fanOut(journalFrame({
+          seq: result.seq, convo_id: appendArgs.convoId, ts: result.ts,
+          sender: appendArgs.sender, type: appendArgs.type, payload: appendArgs.payload,
+        }))
         return result
       }
       case 'publish': {
