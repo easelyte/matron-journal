@@ -5,7 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import {
   createSpawnRequest, getSpawn, denySpawn, claimApprove,
   markStarted, markFailed, expireSpawns, expireApproved, countPendingAsks, approveSpawn,
-  sanitizeSpawnActivity, sanitizeSpawnLimits,
+  sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk,
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation, messagesBefore } from '../src/journal.js'
@@ -227,4 +227,24 @@ test('sanitizeSpawnLimits flattens control characters in resets_at like every ot
     lines: [{ id: 'session', label: 'Session', percent: 5, resets_at: '2026-08-11T01\n:00:00.000Z' }],
   })
   assert.ok(!out.lines[0].resets_at.includes('\n'))
+})
+
+test('sanitizeSpawnDisk accepts sane byte counts, free == total included', () => {
+  assert.deepEqual(sanitizeSpawnDisk({ free_bytes: 1024, total_bytes: 4096 }), { free_bytes: 1024, total_bytes: 4096 })
+  assert.deepEqual(sanitizeSpawnDisk({ free_bytes: 4096, total_bytes: 4096 }), { free_bytes: 4096, total_bytes: 4096 })
+  assert.deepEqual(sanitizeSpawnDisk({ free_bytes: 0, total_bytes: 4096 }), { free_bytes: 0, total_bytes: 4096 })
+  // Extra fields do not survive — the return is rebuilt, not passed through.
+  assert.deepEqual(sanitizeSpawnDisk({ free_bytes: 1, total_bytes: 2, mount: '/etc\npasswd' }), { free_bytes: 1, total_bytes: 2 })
+})
+
+test('sanitizeSpawnDisk rejects malformed blocks whole', () => {
+  assert.equal(sanitizeSpawnDisk(null), null)
+  assert.equal(sanitizeSpawnDisk('41G free'), null)
+  assert.equal(sanitizeSpawnDisk([]), null)
+  assert.equal(sanitizeSpawnDisk({ free_bytes: -1, total_bytes: 4096 }), null)
+  assert.equal(sanitizeSpawnDisk({ free_bytes: 1, total_bytes: 0 }), null)
+  assert.equal(sanitizeSpawnDisk({ free_bytes: 9, total_bytes: 4 }), null)             // free > total
+  assert.equal(sanitizeSpawnDisk({ free_bytes: 1.5, total_bytes: 4096 }), null)        // fractional bytes
+  assert.equal(sanitizeSpawnDisk({ free_bytes: '1024', total_bytes: 4096 }), null)     // stringly numbers
+  assert.equal(sanitizeSpawnDisk({ free_bytes: 2 ** 60, total_bytes: 2 ** 61 }), null) // isInteger-true, isSafeInteger-false
 })

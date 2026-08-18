@@ -117,12 +117,16 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
 CREATE INDEX IF NOT EXISTS idx_spawn_state ON agent_spawn_requests(state, from_device_id);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
--- DELETE anywhere, and retention only rewrites tool_output payloads, which
--- indexableBody never indexes — so no update/delete trigger can ever be
--- needed. If a delete/update path is ever added to \`events\`, this schema
--- must be revisited (external-content FTS corrupts when content rows change
--- without the matching fts delete — matron-apple #106). Never INSERT OR
--- REPLACE into search_messages for the same reason.
+-- DELETE anywhere, and the only paths that rewrite an event's payload are
+-- retention's tool_output offload/expire passes and the media reaper's
+-- file/image tombstones (runReapMedia) — all three touch only types that
+-- indexableBody never indexes (it reads text/prompt/prompt_reply bodies) —
+-- so no update/delete trigger can ever be needed. If a delete/update path
+-- for an INDEXED type is ever added to \`events\`, or indexableBody grows to
+-- read file/image captions or tool_output, this schema must be revisited
+-- (external-content FTS corrupts when content rows change without the
+-- matching fts delete — matron-apple #106). Never INSERT OR REPLACE into
+-- search_messages for the same reason.
 CREATE TABLE IF NOT EXISTS search_messages(
   rowid     INTEGER PRIMARY KEY,
   user_id   INTEGER NOT NULL,
@@ -322,6 +326,11 @@ export function openDb(path) {
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
+  // Media reaper (runReapMedia) probes events by blob_ref three ways
+  // (candidate join, tool_output guard, tombstone refs) — without this,
+  // each is a full events scan, synchronous, inside the listen callback.
+  // Partial: most events carry no blob_ref.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_events_blob_ref ON events(blob_ref) WHERE blob_ref IS NOT NULL')
   // SQLite cannot ALTER a CHECK constraint, so convo_agents needs a rebuild to
   // add consent states (awaiting_user, denied) and new columns (topic, delivered_at).
   // delivered_at = created_at is correct for pre-consent flow (rows were delivered

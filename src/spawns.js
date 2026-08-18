@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined } from './participants.js'
+import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
@@ -53,10 +53,38 @@ export function markFailed(db, id, now = Date.now()) {
   ).run(now, id).changes > 0
 }
 
+// Durable outcome + ephemeral frame, in that order — the settlement
+// reporter every terminal transition routes through. The append is
+// best-effort: from_convo_id may point at a conversation deleted since the
+// ask was parked (append() throws on a missing/foreign conversation), and
+// telling the parent is the one thing this tail cannot skip — so a failed
+// append is logged and the frame still goes out. Exactly-once emission
+// stays the CALLER's job (the state-scoped UPDATEs): by the time this
+// runs, the caller has already won the transition. Agent-visible on
+// purpose (not in isClientOnlyEvent): the parent owns from_convo_id, so
+// replay hands it the outcome durably — the fix for the at-most-once
+// delivery gap protocol.md used to document.
+export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode }) {
+  const extras = {
+    ...(roomId ? { room_id: roomId } : {}),
+    ...(childConvoId ? { child_convo_id: childConvoId } : {}),
+    ...(errorCode ? { error_code: errorCode } : {}),
+  }
+  try {
+    appendAndBroadcast(db, hub, {
+      userId, convoId: fromConvoId, sender: 'journal', type: 'spawn_outcome',
+      payload: { request_id: requestId, outcome, ...extras },
+    })
+  } catch (err) {
+    console.error('emitSpawnOutcome: durable outcome append failed', err)
+  }
+  hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
+}
+
 // Sweep-driven 24h TTL, mirroring participants.expireAwaiting: flip stale
 // parked rows and report them so the sweep can tell each parent its ask
-// timed out. RETURNING keeps flip-and-report atomic. user_id/from_device_id
-// ride along so the caller needs no per-row lookups.
+// timed out. RETURNING keeps flip-and-report atomic. user_id/from_device_id/
+// from_convo_id ride along so the caller needs no per-row lookups.
 export function expireSpawns(db, ttlMs, now = Date.now()) {
   return db.prepare(
     "UPDATE agent_spawn_requests SET state='expired', answered_at=?, resolved_at=? WHERE state='awaiting_user' AND created_at<=? RETURNING id, user_id, from_device_id, from_convo_id"
@@ -76,9 +104,11 @@ export function expireSpawns(db, ttlMs, now = Date.now()) {
 // legitimately in flight. State-scoped like expireSpawns above: RETURNING
 // keeps flip-and-report atomic, and the WHERE state='approved' guarantees a
 // row a live orchestration just resolved (started/failed) is never touched.
+// user_id/from_device_id/room_id/from_convo_id ride along so the caller
+// needs no per-row lookups.
 export function expireApproved(db, ttlMs, now = Date.now()) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id"
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id, from_convo_id"
   ).all(now, now - ttlMs)
 }
 
@@ -139,10 +169,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
     // msg.error.code) — peer-authored, not journal-composed — so it goes
     // through the same sanitizePeerText sieve as fromName below. Used for
-    // BOTH the room epitaph and the outcome frame: the frame lands on the
-    // parent bridge and, later, consent-card clients, so a raw code with
-    // embedded newlines must never cross the wire either. Same 'unknown'
-    // fallback for a missing code.
+    // the room epitaph, the ephemeral outcome frame, AND the durable
+    // spawn_outcome payload emitSpawnOutcome journals below: the frame
+    // lands on the parent bridge and, later, consent-card clients, and the
+    // durable event replays to both, so a raw code with embedded newlines
+    // must never cross any of those wires. Same 'unknown' fallback for a
+    // missing code.
     const safeCode = sanitizePeerText(code, 64) || 'unknown'
     try {
       appendAndBroadcast(db, hub, {
@@ -152,13 +184,14 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     } catch (err) {
       console.error('approveSpawn: epitaph write failed (room likely never created)', err)
     }
-    hub.sendToDevice(row.user_id, row.from_device_id, {
-      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: safeCode,
-    })
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode })
     return 'failed'
   }
   try {
-    const title = row.topic || row.task.slice(0, 80)
+    // Same title convention as bridge-minted agent-chat rooms (🔗 marker +
+    // 2-char room short): a spawn room is a multi-agent room too, and the
+    // chat list should say so the same way.
+    const title = `🔗 [${roomId.slice(0, 2)}] ${row.topic || row.task.slice(0, 80)}`
     // The parent owns the room (conversations.agent_device_id), the target is
     // its joined participant — the same shape an accepted chat invite leaves.
     upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
@@ -166,7 +199,18 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // Live clients learn the room exists now, not at their next /snapshot —
     // the same two frames convo_upsert fans for a fresh conversation.
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
-    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    // participants rides the same meta so the spawn room chips both boxes
+    // (parent owner + spawned target) the moment it appears (spec:
+    // multi-agent room tags). Best-effort: the row's title and membership
+    // are already committed (upsertConversation/recordJoined above) and
+    // /snapshot serves both, so a failed live fan must log and let the
+    // spawn proceed — not trip the outer catch into reporting a failed
+    // outcome for a room that exists with joined membership.
+    try {
+      appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+    } catch (err) {
+      console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
+    }
     // Persist the room linkage NOW, before the `start` RPC — the row is
     // still 'approved', so a restart in the RPC gap leaves the sweep
     // (expireApproved) a room_id to report and write the epitaph into.
@@ -189,8 +233,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
     // reply is a bad reply, same 'bad_start_reply' the missing-field case
-    // already gets below.
-    if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS) {
+    // already gets below. Sanitisation is a REJECT, not a rewrite: this id
+    // now persists into the durable spawn_outcome payload and replays to
+    // card-rendering clients, so control characters make it a bad reply —
+    // but an id must never be silently mutated into a different id.
+    if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS
+      && sanitizePeerText(r.result.convo_id, CONVO_ID_MAX_CHARS) === r.result.convo_id) {
       // Exactly-once guard, mirroring fail()'s: markStarted is state-scoped
       // (WHERE state='approved'), so a false means something else — in
       // practice only the orphan sweep — already resolved this row and told
@@ -201,10 +249,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
-      hub.sendToDevice(row.user_id, row.from_device_id, {
-        kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
-        room_id: roomId, child_convo_id: r.result.convo_id,
-      })
+      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id })
       return 'started'
     }
     return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))
@@ -250,6 +295,19 @@ export function sanitizeSpawnActivity(raw) {
 // matron-bridge lib/agent-boxes-format.js's formatBox) — reject it here
 // instead of letting every reader guard against it separately.
 const AS_OF_MAX_MS = 8640000000000000
+
+// Disk block: two byte counts, no peer strings. isSafeInteger, not
+// isInteger — 2^60 passes isInteger (it is a representable float with no
+// fraction) and would then survive into arithmetic downstream renderers do
+// on it. free may equal total (fresh empty volume) but never exceed it, and
+// a zero-total filesystem is nonsense, not data.
+export function sanitizeSpawnDisk(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!Number.isSafeInteger(raw.free_bytes) || raw.free_bytes < 0) return null
+  if (!Number.isSafeInteger(raw.total_bytes) || raw.total_bytes <= 0) return null
+  if (raw.free_bytes > raw.total_bytes) return null
+  return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
+}
 
 export function sanitizeSpawnLimits(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null

@@ -14,9 +14,10 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
+import { makeWaker } from './wake.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -95,6 +96,47 @@ function resolveToolLogTtlHours(override) {
   return n
 }
 
+export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
+export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
+
+// High/low-water marks for the quota-pressure attachment reaper
+// (runReapMedia), as integer percentages of the per-user media quota.
+// Overrides (startServer's `mediaReapHighPct`/`mediaReapLowPct` opts) beat
+// the env vars per-knob, mirroring the other retention resolvers. Fail
+// closed means DISABLED here — this pass deletes user data, so an
+// unparseable value, 0, a percentage over 100, or an inverted pair
+// (low >= high would make the reap loop's stop condition unreachable on
+// entry) must all turn the reaper off with one warn line, never run it
+// with surprise thresholds. Returns { highPct, lowPct } or null.
+export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
+  const resolveOne = (override, envName, optName, defaultValue) => {
+    const fromEnv = override === undefined
+    const raw = fromEnv ? process.env[envName] : override
+    if (raw === undefined) return defaultValue
+    const name = fromEnv ? envName : optName
+    const n = Number(raw)
+    if (!Number.isInteger(n) || n < 0 || n > 100) {
+      console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — media reaper disabled`)
+      return null
+    }
+    if (n === 0) {
+      // JSON.stringify(raw), not `0`: Number('') is 0, so an empty env
+      // assignment lands here too and "=0" would misdirect the diagnosis.
+      console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — media reaper disabled`)
+      return null
+    }
+    return n
+  }
+  const highPct = resolveOne(mediaReapHighPct, 'MATRON_MEDIA_REAP_HIGH_PCT', 'mediaReapHighPct', DEFAULT_MEDIA_REAP_HIGH_PCT)
+  const lowPct = resolveOne(mediaReapLowPct, 'MATRON_MEDIA_REAP_LOW_PCT', 'mediaReapLowPct', DEFAULT_MEDIA_REAP_LOW_PCT)
+  if (highPct === null || lowPct === null) return null
+  if (lowPct >= highPct) {
+    console.warn(`retention: media reap low-water ${lowPct}% >= high-water ${highPct}% — media reaper disabled`)
+    return null
+  }
+  return { highPct, lowPct }
+}
+
 // Runs at boot (called after `server.listen` succeeds) and every 6h
 // thereafter (unref'd — never keeps the process alive on its own). Runs the
 // live-log TTL pass BEFORE the offload pass (opposite of declaration order
@@ -107,12 +149,16 @@ function resolveToolLogTtlHours(override) {
 // disabled on its own (see resolveRetentionDays / resolveToolLogTtlHours)
 // without affecting the other — each with its own try/catch so one pass
 // failing (e.g. a disk error) never prevents the other from running on this
-// tick or being scheduled for the next. Returns the interval handle (for
-// close()) or null only when BOTH passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours }) {
+// tick or being scheduled for the next. The quota-pressure media reaper runs
+// LAST: the offload pass just before it converts inline payloads into new
+// blobs, so reaping after offload sees the user's honest post-offload
+// footprint instead of triggering one tick late. Returns the interval handle
+// (for close()) or null only when ALL passes are disabled.
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
-  if (days === null && ttlHours === null) return null
+  const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
+  if (days === null && ttlHours === null && reapPcts === null) return null
   const run = () => {
     if (ttlHours !== null) {
       try {
@@ -128,6 +174,14 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
         if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
       } catch (err) {
         console.error('retention: offload run failed', err)
+      }
+    }
+    if (reapPcts !== null) {
+      try {
+        const r = runReapMedia(db, { quotaBytes: mediaUserQuotaBytes, highPct: reapPcts.highPct, lowPct: reapPcts.lowPct })
+        if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
+      } catch (err) {
+        console.error('retention: media reap run failed', err)
       }
     }
   }
@@ -222,6 +276,7 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  mediaReapHighPct, mediaReapLowPct, waker,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -258,6 +313,9 @@ export function startServer({
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const broker = makeRpcBroker()
+  // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
+  // MATRON_WAKE_CMD is set (or a waker is injected by tests).
+  const resolvedWaker = waker || makeWaker()
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -282,14 +340,17 @@ export function startServer({
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
-    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs,
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, waker: resolvedWaker,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
-      retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours })
+      retentionInterval = scheduleRetention(db, {
+        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours,
+        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+      })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       // Fire-and-forget: search serves partial results until this finishes
       // (self-healing — spec). shouldStop lets close() end the walk cleanly

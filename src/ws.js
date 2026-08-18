@@ -4,10 +4,10 @@ import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
-import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -254,7 +254,7 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, waker = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment).
@@ -342,9 +342,7 @@ export function attachWs({
       // The cap (countPendingAsks) is what stops a re-ask loop, not
       // ambiguity. Rows carry their own user/device ids — no lookups.
       for (const row of expireSpawns(db, AWAITING_USER_TTL_MS)) {
-        hub.sendToDevice(row.user_id, row.from_device_id, {
-          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'expired',
-        })
+        emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'expired' })
       }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never
@@ -370,9 +368,7 @@ export function attachWs({
             console.error('orphan sweep: epitaph write failed', err)
           }
         }
-        hub.sendToDevice(row.user_id, row.from_device_id, {
-          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: 'orphaned',
-        })
+        emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: 'orphaned' })
       }
       const conns = hub.allConns()
       if (conns.length === 0) return
@@ -587,7 +583,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -643,7 +639,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, log = console.log }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, waker = null, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -744,6 +740,46 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
     return !!row && row.parent_convo_id != null
   }
+  // Wake-on-message (src/wake.js): when traffic targets an agent device with
+  // no live socket, ask the infra layer to start its (possibly idle-stopped)
+  // box. Purely additive: every op keeps its existing answer — the journal
+  // already persists what matters (send/prompt_reply) or refuses cleanly
+  // (agent_unreachable), and the bridge catches up from its cursor once the
+  // box is back. Same-user scoping mirrors the anti-enumeration stance of
+  // the call sites: a foreign device id never reaches the waker.
+  const wakeIfOffline = (agentDeviceId) => {
+    if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
+    const online = hub.connsOf(conn.userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
+    if (online) return
+    const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, conn.userId)
+    if (!dev || dev.kind !== 'agent') return
+    waker.wake(dev.name)
+  }
+  // The send/prompt_reply variant: those ops name a conversation, not a
+  // device, so resolve the managing agent first (null for legacy rows and
+  // client-broadcast convos — nothing to wake).
+  const wakeConvoAgent = (convoId) => {
+    if (!waker || !waker.enabled) return
+    const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
+    if (row && row.agent_device_id != null) wakeIfOffline(row.agent_device_id)
+  }
+  // Membership convo_meta fan (spec: multi-agent room tags): live clients
+  // re-chip a room the moment its membership changes. Best-effort like every
+  // other post-commit notification in the invite lifecycle — by the time
+  // this runs the membership flip is already committed, so a failing
+  // append/broadcast must log and move on, not surface as {code:'internal'}
+  // (the caller would retry an op that already happened) or strand the peer
+  // notifications that follow it.
+  const fanParticipants = (roomId) => {
+    try {
+      appendAndBroadcast(db, hub, {
+        userId: conn.userId, convoId: roomId, sender: 'journal',
+        type: 'convo_meta', payload: { participants: participantIds(db, roomId) },
+      })
+    } catch (err) {
+      console.error('participants meta fan failed (the membership change itself already committed)', err)
+    }
+  }
   try {
     switch (msg.op) {
       case 'viewing': {
@@ -802,6 +838,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: msg.blob_ref ?? null,
           idemKey: msg.local_id ? `client:${conn.deviceId}:${msg.local_id}` : null,
         })
+        // After the append (which authorizes the convo): a message for a
+        // stopped box should also start that box.
+        wakeConvoAgent(msg.convo_id)
         break
       }
       case 'prompt_reply': {
@@ -836,6 +875,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sender: `user:${conn.username}`, type: 'prompt_reply',
           payload: replyPayload,
         })
+        wakeConvoAgent(msg.convo_id)
         break
       }
       case 'agent_request': {
@@ -876,7 +916,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           kind: 'rpc',
           request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
         })
-        if (!delivered) return failRpc('agent_unreachable')
+        if (!delivered) {
+          // Still refused — no RPC queueing — but the box starts booting, so
+          // the caller's retry lands on a live bridge.
+          wakeIfOffline(msg.agent_device_id)
+          return failRpc('agent_unreachable')
+        }
         break
       }
       case 'agent_response': {
@@ -955,7 +1000,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // spend the user's tap on something that cannot work. Same liveness
         // rule as hub.sendRpcRequest without sending anything.
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
-        if (!online) return fail('agent_unreachable')
+        if (!online) {
+          // Same shape as agent_request above: refuse now, boot the box so
+          // the parent's retry can succeed.
+          wakeIfOffline(msg.target_device_id)
+          return fail('agent_unreachable')
+        }
         const workdir = sanitizePeerText(msg.workdir, SPAWN_WORKDIR_MAX_CHARS)
         if (!workdir) return fail('bad_request', 'bad workdir')
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
@@ -1047,6 +1097,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             let folders = []
             let activity = null
             let limits = null
+            let disk = null
             if (online) {
               const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
               if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
@@ -1055,6 +1106,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 // all-or-nothing; a bridge that predates them just lists folders.
                 activity = sanitizeSpawnActivity(r.result?.activity)
                 limits = sanitizeSpawnLimits(r.result?.limits)
+                disk = sanitizeSpawnDisk(r.result?.disk)
               }
             }
             // Sanitised like every other client-bound device name (roster,
@@ -1064,6 +1116,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
+              ...(disk ? { disk } : {}),
             }
           }))
           conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
@@ -1282,6 +1335,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!answerInvite(db, { convoId: msg.room_id, agentDeviceId: rowDeviceId, accept: msg.accept })) {
           return fail('conflict', 'no pending invite')
         }
+        // Membership grew. Refusals change nothing and fan nothing.
+        if (msg.accept) fanParticipants(msg.room_id)
         hub.sendToDevice(conn.userId, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: msg.room_id,
           peer_device_id: rowDeviceId, accept: msg.accept, from_device_id: conn.deviceId,
@@ -1320,6 +1375,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // takes this branch and stays idempotent.
         if (room.agent_device_id === conn.deviceId && hasParticipants(db, msg.room_id)) {
           const { joined, pending } = leaveAllParticipants(db, msg.room_id)
+          // Membership shrank to the owner alone. Only when someone was
+          // actually joined: a repeat dissolve of an already-empty room must
+          // stay a no-op on the event stream, not append a duplicate meta.
+          if (joined.length > 0) fanParticipants(msg.room_id)
           // Everyone who was actually in the room hears the owner leave.
           for (const deviceId of joined) {
             notify(deviceId, {
@@ -1353,6 +1412,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
           return fail('conflict', 'not a joined participant')
         }
+        // Same re-chip as the dissolve branch above, one departure at a time.
+        fanParticipants(msg.room_id)
         // A participant left: tell the room's recorded owner, if there is
         // one. (No need to exclude the caller — a caller that IS the owner
         // has no convo_agents row to have been 'joined' in, so leaveConvo

@@ -4,8 +4,14 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
 export const MESSAGE_TYPES = [
-  'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
+  'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
 ]
+
+// SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
+// roster in http.js). Safe to inline — the list is a compile-time constant
+// of bare identifiers, and a placeholder spread inside a correlated
+// subquery would force every caller to append the same seven arguments.
+export const MESSAGE_TYPES_SQL = MESSAGE_TYPES.map((t) => `'${t}'`).join(',')
 
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
@@ -51,6 +57,14 @@ export function snippetOf(type, payload) {
   // rule because a caption is the user's own words about this specific
   // attachment — the most specific description available.
   if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
+  if (type === 'spawn_outcome') {
+    // Object.hasOwn, not `m[p.outcome]`: p.outcome is agent-authored (the
+    // bridge's `start` reply flows into it via the error path), so a value
+    // like 'constructor' or 'toString' must not resolve to an inherited
+    // Object.prototype value instead of falling through to the placeholder.
+    const m = { started: '🚀 Spawned session started', declined: '🚫 Spawn declined', expired: '⌛ Spawn request expired', failed: '❌ Spawn failed' }
+    return Object.hasOwn(m, p.outcome) ? m[p.outcome] : '[spawn_outcome]'
+  }
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   // Matches the relay's fixed 'done'-category alert (see relay.js
@@ -224,17 +238,24 @@ export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
 //     agent_device_id is NULL (never private-owned). Only for the "ordinary
 //     agent" caller; clients and private agents pass this false.
 export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false } = {}) {
-  // last_ts: timestamp of the conversation's newest event, so a client can
-  // show a correct "last activity" time from a snapshot alone. Without it,
-  // a client refreshing via /snapshot after missing frames advanced the
-  // snippet but kept a stale timestamp. NULL when a conversation has no
-  // events (just created, or history pruned by retention) — clients fall
-  // back to created_at. The (convo_id, seq) index makes the subquery a seek.
+  // last_ts: timestamp of the conversation's newest MESSAGE event, so a
+  // client can show a correct "last activity" time from a snapshot alone.
+  // Without it, a client refreshing via /snapshot after missing frames
+  // advanced the snippet but kept a stale timestamp. Message types only:
+  // session_status (the reaper winding a session down), convo_meta (renames,
+  // membership fans) and read_marker rows also land in `events` with fresh
+  // timestamps, and counting them resurfaced hour-old chats as "8m ago"
+  // after every snapshot refresh — the exact phantom-aliveness bug the
+  // clients' live path already filters against. NULL when a conversation
+  // has no message events (just created, or history pruned by retention) —
+  // clients fall back to created_at. The (convo_id, seq) index keeps the
+  // subquery a backwards seek to the first message row.
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
             parent_convo_id, summary, created_at, agent_device_id, agent_kind,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+             AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=?${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
@@ -242,6 +263,33 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
        : ''}
      ORDER BY last_seq DESC`
   ).all(userId)
+  // Room membership, so a client can chip every participating box, not just
+  // the recorded owner (spec: multi-agent room tags). One grouped query for
+  // all of this user's joined convo_agents rows, attached per-convo as
+  // `participants` (owner + joined, deduped, sorted). Convos with no joined
+  // row — solo sessions, dissolved rooms — omit the key entirely, so the
+  // wire stays byte-identical for everything that is not a live room. Same
+  // private-device sieve as the `agents` list below: a filtered caller must
+  // not learn a private box's id from a membership array.
+  const joinedRows = db.prepare(
+    `SELECT ca.convo_id, ca.agent_device_id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=? AND ca.state='joined'${excludePrivateOwned
+       ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=ca.agent_device_id AND d.private=1)`
+       : ''}`
+  ).all(userId)
+  const joinedByConvo = new Map()
+  for (const r of joinedRows) {
+    if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
+    joinedByConvo.get(r.convo_id).push(r.agent_device_id)
+  }
+  for (const c of conversations) {
+    const joined = joinedByConvo.get(c.id)
+    if (!joined) continue
+    const ids = new Set(joined)
+    if (c.agent_device_id != null) ids.add(c.agent_device_id)
+    c.participants = [...ids].sort((a, b) => a - b)
+  }
   // id -> name for the user's agent boxes, so a client can render the
   // owning box of each conversation without a second round-trip. Same
   // privacy predicate as the conversation filter above: a filtered

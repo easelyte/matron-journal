@@ -242,6 +242,18 @@ export function joinedAgentIds(db, convoId) {
   ).all(convoId).map((r) => r.agent_device_id)
 }
 
+// The room's current membership as clients render it: recorded owner plus
+// every joined participant, deduped and sorted. This is the `participants`
+// array snapshot rows and membership convo_meta frames carry (spec:
+// multi-agent room tags) — one box chip per id. Empty when the convo has
+// no owner and no joined rows, which callers treat as "not a room".
+export function participantIds(db, convoId) {
+  const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
+  const ids = new Set(joinedAgentIds(db, convoId))
+  if (owner != null) ids.add(owner)
+  return [...ids].sort((a, b) => a - b)
+}
+
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
     'SELECT state, initiator_device_id, justification, topic, target_convo_id, created_at, answered_at, delivered_at FROM convo_agents WHERE convo_id=? AND agent_device_id=?'

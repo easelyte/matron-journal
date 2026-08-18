@@ -29,9 +29,20 @@ test('indexableBody: tool_output is NEVER indexed — the privacy property', () 
 })
 
 test('indexableBody: every other type returns null', () => {
-  for (const type of ['prompt', 'file', 'image', 'permission_request', 'session_status', 'read_marker', 'convo_meta']) {
+  for (const type of ['prompt', 'file', 'image', 'permission_request', 'session_status', 'read_marker', 'convo_meta', 'spawn_outcome']) {
     assert.equal(indexableBody(type, { body: 'x', question: 'x', description: 'x' }), null, type)
   }
+})
+
+// spawn_outcome (spec: 2026-08-11 spawn outcome events) is a MESSAGE_TYPE
+// (sets the conversation snippet, bumps unread) but must never be
+// searchable — its payload carries no prose, only ids/enum/error codes, and
+// indexableBody's return-null-for-unknown-type default already covers it;
+// this pins that with the type's actual field shape rather than the shared
+// {body,question,description} probe above.
+test('indexableBody: spawn_outcome is never indexed regardless of payload shape', () => {
+  assert.equal(indexableBody('spawn_outcome', { request_id: 'q1', outcome: 'started', room_id: 'r1', child_convo_id: 'c1' }), null)
+  assert.equal(indexableBody('spawn_outcome', { request_id: 'q1', outcome: 'failed', error_code: 'timeout' }), null)
 })
 
 test('indexableBody: tolerates malformed payloads', () => {

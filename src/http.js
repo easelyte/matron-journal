@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
@@ -9,7 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
-import { getSpawn, denySpawn, claimApprove, approveSpawn } from './spawns.js'
+import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -347,6 +347,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+                   AND e.type IN (${MESSAGE_TYPES_SQL})
                    ORDER BY e.seq DESC LIMIT 1) AS last_ts
            FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
@@ -440,7 +441,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
           // Reported plainly (spec: no peer to hide behind) — 'declined',
           // never a fabricated box-side failure.
-          hub.sendToDevice(who.userId, row.from_device_id, { kind: 'spawn', event: 'outcome', request_id, outcome: 'declined' })
+          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined' })
           return json(res, 200, { ok: true })
         }
         // The tap CLAIMS the row; a zero row-count means another tap already

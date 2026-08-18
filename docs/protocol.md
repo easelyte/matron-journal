@@ -16,7 +16,14 @@ the machine-checkable version of this page.
   carries `parent_convo_id` (`null` for a normal conversation; set for a
   subagent child — see "Child conversations") and `agent_device_id` (the
   agent box that manages it; `null` for legacy rows created before ownership
-  was recorded). `agents` is `[{device_id, name}]` for the caller's
+  was recorded). A conversation with at least one **joined** `convo_agents`
+  row (an agent-chat room, see "Agent chat") additionally carries
+  `participants`: the recorded owner plus every joined participant's device
+  id, deduped and ascending — one box chip per id, client-side. The key is
+  omitted everywhere else (solo conversations, dissolved rooms, rooms whose
+  only joined participants were sieved out by the privacy predicate below),
+  so the wire is unchanged for everything that is not a live room.
+  `agents` is `[{device_id, name}]` for the caller's
   `kind='agent'` devices — the id→name table a client needs to render which
   box owns a conversation, so no second round-trip is required. It obeys the
   same privacy predicate as the conversation list: an ordinary (non-private)
@@ -95,6 +102,15 @@ the machine-checkable version of this page.
   `Content-Disposition: attachment` so an uploader-chosen content-type can never
   render as active content on the API origin. Owner-only; missing or not-owned
   are indistinguishable, both 404 `{error:'not_found'}`.
+  A blob may also disappear later via the quota-pressure reaper: once a user's
+  total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
+  quota, the retention scheduler deletes their oldest `file`/`image`
+  attachment blobs (never `tool_output` blobs, never orphan uploads) until the
+  footprint is back under `MATRON_MEDIA_REAP_LOW_PCT` (default 70%). Each
+  reaped event's payload is rewritten in place to a tombstone — the original
+  fields (`name`, `size`, `content_type`, `caption`) with `blob_ref: null` and
+  `expired: true` — so fresh syncs render an "expired" attachment; clients
+  that already hold the event learn from the 404 on `GET /media/:id`.
 - `POST /push/register` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
@@ -379,6 +395,15 @@ an agent token, selected by which query parameter is present:
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- Room membership changes append a server-authored `convo_meta` (sender
+  `journal`) whose payload is just `{participants}` — the same
+  owner-plus-joined array `/snapshot` carries — so live clients re-chip a
+  room the moment an invite is accepted, a spawn room appears (there it
+  rides the creation `convo_meta` alongside `title`), a participant leaves,
+  or the owner dissolves the room. Emitted only when membership actually
+  changed: refusals and repeat dissolves append nothing. Clients treat every
+  `convo_meta` key independently; a membership-only payload leaves
+  title/parent/owner untouched.
 - `device_meta` — `{kind:'device_meta', device_id, name}`, sent to a user's
   **client** sockets when `POST /devices/:id/rename` succeeds. Transient: not
   a journal event, carries no seq, and is never replayed. Recovery for a
@@ -1169,7 +1194,27 @@ All settlement notifications to the parent take the form `{kind:'spawn', event:'
 }
 ```
 
-The four outcomes flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, returned a bad start response, or — see "Stranded-`approved` recovery" below — orphaned by a restart or an internal error mid-orchestration). These outcomes are coarser than the six `agent_spawn_requests.state` values: `awaiting_user` and `approved` are transient parking states with no outcome frame of their own, folded into whichever of the four above the row eventually resolves to. **Emission is exactly-once; delivery is at-most-once.** Every parked request resolves to exactly one terminal state and exactly one outcome frame is ever *sent* for it — but the send is fire-and-forget to the parent's live sockets (like `/agent-chat/answer` frames), not journaled or replayed, so a parent offline at resolution time misses the frame entirely. The durable row itself (`agent_spawn_requests.state`) is the source of truth; durable outcome delivery (appending the outcome as a journal event into `from_convo_id`) is a recorded follow-up.
+**The durable `spawn_outcome` event.** (spec: `docs/superpowers/specs/2026-08-11-spawn-outcome-events-design.md`.) Every call site that sends the ephemeral frame above also appends — first, then sends the frame — a `spawn_outcome` journal event into the **parent conversation** (`from_convo_id`, the same conversation the consent card was published into), through one shared helper (`emitSpawnOutcome`, `src/spawns.js`). The payload mirrors the frame exactly, minus `kind`/`event`:
+
+```json
+{
+  "request_id": "the spawn row's id (same value the card carries)",
+  "outcome": "started | declined | expired | failed",
+  "room_id": "new room id (started only)",
+  "child_convo_id": "child session id (started only)",
+  "error_code": "sanitised failure code (failed only)"
+}
+```
+
+Sent with `sender: "journal"` — server-authored, no `sender_device_id`, the same convention as the failure epitaph written into the room on the failure paths. Correlation is by `payload.request_id`: the card carries the same id, and the card's `seq` is not otherwise discoverable by a client that missed the live frame.
+
+Unlike the card, `spawn_outcome` is **agent-visible** — deliberately *not* added to the client-only-event predicate. The parent agent owns `from_convo_id`, so it receives the event in live fan-out and hello replay exactly like any other event in a conversation it manages; the un-approved ask stays withheld (the card itself is still client-only, unchanged), but the *resolution* is precisely what the parent is entitled to know. If `from_convo_id` is itself a room with joined peer agents, those participants receive the event too — the ordinary fan-out rule for any event in a room they're joined to. That's information, not capability: a leaked `room_id`/`child_convo_id` grants nothing (transcript reads stay gated by write-authorisation, and foreign-context reads are filtered to indexable prose, which `spawn_outcome` never is). It is also, like the card, **unforgeable**: `spawn_outcome` is deliberately *not* added to `AGENT_PUBLISH_TYPES`, so a bare `publish` or `finalize` of the type is rejected `bad_request` before it ever reaches the append path — server-minted only.
+
+`spawn_outcome` joins `MESSAGE_TYPES`, so a resolution updates the parent conversation's snippet and bumps unread the same way the card itself did — the resolved state must retire the card's `🤝 Agent spawn request` snippet, or the chat-list row keeps advertising a settled ask forever. `snippetOf` maps each outcome: `started` → `🚀 Spawned session started`, `declined` → `🚫 Spawn declined`, `expired` → `⌛ Spawn request expired`, `failed` → `❌ Spawn failed`. No push notification follows — journal-authored events never enter the push pipeline (only agent-published events via the ws append path do) — which is correct: a started child generates its own activity, and answered outcomes were just acted on by the user looking at the screen. The event is not searchable either: its payload carries only ids/an enum/error codes, no prose, and `indexableBody` returns `null` for it like every other non-text/diff type.
+
+The append is **best-effort**: `from_convo_id` may point at a conversation deleted since the ask was parked, and `append()` throws on a missing/foreign conversation. `emitSpawnOutcome` catches that, logs it, and sends the ephemeral frame regardless — telling the parent (if reachable) is the one thing this tail must never skip, even when the durable half fails.
+
+The four outcomes flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, returned a bad start response, or — see "Stranded-`approved` recovery" below — orphaned by a restart or an internal error mid-orchestration). These outcomes are coarser than the six `agent_spawn_requests.state` values: `awaiting_user` and `approved` are transient parking states with no outcome frame of their own, folded into whichever of the four above the row eventually resolves to. **Frame delivery to live sockets is still at-most-once; the journaled event is now the durable record.** Every parked request resolves to exactly one terminal state, and both the outcome frame and the `spawn_outcome` event fire exactly once for it — but the frame itself remains fire-and-forget to the parent's live sockets (like `/agent-chat/answer` frames), so a parent offline at resolution time still misses *the frame*. It no longer misses the outcome (absent an append failure, above): the journaled event lands in `from_convo_id` regardless of whether anyone was listening, and a parent that was offline picks it up on its next hello replay, the same way it would any other event in a conversation it manages. The durable row (`agent_spawn_requests.state`) remains the ultimate source of truth; the journal event is what makes that truth reach the parent agent without depending on socket timing — the recorded follow-up this section used to promise, now implemented.
 
 **Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
 
@@ -1689,7 +1734,8 @@ and its `blobs` row are deleted and the payload is rewritten to the tombstone
 expired: true, blob_ref: null}` — the snippet is removed; what a command ran
 and whether it succeeded survive forever, what it printed does not. If the
 purged event is still the newest message-type event (text, tool_output,
-diff, prompt, permission_request, file, image) in its conversation, the
+diff, prompt, permission_request, file, image, spawn_outcome) in its
+conversation, the
 conversation-list preview is rewritten to `$ <command>`. Offload skips
 `expired` payloads. Manual run:
 `matron-admin expire-logs [--hours N]`.
