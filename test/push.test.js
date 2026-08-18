@@ -2,11 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
-import { makePushPipeline } from '../src/push.js'
+import { makePushPipeline, classify } from '../src/push.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
 import { startTestServer, makeWsClient } from './helpers.js'
+
+// T-2.6: peer_message is a routine coalesced activity push (priority 5), not an
+// attention alert and never silent — asserted explicitly, not via fallthrough.
+test('classify(peer_message) deep-equals a coalesced activity push', () => {
+  assert.deepEqual(classify('peer_message'), { priority: 5, coalesce: true, kind: 'activity' })
+})
 
 // A stub apnsClient recording every send() call. `respond` maps a call to a
 // {status, reason} result (default: 200 success); tests override it to

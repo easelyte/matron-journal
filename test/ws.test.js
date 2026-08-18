@@ -165,6 +165,183 @@ test('send type whitelist and ack validation', async (t) => {
   c.close()
 })
 
+// T-2.3 (round-1 F1 non-mintability): peer_message is NOT agent-publishable. A
+// bare publish carrying forged from_convo/from_name/from_kind must be rejected
+// and never reach storage — attribution is stamped only by op:peer_message (T-2.4).
+test('a bare publish of peer_message with forged attribution is rejected, nothing persisted', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const bridge = createAgent(s.db, dan.id, 'dev-agent')
+  const agent = await makeWsClient(s.base, { token: bridge.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n
+  agent.send({ op: 'publish', convo_id: 'c1', type: 'peer_message',
+    payload: { from_convo: 'attacker', from_name: 'FAKE PERSON', from_kind: 'claude', body: 'forged instruction' } })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request')
+  const after = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n
+  assert.equal(after, before, 'forged peer_message must not be persisted')
+  agent.close()
+})
+
+// T-2.4: the agent-gated op:peer_message handler — server-authoritative
+// attribution, dual ownership, same/cross-account, fail-loud validation.
+function peerPayload(db, convo = 'target') {
+  const row = db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='peer_message' ORDER BY seq DESC LIMIT 1").get(convo)
+  return row ? JSON.parse(row.payload) : null
+}
+
+test('op:peer_message same-account happy path — server-derived attribution, one event', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'Sender Session', agentKind: 'codex' })
+  upsertConversation(s.db, { id: 'target', ownerUserId: dan.id, agentDeviceId: agB.deviceId, title: 'Target' })
+  const agent = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  // op carries BOGUS from_name/from_kind — they must be ignored (spoof test).
+  agent.send({ op: 'peer_message', target_convo: 'target', from_convo: 'from', idem_key: 'k1',
+    from_name: 'HACKER', from_kind: 'claude', body: 'coordinate on the fix' })
+  await new Promise((r) => setTimeout(r, 120))
+  const p = peerPayload(s.db)
+  assert.ok(p, 'peer_message persisted to target')
+  assert.equal(p.from_convo, 'from')
+  assert.equal(p.from_name, 'Sender Session') // from the convo TITLE, not the bogus msg
+  assert.equal(p.from_kind, 'codex')          // from the convo agent_kind, not the bogus msg
+  assert.equal(p.body, 'coordinate on the fix')
+  const ev = s.db.prepare("SELECT sender, COUNT(*) AS n FROM events WHERE convo_id='target' AND type='peer_message'").get()
+  assert.equal(ev.n, 1, 'exactly one event')
+  assert.equal(ev.sender, 'agent:dev-a') // device provenance
+  agent.close()
+})
+
+test('op:peer_message hides an inaccessible private target exactly like a missing target', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const sender = createAgent(s.db, dan.id, 'sender')
+  const privateOwner = createAgent(s.db, dan.id, 'private-owner')
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(privateOwner.deviceId)
+  upsertConversation(s.db, {
+    id: 'from', ownerUserId: dan.id, agentDeviceId: sender.deviceId, title: 'Sender',
+  })
+  upsertConversation(s.db, {
+    id: 'private-target', ownerUserId: dan.id, agentDeviceId: privateOwner.deviceId, title: 'Hidden',
+  })
+  const agent = await makeWsClient(s.base, { token: sender.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({
+    op: 'peer_message', target_convo: 'private-target', from_convo: 'from',
+    idem_key: 'private', body: 'must not land',
+  })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message')
+  agent.send({
+    op: 'peer_message', target_convo: 'missing-target', from_convo: 'from',
+    idem_key: 'missing', body: 'must not land',
+  })
+  await agent.waitFor(() => agent.frames.filter((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message').length === 2)
+
+  const errors = agent.frames.filter((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message')
+  assert.deepEqual(errors[0], errors[1])
+  assert.equal(errors[0].code, 'not_found')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, 0)
+  agent.close()
+})
+
+test('op:peer_message rejects ownerless and dangling targets as not found before append', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const sender = createAgent(s.db, dan.id, 'sender')
+  upsertConversation(s.db, {
+    id: 'from', ownerUserId: dan.id, agentDeviceId: sender.deviceId, title: 'Sender',
+  })
+  upsertConversation(s.db, { id: 'ownerless', ownerUserId: dan.id, title: 'Legacy' })
+  upsertConversation(s.db, {
+    id: 'dangling', ownerUserId: dan.id, agentDeviceId: 999999, title: 'Revoked owner',
+  })
+  const agent = await makeWsClient(s.base, { token: sender.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  for (const target of ['ownerless', 'dangling']) {
+    const count = agent.frames.filter((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message').length
+    agent.send({
+      op: 'peer_message', target_convo: target, from_convo: 'from',
+      idem_key: target, body: 'must not broadcast',
+    })
+    await agent.waitFor(() => agent.frames.filter((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message').length === count + 1)
+  }
+
+  const errors = agent.frames.filter((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'peer_message')
+  assert.equal(errors.every((frame) => frame.code === 'not_found'), true)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, 0)
+  agent.close()
+})
+
+test('op:peer_message forbidden when sender device does not own from_convo (device parity, F1)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b') // same account, different device
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'A session' })
+  upsertConversation(s.db, { id: 'target', ownerUserId: dan.id, title: 'Target' })
+  const bWs = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  await bWs.waitFor((f) => f.op === 'hello_ok')
+  // agB claims agA's convo as from_convo → device ownership fails
+  bWs.send({ op: 'peer_message', target_convo: 'target', from_convo: 'from', idem_key: 'k1', body: 'borrowed identity' })
+  await bWs.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, 0)
+  bWs.close()
+})
+
+test('op:peer_message cross-account target is forbidden with the boundary detail', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const eve = await createUser(s.db, 'eve', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const eveAgent = createAgent(s.db, eve.id, 'eve-agent')
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'A session' })
+  upsertConversation(s.db, { id: 'evetarget', ownerUserId: eve.id, agentDeviceId: eveAgent.deviceId, title: 'Eve target' })
+  const agent = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'peer_message', target_convo: 'evetarget', from_convo: 'from', idem_key: 'k1', body: 'cross' })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden' && /cross-user/.test(f.detail || ''))
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, 0)
+  agent.close()
+})
+
+test('op:peer_message fail-loud validation — target==from, empty body, missing/oversized idem_key', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'A' })
+  upsertConversation(s.db, { id: 'target', ownerUserId: dan.id, title: 'T' })
+  const agent = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  const badCases = [
+    { target_convo: 'from', from_convo: 'from', idem_key: 'k', body: 'x' },        // target==from
+    { target_convo: 'target', from_convo: 'from', idem_key: 'k', body: '   ' },     // empty after sanitize
+    { target_convo: 'target', from_convo: 'from', body: 'x' },                       // missing idem_key
+    { target_convo: 'target', from_convo: 'from', idem_key: 'z'.repeat(129), body: 'x' }, // oversized
+  ]
+  for (const c of badCases) {
+    const n0 = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n
+    agent.send({ op: 'peer_message', ...c })
+    await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request')
+    assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='peer_message'").get().n, n0, 'nothing persisted on bad_request')
+  }
+  agent.close()
+})
+
 test('client file/image sends append with blob_ref; media sends without blob_ref rejected', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
+import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -21,6 +22,12 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
+// peer_message is DELIBERATELY NOT here (T-2.2/T-2.3): its attribution is
+// server-authoritative (bridge-stamped from_convo/from_name/from_kind), so it is
+// mintable ONLY via the dedicated agent-gated op:peer_message (T-2.4), never a
+// bare publish. Adding it here would let an agent forge attribution — an R501
+// non-mintability violation. It IS in journal.js MESSAGE_TYPES (snippet/last_seq
+// only), which is a distinct storage/snippet concern, not a publish gate.
 const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
@@ -88,6 +95,27 @@ const SPAWN_WORKDIR_MAX_CHARS = 1024
 // sanitising; the cap is tighter than a topic's because these are rendered
 // as identity on one line, not as body copy.
 const CARD_TITLE_MAX_CHARS = 120
+const PEER_IDEM_KEY_MAX_CHARS = 128
+
+function logPeerMessageDecision(log, {
+  decision, reason = null, correlationId, convoId, seq,
+}) {
+  const entry = {
+    type: 'peer_message_decision',
+    ts: new Date().toISOString(),
+    decision,
+    reason,
+    correlation_id: correlationId,
+    convo_id: convoId,
+  }
+  if (seq != null) entry.seq = seq
+  try {
+    log(JSON.stringify(entry))
+  } catch (err) {
+    // Observability must not turn a committed append into a protocol failure.
+    console.error('peer_message decision log failed', err)
+  }
+}
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
 // the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
@@ -615,7 +643,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1508,8 +1536,107 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         break
       }
+      case 'peer_message': {
+        const validIdemKey = typeof msg.idem_key === 'string' && msg.idem_key
+          && msg.idem_key.length <= PEER_IDEM_KEY_MAX_CHARS
+        const correlationId = Number.isInteger(conn.deviceId) && validIdemKey
+          ? `agent:${conn.deviceId}:${msg.idem_key}` : null
+        const convoId = typeof msg.target_convo === 'string' && msg.target_convo
+          && msg.target_convo.length <= CONVO_ID_MAX_CHARS
+          ? msg.target_convo : null
+        const reject = (reason, detail, seq) => {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason, correlationId, convoId, seq,
+          })
+          return fail(reason, detail)
+        }
+
+        if (conn.kind !== 'agent') return reject('forbidden')
+        if (typeof msg.target_convo !== 'string' || !msg.target_convo
+          || typeof msg.from_convo !== 'string' || !msg.from_convo
+          || msg.target_convo === msg.from_convo) {
+          return reject('bad_request')
+        }
+        if (!validIdemKey) return reject('bad_request')
+        const body = sanitizePeerText(msg.body)
+        if (!body) return reject('bad_request')
+
+        // Attribution comes only from the conversation row. Requiring both
+        // account and managing-device ownership prevents one same-account
+        // agent from borrowing another session's title or kind.
+        const fromConvo = db.prepare(
+          'SELECT owner_user_id, agent_device_id, title, agent_kind FROM conversations WHERE id=?'
+        ).get(msg.from_convo)
+        if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+          || fromConvo.agent_device_id !== conn.deviceId) {
+          return reject('forbidden')
+        }
+
+        // A peer message is targeted at a live agent-owned conversation.
+        // Ownerless legacy rows and dangling/revoked owners must take the
+        // same path as a missing target; otherwise fanOut's legacy null-owner
+        // behavior would broadcast targeted coordination text to every agent.
+        const targetConvo = db.prepare(`
+          SELECT c.owner_user_id, c.agent_device_id
+            FROM conversations c
+            JOIN devices d ON d.id=c.agent_device_id
+                          AND d.user_id=c.owner_user_id
+                          AND d.kind='agent'
+           WHERE c.id=?
+        `).get(msg.target_convo)
+        if (!targetConvo) return reject('not_found')
+        if (targetConvo.owner_user_id !== conn.userId) {
+          return reject('forbidden', 'cross-user peer messaging not enabled yet')
+        }
+        // Same private-owner visibility rule as read_marker/loadRoom. A
+        // private caller or an ordinary caller with known standing in the
+        // target may write; every other ordinary agent sees byte-identical
+        // not_found behavior for private and nonexistent targets.
+        if (isPrivateDevice(db, targetConvo.agent_device_id)
+          && !isPrivateDevice(db, conn.deviceId)
+          && !isKnownParticipant(db, msg.target_convo, conn.deviceId)) {
+          return reject('not_found')
+        }
+
+        const appendArgs = {
+          userId: conn.userId, convoId: msg.target_convo,
+          sender: `agent:${conn.name}`, type: 'peer_message',
+          payload: {
+            from_convo: msg.from_convo,
+            from_name: sanitizePeerText(fromConvo.title, PEER_NAME_CAP),
+            from_kind: fromConvo.agent_kind,
+            body,
+          },
+        }
+        const result = appendAgentIdempotent(db, {
+          deviceId: conn.deviceId,
+          key: correlationId,
+          appendArgs,
+        })
+        if (result.duplicate) {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason: 'duplicate', correlationId, convoId,
+            seq: result.seq,
+          })
+          return result
+        }
+        logPeerMessageDecision(log, {
+          decision: 'accept', correlationId, convoId, seq: result.seq,
+        })
+        fanOut(journalFrame({
+          seq: result.seq, convo_id: appendArgs.convoId, ts: result.ts,
+          sender: appendArgs.sender, type: appendArgs.type, payload: appendArgs.payload,
+        }))
+        return result
+      }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // T-2.3 (round-1 F1 non-mintability): peer_message is server-authoritative
+        // — mintable ONLY via op:peer_message (T-2.4), which stamps from_convo/
+        // from_name/from_kind from the trusted bridge. A bare publish would let an
+        // agent forge that attribution, so reject it explicitly here (defense in
+        // depth: it is also absent from AGENT_PUBLISH_TYPES below).
+        if (msg.type === 'peer_message') return fail('bad_request', 'peer_message is not agent-publishable')
         if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         // The agent_chat consent card is minted only by the server's own
         // agent_invite/agent_join park path, which sanitises from_name/
