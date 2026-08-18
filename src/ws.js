@@ -1541,12 +1541,30 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           return fail('forbidden')
         }
 
-        const targetConvo = db.prepare(
-          'SELECT owner_user_id FROM conversations WHERE id=?'
-        ).get(msg.target_convo)
-        if (!targetConvo) return fail('bad_request', 'bad target_convo')
+        // A peer message is targeted at a live agent-owned conversation.
+        // Ownerless legacy rows and dangling/revoked owners must take the
+        // same path as a missing target; otherwise fanOut's legacy null-owner
+        // behavior would broadcast targeted coordination text to every agent.
+        const targetConvo = db.prepare(`
+          SELECT c.owner_user_id, c.agent_device_id
+            FROM conversations c
+            JOIN devices d ON d.id=c.agent_device_id
+                          AND d.user_id=c.owner_user_id
+                          AND d.kind='agent'
+           WHERE c.id=?
+        `).get(msg.target_convo)
+        if (!targetConvo) return fail('not_found')
         if (targetConvo.owner_user_id !== conn.userId) {
           return fail('forbidden', 'cross-user peer messaging not enabled yet')
+        }
+        // Same private-owner visibility rule as read_marker/loadRoom. A
+        // private caller or an ordinary caller with known standing in the
+        // target may write; every other ordinary agent sees byte-identical
+        // not_found behavior for private and nonexistent targets.
+        if (isPrivateDevice(db, targetConvo.agent_device_id)
+          && !isPrivateDevice(db, conn.deviceId)
+          && !isKnownParticipant(db, msg.target_convo, conn.deviceId)) {
+          return fail('not_found')
         }
 
         const appendArgs = {
@@ -1560,6 +1578,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           },
         }
         const result = appendAgentIdempotent(db, {
+          deviceId: conn.deviceId,
           key: `agent:${conn.deviceId}:${msg.idem_key}`,
           appendArgs,
         })

@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
+import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { appendAgentIdempotent, AGENT_IDEM_TTL_MS } from '../src/agent-idem.js'
 import { toEventShape, upsertConversation } from '../src/journal.js'
@@ -11,6 +12,7 @@ import { handleOp } from '../src/ws.js'
 
 function seed(db) {
   db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','dev-a','ha',0)").run()
   upsertConversation(db, { id: 'target', ownerUserId: 1, title: 'Target' })
 }
 
@@ -28,10 +30,10 @@ test('agent idem dedupes inside 120s without populating permanent events.idem_ke
   const db = openDb(':memory:')
   seed(db)
   const first = appendAgentIdempotent(db, {
-    key: 'agent:7:same-content-hash', appendArgs: peerAppendArgs(), now: 1_000,
+    deviceId: 7, key: 'agent:7:same-content-hash', appendArgs: peerAppendArgs(), now: 1_000,
   })
   const duplicate = appendAgentIdempotent(db, {
-    key: 'agent:7:same-content-hash', appendArgs: peerAppendArgs(), now: 2_000,
+    deviceId: 7, key: 'agent:7:same-content-hash', appendArgs: peerAppendArgs(), now: 2_000,
   })
 
   assert.deepEqual(duplicate, { seq: first.seq, duplicate: true })
@@ -51,7 +53,6 @@ test('agent idem dedupes inside 120s without populating permanent events.idem_ke
 test('op:peer_message namespaces the key and returns the original seq without a second fan', async () => {
   const db = openDb(':memory:')
   seed(db)
-  db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','dev-a','ha',0)").run()
   db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(8,1,'agent','dev-b','hb',0)").run()
   upsertConversation(db, {
     id: 'from', ownerUserId: 1, agentDeviceId: 7,
@@ -85,13 +86,13 @@ test('agent idem allows the same key after expiry and distinguishes different lo
   const db = openDb(':memory:')
   seed(db)
   const first = appendAgentIdempotent(db, {
-    key: 'agent:7:body-a-hash', appendArgs: peerAppendArgs('body a'), now: 10,
+    deviceId: 7, key: 'agent:7:body-a-hash', appendArgs: peerAppendArgs('body a'), now: 10,
   })
   const different = appendAgentIdempotent(db, {
-    key: 'agent:7:body-b-hash', appendArgs: peerAppendArgs('body b'), now: 11,
+    deviceId: 7, key: 'agent:7:body-b-hash', appendArgs: peerAppendArgs('body b'), now: 11,
   })
   const afterWindow = appendAgentIdempotent(db, {
-    key: 'agent:7:body-a-hash', appendArgs: peerAppendArgs('body a'), now: 10 + AGENT_IDEM_TTL_MS,
+    deviceId: 7, key: 'agent:7:body-a-hash', appendArgs: peerAppendArgs('body a'), now: 10 + AGENT_IDEM_TTL_MS,
   })
 
   assert.equal(first.duplicate, false)
@@ -109,13 +110,13 @@ test('agent idem survives a database close and reopen inside the live window', (
   try {
     seed(db)
     const first = appendAgentIdempotent(db, {
-      key: 'agent:7:restart-hash', appendArgs: peerAppendArgs(), now: 5_000,
+      deviceId: 7, key: 'agent:7:restart-hash', appendArgs: peerAppendArgs(), now: 5_000,
     })
     db.close()
     db = openDb(dbPath)
 
     const duplicate = appendAgentIdempotent(db, {
-      key: 'agent:7:restart-hash', appendArgs: peerAppendArgs(), now: 6_000,
+      deviceId: 7, key: 'agent:7:restart-hash', appendArgs: peerAppendArgs(), now: 6_000,
     })
     assert.deepEqual(duplicate, { seq: first.seq, duplicate: true })
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 1)
@@ -135,7 +136,7 @@ test('failure between append and dedup insert rolls back both; retransmit persis
 
   assert.throws(
     () => appendAgentIdempotent(db, {
-      key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 1_000,
+      deviceId: 7, key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 1_000,
     }),
     /simulated crash/,
   )
@@ -144,14 +145,82 @@ test('failure between append and dedup insert rolls back both; retransmit persis
 
   db.exec('DROP TRIGGER fail_agent_idem_insert')
   const retransmit = appendAgentIdempotent(db, {
-    key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 2_000,
+    deviceId: 7, key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 2_000,
   })
   const duplicate = appendAgentIdempotent(db, {
-    key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 3_000,
+    deviceId: 7, key: 'agent:7:crash-hash', appendArgs: peerAppendArgs(), now: 3_000,
   })
   assert.deepEqual(duplicate, { seq: retransmit.seq, duplicate: true })
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 1)
   db.close()
+})
+
+test('revoking a device cascades its dedupe rows so a reused device id can send', () => {
+  const db = openDb(':memory:')
+  seed(db)
+  const first = appendAgentIdempotent(db, {
+    deviceId: 7,
+    key: 'agent:7:reused-key',
+    appendArgs: peerAppendArgs('first incarnation'),
+    now: 1_000,
+  })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n, 1)
+
+  db.prepare('DELETE FROM devices WHERE id=7').run()
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n, 0)
+  db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','replacement','hb',1)").run()
+
+  const replacement = appendAgentIdempotent(db, {
+    deviceId: 7,
+    key: 'agent:7:reused-key',
+    appendArgs: peerAppendArgs('replacement incarnation'),
+    now: 2_000,
+  })
+  assert.equal(replacement.duplicate, false)
+  assert.notEqual(replacement.seq, first.seq)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 2)
+  db.close()
+})
+
+test('openDb safely migrates legacy agent_idem rows and binds live rows to devices', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-agent-idem-migrate-'))
+  const dbPath = path.join(dir, 'journal.db')
+  const legacy = new Database(dbPath)
+  legacy.exec(`
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE devices(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+      kind TEXT NOT NULL CHECK(kind IN ('client','agent')), name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0,
+      apns_token TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER
+    );
+    CREATE TABLE agent_idem(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+    INSERT INTO users VALUES(1, 'dan', 'x', 0);
+    INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','dev-a','ha',0);
+    INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(10,1,'agent','replacement','hb',900000);
+    INSERT INTO agent_idem VALUES('agent:7:keep', 3, 999999);
+    INSERT INTO agent_idem VALUES('agent:99:revoked', 4, 999999);
+    INSERT INTO agent_idem VALUES('agent:10:prior-incarnation', 5, 999999);
+  `)
+  legacy.close()
+
+  let db
+  try {
+    db = openDb(dbPath)
+    assert.deepEqual(
+      db.prepare('SELECT key, device_id, seq FROM agent_idem').all(),
+      [{ key: 'agent:7:keep', device_id: 7, seq: 3 }],
+    )
+    const fk = db.prepare('PRAGMA foreign_key_list(agent_idem)').all()
+      .find((row) => row.from === 'device_id')
+    assert.equal(fk?.table, 'devices')
+    assert.equal(fk?.on_delete, 'CASCADE')
+    db.prepare('DELETE FROM devices WHERE id=7').run()
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n, 0)
+  } finally {
+    if (db?.open) db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('concurrent same-key arrivals on separate DB connections serialize to one event', async () => {
@@ -175,6 +244,7 @@ test('concurrent same-key arrivals on separate DB connections serialize to one e
       let result
       try {
         result = appendAgentIdempotent(db, {
+          deviceId: 7,
           key: 'agent:7:concurrent-hash',
           appendArgs: workerData.appendArgs,
           now: 10_000,

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { appendAgentIdempotent } from '../src/agent-idem.js'
 import { openDb } from '../src/db.js'
 import { toEventShape, upsertConversation } from '../src/journal.js'
+import { handleOp } from '../src/ws.js'
 
 // Canonical producer-owned contract. Bridge and web vendor this file verbatim;
 // their cross-repo byte-parity gate is intentionally owned by T-6.4.
@@ -43,8 +44,10 @@ test('canonical peer_message fixture matches the real toEventShape wire contract
   const db = openDb(':memory:')
   try {
     db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','sender-device','ha',0)").run()
     upsertConversation(db, { id: 'target', ownerUserId: 1, title: 'Target' })
     const result = appendAgentIdempotent(db, {
+      deviceId: 7,
       key: 'agent:7:fixture-shape',
       now: 1_000,
       appendArgs: {
@@ -72,7 +75,46 @@ test('canonical peer_message fixture matches the real toEventShape wire contract
     assert.equal(typeof wire.ts, 'number')
     assert.equal(typeof wire.sender, 'string')
     assert.equal(wire.type, 'peer_message')
-    for (const key of PAYLOAD_KEYS) assert.equal(typeof wire.payload[key], 'string')
+    for (const key of PAYLOAD_KEYS.filter((key) => key !== 'from_kind')) {
+      assert.equal(typeof wire.payload[key], 'string')
+    }
+    assert.equal(wire.payload.from_kind === null || typeof wire.payload.from_kind === 'string', true)
+  } finally {
+    db.close()
+  }
+})
+
+test('handleOp emits the canonical peer_message shape with nullable legacy from_kind', async () => {
+  const db = openDb(':memory:')
+  try {
+    db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','sender-device','ha',0)").run()
+    db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(8,1,'agent','target-device','hb',0)").run()
+    upsertConversation(db, {
+      id: 'source', ownerUserId: 1, agentDeviceId: 7, title: 'Legacy Sender',
+    })
+    upsertConversation(db, {
+      id: 'target', ownerUserId: 1, agentDeviceId: 8, title: 'Target',
+    })
+
+    await handleOp({
+      db,
+      hub: { broadcastJournal() {} },
+      conn: { kind: 'agent', userId: 1, deviceId: 7, name: 'sender-device', ws: { send() {} } },
+      msg: {
+        op: 'peer_message', target_convo: 'target', from_convo: 'source',
+        idem_key: 'legacy-null-kind', body: 'Coordinate safely.',
+      },
+    })
+
+    const stored = db.prepare("SELECT * FROM events WHERE type='peer_message'").get()
+    const wire = toEventShape({ ...stored, payload: JSON.parse(stored.payload) })
+    assert.deepEqual(keys(wire), EVENT_KEYS)
+    assert.deepEqual(keys(wire.payload), PAYLOAD_KEYS)
+    assert.equal(wire.payload.from_kind, null)
+    for (const key of PAYLOAD_KEYS.filter((key) => key !== 'from_kind')) {
+      assert.equal(typeof wire.payload[key], 'string')
+    }
   } finally {
     db.close()
   }

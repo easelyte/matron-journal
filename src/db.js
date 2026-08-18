@@ -47,6 +47,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS agent_idem(
   key TEXT PRIMARY KEY,
+  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   seq INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
@@ -193,6 +194,52 @@ export function openDb(path) {
   }
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
+  }
+  // Bind peer-message idempotency rows to the device incarnation that wrote
+  // them. devices.id is a reusable rowid, so retaining a dedupe row after
+  // revocation could otherwise suppress a replacement device's first send.
+  // Existing rows predate the explicit device_id column; their keys are
+  // server-generated as `agent:<device id>:<bridge key>`, so preserve only
+  // rows whose encoded device existed when the row was written (expires_at
+  // minus the fixed 120s TTL). That timestamp check also rejects a stale row
+  // if its numeric id was already reused before this migration. Rows for
+  // revoked/replacement devices are intentionally discarded because the new
+  // cascade would have removed them.
+  const agentIdemCols = db.prepare('PRAGMA table_info(agent_idem)').all()
+  const agentIdemFks = db.prepare('PRAGMA foreign_key_list(agent_idem)').all()
+  const agentIdemHasDevice = agentIdemCols.some((c) => c.name === 'device_id')
+  const agentIdemHasCascade = agentIdemFks.some((fk) => (
+    fk.from === 'device_id' && fk.table === 'devices' && fk.to === 'id'
+    && String(fk.on_delete).toUpperCase() === 'CASCADE'
+  ))
+  if (!agentIdemHasDevice || !agentIdemHasCascade) {
+    const before = db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n
+    const copy = agentIdemHasDevice
+      ? `SELECT ai.key, ai.device_id, ai.seq, ai.expires_at
+           FROM agent_idem ai JOIN devices d ON d.id=ai.device_id
+          WHERE d.created_at <= ai.expires_at - 120000`
+      : `SELECT ai.key, d.id, ai.seq, ai.expires_at
+           FROM agent_idem ai JOIN devices d
+             ON ai.key LIKE 'agent:' || d.id || ':%'
+          WHERE d.created_at <= ai.expires_at - 120000`
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE agent_idem_fk(
+          key TEXT PRIMARY KEY,
+          device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        INSERT INTO agent_idem_fk(key, device_id, seq, expires_at) ${copy};
+        DROP TABLE agent_idem;
+        ALTER TABLE agent_idem_fk RENAME TO agent_idem;
+        CREATE INDEX idx_agent_idem_expires ON agent_idem(expires_at);
+      `)
+    })()
+    const dropped = before - db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n
+    if (dropped > 0) {
+      console.log(`agent_idem: dropped ${dropped} row(s) whose device was already revoked`)
+    }
   }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
