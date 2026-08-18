@@ -318,6 +318,24 @@ test('runExpireLogs leaves the convo preview alone when a newer message exists',
   assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, 'newer message')
 })
 
+test('runExpireLogs preserves a latest peer_message body as the convo preview', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  seedLiveLog(db, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  append(db, {
+    userId: dan.id, convoId: 'c1', sender: 'agent:peer', type: 'peer_message',
+    payload: { body: 'deploy after checks' },
+  })
+  // A newer non-message row proves retention keys preview ownership on the
+  // latest MESSAGE_TYPES event, not conversations.last_seq.
+  markRead(db, dan.id, 'c1', null, 'user:dan')
+
+  assert.equal(runExpireLogs(db, { hours: 24, mediaDir }).expired, 1)
+  const snippet = db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet
+  assert.equal(snippet, '💬 deploy after checks')
+  assert.notEqual(snippet, '[peer_message]')
+})
+
 test('runExpireLogs scrubs the preview even when a read_marker bumped last_seq after the purged event (read_marker never owns the preview)', async () => {
   const { db, dan } = await setup()
   const mediaDir = tmpMediaDir()
