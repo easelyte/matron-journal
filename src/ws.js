@@ -1667,6 +1667,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             from_name: sanitizePeerText(fromConvo.title, PEER_NAME_CAP),
             from_kind: fromConvo.agent_kind,
             body,
+            // Server-authoritative reconstruction: only the fields listed here reach the
+            // stored/broadcast payload. Include `priority` ONLY when the sender set it true,
+            // so a normal peer message keeps its 4-key payload (matching the byte-identical
+            // cross-repo fixture) and clients that read event.payload.priority defensively
+            // see the flag exactly when it was sent.
+            ...(msg.priority === true ? { priority: true } : {}),
           },
         }
         const result = appendAgentIdempotent(db, {

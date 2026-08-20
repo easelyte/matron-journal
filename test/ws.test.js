@@ -214,9 +214,52 @@ test('op:peer_message same-account happy path — server-derived attribution, on
   assert.equal(p.from_name, 'Sender Session') // from the convo TITLE, not the bogus msg
   assert.equal(p.from_kind, 'codex')          // from the convo agent_kind, not the bogus msg
   assert.equal(p.body, 'coordinate on the fix')
+  assert.equal('priority' in p, false, 'a normal peer message carries no priority key (base 4-key payload)')
   const ev = s.db.prepare("SELECT sender, COUNT(*) AS n FROM events WHERE convo_id='target' AND type='peer_message'").get()
   assert.equal(ev.n, 1, 'exactly one event')
   assert.equal(ev.sender, 'agent:dev-a') // device provenance
+  agent.close()
+})
+
+// Priority peer messages (matron-web Surface B): the sender may set priority:true, which the
+// server-authoritative reconstruction carries into the stored/broadcast payload ONLY when true,
+// so a normal message keeps its 4-key shape and the byte-identical cross-repo fixture is unchanged.
+test('op:peer_message threads priority into the stored payload only when explicitly true', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'Sender Session', agentKind: 'codex' })
+  upsertConversation(s.db, { id: 'target', ownerUserId: dan.id, agentDeviceId: agB.deviceId, title: 'Target' })
+  const agent = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({ op: 'peer_message', target_convo: 'target', from_convo: 'from', idem_key: 'kp', body: 'error rate crossed 1%', priority: true })
+  await new Promise((r) => setTimeout(r, 120))
+  const p = peerPayload(s.db)
+  assert.ok(p, 'priority peer_message persisted')
+  assert.equal(p.priority, true, 'priority:true carried into the stored payload')
+  assert.equal(p.body, 'error rate crossed 1%')
+  agent.close()
+})
+
+test('op:peer_message ignores a non-true priority value — no priority key stored', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  upsertConversation(s.db, { id: 'from', ownerUserId: dan.id, agentDeviceId: agA.deviceId, title: 'Sender Session', agentKind: 'codex' })
+  upsertConversation(s.db, { id: 'target', ownerUserId: dan.id, agentDeviceId: agB.deviceId, title: 'Target' })
+  const agent = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({ op: 'peer_message', target_convo: 'target', from_convo: 'from', idem_key: 'kp2', body: 'calm update', priority: 'yes' })
+  await new Promise((r) => setTimeout(r, 120))
+  const p = peerPayload(s.db)
+  assert.ok(p, 'peer_message persisted')
+  assert.equal('priority' in p, false, 'a non-true priority value must not be stored')
   agent.close()
 })
 
