@@ -494,22 +494,87 @@ function reserveDestination(prepared, isDirectory) {
   reverifyPrepared(prepared);
   assertImmediateParent(prepared);
   if (lstatIfPresent(prepared.target)) throw new FileLinkDenied('dest-exists');
-  if (isDirectory) {
-    fs.mkdirSync(prepared.target, { mode: 0o700 });
-    return { isDirectory: true };
+  try {
+    if (isDirectory) {
+      fs.mkdirSync(prepared.target, { mode: 0o700 });
+      const stat = fs.lstatSync(prepared.target);
+      return { isDirectory: true, dev: stat.dev, ino: stat.ino };
+    }
+    const fd = fs.openSync(
+      prepared.target,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      const stat = fs.fstatSync(fd);
+      return { isDirectory: false, dev: stat.dev, ino: stat.ino };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    if (err?.code === 'EEXIST') throw new FileLinkDenied('dest-exists');
+    throw err;
   }
-  const fd = fs.openSync(
-    prepared.target,
-    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-    0o600,
-  );
-  fs.closeSync(fd);
-  return { isDirectory: false };
+}
+
+function assertReservationIdentity(targetPath, reservation) {
+  const current = lstatIfPresent(targetPath);
+  if (!current
+      || current.isSymbolicLink()
+      || current.isDirectory() !== reservation.isDirectory
+      || current.dev !== reservation.dev
+      || current.ino !== reservation.ino) {
+    throw new FileLinkDenied('dest-exists');
+  }
+}
+
+function releaseReservation(targetPath, reservation, onReleased) {
+  assertReservationIdentity(targetPath, reservation);
+  try {
+    if (reservation.isDirectory) fs.rmdirSync(targetPath);
+    else fs.unlinkSync(targetPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'EEXIST' || err?.code === 'ENOTEMPTY') {
+      throw new FileLinkDenied('dest-exists');
+    }
+    throw err;
+  }
+  onReleased();
+}
+
+function linkNoReplace(sourcePath, destinationPath, expectedStat) {
+  try {
+    fs.linkSync(sourcePath, destinationPath);
+  } catch (err) {
+    if (err?.code === 'EEXIST') throw new FileLinkDenied('dest-exists');
+    throw err;
+  }
+  const installed = lstatIfPresent(destinationPath);
+  if (!installed
+      || installed.isSymbolicLink()
+      || !installed.isFile()
+      || installed.dev !== expectedStat.dev
+      || installed.ino !== expectedStat.ino) {
+    throw new FileLinkDenied('unreadable');
+  }
+  return installed;
+}
+
+function removeInstalledFile(targetPath, installedStat) {
+  const current = lstatIfPresent(targetPath);
+  if (!current
+      || current.isSymbolicLink()
+      || current.dev !== installedStat.dev
+      || current.ino !== installedStat.ino) {
+    throw new FileLinkDenied('dest-exists');
+  }
+  fs.unlinkSync(targetPath);
 }
 
 function removeReservation(targetPath, reservation) {
   if (!reservation) return;
   try {
+    assertReservationIdentity(targetPath, reservation);
     if (reservation.isDirectory) fs.rmdirSync(targetPath);
     else fs.unlinkSync(targetPath);
   } catch {}
@@ -520,7 +585,8 @@ function copyRegularFileForMove(
   destination,
   sourcePrepared,
   destinationPrepared,
-  onSourceUnlinked,
+  reservation,
+  onReservationReleased,
 ) {
   let sourceFd;
   let tmpFd;
@@ -546,24 +612,26 @@ function copyRegularFileForMove(
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = undefined;
+    const tmpStat = fs.lstatSync(tmpPath);
     fs.closeSync(sourceFd);
     sourceFd = undefined;
     reverifyPrepared(sourcePrepared);
     reverifyPrepared(destinationPrepared);
     assertTargetIdentity(sourcePrepared, sourcePrepared.targetStat);
-    fs.renameSync(tmpPath, destination);
-    tmpPath = undefined;
-    fs.fsyncSync(destinationPrepared.parentFd);
+    releaseReservation(destination, reservation, onReservationReleased);
+    const installedStat = linkNoReplace(tmpPath, destination, tmpStat);
     let sourceUnlinked = false;
     try {
+      fs.unlinkSync(tmpPath);
+      tmpPath = undefined;
+      fs.fsyncSync(destinationPrepared.parentFd);
       fs.unlinkSync(source);
       sourceUnlinked = true;
-      onSourceUnlinked();
       fs.fsyncSync(sourcePrepared.parentFd);
     } catch (err) {
       if (!sourceUnlinked) {
         try {
-          fs.unlinkSync(destination);
+          removeInstalledFile(destination, installedStat);
           fs.fsyncSync(destinationPrepared.parentFd);
         } catch (rollbackErr) {
           err.rollbackError = rollbackErr;
@@ -590,26 +658,60 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
     if (!source.targetStat.isFile() && !source.targetStat.isDirectory()) {
       throw new FileLinkDenied('unreadable');
     }
+    if (source.pinnedRoots.some((root) => contains(source.target, root.realPath))) {
+      throw new FileLinkDenied('outside-scope');
+    }
     if (destination.targetStat) throw new FileLinkDenied('dest-exists');
     reverifyPrepared(source);
     reverifyPrepared(destination);
     assertTargetIdentity(source, source.targetStat);
     reservation = reserveDestination(destination, source.targetStat.isDirectory());
-    try {
-      fs.renameSync(source.target, destination.target);
+    if (source.targetStat.isDirectory()) {
+      assertReservationIdentity(destination.target, reservation);
+      try {
+        fs.renameSync(source.target, destination.target);
+      } catch (err) {
+        if (err?.code === 'EXDEV') throw new FileLinkDenied('cross-device-dir');
+        throw err;
+      }
       reservation = undefined;
       fs.fsyncSync(destination.parentFd);
       if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
-    } catch (err) {
-      if (err?.code !== 'EXDEV') throw err;
-      if (source.targetStat.isDirectory()) throw new FileLinkDenied('cross-device-dir');
-      copyRegularFileForMove(
-        source.target,
-        destination.target,
-        source,
-        destination,
-        () => { reservation = undefined; },
-      );
+    } else {
+      releaseReservation(destination.target, reservation, () => { reservation = undefined; });
+      let installedStat;
+      try {
+        installedStat = linkNoReplace(source.target, destination.target, source.targetStat);
+      } catch (err) {
+        if (err?.code !== 'EXDEV') throw err;
+        reservation = reserveDestination(destination, false);
+        copyRegularFileForMove(
+          source.target,
+          destination.target,
+          source,
+          destination,
+          reservation,
+          () => { reservation = undefined; },
+        );
+        return { from: source.target, to: destination.target };
+      }
+      let sourceUnlinked = false;
+      try {
+        fs.fsyncSync(destination.parentFd);
+        fs.unlinkSync(source.target);
+        sourceUnlinked = true;
+        fs.fsyncSync(source.parentFd);
+      } catch (err) {
+        if (!sourceUnlinked) {
+          try {
+            removeInstalledFile(destination.target, installedStat);
+            fs.fsyncSync(destination.parentFd);
+          } catch (rollbackErr) {
+            err.rollbackError = rollbackErr;
+          }
+        }
+        throw err;
+      }
     }
     return { from: source.target, to: destination.target };
   } finally {
@@ -771,15 +873,20 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
     destination = path.join(trash.trashDir, trashName(source.target));
     if (source.targetStat.isDirectory()) {
       fs.mkdirSync(destination, { mode: 0o700 });
-      reservation = { isDirectory: true };
+      const stat = fs.lstatSync(destination);
+      reservation = { isDirectory: true, dev: stat.dev, ino: stat.ino };
     } else {
       const reserveFd = fs.openSync(
         destination,
         fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
         0o600,
       );
-      fs.closeSync(reserveFd);
-      reservation = { isDirectory: false };
+      try {
+        const stat = fs.fstatSync(reserveFd);
+        reservation = { isDirectory: false, dev: stat.dev, ino: stat.ino };
+      } finally {
+        fs.closeSync(reserveFd);
+      }
     }
     reverifyPrepared(source);
     assertTargetIdentity(source, source.targetStat);
@@ -809,6 +916,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
           destination,
           source,
           trashPrepared,
+          reservation,
           () => { reservation = undefined; },
         );
       } catch {

@@ -713,7 +713,91 @@ test('moveGuarded never clobbers an existing destination and validates both side
   }
 })
 
-test('moveGuarded atomically renames a file on the same device', async () => {
+test('moveGuarded rejects a source that equals or contains a pinned write-root', async () => {
+  const f = makeWriteFixture()
+  try {
+    const nestedRoot = path.join(f.root, 'container', 'nested-root')
+    mkdirSync(nestedRoot, { recursive: true })
+    const writeRoots = pinAllowedRootsSync([f.root, nestedRoot, f.out])
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(f.root, path.join(f.out, 'moved-root'), { writeRoots })),
+      'outside-scope',
+    )
+    assert.equal(
+      await writeDenied(() => moveGuarded(path.dirname(nestedRoot), path.join(f.out, 'moved-container'), { writeRoots })),
+      'outside-scope',
+    )
+    assert.equal(fs.statSync(f.root).isDirectory(), true)
+    assert.equal(fs.statSync(nestedRoot).isDirectory(), true)
+    assert.equal(fs.existsSync(path.join(f.out, 'moved-root')), false)
+    assert.equal(fs.existsSync(path.join(f.out, 'moved-container')), false)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded preserves a destination created while its reservation is released', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'source')
+    const realUnlink = fs.unlinkSync
+    let injectedRace = false
+    t.mock.method(fs, 'unlinkSync', (target) => {
+      const result = realUnlink(target)
+      if (target === destination && !injectedRace) {
+        injectedRace = true
+        writeFileSync(destination, 'racer')
+      }
+      return result
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'dest-exists',
+    )
+    assert.equal(injectedRace, true)
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'racer')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded maps a destination reservation race to dest-exists', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'source')
+    const realOpen = fs.openSync
+    let injectedRace = false
+    t.mock.method(fs, 'openSync', (target, flags, mode) => {
+      if (target === destination && !injectedRace) {
+        injectedRace = true
+        const raceFd = realOpen(target, flags, mode)
+        fs.writeSync(raceFd, 'racer')
+        fs.closeSync(raceFd)
+        throw Object.assign(new Error('created concurrently'), { code: 'EEXIST' })
+      }
+      return realOpen(target, flags, mode)
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'dest-exists',
+    )
+    assert.equal(injectedRace, true)
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'racer')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded atomically moves a file on the same device', async () => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'source.txt')
@@ -736,10 +820,10 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'cross-device')
-    const realRename = fs.renameSync
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    const realLink = fs.linkSync
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
-      return realRename(from, to)
+      return realLink(from, to)
     })
     assert.deepEqual(await moveGuarded(source, destination, { writeRoots: f.writeRoots }), { from: source, to: destination })
     assert.equal(fs.existsSync(source), false)
@@ -753,10 +837,10 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
     const source = path.join(rollback.root, 'source.txt')
     const destination = path.join(rollback.root, 'destination.txt')
     writeFileSync(source, 'keep-me')
-    const realRename = fs.renameSync
-    const renameMock = mock.method(fs, 'renameSync', (from, to) => {
+    const realLink = fs.linkSync
+    const linkMock = mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
-      return realRename(from, to)
+      return realLink(from, to)
     })
     const realUnlink = fs.unlinkSync
     const unlinkMock = mock.method(fs, 'unlinkSync', (target) => {
@@ -767,7 +851,7 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
       await assert.rejects(moveGuarded(source, destination, { writeRoots: rollback.writeRoots }), /busy/)
     } finally {
       unlinkMock.mock.restore()
-      renameMock.mock.restore()
+      linkMock.mock.restore()
     }
     assert.equal(fs.readFileSync(source, 'utf8'), 'keep-me')
     assert.equal(fs.existsSync(destination), false)
@@ -782,13 +866,13 @@ test('moveGuarded cross-device fallback retains the destination after post-unlin
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'only-surviving-copy')
-    const realRename = fs.renameSync
+    const realLink = fs.linkSync
     const realFsync = fs.fsyncSync
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) {
         throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
       }
-      return realRename(from, to)
+      return realLink(from, to)
     })
     t.mock.method(fs, 'fsyncSync', (fd) => {
       if (!fs.existsSync(source) && fs.existsSync(destination)) {
