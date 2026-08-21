@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
+import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
@@ -93,7 +95,15 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
+// Default-hidden listing entries (dev noise). Hiding is a DISPLAY filter layered
+// on top of the always-on sensitive DROP in listDirGuarded — a `?all=1` toggle
+// reveals these, but never a sensitive entry (those are gone before this runs).
+const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__'])
+const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
+// Strip anything that could break a Content-Disposition header (quotes, CR/LF).
+const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
+
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, fileReadRoots, fileListMax = 2000 }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -253,6 +263,185 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // --- File Explorer read API (spec: matron-file-explorer §5) -----------
+      // Opt-in: the routes exist only when read-roots were configured at boot
+      // (fileReadRoots is a non-empty pinned set); otherwise `/files/*` falls
+      // through to the final 404, so an un-configured/disabled deploy serves
+      // everything else normally (review F1). Client devices only (operator
+      // devices browse; agents do not). Every path is parsed/validated at the
+      // boundary and jailed server-side to the pinned read-roots + always-on
+      // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
+      // rejection reasons uniform.
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        const showAll = url.searchParams.get('all') === '1'
+        let listed
+        try {
+          listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
+        } catch (e) {
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          throw e
+        }
+        // Sensitive entries are already dropped by the guard; this is only the
+        // dev-noise/dotfile display filter, toggled off by ?all=1.
+        const visible = showAll ? listed.entries : listed.entries.filter((e) => !isHiddenListEntry(e.name))
+        // Dirs first, then case-insensitive name.
+        visible.sort((a, b) => {
+          if (a.kind !== b.kind) {
+            if (a.kind === 'dir') return -1
+            if (b.kind === 'dir') return 1
+          }
+          return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+        })
+        // Breadcrumb jail (frontend F4): expose the containing read-root so the
+        // client builds breadcrumbs from `root` down, and clamp `parent` so it
+        // NEVER points above the jail. `path ∈ root` was already enforced by
+        // the guard, so dirname(path) stays within/at `root`; when `path` IS a
+        // read-root, `parent` is null (top boundary).
+        const containingRoot = fileReadRoots.roots.find((r) => contains(r.realPath, listed.realDir))?.realPath ?? null
+        const parent = (containingRoot === null || listed.realDir === containingRoot)
+          ? null
+          : path.dirname(listed.realDir)
+        return json(res, 200, { path: listed.realDir, root: containingRoot, parent, entries: visible, truncated: listed.truncated })
+      }
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        let meta
+        try {
+          meta = await metaGuarded(p, { allowedRoots: fileReadRoots })
+        } catch (e) {
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          return json(res, 404, { error: 'not_found' })
+        }
+        return json(res, 200, {
+          path: meta.realPath,
+          kind: meta.kind,
+          size: meta.size,
+          mtime: meta.mtime,
+          mime: meta.mime,
+          is_text: meta.is_text,
+        })
+      }
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/content') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        const attachment = url.searchParams.get('disposition') === 'attachment'
+        const maxBytes = attachment ? MAX_DOWNLOAD_BYTES : MAX_VIEW_BYTES
+        // Single idempotent fd-close covering EVERY terminal path (denial,
+        // cap/416 rejects, empty body, stream end/error, AND a client abort at
+        // any point — including while openGuarded() is still awaiting). `fd` is
+        // filled once the handle is validated; `streaming` gates whether an
+        // abort should close the fd directly (pre-stream) or tear the stream
+        // down and let its 'close' close the fd (mid-stream — closing the fd
+        // under an active read would error it) (review round-2 F1).
+        let fd = null
+        let fdClosed = false
+        let streaming = false
+        let aborted = false
+        const closeFd = () => { if (fdClosed || !fd) return; fdClosed = true; fd.close().catch(() => {}) }
+        const onEarlyAbort = () => { aborted = true; if (!streaming) closeFd() }
+        res.on('close', onEarlyAbort)
+        try {
+          let opened
+          try {
+            // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
+            // sensitivity checks as the buffering path but returns the OPEN fd
+            // WITHOUT reading — we STREAM it with backpressure (P21), never
+            // buffering the whole file. Never readBody (JSON/1MB).
+            opened = await openGuarded(p, { allowedRoots: fileReadRoots })
+          } catch (e) {
+            res.removeListener('close', onEarlyAbort)
+            // Guard contract: map ANY throw to a denial (404 default), not just
+            // FileLinkDenied — an unexpected fs error must not leak/500.
+            if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+            return json(res, 404, { error: 'not_found' })
+          }
+          fd = opened.fd
+          const { size, realPath } = opened
+          // The client may have disconnected WHILE openGuarded was awaiting —
+          // onEarlyAbort ran with fd still null (no close), so close the now-
+          // validated fd and bail before writing anything.
+          if (aborted || res.destroyed) { res.removeListener('close', onEarlyAbort); closeFd(); return }
+          // Cap on the FULL file size, decided from fstat BEFORE any byte is
+          // read (so an oversized download never allocates or streams).
+          if (size > maxBytes) { res.removeListener('close', onEarlyAbort); closeFd(); return json(res, 413, { error: 'too_large' }) }
+          const { type, inlineSafe } = contentTypeFor(realPath)
+          // Force download for a non-inline-safe type even if inline was asked
+          // (nothing script-capable renders inline on this origin).
+          const disposition = attachment || !inlineSafe ? 'attachment' : 'inline'
+          const headers = {
+            'content-type': type,
+            'cache-control': 'private',
+            'x-content-type-options': 'nosniff',
+            'accept-ranges': 'bytes',
+            'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+          }
+          // Compute the Range window from `size` BEFORE reading — only the
+          // selected interval is streamed (createReadStream end is inclusive).
+          let statusCode = 200
+          let start = 0
+          let end = size > 0 ? size - 1 : 0
+          const range = req.headers.range
+          if (range) {
+            const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+            if (!m || (m[1] === '' && m[2] === '')) {
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            let s = m[1] === '' ? null : Number(m[1])
+            let e = m[2] === '' ? null : Number(m[2])
+            if (s === null) {
+              // suffix range: last `e` bytes
+              s = Math.max(0, size - e)
+              e = size - 1
+            } else if (e === null || e >= size) {
+              e = size - 1
+            }
+            if (!Number.isInteger(s) || s > e || s >= size || s < 0) {
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            statusCode = 206
+            start = s
+            end = e
+            headers['content-range'] = `bytes ${start}-${end}/${size}`
+          }
+          const length = size === 0 ? 0 : (end - start + 1)
+          res.writeHead(statusCode, { ...headers, 'content-length': String(length) })
+          if (length === 0) { res.removeListener('close', onEarlyAbort); closeFd(); return res.end() }
+          await new Promise((resolve) => {
+            // Hand off from the pre-stream abort listener to stream teardown:
+            // once streaming, an abort must destroy the stream (its 'close'
+            // then closes the fd) rather than close the fd out from under it.
+            res.removeListener('close', onEarlyAbort)
+            streaming = true
+            const stream = fd.createReadStream({ start, end, autoClose: false })
+            let settled = false
+            const finish = () => { if (settled) return; settled = true; closeFd(); resolve() }
+            stream.on('error', () => { res.destroy(); finish() })
+            stream.on('close', finish)
+            res.on('close', () => stream.destroy())
+            // Race guard: the socket may already have closed between the check
+            // above and attaching the listener — tear down immediately if so.
+            if (res.destroyed) stream.destroy()
+            stream.pipe(res)
+          })
+          return
+        } catch (e) {
+          res.removeListener('close', onEarlyAbort)
+          closeFd()
+          throw e
+        }
+      }
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         // Two independent rules layered on top of the client shape (spec:
         // agent visibility & privacy, task 8):
