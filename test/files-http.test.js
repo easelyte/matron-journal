@@ -29,6 +29,19 @@ function makeFixture() {
   const binBytes = Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x81]), crypto.randomBytes(2048)])
   fs.writeFileSync(path.join(root, 'blob.bin'), binBytes)
 
+  // Credential/config material reachable under a broad /root-style root (F2).
+  // Each must be dropped from listings (even ?all=1) and 403 on content/meta.
+  fs.mkdirSync(path.join(root, '.codex'))
+  fs.writeFileSync(path.join(root, '.codex', 'auth.json'), '{"OPENAI_API_KEY":"sk-x"}\n')
+  fs.mkdirSync(path.join(root, '.config', 'gh'), { recursive: true })
+  fs.writeFileSync(path.join(root, '.config', 'gh', 'hosts.yml'), 'token: ghp_x\n')
+  fs.mkdirSync(path.join(root, '.claude'))
+  fs.writeFileSync(path.join(root, '.claude', 'settings.json'), '{"k":"v"}\n')
+  fs.writeFileSync(path.join(root, 'auth.json'), '{"token":"x"}\n')
+  fs.writeFileSync(path.join(root, '.git-credentials'), 'https://x:y@github.com\n')
+  fs.writeFileSync(path.join(root, '.pgpass'), 'localhost:5432:db:u:p\n')
+  fs.writeFileSync(path.join(root, '.claude.json'), '{"k":"v"}\n')
+
   // Adversarial symlinks that must never be served / listed.
   fs.writeFileSync(path.join(outside, 'target.txt'), 'ESCAPED SECRET\n')
   fs.symlinkSync(path.join(outside, 'target.txt'), path.join(root, 'escape.txt'))     // symlink-out
@@ -37,6 +50,18 @@ function makeFixture() {
 
   return { root, outside, binBytes }
 }
+
+// F2 credential entries: (segment-relative path, secret substring that must
+// never appear in any response body).
+const F2_SENSITIVE = [
+  ['.codex/auth.json', 'sk-x'],
+  ['.config/gh/hosts.yml', 'ghp_x'],
+  ['.claude/settings.json', '"k":"v"'],
+  ['auth.json', '"token":"x"'],
+  ['.git-credentials', 'github.com'],
+  ['.pgpass', '5432'],
+  ['.claude.json', '"k":"v"'],
+]
 
 async function clientToken(s, name = 'op', pw = 'pw') {
   await createUser(s.db, name, pw)
@@ -242,9 +267,103 @@ test('File API is client-only (agent -> 403) and requires auth (-> 401)', async 
   }
 })
 
-test('startServer fails visible on an unreadable configured read-root', async () => {
+// --- F2: credential/config material is never listed or served ---------------
+test('F2: sensitive credential entries are dropped from listings and 403 on meta/content', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  // Listing must never surface any F2 entry, in either display mode.
+  for (const mode of ['', '&all=1']) {
+    const body = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}${mode}`, token)).json()
+    const names = body.entries.map((e) => e.name)
+    for (const forbidden of ['.codex', '.config', '.claude', 'auth.json', '.git-credentials', '.pgpass', '.claude.json']) {
+      assert.ok(!names.includes(forbidden), `${forbidden} must never be listed (mode="${mode}")`)
+    }
+  }
+  // Direct meta + content on each must be 403 and never leak the secret bytes.
+  for (const [rel, secret] of F2_SENSITIVE) {
+    const abs = encodeURIComponent(path.join(root, rel))
+    const meta = await authGet(s, `/files/meta?path=${abs}`, token)
+    assert.equal(meta.status, 403, `meta ${rel} must be 403`)
+    const content = await authGet(s, `/files/content?path=${abs}`, token)
+    assert.equal(content.status, 403, `content ${rel} must be 403`)
+    assert.ok(!(await content.text()).includes(secret), `content ${rel} must not leak ${secret}`)
+  }
+})
+
+// --- F3: content streams; a Range reads only the requested slice ------------
+test('F3: a large-file Range returns only the slice (streamed, not whole-file buffered)', async (t) => {
+  const { root } = makeFixture()
+  // 40MB file — over inline cap, well under the 100MB attachment cap.
+  const big = path.join(root, 'huge.bin')
+  const size = 40 * 1024 * 1024
+  const fh = fs.openSync(big, 'w')
+  fs.writeSync(fh, Buffer.alloc(size, 0x41))
+  // Put a distinctive marker near the end so a correct slice proves seeking.
+  fs.writeSync(fh, Buffer.from('MARKER'), 0, 6, size - 6)
+  fs.closeSync(fh)
+
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const url = `/files/content?path=${encodeURIComponent(big)}&disposition=attachment`
+
+  const ranged = await authGet(s, url, token, { range: `bytes=${size - 6}-${size - 1}` })
+  assert.equal(ranged.status, 206)
+  assert.equal(ranged.headers.get('content-length'), '6')
+  assert.equal(ranged.headers.get('content-range'), `bytes ${size - 6}-${size - 1}/${size}`)
+  assert.equal(Buffer.from(await ranged.arrayBuffer()).toString(), 'MARKER')
+
+  // A full attachment of the same 40MB file streams end-to-end with the right
+  // length (proves the stream path handles large payloads, not a 5MB buffer).
+  const full = await authGet(s, url, token)
+  assert.equal(full.status, 200)
+  assert.equal(full.headers.get('content-length'), String(size))
+  const buf = Buffer.from(await full.arrayBuffer())
+  assert.equal(buf.length, size)
+  assert.equal(buf.subarray(size - 6).toString(), 'MARKER')
+})
+
+// --- F1/F4/F6: opt-in + fail-safe disabling ---------------------------------
+test('F1: with no roots configured, the server starts and /files/* is 404 (feature off)', async (t) => {
+  const s = await startTestServer() // no fileReadRoots, env unset
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  // server is fully functional
+  assert.equal((await s.http('/snapshot', { token })).status, 200)
+  // file routes are simply not there
+  for (const url of ['/files/list?path=/tmp', '/files/meta?path=/etc/hosts', '/files/content?path=/etc/hosts']) {
+    const r = await authGet(s, url, token)
+    assert.equal(r.status, 404, `${url} should 404 when the file API is disabled`)
+  }
+})
+
+test('F1: startServer fails visible on an unreadable configured read-root', async () => {
   await assert.rejects(
     startTestServer({ fileReadRoots: [path.join(os.tmpdir(), 'matron-does-not-exist-' + crypto.randomBytes(6).toString('hex'))] }),
     (e) => e && e.reason === 'bad-workdir',
   )
+})
+
+test('F4: an empty configured root set disables the API (never fails open)', async (t) => {
+  const s = await startTestServer({ fileReadRoots: [] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  assert.equal((await s.http('/snapshot', { token })).status, 200)
+  // Must NOT serve an arbitrary absolute file — the route is off entirely.
+  assert.equal((await authGet(s, '/files/content?path=/etc/hosts', token)).status, 404)
+  assert.equal((await authGet(s, '/files/list?path=/etc', token)).status, 404)
+})
+
+test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', async (t) => {
+  const { root } = makeFixture()
+  // Roots ARE configured, but the fd-identity re-check platform is absent.
+  const s = await startTestServer({ fileReadRoots: [root], procSelfFdAvailable: false })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  assert.equal((await s.http('/snapshot', { token })).status, 200)
+  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).status, 404)
+  assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
 })

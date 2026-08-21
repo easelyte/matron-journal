@@ -25,22 +25,40 @@ export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 // (no silent caps — the client is told the listing was cut).
 export const MAX_LIST_ENTRIES = 2000;
 
-// Basename patterns: bridge PR #54 verbatim plus ^secrets?$. config.json is
-// deliberate: this ecosystem's config.json files hold tokens. Patterns apply
-// to every path segment (a sensitively-named directory denies its contents).
+// Basename patterns applied to EVERY path segment (a sensitively-named
+// directory denies its contents). Bridge PR #54 set, hardened (review F2) to
+// cover the credential/config dirs + files that live under a broad `/root`
+// read-root — a compromised journal session must never be able to fetch e.g.
+// /root/.codex/auth.json or /root/.config/**.
 const SENSITIVE_BASENAME_PATTERNS = [
+  // Credential / config directories (deny the dir segment => denies its tree).
+  /^\.ssh$/i,
+  /^\.aws$/i,
+  /^\.gnupg$/i,
+  /^\.kube$/i,
+  /^\.docker$/i,
+  /^\.codex$/i,
+  /^\.config$/i,
+  /^\.claude$/i,
+  /^\.gcloud$/i,
+  /^\.azure$/i,
+  // Credential / secret files.
   /\.env(\..*)?$/i,
   /secrets?\.(json|ya?ml|toml|txt)$/i,
   /^secrets?$/i,
   /^credentials$/i,
   /credentials?\.(json|ya?ml|toml|txt)$/i,
+  /^auth\.json$/i,
   /\.(pem|key|p12|pfx|jks|keystore)$/i,
   /id_rsa|id_ed25519|id_ecdsa/i,
-  /\.npmrc$/i,
-  /\.netrc$/i,
+  /^\.npmrc$/i,
+  /^\.netrc$/i,
+  /^\.pgpass$/i,
+  /^\.git-credentials$/i,
+  /^\.claude\.json$/i,
   /token(s)?\.(json|txt)$/i,
   /service[-_]?account.*\.json$/i,
-  /\.htpasswd$/i,
+  /^\.htpasswd$/i,
   /^config\.json$/i,
 ];
 
@@ -50,6 +68,9 @@ const SENSITIVE_PATH_PATTERNS = [
   /\/\.kube\//i,
   /\/\.ssh\//i,
   /\/\.gnupg\//i,
+  /\/\.codex\//i,
+  /\/\.config\//i,
+  /\/\.claude\//i,
   /\/\.env(\.[^/]*)?\//i,
   /\/secrets?\//i,
   /\/credentials?\//i,
@@ -139,16 +160,20 @@ export function pinAllowedRootsSync(allowedRoots) {
   return Object.freeze({ [PINNED_ROOTS]: true, roots: Object.freeze(roots) });
 }
 
-// Shared: unwrap a pinned-roots object, rejecting an unresolved root-string
-// array as an authorization boundary (empty array -> legacy "no roots, fall
-// back to workdir" behaviour is preserved).
+// Shared: unwrap a pinned-roots object. `isPinnedApi` is true when the caller
+// passed a real pinned-roots object (the file API) rather than the legacy
+// workdir form. An unresolved root-string array is rejected outright. An empty
+// bare `[]` stays legacy (no-roots -> workdir fallback) for the ported bridge
+// tests; the FILE API never reaches here with an empty pinned object (server
+// treats no/empty roots as "disabled", F1/F4), and the guards below fail CLOSED
+// on a zero-root pinned object as defense-in-depth.
 function pinnedRootsOf(allowedRoots) {
-  const pinnedRoots = allowedRoots?.[PINNED_ROOTS] === true ? allowedRoots.roots : [];
-  if (allowedRoots && (!Array.isArray(allowedRoots) || allowedRoots.length !== 0)
-      && allowedRoots[PINNED_ROOTS] !== true) {
+  const isPinnedApi = allowedRoots?.[PINNED_ROOTS] === true;
+  const pinnedRoots = isPinnedApi ? allowedRoots.roots : [];
+  if (allowedRoots && (!Array.isArray(allowedRoots) || allowedRoots.length !== 0) && !isPinnedApi) {
     throw new FileLinkDenied('bad-workdir');
   }
-  return pinnedRoots;
+  return { pinnedRoots, isPinnedApi };
 }
 
 // Shared: re-verify each pinned root still IS the same directory (dev+ino) it
@@ -190,7 +215,10 @@ export async function validateAndOpen(filePath, { workdir, allowedRoots, maxByte
   let fd;
   try {
     if (!path.isAbsolute(String(filePath))) throw new FileLinkDenied('relative-path');
-    const pinnedRoots = pinnedRootsOf(allowedRoots);
+    const { pinnedRoots, isPinnedApi } = pinnedRootsOf(allowedRoots);
+    // File API with zero roots -> fail CLOSED, never fall through to the
+    // no-containment path (review F4).
+    if (isPinnedApi && pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
     try {
       fd = await fsp.open(
         path.resolve(filePath),
@@ -246,6 +274,50 @@ export async function validateAndOpen(filePath, { workdir, allowedRoots, maxByte
   }
 }
 
+// Streaming serve-time boundary for CONTENT (review F3). Runs the SAME
+// TOCTOU-safe validation as validateAndOpen (fd-pin via O_NOFOLLOW,
+// /proc/self/fd realpath re-check, root-identity + containment + sensitivity),
+// but reads NO bytes and returns the OPEN FileHandle so the caller can stream
+// the validated descriptor with backpressure. The caller MUST close the
+// returned handle (or destroy the stream it builds from it). On ANY validation
+// failure the fd is closed here before throwing. The size cap is left to the
+// caller (it decides 413-vs-stream and the Range window from `size` before a
+// single byte is read), so a 100MB download never allocates 100MB.
+export async function openGuarded(filePath, { allowedRoots } = {}) {
+  let fd;
+  let handedOff = false;
+  try {
+    if (!path.isAbsolute(String(filePath))) throw new FileLinkDenied('relative-path');
+    const { pinnedRoots, isPinnedApi } = pinnedRootsOf(allowedRoots);
+    if (isPinnedApi && pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
+    try {
+      fd = await fsp.open(
+        path.resolve(filePath),
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
+    } catch (err) {
+      throw new FileLinkDenied(err.code === 'ELOOP' ? 'symlink' : 'unreadable');
+    }
+    const stat = await fd.stat();
+    if (!stat.isFile()) throw new FileLinkDenied('not-a-file');
+    const realPath = process.platform === 'linux'
+      ? await fsp.readlink(`/proc/self/fd/${fd.fd}`)
+      : await fsp.realpath(path.resolve(filePath));
+    if (pinnedRoots.length) {
+      await assertPinnedRootIdentity(pinnedRoots);
+      if (!pinnedRoots.some((root) => contains(root.realPath, realPath))) {
+        throw new FileLinkDenied('outside-scope');
+      }
+    }
+    if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    handedOff = true;
+    // The caller owns fd from here (streams then closes it).
+    return { fd, size: stat.size, mtimeMs: stat.mtimeMs, realPath };
+  } finally {
+    if (!handedOff) await fd?.close().catch(() => {});
+  }
+}
+
 // Guarded stat for META — fd-pinned like validateAndOpen but reads NO bytes,
 // and accepts BOTH files and directories (a directory opens read-only; its
 // final component is still symlink-proof via O_NOFOLLOW). Returns typed
@@ -254,7 +326,8 @@ export async function metaGuarded(targetPath, { allowedRoots } = {}) {
   let fd;
   try {
     if (!path.isAbsolute(String(targetPath))) throw new FileLinkDenied('relative-path');
-    const pinnedRoots = pinnedRootsOf(allowedRoots);
+    const { pinnedRoots, isPinnedApi } = pinnedRootsOf(allowedRoots);
+    if (isPinnedApi && pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
     try {
       fd = await fsp.open(
         path.resolve(targetPath),
@@ -296,7 +369,8 @@ export async function metaGuarded(targetPath, { allowedRoots } = {}) {
 // drops broken/unreadable entries. Caps at maxEntries with a truncated flag.
 export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_ENTRIES } = {}) {
   if (!path.isAbsolute(String(dirPath))) throw new FileLinkDenied('relative-path');
-  const pinnedRoots = pinnedRootsOf(allowedRoots);
+  const { pinnedRoots, isPinnedApi } = pinnedRootsOf(allowedRoots);
+  if (isPinnedApi && pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
 
   let realDir;
   try {

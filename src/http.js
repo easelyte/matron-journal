@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { validateAndOpen, metaGuarded, listDirGuarded, contentTypeFor, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
+import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
@@ -264,11 +264,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // --- File Explorer read API (spec: matron-file-explorer §5) -----------
-      // Client devices only (operator devices browse; agents do not). Every
-      // path is parsed/validated at the boundary and jailed server-side to the
-      // pinned read-roots + always-on secret denylist. Writes are Phase 2 and
-      // absent here. denialToStatus keeps rejection reasons uniform.
-      if (req.method === 'GET' && url.pathname === '/files/list') {
+      // Opt-in: the routes exist only when read-roots were configured at boot
+      // (fileReadRoots is a non-empty pinned set); otherwise `/files/*` falls
+      // through to the final 404, so an un-configured/disabled deploy serves
+      // everything else normally (review F1). Client devices only (operator
+      // devices browse; agents do not). Every path is parsed/validated at the
+      // boundary and jailed server-side to the pinned read-roots + always-on
+      // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
+      // rejection reasons uniform.
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
@@ -294,7 +298,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const parent = listed.realDir === path.parse(listed.realDir).root ? null : path.dirname(listed.realDir)
         return json(res, 200, { path: listed.realDir, parent, entries: visible, truncated: listed.truncated })
       }
-      if (req.method === 'GET' && url.pathname === '/files/meta') {
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
@@ -314,7 +318,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           is_text: meta.is_text,
         })
       }
-      if (req.method === 'GET' && url.pathname === '/files/content') {
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/content') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
@@ -322,54 +326,83 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const maxBytes = attachment ? MAX_DOWNLOAD_BYTES : MAX_VIEW_BYTES
         let opened
         try {
-          // validateAndOpen buffers the (bounded) file behind an fd-pinned,
-          // symlink-proof, containment-checked open. Never readBody (JSON/1MB).
-          opened = await validateAndOpen(p, { allowedRoots: fileReadRoots, maxBytes })
+          // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
+          // sensitivity checks as the buffering path but returns the OPEN fd
+          // WITHOUT reading — we STREAM it with backpressure (P21), never
+          // buffering the whole file. Never readBody (JSON/1MB).
+          opened = await openGuarded(p, { allowedRoots: fileReadRoots })
         } catch (e) {
-          // The guard's contract: map ANY throw to a denial (404 default), not
-          // just FileLinkDenied — an unexpected fs error must not leak/500.
+          // Guard contract: map ANY throw to a denial (404 default), not just
+          // FileLinkDenied — an unexpected fs error must not leak/500.
           if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
           return json(res, 404, { error: 'not_found' })
         }
-        const { content, realPath } = opened
-        const { type, inlineSafe } = contentTypeFor(realPath)
-        // Force download for a non-inline-safe type even if inline was asked
-        // (nothing script-capable renders inline on this origin).
-        const disposition = attachment || !inlineSafe ? 'attachment' : 'inline'
-        const total = content.length
-        const headers = {
-          'content-type': type,
-          'cache-control': 'private',
-          'x-content-type-options': 'nosniff',
-          'accept-ranges': 'bytes',
-          'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+        const { fd, size, realPath } = opened
+        try {
+          // Cap on the FULL file size, decided from fstat BEFORE any byte is
+          // read (so an oversized download never allocates or streams).
+          if (size > maxBytes) { await fd.close().catch(() => {}); return json(res, 413, { error: 'too_large' }) }
+          const { type, inlineSafe } = contentTypeFor(realPath)
+          // Force download for a non-inline-safe type even if inline was asked
+          // (nothing script-capable renders inline on this origin).
+          const disposition = attachment || !inlineSafe ? 'attachment' : 'inline'
+          const headers = {
+            'content-type': type,
+            'cache-control': 'private',
+            'x-content-type-options': 'nosniff',
+            'accept-ranges': 'bytes',
+            'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+          }
+          // Compute the Range window from `size` BEFORE reading — only the
+          // selected interval is streamed (createReadStream end is inclusive).
+          let statusCode = 200
+          let start = 0
+          let end = size > 0 ? size - 1 : 0
+          const range = req.headers.range
+          if (range) {
+            const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+            if (!m || (m[1] === '' && m[2] === '')) {
+              await fd.close().catch(() => {})
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            let s = m[1] === '' ? null : Number(m[1])
+            let e = m[2] === '' ? null : Number(m[2])
+            if (s === null) {
+              // suffix range: last `e` bytes
+              s = Math.max(0, size - e)
+              e = size - 1
+            } else if (e === null || e >= size) {
+              e = size - 1
+            }
+            if (!Number.isInteger(s) || s > e || s >= size || s < 0) {
+              await fd.close().catch(() => {})
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            statusCode = 206
+            start = s
+            end = e
+            headers['content-range'] = `bytes ${start}-${end}/${size}`
+          }
+          const length = size === 0 ? 0 : (end - start + 1)
+          res.writeHead(statusCode, { ...headers, 'content-length': String(length) })
+          if (length === 0) { await fd.close().catch(() => {}); return res.end() }
+          await new Promise((resolve) => {
+            // Stream the validated fd. autoClose:false — we own fd and close it
+            // in every terminal branch. Mirrors GET /media/:id's pipe pattern.
+            const stream = fd.createReadStream({ start, end, autoClose: false })
+            const done = () => { fd.close().catch(() => {}); resolve() }
+            stream.on('error', () => { res.destroy(); done() })
+            stream.on('close', done)
+            res.on('close', () => stream.destroy())
+            stream.pipe(res)
+          })
+          return
+        } catch (e) {
+          await fd.close().catch(() => {})
+          throw e
         }
-        const range = req.headers.range
-        if (range) {
-          const m = /^bytes=(\d*)-(\d*)$/.exec(range)
-          if (!m || (m[1] === '' && m[2] === '')) {
-            res.writeHead(416, { 'content-range': `bytes */${total}` })
-            return res.end()
-          }
-          let start = m[1] === '' ? null : Number(m[1])
-          let end = m[2] === '' ? null : Number(m[2])
-          if (start === null) {
-            // suffix range: last `end` bytes
-            start = Math.max(0, total - end)
-            end = total - 1
-          } else if (end === null || end >= total) {
-            end = total - 1
-          }
-          if (!Number.isInteger(start) || start > end || start >= total || start < 0) {
-            res.writeHead(416, { 'content-range': `bytes */${total}` })
-            return res.end()
-          }
-          const slice = content.subarray(start, end + 1)
-          res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${total}`, 'content-length': String(slice.length) })
-          return res.end(slice)
-        }
-        res.writeHead(200, { ...headers, 'content-length': String(total) })
-        return res.end(content)
       }
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         // Two independent rules layered on top of the client shape (spec:

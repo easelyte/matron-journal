@@ -10,7 +10,7 @@ import fsp from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
-  isSensitivePath, checkFileLink, validateAndOpen, metaGuarded, listDirGuarded,
+  isSensitivePath, checkFileLink, validateAndOpen, openGuarded, metaGuarded, listDirGuarded,
   pinAllowedRoots, pinAllowedRootsSync, FileLinkDenied, denialToStatus,
   contentTypeFor, mimeForPath, isTextPath, MAX_VIEW_BYTES,
 } from '../src/file-guard.js'
@@ -27,6 +27,11 @@ const SENSITIVE = [
   '/w/secret/note.txt', '/w/credentials/token.dat',
   '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
   '/w/app.key/nested/file.txt',
+  // review F2 — credential/config material reachable under a broad /root root
+  '/root/.codex/auth.json', '/root/.codex', '/root/auth.json',
+  '/root/.config/gh/hosts.yml', '/root/.config', '/root/.claude/settings.json',
+  '/root/.claude', '/root/.claude.json', '/root/.git-credentials', '/root/.pgpass',
+  '/home/u/.gcloud/x', '/home/u/.azure/y', '/root/.ssh', '/root/.aws',
 ]
 const NOT_SENSITIVE = [
   '/w/index.js', '/w/env.md', '/w/configuration.json', '/w/package.json',
@@ -302,6 +307,51 @@ test('validateAndOpen rejects a FIFO without blocking in open or attempting a re
 
 test('MAX_VIEW_BYTES is the 5MB default cap', () => {
   assert.equal(MAX_VIEW_BYTES, 5 * 1024 * 1024)
+})
+
+// --- openGuarded (streaming validate, review F3) -----------------------------
+test('openGuarded returns an OPEN fd + size + realPath without reading bytes', async () => {
+  const roots = await pinAllowedRoots([dir])
+  const { fd, size, realPath } = await openGuarded(path.join(dir, 'ok.txt'), { allowedRoots: roots })
+  try {
+    assert.equal(size, 'hello guard\n'.length)
+    assert.equal(realPath, path.join(dir, 'ok.txt'))
+    // fd is live: a stream from it yields the exact bytes.
+    const chunks = []
+    for await (const c of fd.createReadStream({ start: 0, end: size - 1, autoClose: false })) chunks.push(c)
+    assert.equal(Buffer.concat(chunks).toString('utf-8'), 'hello guard\n')
+  } finally {
+    await fd.close().catch(() => {})
+  }
+})
+
+test('openGuarded denials mirror validateAndOpen and never leak an fd', async () => {
+  const roots = await pinAllowedRoots([dir])
+  const openDenied = async (p, opts = { allowedRoots: roots }) => {
+    try { const r = await openGuarded(p, opts); await r.fd.close().catch(() => {}) } catch (e) {
+      assert.ok(e instanceof FileLinkDenied); return e.reason
+    }
+    throw new Error('expected FileLinkDenied')
+  }
+  assert.equal(await openDenied(path.join(dir, '.env')), 'sensitive')
+  assert.equal(await openDenied(path.join(dir, 'sneaky.txt')), 'symlink')          // symlink-out
+  assert.equal(await openDenied(path.join(outside, 'target.txt')), 'outside-scope')
+  assert.equal(await openDenied(path.join(dir, 'sub')), 'not-a-file')              // a directory
+  assert.equal(await openDenied(path.join(dir, 'nope.txt')), 'unreadable')
+  assert.equal(await openDenied('relative.txt'), 'relative-path')
+})
+
+// --- empty pinned root set must FAIL CLOSED (review F4) ----------------------
+test('a zero-root pinned set is refused (outside-scope) by every file-API guard', async () => {
+  const empty = pinAllowedRootsSync([])
+  const guardDenied = async (fn) => {
+    try { await fn() } catch (e) { assert.ok(e instanceof FileLinkDenied); return e.reason }
+    throw new Error('expected FileLinkDenied')
+  }
+  assert.equal(await guardDenied(() => openGuarded(path.join(dir, 'ok.txt'), { allowedRoots: empty })), 'outside-scope')
+  assert.equal(await guardDenied(() => validateAndOpen(path.join(dir, 'ok.txt'), { allowedRoots: empty })), 'outside-scope')
+  assert.equal(await guardDenied(() => metaGuarded(path.join(dir, 'ok.txt'), { allowedRoots: empty })), 'outside-scope')
+  assert.equal(await guardDenied(async () => listDirGuarded(dir, { allowedRoots: empty })), 'outside-scope')
 })
 
 // --- metaGuarded -------------------------------------------------------------

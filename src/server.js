@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { realpathSync } from 'node:fs'
+import { realpathSync, readlinkSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
@@ -27,10 +27,11 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // busiest user's current footprint on dev-2 — generous headroom, not a squeeze.
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
-// File Explorer read API (spec: matron-file-explorer §5.4). Reads are broad by
-// operator preference; the always-on secret denylist (isSensitivePath) bounds
-// exposure regardless of how wide the roots are.
-export const DEFAULT_FILE_READ_ROOTS = '/root/.openclaw/workspace:/root'
+// File Explorer read API (spec: matron-file-explorer §5.4). OPT-IN: there is
+// no host-specific default read-root (review F1) — the feature is OFF unless
+// MATRON_FILE_READ_ROOTS is set at deploy (or fileReadRoots is passed). When
+// enabled, reads are broad by operator preference; the always-on secret
+// denylist (isSensitivePath) bounds exposure regardless of root breadth.
 export const DEFAULT_FILE_LIST_MAX = 2000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
@@ -282,7 +283,7 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileListMax,
+  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileListMax, procSelfFdAvailable,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -317,16 +318,39 @@ export function startServer({
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
-  // File Explorer read API config (spec §5.4). Roots are resolved and pinned
-  // ONCE here, at boot, on the trusted server side — never request-controlled.
-  // Tests inject `fileReadRoots` (array) directly; otherwise the colon-sep env
-  // (or its default) is used. pinAllowedRootsSync fails VISIBLE (throws) on an
-  // unreadable/nonexistent configured root: a misconfigured jail must be loud,
-  // not a silently-wide-open file API (P3 fail-closed). Phase 1 ships reads
-  // only — MATRON_FILE_ENABLE_WRITES is read but no write route exists.
-  const fileReadRootList = fileReadRoots
-    ?? (process.env.MATRON_FILE_READ_ROOTS || DEFAULT_FILE_READ_ROOTS).split(':').filter(Boolean)
-  const resolvedFileReadRoots = pinAllowedRootsSync(fileReadRootList)
+  // File Explorer read API config (spec §5.4). OPT-IN + fail-safe by design:
+  //  - No roots configured (fileReadRoots opt absent AND MATRON_FILE_READ_ROOTS
+  //    unset) -> feature DISABLED; handler gets null; /files/* -> 404; the rest
+  //    of the server starts normally (review F1). A deploy enables it via env.
+  //  - Configured but EMPTY (opt [] or MATRON_FILE_READ_ROOTS="") -> DISABLED
+  //    too (an empty root set must never fail open — review F4).
+  //  - Configured & non-empty but /proc/self/fd unavailable (non-Linux) ->
+  //    DISABLED: the fd-identity re-check needs procfs; refuse the racy
+  //    realpath fallback rather than serve with a TOCTOU hole (review F6).
+  //  - Configured & non-empty & procfs OK -> pin the roots ONCE, on the trusted
+  //    server side. pinAllowedRootsSync fails VISIBLE (throws, restart-loud) on
+  //    an unreadable/missing configured root: that is an explicit operator
+  //    misconfiguration, not a reason to silently disable (review F1).
+  // Phase 1 ships reads only — MATRON_FILE_ENABLE_WRITES is untouched here and
+  // no write route exists.
+  const fileRootsConfigured = fileReadRoots !== undefined
+    ? fileReadRoots
+    : (process.env.MATRON_FILE_READ_ROOTS !== undefined
+        ? process.env.MATRON_FILE_READ_ROOTS.split(':').filter(Boolean)
+        : null)
+  const procFdOk = procSelfFdAvailable ?? (() => {
+    try { readlinkSync('/proc/self/fd/0'); return true } catch { return false }
+  })()
+  let resolvedFileReadRoots = null
+  if (Array.isArray(fileRootsConfigured) && fileRootsConfigured.length > 0) {
+    if (!procFdOk) {
+      console.warn('file API: disabled — /proc/self/fd unavailable; refusing the racy realpath fallback (set up on a Linux host to enable)')
+    } else {
+      resolvedFileReadRoots = pinAllowedRootsSync(fileRootsConfigured)
+    }
+  } else if (Array.isArray(fileRootsConfigured)) {
+    console.warn('file API: disabled — configured read-root list is empty')
+  }
   const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
   const broker = makeRpcBroker()
