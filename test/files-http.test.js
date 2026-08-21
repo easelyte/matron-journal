@@ -11,6 +11,7 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
+import { makeHttpHandler } from '../src/http.js'
 
 // Build a canonical read-root with a representative tree + adversarial entries.
 function makeFixture() {
@@ -72,6 +73,15 @@ async function clientToken(s, name = 'op', pw = 'pw') {
 
 function authGet(s, pathAndQuery, token, headers = {}) {
   return fetch(s.base + pathAndQuery, { headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers } })
+}
+
+function captureHttpHandlerOptions() {
+  const capture = { options: null }
+  capture.factory = (options) => {
+    capture.options = options
+    return makeHttpHandler(options)
+  }
+  return capture
 }
 
 test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?all=1', async (t) => {
@@ -447,35 +457,44 @@ test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', as
 test('T-1.1: writes are off by default even with a valid pinned write-root', async (t) => {
   const { root } = makeFixture()
   const writeRoot = path.join(root, 'src')
-  const s = await startTestServer({ fileReadRoots: [root], fileWriteRoots: [writeRoot] })
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileWriteRoots: [writeRoot], httpHandlerFactory: capture.factory,
+  })
   t.after(() => s.close())
-  const token = await clientToken(s)
 
-  // T-2.0 registers this route only when the resolved kill switch is on.
-  // Until then, and by default, the write surface must remain absent.
-  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(writeRoot, 'new') } })).status, 404)
+  assert.deepEqual(capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath), [writeRoot])
+  assert.equal(capture.options.fileEnableWrites, false)
+  assert.equal(capture.options.fileWritesDryRun, false)
 })
 
 test('T-1.1: ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
   const { root } = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
-  const s = await startTestServer({ fileReadRoots: [root], fileEnableWrites: true })
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileEnableWrites: true, httpHandlerFactory: capture.factory,
+  })
   t.after(() => s.close())
-  const token = await clientToken(s)
 
   assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'new') } })).status, 404)
+  assert.equal(capture.options.fileWriteRoots, null)
+  assert.equal(capture.options.fileEnableWrites, false)
 })
 
 test('T-1.1: ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
   const { root } = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
-  const s = await startTestServer({ fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true })
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true,
+    httpHandlerFactory: capture.factory,
+  })
   t.after(() => s.close())
-  const token = await clientToken(s)
 
   assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'new') } })).status, 404)
+  assert.equal(capture.options.fileWriteRoots, null)
+  assert.equal(capture.options.fileEnableWrites, false)
 })
 
 test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
@@ -492,12 +511,25 @@ test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated 
   process.env.MATRON_FILE_ENABLE_WRITES = '1'
   process.env.MATRON_FILE_WRITES_DRYRUN = '1'
 
-  // Successful boot proves both env roots were split, pinned, and accepted as
-  // subsets. T-2.0 will consume the enabled/dry-run values already wired below.
-  const s = await startTestServer({ fileReadRoots: [root] })
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({ fileReadRoots: [root], httpHandlerFactory: capture.factory })
   t.after(() => s.close())
-  const token = await clientToken(s)
-  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'src', 'new') } })).status, 404)
+  assert.deepEqual(
+    capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath),
+    [path.join(root, 'src'), path.join(root, 'node_modules')],
+  )
+  assert.equal(capture.options.fileEnableWrites, true)
+  assert.equal(capture.options.fileWritesDryRun, true)
+})
+
+test('T-1.1: bare broad write-roots are rejected visibly at boot', async () => {
+  for (const broadRoot of ['/', '/root', '/opt/matron']) {
+    await assert.rejects(
+      startTestServer({ fileReadRoots: [broadRoot], fileWriteRoots: [broadRoot] }),
+      new RegExp(`configured write-root is prohibited because it is too broad: ${broadRoot === '/' ? '\\/' : broadRoot}`),
+      broadRoot,
+    )
+  }
 })
 
 test('T-1.1: a write-root outside all read-roots fails visibly at boot', async () => {
@@ -517,16 +549,4 @@ test('T-1.1: an unreadable configured write-root fails visibly while pinning', a
     }),
     (e) => e && e.reason === 'bad-workdir',
   )
-})
-
-test('T-1.1: pinned write roots, enable state, and dry-run state are threaded into the HTTP handler', () => {
-  // startServer's concrete handler factory is intentionally not injectable.
-  // Pin its security-sensitive wiring at the non-testable entry-point boundary
-  // (universal principle P71), while the tests above exercise boot + HTTP.
-  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8')
-  const httpSource = fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8')
-  assert.match(serverSource, /fileWriteRoots: resolvedFileWriteRoots/)
-  assert.match(serverSource, /fileEnableWrites: resolvedFileEnableWrites/)
-  assert.match(serverSource, /fileWritesDryRun: resolvedFileWritesDryRun/)
-  assert.match(httpSource, /fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false/)
 })

@@ -33,6 +33,7 @@ export const DEFAULT_MAX_REPLAY = 50000
 // enabled, reads are broad by operator preference; the always-on secret
 // denylist (isSensitivePath) bounds exposure regardless of root breadth.
 export const DEFAULT_FILE_LIST_MAX = 2000
+const PROHIBITED_FILE_WRITE_ROOTS = new Set(['/', '/root', '/opt/matron'])
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
@@ -284,7 +285,7 @@ export function startServer({
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileListMax, procSelfFdAvailable,
+  fileListMax, procSelfFdAvailable, httpHandlerFactory = makeHttpHandler,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -370,6 +371,11 @@ export function startServer({
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
     resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
+    const prohibitedRoot = resolvedFileWriteRoots.roots.find((writeRoot) =>
+      PROHIBITED_FILE_WRITE_ROOTS.has(writeRoot.realPath))
+    if (prohibitedRoot) {
+      throw new Error(`file writes: configured write-root is prohibited because it is too broad: ${prohibitedRoot.realPath}`)
+    }
     if (!resolvedFileReadRoots || resolvedFileWriteRoots.roots.some((writeRoot) =>
       !resolvedFileReadRoots.roots.some((readRoot) => contains(readRoot.realPath, writeRoot.realPath)))) {
       throw new Error('file writes: every configured write-root must be contained in a configured read-root')
@@ -393,7 +399,7 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
-  const server = http.createServer(makeHttpHandler({
+  const server = http.createServer(httpHandlerFactory({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
