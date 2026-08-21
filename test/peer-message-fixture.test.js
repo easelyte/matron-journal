@@ -119,3 +119,49 @@ test('handleOp emits the canonical peer_message shape with nullable legacy from_
     db.close()
   }
 })
+
+// Canonical PRIORITY variant: a peer_message with priority:true carries a 5th payload key.
+// Bridge and web vendor this file verbatim — the same cross-repo byte-parity gate as the base
+// fixture — so the supported 5-key wire shape is represented by executable contract evidence.
+const priorityFixturePath = fileURLToPath(new URL('./fixtures/peer_message.priority.fixture.json', import.meta.url))
+const priorityFixture = JSON.parse(fs.readFileSync(priorityFixturePath, 'utf8'))
+const PRIORITY_PAYLOAD_KEYS = ['body', 'from_convo', 'from_kind', 'from_name', 'priority']
+
+test('canonical priority peer_message fixture matches the real handleOp wire contract exactly', async () => {
+  assert.deepEqual(keys(priorityFixture), ['event', 'fixtureVersion'])
+  assert.deepEqual(keys(priorityFixture.event), EVENT_KEYS)
+  assert.deepEqual(keys(priorityFixture.event.payload), PRIORITY_PAYLOAD_KEYS)
+  assert.equal(priorityFixture.event.payload.priority, true)
+  assert.equal(priorityFixture.event.type, 'peer_message')
+  assert.equal(priorityFixture.fixtureVersion, fixtureVersion(priorityFixture.event))
+  assert.equal(JSON.stringify(priorityFixture).includes('idem_key'), false)
+
+  const db = openDb(':memory:')
+  try {
+    db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(7,1,'agent','sender-device','ha',0)").run()
+    db.prepare("INSERT INTO devices(id,user_id,kind,name,token_hash,created_at) VALUES(8,1,'agent','target-device','hb',0)").run()
+    upsertConversation(db, { id: 'source', ownerUserId: 1, agentDeviceId: 7, title: 'Sender Session', agentKind: 'codex' })
+    upsertConversation(db, { id: 'target', ownerUserId: 1, agentDeviceId: 8, title: 'Target' })
+
+    await handleOp({
+      db,
+      hub: { broadcastJournal() {} },
+      conn: { kind: 'agent', userId: 1, deviceId: 7, name: 'sender-device', ws: { send() {} } },
+      msg: {
+        op: 'peer_message', target_convo: 'target', from_convo: 'source',
+        idem_key: 'priority-shape', body: 'Coordinate on the release checklist.', priority: true,
+      },
+    })
+
+    const stored = db.prepare("SELECT * FROM events WHERE type='peer_message'").get()
+    const wire = toEventShape({ ...stored, payload: JSON.parse(stored.payload) })
+    // The real producer emits exactly the canonical priority shape — 5 payload keys, priority true.
+    assert.deepEqual(keys(wire), EVENT_KEYS)
+    assert.deepEqual(keys(wire.payload), PRIORITY_PAYLOAD_KEYS)
+    assert.equal(wire.payload.priority, true)
+    assert.equal(wire.payload.from_kind, 'codex')
+  } finally {
+    db.close()
+  }
+})
