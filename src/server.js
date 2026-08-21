@@ -57,6 +57,32 @@ export function resolveNumericEnv(name, raw, defaultValue) {
   return n
 }
 
+// Pin every prohibited broad directory that exists on this host. Some deploys
+// do not have all of the host-specific paths (notably /opt/matron), so absence
+// is not itself a configuration error. The returned dev/ino identities let the
+// caller recognize bind-mount aliases whose realPath spelling is different.
+export function pinProhibitedFileWriteRootsSync(rootPaths = PROHIBITED_FILE_WRITE_ROOTS) {
+  const existingRootPaths = []
+  for (const rootPath of rootPaths) {
+    try {
+      realpathSync(rootPath)
+      existingRootPaths.push(rootPath)
+    } catch (err) {
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
+    }
+  }
+  return pinAllowedRootsSync(existingRootPaths)
+}
+
+export function assertNoProhibitedFileWriteRoots(fileWriteRoots, prohibitedRoots) {
+  const prohibitedRoot = fileWriteRoots.roots.find((writeRoot) =>
+    prohibitedRoots.roots.some((candidate) =>
+      candidate.dev === writeRoot.dev && candidate.ino === writeRoot.ino))
+  if (prohibitedRoot) {
+    throw new Error(`file writes: configured write-root is prohibited because it is too broad: ${prohibitedRoot.realPath}`)
+  }
+}
+
 // `override` is startServer's `retentionDays` opt — when given, it takes
 // precedence over the env var (this is how tests disable/shrink the window
 // without touching process.env), but BOTH sources run through the same
@@ -371,11 +397,7 @@ export function startServer({
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
     resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
-    const prohibitedRoot = resolvedFileWriteRoots.roots.find((writeRoot) =>
-      PROHIBITED_FILE_WRITE_ROOTS.has(writeRoot.realPath))
-    if (prohibitedRoot) {
-      throw new Error(`file writes: configured write-root is prohibited because it is too broad: ${prohibitedRoot.realPath}`)
-    }
+    assertNoProhibitedFileWriteRoots(resolvedFileWriteRoots, pinProhibitedFileWriteRootsSync())
     if (!resolvedFileReadRoots || resolvedFileWriteRoots.roots.some((writeRoot) =>
       !resolvedFileReadRoots.roots.some((readRoot) => contains(readRoot.realPath, writeRoot.realPath)))) {
       throw new Error('file writes: every configured write-root must be contained in a configured read-root')

@@ -12,6 +12,8 @@ import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { makeHttpHandler } from '../src/http.js'
+import { pinAllowedRootsSync } from '../src/file-guard.js'
+import { assertNoProhibitedFileWriteRoots, pinProhibitedFileWriteRootsSync } from '../src/server.js'
 
 // Build a canonical read-root with a representative tree + adversarial entries.
 function makeFixture() {
@@ -522,12 +524,23 @@ test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated 
   assert.equal(capture.options.fileWritesDryRun, true)
 })
 
-test('T-1.1: bare broad write-roots are rejected visibly at boot', async () => {
-  for (const broadRoot of ['/', '/root', '/opt/matron']) {
-    await assert.rejects(
-      startTestServer({ fileReadRoots: [broadRoot], fileWriteRoots: [broadRoot] }),
-      new RegExp(`configured write-root is prohibited because it is too broad: ${broadRoot === '/' ? '\\/' : broadRoot}`),
-      broadRoot,
+test('T-1.1: broad write-root identities reject synthetic bind-mount aliases', () => {
+  const { root, outside } = makeFixture()
+  const broadRoots = [root, path.join(root, 'src'), path.join(root, 'node_modules')]
+  const missingRoot = path.join(root, 'host-path-not-present')
+  const prohibitedRoots = pinProhibitedFileWriteRootsSync([...broadRoots, missingRoot])
+  assert.deepEqual(prohibitedRoots.roots.map((pinned) => pinned.realPath), broadRoots)
+
+  for (const [index, broadRoot] of broadRoots.entries()) {
+    const pinnedWriteRoots = pinAllowedRootsSync([broadRoot])
+    const aliasPath = path.join(outside, `synthetic-bind-alias-${index}`)
+    const aliasedWriteRoots = {
+      roots: pinnedWriteRoots.roots.map((pinned) => ({ ...pinned, realPath: aliasPath })),
+    }
+    assert.throws(
+      () => assertNoProhibitedFileWriteRoots(aliasedWriteRoots, prohibitedRoots),
+      (err) => err?.message === `file writes: configured write-root is prohibited because it is too broad: ${aliasPath}`,
+      aliasPath,
     )
   }
 })
