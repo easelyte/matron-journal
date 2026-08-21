@@ -83,7 +83,8 @@ test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?
   assert.equal(r.status, 200)
   const body = await r.json()
   assert.equal(body.path, root)
-  assert.equal(body.parent, path.dirname(root))
+  assert.equal(body.root, root)          // the containing read-root
+  assert.equal(body.parent, null)        // listing AT a read-root -> top boundary
   assert.equal(body.truncated, false)
   const names = body.entries.map((e) => e.name)
 
@@ -116,6 +117,40 @@ test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?
   assert.ok(allNames.includes('.hidden') && allNames.includes('node_modules') && allNames.includes('.git'))
   for (const forbidden of ['.env', 'escape.txt', 'looksok.txt']) {
     assert.ok(!allNames.includes(forbidden), `${forbidden} must never be listed even with all=1`)
+  }
+})
+
+test('GET /files/list: breadcrumb jail — root exposed, parent never above the read-root (F4)', async (t) => {
+  const { root } = makeFixture()
+  // nested subtree inside the read-root
+  const deep = path.join(root, 'src', 'nested')
+  fs.mkdirSync(deep, { recursive: true })
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  // AT the read-root: root === path, parent null (top boundary)
+  const atRoot = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).json()
+  assert.equal(atRoot.root, root)
+  assert.equal(atRoot.path, root)
+  assert.equal(atRoot.parent, null)
+
+  // one level down: parent = the read-root itself, still the jail boundary
+  const atSrc = await (await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'src'))}`, token)).json()
+  assert.equal(atSrc.root, root)
+  assert.equal(atSrc.path, path.join(root, 'src'))
+  assert.equal(atSrc.parent, root)
+
+  // deeper: parent stays strictly within root, never escaping above it
+  const atDeep = await (await authGet(s, `/files/list?path=${encodeURIComponent(deep)}`, token)).json()
+  assert.equal(atDeep.root, root)
+  assert.equal(atDeep.path, deep)
+  assert.equal(atDeep.parent, path.join(root, 'src'))
+  // invariant: parent is always within/at root, never an ancestor above it
+  for (const b of [atRoot, atSrc, atDeep]) {
+    if (b.parent !== null) {
+      assert.ok(b.parent === b.root || b.parent.startsWith(b.root + path.sep), `parent ${b.parent} must be within root ${b.root}`)
+    }
   }
 })
 

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
+import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
@@ -295,8 +295,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           }
           return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
         })
-        const parent = listed.realDir === path.parse(listed.realDir).root ? null : path.dirname(listed.realDir)
-        return json(res, 200, { path: listed.realDir, parent, entries: visible, truncated: listed.truncated })
+        // Breadcrumb jail (frontend F4): expose the containing read-root so the
+        // client builds breadcrumbs from `root` down, and clamp `parent` so it
+        // NEVER points above the jail. `path ∈ root` was already enforced by
+        // the guard, so dirname(path) stays within/at `root`; when `path` IS a
+        // read-root, `parent` is null (top boundary).
+        const containingRoot = fileReadRoots.roots.find((r) => contains(r.realPath, listed.realDir))?.realPath ?? null
+        const parent = (containingRoot === null || listed.realDir === containingRoot)
+          ? null
+          : path.dirname(listed.realDir)
+        return json(res, 200, { path: listed.realDir, root: containingRoot, parent, entries: visible, truncated: listed.truncated })
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
