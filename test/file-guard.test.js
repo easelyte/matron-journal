@@ -609,6 +609,54 @@ test('writeFileAtomic handles bytes and streams, enforces the cap, and leaves no
   }
 })
 
+test('writeFileAtomic preserves a successful overwrite in durable trash', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'overwritten.txt')
+    const trashDir = path.join(f.root, '.matron-trash')
+    const events = []
+    writeFileSync(target, 'previous version')
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      let isTrashDirectory = false
+      try {
+        const fdStat = fs.fstatSync(fd)
+        const trashStat = fs.statSync(trashDir)
+        isTrashDirectory = fdStat.isDirectory()
+          && fdStat.dev === trashStat.dev
+          && fdStat.ino === trashStat.ino
+      } catch {}
+      events.push(isTrashDirectory ? 'trash-dir-fsync' : 'fsync')
+      return realFsync(fd)
+    })
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from.includes('.matron-tmp-') && path.basename(to) === path.basename(target)) {
+        events.push('target-rename')
+      }
+      return realRename(from, to)
+    })
+
+    assert.equal(
+      await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20 }),
+      target,
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'replacement')
+    const backups = fs.readdirSync(trashDir)
+    assert.equal(backups.length, 1)
+    assert.match(backups[0], /-overwritten\.txt$/)
+    assert.equal(fs.readFileSync(path.join(trashDir, backups[0]), 'utf8'), 'previous version')
+    const renameAt = events.indexOf('target-rename')
+    assert.ok(renameAt > 0, `expected durable backup before overwrite: ${events}`)
+    assert.ok(
+      events.slice(0, renameAt).includes('trash-dir-fsync'),
+      `expected trash-directory fsync before overwrite: ${events}`,
+    )
+  } finally {
+    f.cleanup()
+  }
+})
+
 test('writeFileAtomic fsyncs the temp file before rename and the parent after rename', async (t) => {
   const f = makeWriteFixture()
   try {
@@ -728,6 +776,38 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
   }
 })
 
+test('moveGuarded cross-device fallback retains the destination after post-unlink fsync failure', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'only-surviving-copy')
+    const realRename = fs.renameSync
+    const realFsync = fs.fsyncSync
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from === source && to === destination) {
+        throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      }
+      return realRename(from, to)
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (!fs.existsSync(source) && fs.existsSync(destination)) {
+        throw Object.assign(new Error('source parent fsync failed'), { code: 'EIO' })
+      }
+      return realFsync(fd)
+    })
+
+    await assert.rejects(
+      moveGuarded(source, destination, { writeRoots: f.writeRoots }),
+      /source parent fsync failed/,
+    )
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'only-surviving-copy')
+  } finally {
+    f.cleanup()
+  }
+})
+
 test('moveGuarded maps a cross-device directory move to cross-device-dir', async (t) => {
   const f = makeWriteFixture()
   try {
@@ -813,6 +893,32 @@ test('trashGuarded rejects a replaced trash directory before moving the source',
     assert.equal(await writeDenied(() => trashGuarded(source, { writeRoots: f.writeRoots })), 'trash-write-failed')
     assert.equal(fs.readFileSync(source, 'utf8'), 'source')
     assert.deepEqual(fs.readdirSync(f.out), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('trashGuarded tolerates another process winning trash-directory creation', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const trashDir = path.join(f.root, '.matron-trash')
+    writeFileSync(source, 'recoverable')
+    const realMkdir = fs.mkdirSync
+    let injectedRace = false
+    t.mock.method(fs, 'mkdirSync', (target, options) => {
+      if (target === trashDir && !injectedRace) {
+        injectedRace = true
+        realMkdir(target, options)
+        throw Object.assign(new Error('created concurrently'), { code: 'EEXIST' })
+      }
+      return realMkdir(target, options)
+    })
+
+    const result = await trashGuarded(source, { writeRoots: f.writeRoots })
+    assert.equal(injectedRace, true)
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(result.trashed, 'utf8'), 'recoverable')
   } finally {
     f.cleanup()
   }
