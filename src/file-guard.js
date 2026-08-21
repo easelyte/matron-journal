@@ -216,7 +216,11 @@ function assertPinnedRootIdentitySync(pinnedRoots) {
 // The remaining race requires a concurrent local writer able to alter an
 // ancestor inside these root-owned write roots; that actor is outside the
 // single-operator threat model (the same class as P1's accepted hard-link
-// residual). A native *at-family binding would be required to close it fully.
+// residual). Node also lacks renameat2(RENAME_NOREPLACE), so moveGuarded must
+// precheck destination absence before an atomic same-device rename; a local
+// racer can still create and have that name replaced between those operations,
+// and a crash before the parent fsync leaves rename durability uncertain. A
+// native *at-family binding would be required to close these residuals fully.
 
 function fdRealPathSync(fd, fallbackPath) {
   if (process.platform === 'linux') return fs.readlinkSync(`/proc/self/fd/${fd}`);
@@ -665,9 +669,12 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
     reverifyPrepared(source);
     reverifyPrepared(destination);
     assertTargetIdentity(source, source.targetStat);
-    reservation = reserveDestination(destination, source.targetStat.isDirectory());
     if (source.targetStat.isDirectory()) {
+      reservation = reserveDestination(destination, true);
       assertReservationIdentity(destination.target, reservation);
+      assertTargetIdentity(source, source.targetStat);
+      reverifyPrepared(source);
+      reverifyPrepared(destination);
       try {
         fs.renameSync(source.target, destination.target);
       } catch (err) {
@@ -678,10 +685,12 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
       fs.fsyncSync(destination.parentFd);
       if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
     } else {
-      releaseReservation(destination.target, reservation, () => { reservation = undefined; });
-      let installedStat;
+      if (lstatIfPresent(destination.target)) throw new FileLinkDenied('dest-exists');
+      assertTargetIdentity(source, source.targetStat);
+      reverifyPrepared(source);
+      reverifyPrepared(destination);
       try {
-        installedStat = linkNoReplace(source.target, destination.target, source.targetStat);
+        fs.renameSync(source.target, destination.target);
       } catch (err) {
         if (err?.code !== 'EXDEV') throw err;
         reservation = reserveDestination(destination, false);
@@ -695,23 +704,8 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
         );
         return { from: source.target, to: destination.target };
       }
-      let sourceUnlinked = false;
-      try {
-        fs.fsyncSync(destination.parentFd);
-        fs.unlinkSync(source.target);
-        sourceUnlinked = true;
-        fs.fsyncSync(source.parentFd);
-      } catch (err) {
-        if (!sourceUnlinked) {
-          try {
-            removeInstalledFile(destination.target, installedStat);
-            fs.fsyncSync(destination.parentFd);
-          } catch (rollbackErr) {
-            err.rollbackError = rollbackErr;
-          }
-        }
-        throw err;
-      }
+      fs.fsyncSync(destination.parentFd);
+      if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
     }
     return { from: source.target, to: destination.target };
   } finally {
@@ -735,22 +729,44 @@ function validateTrashDirectory(root) {
   if (realTrash !== trashDir || !contains(root.realPath, realTrash)) {
     throw new FileLinkDenied('trash-write-failed');
   }
-  return { trashDir, exists: true };
+  return { trashDir, exists: true, dev: stat.dev, ino: stat.ino };
 }
 
 function ensureTrashDirectory(prepared) {
   let trash = validateTrashDirectory(prepared.root);
-  if (trash.exists) return trash;
+  if (trash.exists) return { ...trash, created: false };
+  let created = false;
+  let createdTrash;
   try {
     fs.mkdirSync(trash.trashDir, { mode: 0o700 });
+    created = true;
+    const stat = fs.lstatSync(trash.trashDir);
+    createdTrash = { trashDir: trash.trashDir, created: true, dev: stat.dev, ino: stat.ino };
   } catch (err) {
     if (err?.code !== 'EEXIST') throw new FileLinkDenied('trash-write-failed');
   }
-  trash = validateTrashDirectory(prepared.root);
-  if (!trash.exists) throw new FileLinkDenied('trash-write-failed');
-  if (prepared.root.realPath === prepared.pinnedAncestor) fs.fsyncSync(prepared.parentFd);
-  else fsyncDirectoryPathSync(prepared.root.realPath);
-  return trash;
+  try {
+    trash = validateTrashDirectory(prepared.root);
+    if (!trash.exists) throw new FileLinkDenied('trash-write-failed');
+    if (prepared.root.realPath === prepared.pinnedAncestor) fs.fsyncSync(prepared.parentFd);
+    else fsyncDirectoryPathSync(prepared.root.realPath);
+    return { ...trash, created };
+  } catch (err) {
+    removeCreatedTrashDirectory(createdTrash);
+    throw err;
+  }
+}
+
+function removeCreatedTrashDirectory(trash) {
+  if (!trash?.created) return;
+  try {
+    const current = fs.lstatSync(trash.trashDir);
+    if (current.isSymbolicLink()
+        || !current.isDirectory()
+        || current.dev !== trash.dev
+        || current.ino !== trash.ino) return;
+    fs.rmdirSync(trash.trashDir);
+  } catch {}
 }
 
 function assertTrashDirectoryIdentity(root, trashDir, trashFd, expectedStat) {
@@ -846,9 +862,11 @@ function preserveFileForOverwrite(prepared) {
 
 export async function trashGuarded(targetPath, { writeRoots, recursive = false } = {}) {
   const source = prepareWriteTarget(targetPath, writeRoots);
+  let trash;
   let trashFd;
   let destination;
   let reservation;
+  let trashCommitted = false;
   try {
     assertImmediateParent(source);
     if (!source.targetStat) {
@@ -858,12 +876,15 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
       throw new FileLinkDenied('unreadable');
     }
     if (source.target === source.root.realPath) throw new FileLinkDenied('outside-scope');
+    validateTrashDirectory(source.root);
+    reverifyPrepared(source);
+    assertTargetIdentity(source, source.targetStat);
     if (source.targetStat.isDirectory() && !recursive && fs.readdirSync(source.target).length > 0) {
       throw new FileLinkDenied('dir-not-empty');
     }
-    const trash = ensureTrashDirectory(source);
     reverifyPrepared(source);
     assertTargetIdentity(source, source.targetStat);
+    trash = ensureTrashDirectory(source);
     trashFd = fs.openSync(
       trash.trashDir,
       fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
@@ -894,6 +915,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
     try {
       fs.renameSync(source.target, destination);
       reservation = undefined;
+      trashCommitted = true;
       fs.fsyncSync(trashFd);
       fs.fsyncSync(source.parentFd);
     } catch (err) {
@@ -919,6 +941,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
           reservation,
           () => { reservation = undefined; },
         );
+        trashCommitted = true;
       } catch {
         throw new FileLinkDenied('trash-write-failed');
       }
@@ -927,6 +950,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
   } finally {
     if (destination && reservation) removeReservation(destination, reservation);
     if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
+    if (!trashCommitted) removeCreatedTrashDirectory(trash);
     closePrepared(source);
   }
 }
