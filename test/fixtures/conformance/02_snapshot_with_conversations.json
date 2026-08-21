@@ -1,6 +1,6 @@
 {
-  "name": "snapshot: conversations carry title/session_state/unread_count/snippet, ordered by last_seq desc",
-  "description": "Two conversations, one advanced by an agent (bumps unread + snippet), one advanced by the user's own send (does not bump unread). GET /snapshot's seq is the user's journal head; conversations are ordered most-recently-active first.",
+  "name": "snapshot: conversations carry title/session_state/unread_count/snippet, ordered by last message time desc",
+  "description": "Two conversations, one advanced by an agent (bumps unread + snippet), one advanced by the user's own send (does not bump unread). GET /snapshot's seq is the user's journal head; conversations are ordered by last message time (COALESCE(last_ts, created_at) DESC, id DESC), so the most recently messaged conversation is first.",
   "seed": {
     "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-2" }],
     "conversations": [

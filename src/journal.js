@@ -13,6 +13,18 @@ export const MESSAGE_TYPES = [
 // subquery would force every caller to append the same seven arguments.
 export const MESSAGE_TYPES_SQL = MESSAGE_TYPES.map((t) => `'${t}'`).join(',')
 
+// Conversation-list order: newest last-MESSAGE time first (last_ts, falling
+// back to created_at for a conversation with no message events), tie-broken by
+// the immutable id DESC. Done in JS by snapshot() and the /roster handler over
+// the already-fetched rows — NOT a SQL ORDER BY, which would re-evaluate the
+// correlated last_ts subquery a second time per row. Byte-for-byte the same
+// comparator the web client uses (matron-web database.ts) so the two agree.
+export function byLastMessageThenId(a, b) {
+  const activity = (b.last_ts ?? b.created_at) - (a.last_ts ?? a.created_at)
+  if (activity) return activity
+  return a.id > b.id ? -1 : a.id < b.id ? 1 : 0
+}
+
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
 // capping the bridge-returned `start` rpc's convo_id — same 128-char id
@@ -250,6 +262,20 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // has no message events (just created, or history pruned by retention) —
   // clients fall back to created_at. The (convo_id, seq) index keeps the
   // subquery a backwards seek to the first message row.
+  // Ordering is by that last-message time (COALESCE(last_ts, created_at)), not
+  // raw last_seq — every meta/status/read_marker event advances last_seq, so a
+  // last_seq ordering resurfaced a stale conversation to the top on non-message
+  // activity. The tie-break is the immutable `id`, NOT last_seq: a last_seq
+  // tie-break would reintroduce the exact bug on a same-millisecond last_ts
+  // collision (the non-message event still advanced last_seq), and id also
+  // gives message-less rows sharing a created_at a total, flicker-free order.
+  // The ordering is done in JS, not a SQL ORDER BY: referencing the correlated
+  // last_ts subquery in ORDER BY makes SQLite evaluate it a SECOND time per row
+  // (re-walking each conversation's non-message suffix — measured ~2x on a
+  // pathological history), and better-sqlite3 runs synchronously, so that would
+  // block the event loop. Sorting the already-fetched rows costs nothing at
+  // per-user conversation counts, and uses the exact comparator the web client
+  // applies (database.ts), keeping server and client order identical.
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
@@ -260,9 +286,9 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
      FROM conversations WHERE owner_user_id=?${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
-       : ''}
-     ORDER BY last_seq DESC`
+       : ''}`
   ).all(userId)
+  conversations.sort(byLastMessageThenId)
   // Room membership, so a client can chip every participating box, not just
   // the recorded owner (spec: multi-agent room tags). One grouped query for
   // all of this user's joined convo_agents rows, attached per-convo as

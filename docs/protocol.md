@@ -32,7 +32,10 @@ the machine-checkable version of this page.
   or not — gets `snippet` omitted from every row (it can carry `tool_output`
   text, a credential surface); an ordinary (non-private) agent additionally
   has private-owned conversations excluded entirely — see "Device privacy"
-  below.
+  below. Conversations are ordered by last message time, exactly as `/roster`
+  documents below: `COALESCE(last_ts, created_at) DESC, id DESC`, so non-message
+  activity (`session_status`/`convo_meta`/`read_marker`) never resurfaces an
+  idle conversation.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -174,10 +177,16 @@ the machine-checkable version of this page.
   `[{id, title, session_state, last_seq, summary, agent_device_id,
   created_at, last_ts}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
-  chat targets), ordered by `last_seq DESC`; `last_ts` is the newest
-  event's timestamp (`null` for an event-less conversation), same
-  derivation as `/snapshot`. Scoped to the caller's own user like every
-  other read. See "Agent chat rooms" below for what a room and `summary`
+  chat targets), ordered by last message time —
+  `COALESCE(last_ts, created_at) DESC, id DESC` (most recent message first,
+  falling back to the conversation's own `created_at` when it has no message
+  events, with the immutable `id` as a stable tie-break). Deliberately NOT
+  `last_seq DESC`: a `session_status`/`convo_meta`/`read_marker` event advances
+  `last_seq` without being a message, so a `last_seq` order resurfaced an idle
+  conversation to the top on non-message activity. `last_ts` is the newest
+  **message** event's timestamp (`null` for a conversation with no message
+  events), same derivation as `/snapshot`. Scoped to the caller's own user like
+  every other read. See "Agent chat rooms" below for what a room and `summary`
   are.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
