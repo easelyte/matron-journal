@@ -4,6 +4,7 @@
 // copies (bridge + journal) cannot silently diverge.
 import { test, before, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, renameSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import fsp from 'node:fs/promises'
@@ -12,6 +13,7 @@ import path from 'node:path'
 import {
   isSensitivePath, checkFileLink, validateAndOpen, openGuarded, metaGuarded, listDirGuarded,
   pinAllowedRoots, pinAllowedRootsSync, FileLinkDenied, denialToStatus,
+  validateWriteTarget, writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
   contentTypeFor, mimeForPath, isTextPath, MAX_VIEW_BYTES,
 } from '../src/file-guard.js'
 
@@ -443,5 +445,403 @@ test('listDirGuarded denials: outside-scope, not-a-dir, sensitive dir, relative'
     assert.equal(listDenied(secretDir), 'sensitive')
   } finally {
     rmSync(secretDir, { recursive: true, force: true })
+  }
+})
+
+// --- Phase-2 write primitives -----------------------------------------------
+const writeDenied = async (fn) => {
+  try {
+    await fn()
+  } catch (err) {
+    assert.ok(err instanceof FileLinkDenied, `expected FileLinkDenied, got ${err}`)
+    return err.reason
+  }
+  throw new Error('expected FileLinkDenied')
+}
+
+const makeWriteFixture = () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'fg-write-root-'))
+  const out = mkdtempSync(path.join(tmpdir(), 'fg-write-out-'))
+  return {
+    root,
+    out,
+    writeRoots: pinAllowedRootsSync([root]),
+    cleanup() {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(out, { recursive: true, force: true })
+    },
+  }
+}
+
+test('validateWriteTarget canonicalizes safe targets and rejects boundary escapes', () => {
+  const f = makeWriteFixture()
+  try {
+    mkdirSync(path.join(f.root, 'existing'))
+    assert.equal(
+      validateWriteTarget(path.join(f.root, 'existing', '..', 'new.txt'), { writeRoots: f.writeRoots }),
+      path.join(f.root, 'new.txt'),
+    )
+    assert.throws(
+      () => validateWriteTarget(path.join(f.out, 'escape.txt'), { writeRoots: f.writeRoots }),
+      (err) => err instanceof FileLinkDenied && err.reason === 'outside-scope',
+    )
+    assert.throws(
+      () => validateWriteTarget('relative.txt', { writeRoots: f.writeRoots }),
+      (err) => err instanceof FileLinkDenied && err.reason === 'relative-path',
+    )
+    assert.throws(
+      () => validateWriteTarget(path.join(f.root, '.env'), { writeRoots: f.writeRoots }),
+      (err) => err instanceof FileLinkDenied && err.reason === 'sensitive',
+    )
+    for (const target of [
+      path.join(f.root, '.matron-trash'),
+      path.join(f.root, '.matron-trash', 'saved.txt'),
+      path.join(f.root, 'nested', '.matron-trash', 'saved.txt'),
+    ]) {
+      assert.throws(
+        () => validateWriteTarget(target, { writeRoots: f.writeRoots }),
+        (err) => err instanceof FileLinkDenied && err.reason === 'trash-protected',
+      )
+    }
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('every write helper rejects outside, sensitive, and symlink-escaped targets without mutation', async () => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const sensitive = path.join(f.root, '.env')
+    writeFileSync(source, 'source')
+    writeFileSync(sensitive, 'SECRET=1')
+    symlinkSync(f.out, path.join(f.root, 'escape'))
+    const cases = [
+      () => writeFileAtomic(path.join(f.out, 'x.txt'), Buffer.from('x'), { writeRoots: f.writeRoots, maxBytes: 10 }),
+      () => writeFileAtomic(path.join(f.root, '.env'), Buffer.from('x'), { writeRoots: f.writeRoots, maxBytes: 10 }),
+      () => writeFileAtomic(path.join(f.root, 'escape', 'x.txt'), Buffer.from('x'), { writeRoots: f.writeRoots, maxBytes: 10 }),
+      () => mkdirGuarded(path.join(f.out, 'dir'), { writeRoots: f.writeRoots }),
+      () => mkdirGuarded(path.join(f.root, '.env', 'dir'), { writeRoots: f.writeRoots }),
+      () => mkdirGuarded(path.join(f.root, 'escape', 'dir'), { writeRoots: f.writeRoots }),
+      () => moveGuarded(source, path.join(f.out, 'moved.txt'), { writeRoots: f.writeRoots }),
+      () => moveGuarded(source, path.join(f.root, '.env.local'), { writeRoots: f.writeRoots }),
+      () => moveGuarded(source, path.join(f.root, 'escape', 'moved.txt'), { writeRoots: f.writeRoots }),
+      () => moveGuarded(sensitive, path.join(f.root, 'moved-secret.txt'), { writeRoots: f.writeRoots }),
+      () => moveGuarded(path.join(f.root, 'escape', 'target.txt'), path.join(f.root, 'moved.txt'), { writeRoots: f.writeRoots }),
+      () => trashGuarded(path.join(f.out, 'x.txt'), { writeRoots: f.writeRoots }),
+      () => trashGuarded(sensitive, { writeRoots: f.writeRoots }),
+      () => trashGuarded(path.join(f.root, 'escape', 'x.txt'), { writeRoots: f.writeRoots }),
+    ]
+    for (const run of cases) await writeDenied(run)
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.equal(fs.existsSync(path.join(f.out, 'x.txt')), false)
+    assert.equal(fs.existsSync(path.join(f.root, '.matron-trash')), false)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic cleans its temp file when stream validation fails mid-operation', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'invalid-stream.txt')
+    async function* invalidStream() {
+      yield Buffer.from('partial')
+      yield { not: 'bytes' }
+    }
+    await assert.rejects(
+      writeFileAtomic(target, invalidStream(), { writeRoots: f.writeRoots, maxBytes: 100 }),
+      /stream chunks must be bytes/,
+    )
+    assert.equal(fs.existsSync(target), false)
+    assert.deepEqual(fs.readdirSync(f.root).filter((name) => name.includes('.matron-tmp-')), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic detects an ancestor swap before rename and cleans through the pinned parent fd', async () => {
+  const f = makeWriteFixture()
+  try {
+    const parent = path.join(f.root, 'parent')
+    const movedParent = path.join(f.root, 'moved-parent')
+    const target = path.join(parent, 'target.txt')
+    mkdirSync(parent)
+    async function* swappingStream() {
+      yield Buffer.from('first')
+      renameSync(parent, movedParent)
+      symlinkSync(f.out, parent)
+      yield Buffer.from('second')
+    }
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, swappingStream(), { writeRoots: f.writeRoots, maxBytes: 100 })),
+      'bad-workdir',
+    )
+    assert.equal(fs.existsSync(path.join(f.out, 'target.txt')), false)
+    assert.deepEqual(fs.readdirSync(movedParent), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic handles bytes and streams, enforces the cap, and leaves no partial target', async () => {
+  const f = makeWriteFixture()
+  try {
+    const bytesTarget = path.join(f.root, 'bytes.txt')
+    const streamTarget = path.join(f.root, 'stream.txt')
+    const cappedTarget = path.join(f.root, 'capped.txt')
+    writeFileSync(cappedTarget, 'old')
+    assert.equal(await writeFileAtomic(bytesTarget, Buffer.from('bytes'), { writeRoots: f.writeRoots, maxBytes: 10 }), bytesTarget)
+    assert.equal(
+      await writeFileAtomic(streamTarget, fs.createReadStream(bytesTarget), { writeRoots: f.writeRoots, maxBytes: 10 }),
+      streamTarget,
+    )
+    assert.equal(fs.readFileSync(bytesTarget, 'utf8'), 'bytes')
+    assert.equal(fs.readFileSync(streamTarget, 'utf8'), 'bytes')
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(cappedTarget, Buffer.from('too large'), { writeRoots: f.writeRoots, maxBytes: 3 })),
+      'too-large',
+    )
+    assert.equal(fs.readFileSync(cappedTarget, 'utf8'), 'old')
+    assert.deepEqual(fs.readdirSync(f.root).filter((name) => name.includes('.matron-tmp-')), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic fsyncs the temp file before rename and the parent after rename', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'durable.txt')
+    const events = []
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      events.push('fsync')
+      return realFsync(fd)
+    })
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      events.push('rename')
+      return realRename(from, to)
+    })
+    await writeFileAtomic(target, Buffer.from('durable'), { writeRoots: f.writeRoots, maxBytes: 20 })
+    const renameAt = events.indexOf('rename')
+    assert.ok(renameAt > 0, `expected pre-rename fsync: ${events}`)
+    assert.ok(events.slice(renameAt + 1).includes('fsync'), `expected post-rename parent fsync: ${events}`)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('mkdirGuarded creates nested directories and is idempotent', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'one', 'two')
+    assert.equal(await mkdirGuarded(target, { writeRoots: f.writeRoots }), target)
+    assert.equal(await mkdirGuarded(target, { writeRoots: f.writeRoots }), target)
+    assert.equal(fs.statSync(target).isDirectory(), true)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded never clobbers an existing destination and validates both sides before mutation', async () => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'source')
+    writeFileSync(destination, 'destination')
+    assert.equal(await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })), 'dest-exists')
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'destination')
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, path.join(f.root, '.matron-trash', 'x'), { writeRoots: f.writeRoots })),
+      'trash-protected',
+    )
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded atomically renames a file on the same device', async () => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'moved')
+    assert.deepEqual(await moveGuarded(source, destination, { writeRoots: f.writeRoots }), {
+      from: source,
+      to: destination,
+    })
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'moved')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('moveGuarded cross-device file fallback succeeds and rolls back the destination on source-unlink failure', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'cross-device')
+    const realRename = fs.renameSync
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      return realRename(from, to)
+    })
+    assert.deepEqual(await moveGuarded(source, destination, { writeRoots: f.writeRoots }), { from: source, to: destination })
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'cross-device')
+  } finally {
+    f.cleanup()
+  }
+
+  const rollback = makeWriteFixture()
+  try {
+    const source = path.join(rollback.root, 'source.txt')
+    const destination = path.join(rollback.root, 'destination.txt')
+    writeFileSync(source, 'keep-me')
+    const realRename = fs.renameSync
+    const renameMock = mock.method(fs, 'renameSync', (from, to) => {
+      if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      return realRename(from, to)
+    })
+    const realUnlink = fs.unlinkSync
+    const unlinkMock = mock.method(fs, 'unlinkSync', (target) => {
+      if (target === source) throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+      return realUnlink(target)
+    })
+    try {
+      await assert.rejects(moveGuarded(source, destination, { writeRoots: rollback.writeRoots }), /busy/)
+    } finally {
+      unlinkMock.mock.restore()
+      renameMock.mock.restore()
+    }
+    assert.equal(fs.readFileSync(source, 'utf8'), 'keep-me')
+    assert.equal(fs.existsSync(destination), false)
+  } finally {
+    rollback.cleanup()
+  }
+})
+
+test('moveGuarded maps a cross-device directory move to cross-device-dir', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source-dir')
+    const destination = path.join(f.root, 'destination-dir')
+    mkdirSync(source)
+    const realRename = fs.renameSync
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      return realRename(from, to)
+    })
+    assert.equal(await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })), 'cross-device-dir')
+    assert.equal(fs.statSync(source).isDirectory(), true)
+    assert.equal(fs.existsSync(destination), false)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('trashGuarded enforces the recursive guard and protects the trash tree', async () => {
+  const f = makeWriteFixture()
+  try {
+    const nonempty = path.join(f.root, 'nonempty')
+    mkdirSync(nonempty)
+    writeFileSync(path.join(nonempty, 'child.txt'), 'child')
+    assert.equal(await writeDenied(() => trashGuarded(nonempty, { writeRoots: f.writeRoots, recursive: false })), 'dir-not-empty')
+    assert.equal(fs.existsSync(nonempty), true)
+    assert.equal(fs.existsSync(path.join(f.root, '.matron-trash')), false)
+
+    const result = await trashGuarded(nonempty, { writeRoots: f.writeRoots, recursive: true })
+    assert.equal(result.path, nonempty)
+    assert.equal(result.already_missing, false)
+    assert.equal(fs.existsSync(nonempty), false)
+    assert.equal(fs.statSync(result.trashed).isDirectory(), true)
+    assert.equal(fs.readFileSync(path.join(result.trashed, 'child.txt'), 'utf8'), 'child')
+    assert.equal(
+      await writeDenied(() => trashGuarded(result.trashed, { writeRoots: f.writeRoots, recursive: true })),
+      'trash-protected',
+    )
+    assert.equal(
+      await writeDenied(() => moveGuarded(result.trashed, path.join(f.root, 'restored'), { writeRoots: f.writeRoots })),
+      'trash-protected',
+    )
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('trashGuarded handles cross-device files and maps cross-device directories to trash-write-failed', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const sourceFile = path.join(f.root, 'source.txt')
+    const sourceDir = path.join(f.root, 'source-dir')
+    writeFileSync(sourceFile, 'recoverable')
+    mkdirSync(sourceDir)
+    const realRename = fs.renameSync
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if ((from === sourceFile || from === sourceDir) && to.includes(`${path.sep}.matron-trash${path.sep}`)) {
+        throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      }
+      return realRename(from, to)
+    })
+    const fileResult = await trashGuarded(sourceFile, { writeRoots: f.writeRoots })
+    assert.equal(fs.existsSync(sourceFile), false)
+    assert.equal(fs.readFileSync(fileResult.trashed, 'utf8'), 'recoverable')
+    assert.equal(
+      await writeDenied(() => trashGuarded(sourceDir, { writeRoots: f.writeRoots, recursive: true })),
+      'trash-write-failed',
+    )
+    assert.equal(fs.statSync(sourceDir).isDirectory(), true)
+    assert.deepEqual(fs.readdirSync(path.join(f.root, '.matron-trash')).sort(), [path.basename(fileResult.trashed)])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('trashGuarded rejects a replaced trash directory before moving the source', async () => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    writeFileSync(source, 'source')
+    symlinkSync(f.out, path.join(f.root, '.matron-trash'))
+    assert.equal(await writeDenied(() => trashGuarded(source, { writeRoots: f.writeRoots })), 'trash-write-failed')
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.deepEqual(fs.readdirSync(f.out), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('two same-basename deletes both survive and delete-missing is idempotent', async () => {
+  const f = makeWriteFixture()
+  try {
+    mkdirSync(path.join(f.root, 'a'))
+    mkdirSync(path.join(f.root, 'b'))
+    const first = path.join(f.root, 'a', 'same.txt')
+    const second = path.join(f.root, 'b', 'same.txt')
+    writeFileSync(first, 'first')
+    writeFileSync(second, 'second')
+    const [one, two] = await Promise.all([
+      trashGuarded(first, { writeRoots: f.writeRoots }),
+      trashGuarded(second, { writeRoots: f.writeRoots }),
+    ])
+    assert.notEqual(one.trashed, two.trashed)
+    assert.deepEqual(
+      new Set([fs.readFileSync(one.trashed, 'utf8'), fs.readFileSync(two.trashed, 'utf8')]),
+      new Set(['first', 'second']),
+    )
+    assert.deepEqual(await trashGuarded(first, { writeRoots: f.writeRoots }), {
+      path: first,
+      trashed: null,
+      already_missing: true,
+    })
+  } finally {
+    f.cleanup()
   }
 })
