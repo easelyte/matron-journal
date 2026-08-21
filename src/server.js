@@ -14,6 +14,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
+import { pinAllowedRootsSync } from './file-guard.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
@@ -26,6 +27,11 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // busiest user's current footprint on dev-2 — generous headroom, not a squeeze.
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
+// File Explorer read API (spec: matron-file-explorer §5.4). Reads are broad by
+// operator preference; the always-on secret denylist (isSensitivePath) bounds
+// exposure regardless of how wide the roots are.
+export const DEFAULT_FILE_READ_ROOTS = '/root/.openclaw/workspace:/root'
+export const DEFAULT_FILE_LIST_MAX = 2000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
@@ -276,7 +282,7 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct, waker,
+  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileListMax,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -311,6 +317,17 @@ export function startServer({
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
+  // File Explorer read API config (spec §5.4). Roots are resolved and pinned
+  // ONCE here, at boot, on the trusted server side — never request-controlled.
+  // Tests inject `fileReadRoots` (array) directly; otherwise the colon-sep env
+  // (or its default) is used. pinAllowedRootsSync fails VISIBLE (throws) on an
+  // unreadable/nonexistent configured root: a misconfigured jail must be loud,
+  // not a silently-wide-open file API (P3 fail-closed). Phase 1 ships reads
+  // only — MATRON_FILE_ENABLE_WRITES is read but no write route exists.
+  const fileReadRootList = fileReadRoots
+    ?? (process.env.MATRON_FILE_READ_ROOTS || DEFAULT_FILE_READ_ROOTS).split(':').filter(Boolean)
+  const resolvedFileReadRoots = pinAllowedRootsSync(fileReadRootList)
+  const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
   const broker = makeRpcBroker()
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
@@ -329,6 +346,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs,
+    fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,

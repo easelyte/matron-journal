@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
+import { validateAndOpen, metaGuarded, listDirGuarded, contentTypeFor, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
@@ -93,7 +95,15 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
+// Default-hidden listing entries (dev noise). Hiding is a DISPLAY filter layered
+// on top of the always-on sensitive DROP in listDirGuarded — a `?all=1` toggle
+// reveals these, but never a sensitive entry (those are gone before this runs).
+const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__'])
+const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
+// Strip anything that could break a Content-Disposition header (quotes, CR/LF).
+const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
+
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, fileReadRoots, fileListMax = 2000 }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -253,6 +263,114 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // --- File Explorer read API (spec: matron-file-explorer §5) -----------
+      // Client devices only (operator devices browse; agents do not). Every
+      // path is parsed/validated at the boundary and jailed server-side to the
+      // pinned read-roots + always-on secret denylist. Writes are Phase 2 and
+      // absent here. denialToStatus keeps rejection reasons uniform.
+      if (req.method === 'GET' && url.pathname === '/files/list') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        const showAll = url.searchParams.get('all') === '1'
+        let listed
+        try {
+          listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
+        } catch (e) {
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          throw e
+        }
+        // Sensitive entries are already dropped by the guard; this is only the
+        // dev-noise/dotfile display filter, toggled off by ?all=1.
+        const visible = showAll ? listed.entries : listed.entries.filter((e) => !isHiddenListEntry(e.name))
+        // Dirs first, then case-insensitive name.
+        visible.sort((a, b) => {
+          if (a.kind !== b.kind) {
+            if (a.kind === 'dir') return -1
+            if (b.kind === 'dir') return 1
+          }
+          return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+        })
+        const parent = listed.realDir === path.parse(listed.realDir).root ? null : path.dirname(listed.realDir)
+        return json(res, 200, { path: listed.realDir, parent, entries: visible, truncated: listed.truncated })
+      }
+      if (req.method === 'GET' && url.pathname === '/files/meta') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        let meta
+        try {
+          meta = await metaGuarded(p, { allowedRoots: fileReadRoots })
+        } catch (e) {
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          return json(res, 404, { error: 'not_found' })
+        }
+        return json(res, 200, {
+          path: meta.realPath,
+          kind: meta.kind,
+          size: meta.size,
+          mtime: meta.mtime,
+          mime: meta.mime,
+          is_text: meta.is_text,
+        })
+      }
+      if (req.method === 'GET' && url.pathname === '/files/content') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        const attachment = url.searchParams.get('disposition') === 'attachment'
+        const maxBytes = attachment ? MAX_DOWNLOAD_BYTES : MAX_VIEW_BYTES
+        let opened
+        try {
+          // validateAndOpen buffers the (bounded) file behind an fd-pinned,
+          // symlink-proof, containment-checked open. Never readBody (JSON/1MB).
+          opened = await validateAndOpen(p, { allowedRoots: fileReadRoots, maxBytes })
+        } catch (e) {
+          // The guard's contract: map ANY throw to a denial (404 default), not
+          // just FileLinkDenied — an unexpected fs error must not leak/500.
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          return json(res, 404, { error: 'not_found' })
+        }
+        const { content, realPath } = opened
+        const { type, inlineSafe } = contentTypeFor(realPath)
+        // Force download for a non-inline-safe type even if inline was asked
+        // (nothing script-capable renders inline on this origin).
+        const disposition = attachment || !inlineSafe ? 'attachment' : 'inline'
+        const total = content.length
+        const headers = {
+          'content-type': type,
+          'cache-control': 'private',
+          'x-content-type-options': 'nosniff',
+          'accept-ranges': 'bytes',
+          'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+        }
+        const range = req.headers.range
+        if (range) {
+          const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+          if (!m || (m[1] === '' && m[2] === '')) {
+            res.writeHead(416, { 'content-range': `bytes */${total}` })
+            return res.end()
+          }
+          let start = m[1] === '' ? null : Number(m[1])
+          let end = m[2] === '' ? null : Number(m[2])
+          if (start === null) {
+            // suffix range: last `end` bytes
+            start = Math.max(0, total - end)
+            end = total - 1
+          } else if (end === null || end >= total) {
+            end = total - 1
+          }
+          if (!Number.isInteger(start) || start > end || start >= total || start < 0) {
+            res.writeHead(416, { 'content-range': `bytes */${total}` })
+            return res.end()
+          }
+          const slice = content.subarray(start, end + 1)
+          res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${total}`, 'content-length': String(slice.length) })
+          return res.end(slice)
+        }
+        res.writeHead(200, { ...headers, 'content-length': String(total) })
+        return res.end(content)
+      }
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         // Two independent rules layered on top of the client shape (spec:
         // agent visibility & privacy, task 8):

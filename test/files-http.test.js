@@ -1,0 +1,250 @@
+// Real-server harness for the File Explorer read API (spec §5.2 / §8 / §10).
+// Mirrors media.test.js: startTestServer + fs.mkdtempSync fixtures, asserting
+// the path-jail, sensitive-drop, hidden-toggle, streaming/Range, caps, auth
+// gating, and uniform denials end-to-end over HTTP.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import crypto from 'node:crypto'
+import { startTestServer } from './helpers.js'
+import { createUser, createAgent } from '../src/auth.js'
+
+// Build a canonical read-root with a representative tree + adversarial entries.
+function makeFixture() {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-')))
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-outside-')))
+
+  fs.writeFileSync(path.join(root, 'README.md'), '# hello\n')
+  fs.writeFileSync(path.join(root, 'app.js'), 'console.log(1)\n')
+  fs.writeFileSync(path.join(root, '.env'), 'SECRET=1\n')            // sensitive — always dropped
+  fs.writeFileSync(path.join(root, '.hidden'), 'dot\n')             // hidden by default (dotfile)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.mkdirSync(path.join(root, 'node_modules'))                    // hidden by default
+  fs.mkdirSync(path.join(root, '.git'))                            // hidden by default
+  fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export {}\n')
+
+  // Non-UTF8 binary, so a string-based path would corrupt it.
+  const binBytes = Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x81]), crypto.randomBytes(2048)])
+  fs.writeFileSync(path.join(root, 'blob.bin'), binBytes)
+
+  // Adversarial symlinks that must never be served / listed.
+  fs.writeFileSync(path.join(outside, 'target.txt'), 'ESCAPED SECRET\n')
+  fs.symlinkSync(path.join(outside, 'target.txt'), path.join(root, 'escape.txt'))     // symlink-out
+  fs.writeFileSync(path.join(outside, 'config.json'), '{"token":"x"}\n')
+  fs.symlinkSync(path.join(outside, 'config.json'), path.join(root, 'looksok.txt'))   // symlink-to-secret
+
+  return { root, outside, binBytes }
+}
+
+async function clientToken(s, name = 'op', pw = 'pw') {
+  await createUser(s.db, name, pw)
+  const r = await s.http('/login', { method: 'POST', body: { username: name, password: pw, device_name: 'x' } })
+  return r.json.token
+}
+
+function authGet(s, pathAndQuery, token, headers = {}) {
+  return fetch(s.base + pathAndQuery, { headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers } })
+}
+
+test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?all=1', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  const r = await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)
+  assert.equal(r.status, 200)
+  const body = await r.json()
+  assert.equal(body.path, root)
+  assert.equal(body.parent, path.dirname(root))
+  assert.equal(body.truncated, false)
+  const names = body.entries.map((e) => e.name)
+
+  // sensitive + symlink-escape + symlink-to-secret never appear, in either mode
+  for (const forbidden of ['.env', 'escape.txt', 'looksok.txt']) {
+    assert.ok(!names.includes(forbidden), `${forbidden} must never be listed`)
+  }
+  // hidden by default
+  for (const hidden of ['.hidden', 'node_modules', '.git']) {
+    assert.ok(!names.includes(hidden), `${hidden} should be hidden by default`)
+  }
+  // visible content present
+  for (const shown of ['README.md', 'app.js', 'src', 'blob.bin']) {
+    assert.ok(names.includes(shown), `${shown} should be listed`)
+  }
+  // dirs first
+  const firstFileIdx = body.entries.findIndex((e) => e.kind === 'file')
+  const lastDirIdx = body.entries.map((e) => e.kind).lastIndexOf('dir')
+  assert.ok(lastDirIdx < firstFileIdx, 'all dirs must sort before files')
+  // entry shape
+  const app = body.entries.find((e) => e.name === 'app.js')
+  assert.equal(app.kind, 'file')
+  assert.equal(app.mime, 'text/plain')
+  assert.equal(typeof app.size, 'number')
+  assert.equal(typeof app.mtime, 'number')
+
+  // ?all=1 reveals dev-noise/dotfiles but STILL never the sensitive drop
+  const rAll = await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)
+  const allNames = (await rAll.json()).entries.map((e) => e.name)
+  assert.ok(allNames.includes('.hidden') && allNames.includes('node_modules') && allNames.includes('.git'))
+  for (const forbidden of ['.env', 'escape.txt', 'looksok.txt']) {
+    assert.ok(!allNames.includes(forbidden), `${forbidden} must never be listed even with all=1`)
+  }
+})
+
+test('GET /files/list: truncated flag when over the cap', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root], fileListMax: 3 })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const body = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
+  assert.equal(body.entries.length, 3)
+  assert.equal(body.truncated, true)
+})
+
+test('GET /files/list: outside-root -> 403, missing -> 404, a file path -> 404 (not-a-dir)', async (t) => {
+  const { root, outside } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(outside)}`, token)).status, 403)
+  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'nope'))}`, token)).status, 404)
+  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
+  assert.equal((await authGet(s, `/files/list?path=relative`, token)).status, 400)
+  assert.equal((await authGet(s, `/files/list`, token)).status, 400)
+})
+
+test('GET /files/meta: file + dir metadata; sensitive/outside denied', async (t) => {
+  const { root, outside } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  const md = await (await authGet(s, `/files/meta?path=${encodeURIComponent(path.join(root, 'README.md'))}`, token)).json()
+  assert.equal(md.kind, 'file')
+  assert.equal(md.mime, 'text/markdown')
+  assert.equal(md.is_text, true)
+  assert.equal(md.size, '# hello\n'.length)
+
+  const dir = await (await authGet(s, `/files/meta?path=${encodeURIComponent(path.join(root, 'src'))}`, token)).json()
+  assert.equal(dir.kind, 'dir')
+  assert.equal(dir.is_text, false)
+
+  const bin = await (await authGet(s, `/files/meta?path=${encodeURIComponent(path.join(root, 'blob.bin'))}`, token)).json()
+  assert.equal(bin.mime, 'application/octet-stream')
+  assert.equal(bin.is_text, false)
+
+  assert.equal((await authGet(s, `/files/meta?path=${encodeURIComponent(path.join(root, '.env'))}`, token)).status, 403)
+  assert.equal((await authGet(s, `/files/meta?path=${encodeURIComponent(path.join(outside, 'target.txt'))}`, token)).status, 403)
+})
+
+test('GET /files/content: text inline (text/plain + nosniff + inline), exact bytes', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  const r = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)
+  assert.equal(r.status, 200)
+  assert.equal(r.headers.get('content-type'), 'text/plain; charset=utf-8')
+  assert.equal(r.headers.get('x-content-type-options'), 'nosniff')
+  assert.equal(r.headers.get('cache-control'), 'private')
+  assert.match(r.headers.get('content-disposition'), /^inline;/)
+  assert.equal(await r.text(), 'console.log(1)\n')
+})
+
+test('GET /files/content: binary streams exact bytes; Range -> 206 slice', async (t) => {
+  const { root, binBytes } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const url = `/files/content?path=${encodeURIComponent(path.join(root, 'blob.bin'))}`
+
+  const full = await authGet(s, url, token)
+  assert.equal(full.status, 200)
+  assert.equal(full.headers.get('content-type'), 'application/octet-stream')
+  assert.equal(full.headers.get('accept-ranges'), 'bytes')
+  // octet-stream is not inline-safe -> forced attachment
+  assert.match(full.headers.get('content-disposition'), /^attachment;/)
+  assert.ok(Buffer.from(await full.arrayBuffer()).equals(binBytes))
+
+  const ranged = await authGet(s, url, token, { range: 'bytes=2-5' })
+  assert.equal(ranged.status, 206)
+  assert.equal(ranged.headers.get('content-range'), `bytes 2-5/${binBytes.length}`)
+  assert.equal(ranged.headers.get('content-length'), '4')
+  assert.ok(Buffer.from(await ranged.arrayBuffer()).equals(binBytes.subarray(2, 6)))
+
+  const suffix = await authGet(s, url, token, { range: 'bytes=-4' })
+  assert.equal(suffix.status, 206)
+  assert.ok(Buffer.from(await suffix.arrayBuffer()).equals(binBytes.subarray(binBytes.length - 4)))
+
+  const unsat = await authGet(s, url, token, { range: `bytes=${binBytes.length + 10}-` })
+  assert.equal(unsat.status, 416)
+})
+
+test('GET /files/content: inline cap (5MB) 413s; same file as attachment (100MB cap) 200s', async (t) => {
+  const { root } = makeFixture()
+  const big = path.join(root, 'big.log')
+  fs.writeFileSync(big, Buffer.alloc(6 * 1024 * 1024, 0x61)) // 6MB > MAX_VIEW_BYTES
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const enc = encodeURIComponent(big)
+
+  assert.equal((await authGet(s, `/files/content?path=${enc}`, token)).status, 413)
+  const att = await authGet(s, `/files/content?path=${enc}&disposition=attachment`, token)
+  assert.equal(att.status, 200)
+  assert.equal(att.headers.get('content-length'), String(6 * 1024 * 1024))
+})
+
+test('GET /files/content: no isSensitivePath file is ever served, incl. via symlink-escape', async (t) => {
+  const { root, outside } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  // sensitive file inside the root -> 403, never its bytes
+  const env = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, '.env'))}`, token)
+  assert.equal(env.status, 403)
+  assert.ok(!/SECRET=1/.test(await env.text()))
+
+  // symlink pointing outside the roots -> rejected (symlink -> 404), never the escaped bytes
+  const escape = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'escape.txt'))}`, token)
+  assert.equal(escape.status, 404)
+  assert.ok(!/ESCAPED SECRET/.test(await escape.text()))
+
+  // symlink to a sensitive target -> rejected, never the token bytes
+  const looksok = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'looksok.txt'))}`, token)
+  assert.equal(looksok.status, 404)
+  assert.ok(!/token/.test(await looksok.text()))
+
+  // a plain path outside the read-root -> outside-scope 403
+  assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(outside, 'target.txt'))}`, token)).status, 403)
+})
+
+test('File API is client-only (agent -> 403) and requires auth (-> 401)', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const dan = await createUser(s.db, 'dan', 'pw2')
+  const { token: agentToken } = createAgent(s.db, dan.id, 'agent-1')
+  const enc = encodeURIComponent(root)
+  const fileEnc = encodeURIComponent(path.join(root, 'app.js'))
+
+  for (const url of [`/files/list?path=${enc}`, `/files/meta?path=${fileEnc}`, `/files/content?path=${fileEnc}`]) {
+    assert.equal((await authGet(s, url, agentToken)).status, 403, `${url} must be 403 for an agent`)
+    assert.equal((await authGet(s, url, null)).status, 401, `${url} must be 401 unauthenticated`)
+    assert.equal((await authGet(s, url, token)).status, 200, `${url} must be 200 for a client`)
+  }
+})
+
+test('startServer fails visible on an unreadable configured read-root', async () => {
+  await assert.rejects(
+    startTestServer({ fileReadRoots: [path.join(os.tmpdir(), 'matron-does-not-exist-' + crypto.randomBytes(6).toString('hex'))] }),
+    (e) => e && e.reason === 'bad-workdir',
+  )
+})
