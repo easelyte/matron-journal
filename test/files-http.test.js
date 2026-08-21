@@ -442,3 +442,91 @@ test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', as
   assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).status, 404)
   assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
 })
+
+// --- Phase 2 T-1.1: server-owned write configuration -----------------------
+test('T-1.1: writes are off by default even with a valid pinned write-root', async (t) => {
+  const { root } = makeFixture()
+  const writeRoot = path.join(root, 'src')
+  const s = await startTestServer({ fileReadRoots: [root], fileWriteRoots: [writeRoot] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  // T-2.0 registers this route only when the resolved kill switch is on.
+  // Until then, and by default, the write surface must remain absent.
+  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(writeRoot, 'new') } })).status, 404)
+})
+
+test('T-1.1: ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
+  const { root } = makeFixture()
+  const warn = t.mock.method(console, 'warn', () => {})
+  const s = await startTestServer({ fileReadRoots: [root], fileEnableWrites: true })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
+  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'new') } })).status, 404)
+})
+
+test('T-1.1: ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
+  const { root } = makeFixture()
+  const warn = t.mock.method(console, 'warn', () => {})
+  const s = await startTestServer({ fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
+  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'new') } })).status, 404)
+})
+
+test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
+  const { root } = makeFixture()
+  const envNames = ['MATRON_FILE_WRITE_ROOTS', 'MATRON_FILE_ENABLE_WRITES', 'MATRON_FILE_WRITES_DRYRUN']
+  const previous = new Map(envNames.map((name) => [name, process.env[name]]))
+  t.after(() => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+  process.env.MATRON_FILE_WRITE_ROOTS = `${path.join(root, 'src')}:${path.join(root, 'node_modules')}`
+  process.env.MATRON_FILE_ENABLE_WRITES = '1'
+  process.env.MATRON_FILE_WRITES_DRYRUN = '1'
+
+  // Successful boot proves both env roots were split, pinned, and accepted as
+  // subsets. T-2.0 will consume the enabled/dry-run values already wired below.
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  assert.equal((await s.http('/files/mkdir', { method: 'POST', token, body: { path: path.join(root, 'src', 'new') } })).status, 404)
+})
+
+test('T-1.1: a write-root outside all read-roots fails visibly at boot', async () => {
+  const { root, outside } = makeFixture()
+  await assert.rejects(
+    startTestServer({ fileReadRoots: [root], fileWriteRoots: [outside] }),
+    /every configured write-root must be contained in a configured read-root/,
+  )
+})
+
+test('T-1.1: an unreadable configured write-root fails visibly while pinning', async () => {
+  const { root } = makeFixture()
+  await assert.rejects(
+    startTestServer({
+      fileReadRoots: [root],
+      fileWriteRoots: [path.join(root, 'missing-' + crypto.randomBytes(6).toString('hex'))],
+    }),
+    (e) => e && e.reason === 'bad-workdir',
+  )
+})
+
+test('T-1.1: pinned write roots, enable state, and dry-run state are threaded into the HTTP handler', () => {
+  // startServer's concrete handler factory is intentionally not injectable.
+  // Pin its security-sensitive wiring at the non-testable entry-point boundary
+  // (universal principle P71), while the tests above exercise boot + HTTP.
+  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8')
+  const httpSource = fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8')
+  assert.match(serverSource, /fileWriteRoots: resolvedFileWriteRoots/)
+  assert.match(serverSource, /fileEnableWrites: resolvedFileEnableWrites/)
+  assert.match(serverSource, /fileWritesDryRun: resolvedFileWritesDryRun/)
+  assert.match(httpSource, /fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false/)
+})

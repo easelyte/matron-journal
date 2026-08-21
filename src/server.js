@@ -14,7 +14,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { pinAllowedRootsSync } from './file-guard.js'
+import { contains, pinAllowedRootsSync } from './file-guard.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
@@ -283,7 +283,8 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileListMax, procSelfFdAvailable,
+  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
+  fileListMax, procSelfFdAvailable,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -331,8 +332,6 @@ export function startServer({
   //    server side. pinAllowedRootsSync fails VISIBLE (throws, restart-loud) on
   //    an unreadable/missing configured root: that is an explicit operator
   //    misconfiguration, not a reason to silently disable (review F1).
-  // Phase 1 ships reads only — MATRON_FILE_ENABLE_WRITES is untouched here and
-  // no write route exists.
   const fileRootsConfigured = fileReadRoots !== undefined
     ? fileReadRoots
     : (process.env.MATRON_FILE_READ_ROOTS !== undefined
@@ -350,6 +349,35 @@ export function startServer({
     }
   } else if (Array.isArray(fileRootsConfigured)) {
     console.warn('file API: disabled — configured read-root list is empty')
+  }
+  // File Explorer write config (Phase 2, plan T-1.1). Write roots are a
+  // separate, narrower, server-owned pin. They are resolved even while the
+  // kill switch is off so a bad deployment fails visibly at boot instead of
+  // becoming a latent escape that appears only when the switch is flipped.
+  // Only literal `1` (or boolean true via the test/programmatic option) enables
+  // a flag; every other value fails closed.
+  const writeRootsConfigured = fileWriteRoots !== undefined
+    ? fileWriteRoots
+    : (process.env.MATRON_FILE_WRITE_ROOTS !== undefined
+        ? process.env.MATRON_FILE_WRITE_ROOTS.split(':').filter(Boolean)
+        : null)
+  const writesRequested = fileEnableWrites !== undefined
+    ? fileEnableWrites === true || fileEnableWrites === 1 || fileEnableWrites === '1'
+    : process.env.MATRON_FILE_ENABLE_WRITES === '1'
+  const resolvedFileWritesDryRun = fileWritesDryRun !== undefined
+    ? fileWritesDryRun === true || fileWritesDryRun === 1 || fileWritesDryRun === '1'
+    : process.env.MATRON_FILE_WRITES_DRYRUN === '1'
+  let resolvedFileWriteRoots = null
+  if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
+    resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
+    if (!resolvedFileReadRoots || resolvedFileWriteRoots.roots.some((writeRoot) =>
+      !resolvedFileReadRoots.roots.some((readRoot) => contains(readRoot.realPath, writeRoot.realPath)))) {
+      throw new Error('file writes: every configured write-root must be contained in a configured read-root')
+    }
+  }
+  const resolvedFileEnableWrites = writesRequested && resolvedFileWriteRoots !== null
+  if (writesRequested && resolvedFileWriteRoots === null) {
+    console.warn('file writes: disabled — MATRON_FILE_ENABLE_WRITES=1 but MATRON_FILE_WRITE_ROOTS is unset or empty')
   }
   const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
@@ -371,6 +399,8 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs,
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
+    fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
+    fileWritesDryRun: resolvedFileWritesDryRun,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
