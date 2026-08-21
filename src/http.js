@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
@@ -533,6 +533,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
         ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        // Ordered by last message time then id — same rule and same JS
+        // comparator as /snapshot (byLastMessageThenId, see journal.js); sorting
+        // in JS avoids re-evaluating the correlated last_ts subquery in a SQL
+        // ORDER BY.
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
@@ -541,9 +545,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
            FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
                     SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
-             : ''}
-           ORDER BY last_seq DESC`
+             : ''}`
         ).all(who.userId)
+        conversations.sort(byLastMessageThenId)
         return json(res, 200, { agents, conversations })
       }
       if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {

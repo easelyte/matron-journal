@@ -1,0 +1,42 @@
+{
+  "name": "snapshot: ordering is by last message time, so a later non-message event does not resurface an idle conversation",
+  "description": "c1 gets an early agent message, then c2 gets a later agent message, then c1 receives a session_status event (higher last_seq, but not a message). Under the retired last_seq DESC order c1 would sort first; under COALESCE(last_ts, created_at) DESC, id DESC it must sort AFTER c2, whose last message is newer. Pins the non-message-does-not-resurface contract for every conformance consumer.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-2" }],
+    "conversations": [
+      { "id": "c1", "owner": "dan", "title": "Older chat", "sessionState": "running" },
+      { "id": "c2", "owner": "dan", "title": "Newer chat", "sessionState": "running" }
+    ],
+    "events": [
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "older message" } },
+      { "convo": "c2", "sender": "agent:dev-2", "type": "text", "payload": { "body": "newer message" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "session_status", "payload": { "state": "waiting" } }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-2", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
+      "expect": { "status": 200, "body": {
+        "seq": 3,
+        "agents": [],
+        "conversations": [
+          {
+            "id": "c2", "title": "Newer chat", "session_state": "running", "session_outcome": null,
+            "last_seq": 2, "unread_count": 1, "snippet": "newer message",
+            "parent_convo_id": null, "summary": "", "agent_device_id": null, "agent_kind": null,
+            "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
+          },
+          {
+            "id": "c1", "title": "Older chat", "session_state": "waiting", "session_outcome": null,
+            "last_seq": 3, "unread_count": 1, "snippet": "older message",
+            "parent_convo_id": null, "summary": "", "agent_device_id": null, "agent_kind": null,
+            "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
+          }
+        ]
+      } } }
+  ]
+}
