@@ -332,24 +332,44 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
         const attachment = url.searchParams.get('disposition') === 'attachment'
         const maxBytes = attachment ? MAX_DOWNLOAD_BYTES : MAX_VIEW_BYTES
-        let opened
+        // Single idempotent fd-close covering EVERY terminal path (denial,
+        // cap/416 rejects, empty body, stream end/error, AND a client abort at
+        // any point — including while openGuarded() is still awaiting). `fd` is
+        // filled once the handle is validated; `streaming` gates whether an
+        // abort should close the fd directly (pre-stream) or tear the stream
+        // down and let its 'close' close the fd (mid-stream — closing the fd
+        // under an active read would error it) (review round-2 F1).
+        let fd = null
+        let fdClosed = false
+        let streaming = false
+        let aborted = false
+        const closeFd = () => { if (fdClosed || !fd) return; fdClosed = true; fd.close().catch(() => {}) }
+        const onEarlyAbort = () => { aborted = true; if (!streaming) closeFd() }
+        res.on('close', onEarlyAbort)
         try {
-          // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
-          // sensitivity checks as the buffering path but returns the OPEN fd
-          // WITHOUT reading — we STREAM it with backpressure (P21), never
-          // buffering the whole file. Never readBody (JSON/1MB).
-          opened = await openGuarded(p, { allowedRoots: fileReadRoots })
-        } catch (e) {
-          // Guard contract: map ANY throw to a denial (404 default), not just
-          // FileLinkDenied — an unexpected fs error must not leak/500.
-          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
-          return json(res, 404, { error: 'not_found' })
-        }
-        const { fd, size, realPath } = opened
-        try {
+          let opened
+          try {
+            // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
+            // sensitivity checks as the buffering path but returns the OPEN fd
+            // WITHOUT reading — we STREAM it with backpressure (P21), never
+            // buffering the whole file. Never readBody (JSON/1MB).
+            opened = await openGuarded(p, { allowedRoots: fileReadRoots })
+          } catch (e) {
+            res.removeListener('close', onEarlyAbort)
+            // Guard contract: map ANY throw to a denial (404 default), not just
+            // FileLinkDenied — an unexpected fs error must not leak/500.
+            if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+            return json(res, 404, { error: 'not_found' })
+          }
+          fd = opened.fd
+          const { size, realPath } = opened
+          // The client may have disconnected WHILE openGuarded was awaiting —
+          // onEarlyAbort ran with fd still null (no close), so close the now-
+          // validated fd and bail before writing anything.
+          if (aborted || res.destroyed) { res.removeListener('close', onEarlyAbort); closeFd(); return }
           // Cap on the FULL file size, decided from fstat BEFORE any byte is
           // read (so an oversized download never allocates or streams).
-          if (size > maxBytes) { await fd.close().catch(() => {}); return json(res, 413, { error: 'too_large' }) }
+          if (size > maxBytes) { res.removeListener('close', onEarlyAbort); closeFd(); return json(res, 413, { error: 'too_large' }) }
           const { type, inlineSafe } = contentTypeFor(realPath)
           // Force download for a non-inline-safe type even if inline was asked
           // (nothing script-capable renders inline on this origin).
@@ -370,7 +390,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (range) {
             const m = /^bytes=(\d*)-(\d*)$/.exec(range)
             if (!m || (m[1] === '' && m[2] === '')) {
-              await fd.close().catch(() => {})
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
               res.writeHead(416, { 'content-range': `bytes */${size}` })
               return res.end()
             }
@@ -384,7 +405,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
               e = size - 1
             }
             if (!Number.isInteger(s) || s > e || s >= size || s < 0) {
-              await fd.close().catch(() => {})
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
               res.writeHead(416, { 'content-range': `bytes */${size}` })
               return res.end()
             }
@@ -395,20 +417,28 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           }
           const length = size === 0 ? 0 : (end - start + 1)
           res.writeHead(statusCode, { ...headers, 'content-length': String(length) })
-          if (length === 0) { await fd.close().catch(() => {}); return res.end() }
+          if (length === 0) { res.removeListener('close', onEarlyAbort); closeFd(); return res.end() }
           await new Promise((resolve) => {
-            // Stream the validated fd. autoClose:false — we own fd and close it
-            // in every terminal branch. Mirrors GET /media/:id's pipe pattern.
+            // Hand off from the pre-stream abort listener to stream teardown:
+            // once streaming, an abort must destroy the stream (its 'close'
+            // then closes the fd) rather than close the fd out from under it.
+            res.removeListener('close', onEarlyAbort)
+            streaming = true
             const stream = fd.createReadStream({ start, end, autoClose: false })
-            const done = () => { fd.close().catch(() => {}); resolve() }
-            stream.on('error', () => { res.destroy(); done() })
-            stream.on('close', done)
+            let settled = false
+            const finish = () => { if (settled) return; settled = true; closeFd(); resolve() }
+            stream.on('error', () => { res.destroy(); finish() })
+            stream.on('close', finish)
             res.on('close', () => stream.destroy())
+            // Race guard: the socket may already have closed between the check
+            // above and attaching the listener — tear down immediately if so.
+            if (res.destroyed) stream.destroy()
             stream.pipe(res)
           })
           return
         } catch (e) {
-          await fd.close().catch(() => {})
+          res.removeListener('close', onEarlyAbort)
+          closeFd()
           throw e
         }
       }

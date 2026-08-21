@@ -5,6 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
@@ -359,6 +360,45 @@ test('F3: a large-file Range returns only the slice (streamed, not whole-file bu
   const buf = Buffer.from(await full.arrayBuffer())
   assert.equal(buf.length, size)
   assert.equal(buf.subarray(size - 6).toString(), 'MARKER')
+})
+
+// --- round-2 F1: an aborted content request must close the validated fd -----
+test('round-2 F1: a client abort during /files/content open closes the fd (no leak) and settles', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  // Spy fs/promises.open so we can (a) widen the open window enough to abort
+  // mid-open, and (b) observe that the server closes the handle it opened.
+  let closeCalled = false
+  let resolveClosed
+  const closed = new Promise((r) => { resolveClosed = r })
+  const origOpen = fsp.open
+  t.mock.method(fsp, 'open', async (...args) => {
+    const fh = await origOpen.apply(fsp, args)
+    const origStat = fh.stat.bind(fh)
+    fh.stat = async (...a) => { await new Promise((r) => setTimeout(r, 80)); return origStat(...a) }
+    const origClose = fh.close.bind(fh)
+    fh.close = (...a) => { if (!closeCalled) { closeCalled = true; resolveClosed() } return origClose(...a) }
+    return fh
+  })
+
+  const ac = new AbortController()
+  const req = fetch(s.base + `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: ac.signal,
+  }).then(() => 'ok', () => 'aborted')
+  setTimeout(() => ac.abort(), 15) // abort while the widened open() is still awaiting
+
+  const outcome = await req
+  assert.equal(outcome, 'aborted')
+  // The handler must have closed the fd it opened, within a bounded wait.
+  await Promise.race([
+    closed,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('validated fd was never closed after the abort (leak)')), 3000)),
+  ])
+  assert.equal(closeCalled, true)
 })
 
 // --- F1/F4/F6: opt-in + fail-safe disabling ---------------------------------
