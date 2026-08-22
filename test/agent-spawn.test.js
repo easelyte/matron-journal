@@ -789,9 +789,12 @@ test('spawn_targets is single-flight per connection: a concurrent second ask is 
 // Fork divergence from upstream's deliberate self-spawn exclusion. A session
 // may spawn ANOTHER session on its OWN box, seeded with a task — the
 // copy-paste elimination the loop was filed for. Every same-box spawn STILL
-// mints the journal-brokered consent card the operator taps (no silent
-// spawn), and a spawned child STILL cannot spawn again (depth capped at 1 by
-// the parent_convo_id recursion guard).
+// mints the journal-brokered consent card the operator taps (no silent spawn),
+// and the child-convo guard STILL holds: a sub-chat / subagent-transcript
+// convo (parent_convo_id set) can never originate a spawn. (That guard blocks
+// child-convo spawns, NOT spawn DEPTH — a spawned session's own top-level
+// convo is a root, so depth is bounded by the human consent gate, every hop
+// needing an operator tap, not by an automatic counter.)
 
 test('same-box spawn: spawn_request against the caller\'s OWN device is accepted and still parks a consent card', async (t) => {
   const { s, parentDev, parent, target, client } = await spawnFleet(t)

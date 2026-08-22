@@ -986,10 +986,19 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // window. Every safeguard below still applies to a self-target: the
         // ownership/privacy gate (the caller's own device passes its own
         // privacy check), the liveness check (the caller's own connection is
-        // online), the recursion guard (a spawned child, parent_convo_id set,
-        // still cannot spawn — see below), the shared pending-ask cap, and —
-        // above all — the journal-brokered consent card the operator must tap.
-        // There is no silent same-box spawn.
+        // online), the child-convo guard (a sub-chat / subagent-transcript
+        // convo, parent_convo_id set, still cannot originate a spawn — see
+        // below), the shared pending-ask cap, and — above all — the
+        // journal-brokered consent card the operator must tap. There is no
+        // silent same-box spawn.
+        // NOTE on depth: the child-convo guard does NOT by itself bound spawn
+        // DEPTH. A spawned session's own top-level conversation is a ROOT convo
+        // (the bridge's RPC-start creates it with parent_convo_id NULL), so it
+        // could in principle spawn again. Depth is bounded by the human consent
+        // gate — every hop, same-box or cross-box, mints a card the operator
+        // must tap — not by an automatic counter. Per operator decision (#690)
+        // no automatic depth/fan-out cap is added here; the consent gate plus
+        // MAX_AWAITING_PER_REQUESTER are the controls.
         // Ownership stance copied from agent_request/agent_invite: unknown
         // id, another user's device, a client device — and a private device
         // seen by an ordinary agent — are indistinguishable not_found.
