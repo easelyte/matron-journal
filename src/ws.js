@@ -979,7 +979,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (typeof msg.task !== 'string' || !msg.task || msg.task.length > SPAWN_TASK_MAX_CHARS) return fail('bad_request', 'bad task')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
-        if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot spawn on self')
+        // Same-box spawn is ALLOWED (loop #690 — fork divergence from
+        // upstream's deliberate self-spawn exclusion): a session may spawn
+        // another session on its OWN box, seeded with this task, so the
+        // operator no longer has to copy-paste a start prompt into a new
+        // window. Every safeguard below still applies to a self-target: the
+        // ownership/privacy gate (the caller's own device passes its own
+        // privacy check), the liveness check (the caller's own connection is
+        // online), the recursion guard (a spawned child, parent_convo_id set,
+        // still cannot spawn — see below), the shared pending-ask cap, and —
+        // above all — the journal-brokered consent card the operator must tap.
+        // There is no silent same-box spawn.
         // Ownership stance copied from agent_request/agent_invite: unknown
         // id, another user's device, a client device — and a private device
         // seen by an ordinary agent — are indistinguishable not_found.
@@ -1079,12 +1089,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // 'conflict' the pending-ask cap uses.
         if (conn.spawnTargetsInflight) return fail('conflict', 'spawn_targets already in flight')
         conn.spawnTargetsInflight = true
-        // Same visibility rule as the roster: self excluded (a self-entry is
-        // a self-spawn trap), private boxes hidden from ordinary agents.
+        // Self is now INCLUDED (loop #690 — fork divergence from upstream,
+        // whose roster excludes self as "a self-spawn trap"): same-box spawn is
+        // a supported flow, so the caller's own device must be a pickable
+        // target, tagged "(this box)" in the map below so agent_boxes can label
+        // it. Private boxes stay hidden from an ordinary agent; the caller's own
+        // box always passes that filter (callerPrivate mirrors self.private).
         const callerPrivate = isPrivateDevice(db, conn.deviceId)
         const boxes = db.prepare(
-          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent' AND id!=?"
-        ).all(conn.userId, conn.deviceId)
+          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent'"
+        ).all(conn.userId)
           .filter((d) => callerPrivate || d.private !== 1)
         const live = new Set(hub.connsOf(conn.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
         // Folder discovery rides the broker (spec: "once it exists, folder
@@ -1092,7 +1106,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // folders and no RPC; a box that fails or times out degrades to []
         // — discovery must never error because one box is sick.
         try {
+          const SELF_TAG = ' (this box)'
           const out = await Promise.all(boxes.map(async (d) => {
+            const isSelf = d.device_id === conn.deviceId
             const online = live.has(d.device_id)
             let folders = []
             let activity = null
@@ -1112,8 +1128,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // Sanitised like every other client-bound device name (roster,
             // consent cards) — the recipient here is an agent, not a client, so
             // this is cheap insurance rather than closing a real hole.
+            // Tag the caller's own box so the picker can label it (loop #690).
+            // The base name is capped short enough that the suffix keeps the
+            // whole string within PEER_NAME_CAP; `self:true` lets a client
+            // detect the same-box entry without string-matching the tag.
+            const baseName = sanitizePeerText(d.name, isSelf ? PEER_NAME_CAP - SELF_TAG.length : PEER_NAME_CAP)
             return {
-              device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
+              device_id: d.device_id,
+              name: isSelf ? `${baseName}${SELF_TAG}` : baseName,
+              ...(isSelf ? { self: true } : {}),
+              online, folders,
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),

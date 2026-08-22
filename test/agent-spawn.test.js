@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getSpawn, createSpawnRequest, claimApprove, approveSpawn, discardSpawnRequest } from '../src/spawns.js'
+import { participantIds } from '../src/participants.js'
 
 // Fleet: one user, a parent agent (dev-6), a target agent (eric), a client.
 // Parent owns 'parent-convo' — the conversation the consent card lands in.
@@ -161,10 +162,14 @@ test('spawn_request sanitizes workdir like task — newlines removed from row an
 })
 
 test('spawn_targets lists other agent boxes with online flags and brokered folders', async (t) => {
-  const { s, targetDev, parent, target } = await spawnFleet(t)
-  // answer the folder RPC like a bridge would
+  const { s, parentDev, targetDev, parent, target } = await spawnFleet(t)
+  // answer the folder RPC like a bridge would — both the target and self (the
+  // caller is now a pickable same-box target too, loop #690)
   target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
     target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/dan/app', last_used: 5 }] } })
+  })
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
   })
   parent.send({ op: 'spawn_targets', request_id: 'q1' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
@@ -173,8 +178,12 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   assert.equal(eric.name, 'eric')
   assert.equal(eric.online, true)
   assert.deepEqual(eric.folders, [{ path: '/home/dan/app', last_used: 5 }])
-  // self is never listed
-  assert.equal(reply.boxes.some((b) => b.name === 'dev-6'), false)
+  assert.ok(!('self' in eric)) // another box carries no self flag
+  // self IS now listed (same-box spawn support), tagged "(this box)"
+  const self = reply.boxes.find((b) => b.device_id === parentDev.deviceId)
+  assert.ok(self, 'the caller\'s own box must now be listed')
+  assert.equal(self.self, true)
+  assert.match(self.name, /^dev-6 \(this box\)$/)
 })
 
 test('spawn_targets: valid capacity blocks pass through; a malformed block is dropped but the box stays', async (t) => {
@@ -199,6 +208,11 @@ test('spawn_targets: valid capacity blocks pass through; a malformed block is dr
       op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true,
       result: { folders: [], activity: { live_sessions: -5, last_hour: [] }, disk: { free_bytes: 9, total_bytes: 4 } },
     })
+  })
+  // self (the caller) is online too and now listed — answer its folder RPC so
+  // the fan-out doesn't wait out the full folders timeout (loop #690)
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
   })
   parent.send({ op: 'spawn_targets', request_id: 'q1' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
@@ -237,6 +251,10 @@ test('spawn_targets is agent-only and hides private boxes from ordinary agents',
   const priv = createAgent(s.db, dan.id, 'secret-box')
   s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
   parent.frames.length = 0
+  // self (ordinary caller) is online and now listed — answer its folder RPC
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   parent.send({ op: 'spawn_targets', request_id: 'q2' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
   assert.equal(reply.boxes.some((b) => b.name === 'secret-box'), false)
@@ -765,4 +783,130 @@ test('spawn_targets is single-flight per connection: a concurrent second ask is 
   parent.send({ op: 'spawn_targets', request_id: 'sf-3' })
   const third = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets' && f.request_id === 'sf-3', 5000)
   assert.ok(third)
+})
+
+// --- Loop #690: same-box spawn -------------------------------------------
+// Fork divergence from upstream's deliberate self-spawn exclusion. A session
+// may spawn ANOTHER session on its OWN box, seeded with a task — the
+// copy-paste elimination the loop was filed for. Every same-box spawn STILL
+// mints the journal-brokered consent card the operator taps (no silent
+// spawn), and a spawned child STILL cannot spawn again (depth capped at 1 by
+// the parent_convo_id recursion guard).
+
+test('same-box spawn: spawn_request against the caller\'s OWN device is accepted and still parks a consent card', async (t) => {
+  const { s, parentDev, parent, target, client } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: parentDev.deviceId, // SELF — same box
+    workdir: '/home/dan/proj', task: 'spin up a sibling session', topic: 'same-box',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(ack.request_id, 'q1')
+  assert.ok(ack.spawn_id)
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.from_device_id, parentDev.deviceId)
+  assert.equal(row.target_device_id, parentDev.deviceId) // both ends the same box
+  // The consent card is STILL created — no silent same-box spawn. Client-only,
+  // landed in the parent convo, naming the same box as both from and target.
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.convo_id, 'parent-convo')
+  assert.equal(card.payload.request_id, ack.spawn_id)
+  assert.equal(card.payload.from_device_id, parentDev.deviceId)
+  assert.equal(card.payload.target_device_id, parentDev.deviceId)
+  // client-only: neither agent socket may ever see the card
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(parent.frames.find(isSpawnCard), undefined)
+  assert.equal(target.frames.find(isSpawnCard), undefined)
+})
+
+test('recursion guard intact: a spawned CHILD (parent_convo_id set) still cannot spawn, even on its own box', async (t) => {
+  const { s, parentDev, parent } = await spawnFleet(t)
+  // A child conversation, as a spawned session's transcript would be recorded.
+  parent.send({ op: 'convo_upsert', convo_id: 'child-convo', title: 'child session', session_state: 'running', parent_convo_id: 'parent-convo' })
+  await new Promise((r) => setTimeout(r, 50))
+  // Attempt to spawn (same box) FROM the child convo — the recursion guard must
+  // still reject it as an indistinguishable not_found: no card, no row.
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'child-convo',
+    target_device_id: parentDev.deviceId, workdir: '/w', task: 'grandchild',
+  })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'not_found')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+})
+
+test('spawn_targets includes the caller\'s own box, tagged "(this box)" and flagged self', async (t) => {
+  const { s, parentDev, targetDev, parent, target } = await spawnFleet(t)
+  // Both the target AND self answer the folder RPC like a bridge would.
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/dan/app', last_used: 5 }] } })
+  })
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/dan/self', last_used: 9 }] } })
+  })
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
+  const self = reply.boxes.find((b) => b.device_id === parentDev.deviceId)
+  assert.ok(self, 'the caller\'s own box must now be listed')
+  assert.equal(self.self, true)
+  assert.match(self.name, /\(this box\)$/)
+  assert.equal(self.online, true)
+  assert.deepEqual(self.folders, [{ path: '/home/dan/self', last_used: 9 }]) // self's own recent folders
+  // other boxes stay untagged
+  const eric = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
+  assert.ok(!('self' in eric))
+  assert.ok(!/\(this box\)/.test(eric.name))
+})
+
+test('spawn_targets still hides a private box from an ordinary agent even though self is now included', async (t) => {
+  const { s, dan, parentDev, parent } = await spawnFleet(t, { connectTarget: false })
+  const priv = createAgent(s.db, dan.id, 'secret-box')
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  assert.ok(reply.boxes.some((b) => b.device_id === parentDev.deviceId), 'self still listed')
+  assert.equal(reply.boxes.some((b) => b.name === 'secret-box'), false, 'private box still hidden')
+})
+
+test('same-box approve produces a valid room: owner and sole participant are the same box, no broken room', async (t) => {
+  const { s, parentDev, clientToken, parent, client } = await spawnFleet(t)
+  // Park a same-box spawn (target == the parent's own device).
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: parentDev.deviceId, workdir: '/w', task: 'same-box job', topic: 'sb',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  const spawnId = ack.spawn_id
+  // The start rpc lands on the SAME box (the parent connection); the room must
+  // already exist and be owned by that box when it arrives.
+  const bridgeTurn = parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    const room = s.db.prepare('SELECT * FROM conversations WHERE id=?').get(req.request.params.room_id)
+    assert.ok(room, 'room row must exist before the same-box start rpc')
+    assert.equal(room.agent_device_id, parentDev.deviceId)
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-sb-1' } })
+    return req.request.params.room_id
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const roomId = await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  assert.equal(out.room_id, roomId)
+  assert.equal(out.child_convo_id, 'child-sb-1')
+  // The degenerate room is valid: owner == the sole joined participant == same
+  // box — one convo_agents row, and participantIds dedups to a single chip
+  // rather than a broken two-of-the-same-box room.
+  const room = s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(roomId)
+  assert.equal(room.agent_device_id, parentDev.deviceId)
+  const joined = s.db.prepare("SELECT agent_device_id, state FROM convo_agents WHERE convo_id=?").all(roomId)
+  assert.deepEqual(joined, [{ agent_device_id: parentDev.deviceId, state: 'joined' }])
+  assert.deepEqual(participantIds(s.db, roomId), [parentDev.deviceId])
+  const dbRow = getSpawn(s.db, spawnId)
+  assert.equal(dbRow.state, 'started')
+  assert.equal(dbRow.room_id, roomId)
 })
