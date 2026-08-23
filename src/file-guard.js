@@ -15,6 +15,7 @@
 // bytes), and a broader extension->MIME map for content preview.
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import crypto from 'node:crypto';
 import path from 'node:path';
 
 export const MAX_VIEW_BYTES = 5 * 1024 * 1024;
@@ -202,6 +203,755 @@ function assertPinnedRootIdentitySync(pinnedRoots) {
     } catch {
       throw new FileLinkDenied('bad-workdir');
     }
+  }
+}
+
+// --- Phase-2 write primitives -----------------------------------------------
+//
+// Node does not expose openat(2), renameat(2), mkdirat(2), or renameat2(2).
+// Consequently a pathname-based mutation cannot be made perfectly immune to
+// an ancestor rename/symlink swap. We minimize that residual by holding the
+// deepest existing parent directory open, resolving its identity through
+// /proc/self/fd, and checking the same fd again immediately before mutation.
+// The remaining race requires a concurrent local writer able to alter an
+// ancestor inside these root-owned write roots; that actor is outside the
+// single-operator threat model (the same class as P1's accepted hard-link
+// residual). Node also lacks renameat2(RENAME_NOREPLACE), so moveGuarded must
+// precheck destination absence before an atomic same-device rename; a local
+// racer can still create and have that name replaced between those operations,
+// and a crash before the parent fsync leaves rename durability uncertain. A
+// native *at-family binding would be required to close these residuals fully.
+
+function fdRealPathSync(fd, fallbackPath) {
+  if (process.platform === 'linux') return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  return fs.realpathSync(fallbackPath);
+}
+
+function isMissing(err) {
+  return err?.code === 'ENOENT';
+}
+
+function lstatIfPresent(targetPath) {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (err) {
+    if (isMissing(err)) return null;
+    throw err;
+  }
+}
+
+function mostSpecificRoot(pinnedRoots, targetPath) {
+  return pinnedRoots
+    .filter((root) => contains(root.realPath, targetPath))
+    .sort((a, b) => b.realPath.length - a.realPath.length)[0] || null;
+}
+
+function assertTrashProtected(targetPath) {
+  if (targetPath.split(path.sep).filter(Boolean).includes('.matron-trash')) {
+    throw new FileLinkDenied('trash-protected');
+  }
+}
+
+// Returns a held directory identity for internal mutation helpers. The caller
+// MUST close parentFd. For mkdir-p targets, the held fd is the deepest existing
+// ancestor; other helpers require it to be the target's immediate parent.
+function prepareWriteTarget(targetPath, writeRoots) {
+  if (!path.isAbsolute(String(targetPath))) throw new FileLinkDenied('relative-path');
+  const { pinnedRoots, isPinnedApi } = pinnedRootsOf(writeRoots);
+  if (!isPinnedApi) throw new FileLinkDenied('bad-workdir');
+  if (pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
+  assertPinnedRootIdentitySync(pinnedRoots);
+
+  const resolved = path.resolve(targetPath);
+  let candidate = path.dirname(resolved);
+  let parentFd;
+  while (true) {
+    try {
+      parentFd = fs.openSync(
+        candidate,
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+      );
+      break;
+    } catch (err) {
+      if (err?.code === 'ELOOP') throw new FileLinkDenied('symlink');
+      if (err?.code !== 'ENOENT') throw new FileLinkDenied('unreadable');
+      const next = path.dirname(candidate);
+      if (next === candidate) throw new FileLinkDenied('unreadable');
+      candidate = next;
+    }
+  }
+
+  try {
+    const parentStat = fs.fstatSync(parentFd);
+    if (!parentStat.isDirectory()) throw new FileLinkDenied('unreadable');
+    const pinnedAncestor = fdRealPathSync(parentFd, candidate);
+    const relativeTarget = path.relative(candidate, resolved);
+    if (!relativeTarget || relativeTarget === '..' || relativeTarget.startsWith(`..${path.sep}`)) {
+      throw new FileLinkDenied('outside-scope');
+    }
+    const canonicalTarget = path.resolve(pinnedAncestor, relativeTarget);
+    const root = mostSpecificRoot(pinnedRoots, canonicalTarget);
+    if (!root) throw new FileLinkDenied('outside-scope');
+    if (isSensitivePath(canonicalTarget)) throw new FileLinkDenied('sensitive');
+    assertTrashProtected(canonicalTarget);
+    const targetStat = lstatIfPresent(canonicalTarget);
+    if (targetStat?.isSymbolicLink()) throw new FileLinkDenied('symlink');
+    return {
+      target: canonicalTarget,
+      parentPath: path.dirname(canonicalTarget),
+      pinnedAncestor,
+      parentFd,
+      parentDev: parentStat.dev,
+      parentIno: parentStat.ino,
+      pinnedRoots,
+      root,
+      targetStat,
+    };
+  } catch (err) {
+    fs.closeSync(parentFd);
+    throw err;
+  }
+}
+
+function closePrepared(prepared) {
+  if (prepared?.parentFd !== undefined) {
+    try { fs.closeSync(prepared.parentFd); } catch {}
+    prepared.parentFd = undefined;
+  }
+}
+
+function assertNoSymlinkedNewAncestors(prepared) {
+  const relativeParent = path.relative(prepared.pinnedAncestor, prepared.parentPath);
+  if (!relativeParent) return;
+  let cursor = prepared.pinnedAncestor;
+  for (const segment of relativeParent.split(path.sep)) {
+    cursor = path.join(cursor, segment);
+    const stat = lstatIfPresent(cursor);
+    if (!stat) return;
+    if (stat.isSymbolicLink()) throw new FileLinkDenied('symlink');
+    if (!stat.isDirectory()) throw new FileLinkDenied('unreadable');
+  }
+}
+
+function reverifyPrepared(prepared) {
+  assertPinnedRootIdentitySync(prepared.pinnedRoots);
+  let currentStat;
+  let currentPath;
+  try {
+    currentStat = fs.fstatSync(prepared.parentFd);
+    currentPath = fdRealPathSync(prepared.parentFd, prepared.pinnedAncestor);
+  } catch {
+    throw new FileLinkDenied('bad-workdir');
+  }
+  if (!currentStat.isDirectory()
+      || currentStat.dev !== prepared.parentDev
+      || currentStat.ino !== prepared.parentIno
+      || currentPath !== prepared.pinnedAncestor
+      || !contains(prepared.root.realPath, currentPath)) {
+    throw new FileLinkDenied('bad-workdir');
+  }
+  assertNoSymlinkedNewAncestors(prepared);
+}
+
+function assertImmediateParent(prepared) {
+  if (prepared.parentPath !== prepared.pinnedAncestor) {
+    throw new FileLinkDenied('unreadable');
+  }
+}
+
+function assertTargetIdentity(prepared, expectedStat) {
+  const current = lstatIfPresent(prepared.target);
+  if (!current
+      || current.isSymbolicLink()
+      || current.dev !== expectedStat.dev
+      || current.ino !== expectedStat.ino) {
+    throw new FileLinkDenied('unreadable');
+  }
+}
+
+export function validateWriteTarget(targetPath, { writeRoots } = {}) {
+  const prepared = prepareWriteTarget(targetPath, writeRoots);
+  try {
+    return prepared.target;
+  } finally {
+    closePrepared(prepared);
+  }
+}
+
+function randomSibling(targetPath, marker = '.matron-tmp-') {
+  return path.join(
+    path.dirname(targetPath),
+    `${marker}${process.pid}-${crypto.randomBytes(8).toString('hex')}`,
+  );
+}
+
+function childPathThroughParentFd(prepared, name) {
+  if (process.platform === 'linux') return `/proc/self/fd/${prepared.parentFd}/${name}`;
+  return path.join(prepared.pinnedAncestor, name);
+}
+
+function writeAllSync(fd, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+    if (written === 0) throw new Error('zero-byte filesystem write');
+    offset += written;
+  }
+}
+
+function fsyncDirectoryPathSync(dirPath) {
+  const fd = fs.openSync(
+    dirPath,
+    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function fixedBytes(value) {
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === 'string') return Buffer.from(value);
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  return null;
+}
+
+export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity } = {}) {
+  if (!(maxBytes === Infinity || (Number.isSafeInteger(maxBytes) && maxBytes >= 0))) {
+    throw new TypeError('maxBytes must be a non-negative safe integer or Infinity');
+  }
+  const bytes = fixedBytes(bytesOrStream);
+  const isStream = bytes === null && bytesOrStream != null
+    && (typeof bytesOrStream[Symbol.asyncIterator] === 'function'
+      || typeof bytesOrStream[Symbol.iterator] === 'function');
+  if (bytes === null && !isStream) throw new TypeError('bytesOrStream must be bytes or an iterable stream');
+  if (bytes && bytes.length > maxBytes) throw new FileLinkDenied('too-large');
+
+  const prepared = prepareWriteTarget(targetPath, writeRoots);
+  let tmpPath;
+  let tmpFd;
+  try {
+    assertImmediateParent(prepared);
+    reverifyPrepared(prepared);
+    const tmpName = path.basename(randomSibling(prepared.target));
+    tmpPath = childPathThroughParentFd(prepared, tmpName);
+    tmpFd = fs.openSync(
+      tmpPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      prepared.targetStat ? prepared.targetStat.mode & 0o777 : 0o600,
+    );
+    let size = 0;
+    if (bytes) {
+      writeAllSync(tmpFd, bytes);
+      size = bytes.length;
+    } else {
+      for await (const chunk of bytesOrStream) {
+        const buffer = fixedBytes(chunk);
+        if (buffer === null) throw new TypeError('stream chunks must be bytes');
+        size += buffer.length;
+        if (size > maxBytes) throw new FileLinkDenied('too-large');
+        writeAllSync(tmpFd, buffer);
+      }
+    }
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = undefined;
+    reverifyPrepared(prepared);
+    if (prepared.targetStat) preserveFileForOverwrite(prepared);
+    reverifyPrepared(prepared);
+    if (prepared.targetStat) assertTargetIdentity(prepared, prepared.targetStat);
+    fs.renameSync(tmpPath, childPathThroughParentFd(prepared, path.basename(prepared.target)));
+    tmpPath = undefined;
+    fs.fsyncSync(prepared.parentFd);
+    return prepared.target;
+  } finally {
+    if (tmpFd !== undefined) {
+      try { fs.closeSync(tmpFd); } catch {}
+    }
+    if (tmpPath) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+    closePrepared(prepared);
+  }
+}
+
+export async function mkdirGuarded(targetPath, { writeRoots } = {}) {
+  const prepared = prepareWriteTarget(targetPath, writeRoots);
+  try {
+    if (prepared.targetStat) {
+      if (!prepared.targetStat.isDirectory()) throw new FileLinkDenied('dest-exists');
+      return prepared.target;
+    }
+    reverifyPrepared(prepared);
+    fs.mkdirSync(prepared.target, { recursive: true });
+    fs.fsyncSync(prepared.parentFd);
+    return prepared.target;
+  } finally {
+    closePrepared(prepared);
+  }
+}
+
+function reserveDestination(prepared, isDirectory) {
+  reverifyPrepared(prepared);
+  assertImmediateParent(prepared);
+  if (lstatIfPresent(prepared.target)) throw new FileLinkDenied('dest-exists');
+  try {
+    if (isDirectory) {
+      fs.mkdirSync(prepared.target, { mode: 0o700 });
+      const stat = fs.lstatSync(prepared.target);
+      return { isDirectory: true, dev: stat.dev, ino: stat.ino };
+    }
+    const fd = fs.openSync(
+      prepared.target,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      const stat = fs.fstatSync(fd);
+      return { isDirectory: false, dev: stat.dev, ino: stat.ino };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    if (err?.code === 'EEXIST') throw new FileLinkDenied('dest-exists');
+    throw err;
+  }
+}
+
+function assertReservationIdentity(targetPath, reservation) {
+  const current = lstatIfPresent(targetPath);
+  if (!current
+      || current.isSymbolicLink()
+      || current.isDirectory() !== reservation.isDirectory
+      || current.dev !== reservation.dev
+      || current.ino !== reservation.ino) {
+    throw new FileLinkDenied('dest-exists');
+  }
+}
+
+function releaseReservation(targetPath, reservation, onReleased) {
+  assertReservationIdentity(targetPath, reservation);
+  try {
+    if (reservation.isDirectory) fs.rmdirSync(targetPath);
+    else fs.unlinkSync(targetPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'EEXIST' || err?.code === 'ENOTEMPTY') {
+      throw new FileLinkDenied('dest-exists');
+    }
+    throw err;
+  }
+  onReleased();
+}
+
+function linkNoReplace(sourcePath, destinationPath, expectedStat) {
+  try {
+    fs.linkSync(sourcePath, destinationPath);
+  } catch (err) {
+    if (err?.code === 'EEXIST') throw new FileLinkDenied('dest-exists');
+    throw err;
+  }
+  const installed = lstatIfPresent(destinationPath);
+  if (!installed
+      || installed.isSymbolicLink()
+      || !installed.isFile()
+      || installed.dev !== expectedStat.dev
+      || installed.ino !== expectedStat.ino) {
+    throw new FileLinkDenied('unreadable');
+  }
+  return installed;
+}
+
+function removeInstalledFile(targetPath, installedStat) {
+  const current = lstatIfPresent(targetPath);
+  if (!current
+      || current.isSymbolicLink()
+      || current.dev !== installedStat.dev
+      || current.ino !== installedStat.ino) {
+    throw new FileLinkDenied('dest-exists');
+  }
+  fs.unlinkSync(targetPath);
+}
+
+function removeReservation(targetPath, reservation) {
+  if (!reservation) return;
+  try {
+    assertReservationIdentity(targetPath, reservation);
+    if (reservation.isDirectory) fs.rmdirSync(targetPath);
+    else fs.unlinkSync(targetPath);
+  } catch {}
+}
+
+function copyRegularFileForMove(
+  source,
+  destination,
+  sourcePrepared,
+  destinationPrepared,
+  reservation,
+  onReservationReleased,
+) {
+  let sourceFd;
+  let tmpFd;
+  let tmpPath;
+  try {
+    sourceFd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const sourceStat = fs.fstatSync(sourceFd);
+    assertTargetIdentity(sourcePrepared, sourcePrepared.targetStat);
+    tmpPath = randomSibling(destination);
+    tmpFd = fs.openSync(
+      tmpPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      sourcePrepared.targetStat.mode & 0o777,
+    );
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < sourceStat.size) {
+      const read = fs.readSync(sourceFd, buffer, 0, Math.min(buffer.length, sourceStat.size - position), position);
+      if (read === 0) throw new FileLinkDenied('unreadable');
+      writeAllSync(tmpFd, buffer.subarray(0, read));
+      position += read;
+    }
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = undefined;
+    const tmpStat = fs.lstatSync(tmpPath);
+    fs.closeSync(sourceFd);
+    sourceFd = undefined;
+    reverifyPrepared(sourcePrepared);
+    reverifyPrepared(destinationPrepared);
+    assertTargetIdentity(sourcePrepared, sourcePrepared.targetStat);
+    releaseReservation(destination, reservation, onReservationReleased);
+    const installedStat = linkNoReplace(tmpPath, destination, tmpStat);
+    let sourceUnlinked = false;
+    try {
+      fs.unlinkSync(tmpPath);
+      tmpPath = undefined;
+      fs.fsyncSync(destinationPrepared.parentFd);
+      fs.unlinkSync(source);
+      sourceUnlinked = true;
+      fs.fsyncSync(sourcePrepared.parentFd);
+    } catch (err) {
+      if (!sourceUnlinked) {
+        try {
+          removeInstalledFile(destination, installedStat);
+          fs.fsyncSync(destinationPrepared.parentFd);
+        } catch (rollbackErr) {
+          err.rollbackError = rollbackErr;
+        }
+      }
+      throw err;
+    }
+  } finally {
+    if (sourceFd !== undefined) try { fs.closeSync(sourceFd); } catch {}
+    if (tmpFd !== undefined) try { fs.closeSync(tmpFd); } catch {}
+    if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
+  const source = prepareWriteTarget(fromPath, writeRoots);
+  let destination;
+  let reservation;
+  try {
+    destination = prepareWriteTarget(toPath, writeRoots);
+    assertImmediateParent(source);
+    assertImmediateParent(destination);
+    if (!source.targetStat) throw new FileLinkDenied('unreadable');
+    if (!source.targetStat.isFile() && !source.targetStat.isDirectory()) {
+      throw new FileLinkDenied('unreadable');
+    }
+    if (source.pinnedRoots.some((root) => contains(source.target, root.realPath))) {
+      throw new FileLinkDenied('outside-scope');
+    }
+    if (destination.targetStat) throw new FileLinkDenied('dest-exists');
+    reverifyPrepared(source);
+    reverifyPrepared(destination);
+    assertTargetIdentity(source, source.targetStat);
+    if (source.targetStat.isDirectory()) {
+      reservation = reserveDestination(destination, true);
+      assertReservationIdentity(destination.target, reservation);
+      assertTargetIdentity(source, source.targetStat);
+      reverifyPrepared(source);
+      reverifyPrepared(destination);
+      try {
+        fs.renameSync(source.target, destination.target);
+      } catch (err) {
+        if (err?.code === 'EXDEV') throw new FileLinkDenied('cross-device-dir');
+        throw err;
+      }
+      reservation = undefined;
+      fs.fsyncSync(destination.parentFd);
+      if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
+    } else {
+      if (lstatIfPresent(destination.target)) throw new FileLinkDenied('dest-exists');
+      assertTargetIdentity(source, source.targetStat);
+      reverifyPrepared(source);
+      reverifyPrepared(destination);
+      try {
+        fs.renameSync(source.target, destination.target);
+      } catch (err) {
+        if (err?.code !== 'EXDEV') throw err;
+        reservation = reserveDestination(destination, false);
+        copyRegularFileForMove(
+          source.target,
+          destination.target,
+          source,
+          destination,
+          reservation,
+          () => { reservation = undefined; },
+        );
+        return { from: source.target, to: destination.target };
+      }
+      fs.fsyncSync(destination.parentFd);
+      if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
+    }
+    return { from: source.target, to: destination.target };
+  } finally {
+    if (destination && reservation) removeReservation(destination.target, reservation);
+    closePrepared(destination);
+    closePrepared(source);
+  }
+}
+
+function validateTrashDirectory(root) {
+  const trashDir = path.join(root.realPath, '.matron-trash');
+  const stat = lstatIfPresent(trashDir);
+  if (!stat) return { trashDir, exists: false };
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new FileLinkDenied('trash-write-failed');
+  let realTrash;
+  try {
+    realTrash = fs.realpathSync(trashDir);
+  } catch {
+    throw new FileLinkDenied('trash-write-failed');
+  }
+  if (realTrash !== trashDir || !contains(root.realPath, realTrash)) {
+    throw new FileLinkDenied('trash-write-failed');
+  }
+  return { trashDir, exists: true, dev: stat.dev, ino: stat.ino };
+}
+
+function ensureTrashDirectory(prepared) {
+  let trash = validateTrashDirectory(prepared.root);
+  if (trash.exists) return { ...trash, created: false };
+  let created = false;
+  let createdTrash;
+  try {
+    fs.mkdirSync(trash.trashDir, { mode: 0o700 });
+    created = true;
+    const stat = fs.lstatSync(trash.trashDir);
+    createdTrash = { trashDir: trash.trashDir, created: true, dev: stat.dev, ino: stat.ino };
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw new FileLinkDenied('trash-write-failed');
+  }
+  try {
+    trash = validateTrashDirectory(prepared.root);
+    if (!trash.exists) throw new FileLinkDenied('trash-write-failed');
+    if (prepared.root.realPath === prepared.pinnedAncestor) fs.fsyncSync(prepared.parentFd);
+    else fsyncDirectoryPathSync(prepared.root.realPath);
+    return { ...trash, created };
+  } catch (err) {
+    removeCreatedTrashDirectory(createdTrash);
+    throw err;
+  }
+}
+
+function removeCreatedTrashDirectory(trash) {
+  if (!trash?.created) return;
+  try {
+    const current = fs.lstatSync(trash.trashDir);
+    if (current.isSymbolicLink()
+        || !current.isDirectory()
+        || current.dev !== trash.dev
+        || current.ino !== trash.ino) return;
+    fs.rmdirSync(trash.trashDir);
+  } catch {}
+}
+
+function assertTrashDirectoryIdentity(root, trashDir, trashFd, expectedStat) {
+  try {
+    const fdStat = fs.fstatSync(trashFd);
+    const pathStat = fs.lstatSync(trashDir);
+    const fdPath = fdRealPathSync(trashFd, trashDir);
+    const realPath = fs.realpathSync(trashDir);
+    if (!fdStat.isDirectory()
+        || pathStat.isSymbolicLink()
+        || !pathStat.isDirectory()
+        || fdStat.dev !== expectedStat.dev
+        || fdStat.ino !== expectedStat.ino
+        || pathStat.dev !== expectedStat.dev
+        || pathStat.ino !== expectedStat.ino
+        || fdPath !== trashDir
+        || realPath !== trashDir
+        || !contains(root.realPath, realPath)) {
+      throw new Error('trash directory identity changed');
+    }
+  } catch {
+    throw new FileLinkDenied('trash-write-failed');
+  }
+}
+
+function trashName(sourcePath) {
+  const utc = new Date().toISOString().replace(/[:.]/g, '-');
+  const random = crypto.randomBytes(8).toString('hex');
+  return `${utc}-${random}-${path.basename(sourcePath)}`;
+}
+
+function preserveFileForOverwrite(prepared) {
+  if (!prepared.targetStat.isFile()) throw new FileLinkDenied('unreadable');
+  const trash = ensureTrashDirectory(prepared);
+  let sourceFd;
+  let trashFd;
+  let backupFd;
+  let backupPath;
+  let backupDurable = false;
+  try {
+    trashFd = fs.openSync(
+      trash.trashDir,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    const trashStat = fs.fstatSync(trashFd);
+    assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
+    sourceFd = fs.openSync(prepared.target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const sourceStat = fs.fstatSync(sourceFd);
+    assertTargetIdentity(prepared, prepared.targetStat);
+    if (!sourceStat.isFile()
+        || sourceStat.dev !== prepared.targetStat.dev
+        || sourceStat.ino !== prepared.targetStat.ino) {
+      throw new FileLinkDenied('unreadable');
+    }
+    backupPath = path.join(trash.trashDir, trashName(prepared.target));
+    backupFd = fs.openSync(
+      backupPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      prepared.targetStat.mode & 0o777,
+    );
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < sourceStat.size) {
+      const read = fs.readSync(
+        sourceFd,
+        buffer,
+        0,
+        Math.min(buffer.length, sourceStat.size - position),
+        position,
+      );
+      if (read === 0) throw new FileLinkDenied('unreadable');
+      writeAllSync(backupFd, buffer.subarray(0, read));
+      position += read;
+    }
+    fs.fsyncSync(backupFd);
+    fs.closeSync(backupFd);
+    backupFd = undefined;
+    reverifyPrepared(prepared);
+    assertTargetIdentity(prepared, prepared.targetStat);
+    assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
+    fs.fsyncSync(trashFd);
+    backupDurable = true;
+    return backupPath;
+  } finally {
+    if (sourceFd !== undefined) try { fs.closeSync(sourceFd); } catch {}
+    if (backupFd !== undefined) try { fs.closeSync(backupFd); } catch {}
+    if (!backupDurable && backupPath) {
+      try { fs.unlinkSync(backupPath); } catch {}
+    }
+    if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
+  }
+}
+
+export async function trashGuarded(targetPath, { writeRoots, recursive = false } = {}) {
+  const source = prepareWriteTarget(targetPath, writeRoots);
+  let trash;
+  let trashFd;
+  let destination;
+  let reservation;
+  let trashCommitted = false;
+  try {
+    assertImmediateParent(source);
+    if (!source.targetStat) {
+      return { path: source.target, trashed: null, already_missing: true };
+    }
+    if (!source.targetStat.isFile() && !source.targetStat.isDirectory()) {
+      throw new FileLinkDenied('unreadable');
+    }
+    if (source.target === source.root.realPath) throw new FileLinkDenied('outside-scope');
+    validateTrashDirectory(source.root);
+    reverifyPrepared(source);
+    assertTargetIdentity(source, source.targetStat);
+    if (source.targetStat.isDirectory() && !recursive && fs.readdirSync(source.target).length > 0) {
+      throw new FileLinkDenied('dir-not-empty');
+    }
+    reverifyPrepared(source);
+    assertTargetIdentity(source, source.targetStat);
+    trash = ensureTrashDirectory(source);
+    trashFd = fs.openSync(
+      trash.trashDir,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    const trashStat = fs.fstatSync(trashFd);
+    assertTrashDirectoryIdentity(source.root, trash.trashDir, trashFd, trashStat);
+    destination = path.join(trash.trashDir, trashName(source.target));
+    if (source.targetStat.isDirectory()) {
+      fs.mkdirSync(destination, { mode: 0o700 });
+      const stat = fs.lstatSync(destination);
+      reservation = { isDirectory: true, dev: stat.dev, ino: stat.ino };
+    } else {
+      const reserveFd = fs.openSync(
+        destination,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        const stat = fs.fstatSync(reserveFd);
+        reservation = { isDirectory: false, dev: stat.dev, ino: stat.ino };
+      } finally {
+        fs.closeSync(reserveFd);
+      }
+    }
+    reverifyPrepared(source);
+    assertTargetIdentity(source, source.targetStat);
+    assertTrashDirectoryIdentity(source.root, trash.trashDir, trashFd, trashStat);
+    try {
+      fs.renameSync(source.target, destination);
+      reservation = undefined;
+      trashCommitted = true;
+      fs.fsyncSync(trashFd);
+      fs.fsyncSync(source.parentFd);
+    } catch (err) {
+      if (err?.code !== 'EXDEV' || source.targetStat.isDirectory()) {
+        throw new FileLinkDenied('trash-write-failed');
+      }
+      const trashPrepared = {
+        ...source,
+        target: destination,
+        parentPath: trash.trashDir,
+        pinnedAncestor: trash.trashDir,
+        parentFd: trashFd,
+        parentDev: trashStat.dev,
+        parentIno: trashStat.ino,
+        targetStat: null,
+      };
+      try {
+        copyRegularFileForMove(
+          source.target,
+          destination,
+          source,
+          trashPrepared,
+          reservation,
+          () => { reservation = undefined; },
+        );
+        trashCommitted = true;
+      } catch {
+        throw new FileLinkDenied('trash-write-failed');
+      }
+    }
+    return { path: source.target, trashed: destination, already_missing: false };
+  } finally {
+    if (destination && reservation) removeReservation(destination, reservation);
+    if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
+    if (!trashCommitted) removeCreatedTrashDirectory(trash);
+    closePrepared(source);
   }
 }
 

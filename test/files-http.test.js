@@ -11,6 +11,9 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
+import { makeHttpHandler } from '../src/http.js'
+import { pinAllowedRootsSync } from '../src/file-guard.js'
+import { assertNoProhibitedFileWriteRoots, pinProhibitedFileWriteRootsSync } from '../src/server.js'
 
 // Build a canonical read-root with a representative tree + adversarial entries.
 function makeFixture() {
@@ -72,6 +75,15 @@ async function clientToken(s, name = 'op', pw = 'pw') {
 
 function authGet(s, pathAndQuery, token, headers = {}) {
   return fetch(s.base + pathAndQuery, { headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers } })
+}
+
+function captureHttpHandlerOptions() {
+  const capture = { options: null }
+  capture.factory = (options) => {
+    capture.options = options
+    return makeHttpHandler(options)
+  }
+  return capture
 }
 
 test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?all=1', async (t) => {
@@ -441,4 +453,113 @@ test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', as
   assert.equal((await s.http('/snapshot', { token })).status, 200)
   assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).status, 404)
   assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
+})
+
+// --- Phase 2 T-1.1: server-owned write configuration -----------------------
+test('T-1.1: writes are off by default even with a valid pinned write-root', async (t) => {
+  const { root } = makeFixture()
+  const writeRoot = path.join(root, 'src')
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileWriteRoots: [writeRoot], httpHandlerFactory: capture.factory,
+  })
+  t.after(() => s.close())
+
+  assert.deepEqual(capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath), [writeRoot])
+  assert.equal(capture.options.fileEnableWrites, false)
+  assert.equal(capture.options.fileWritesDryRun, false)
+})
+
+test('T-1.1: ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
+  const { root } = makeFixture()
+  const warn = t.mock.method(console, 'warn', () => {})
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileEnableWrites: true, httpHandlerFactory: capture.factory,
+  })
+  t.after(() => s.close())
+
+  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
+  assert.equal(capture.options.fileWriteRoots, null)
+  assert.equal(capture.options.fileEnableWrites, false)
+})
+
+test('T-1.1: ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
+  const { root } = makeFixture()
+  const warn = t.mock.method(console, 'warn', () => {})
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({
+    fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true,
+    httpHandlerFactory: capture.factory,
+  })
+  t.after(() => s.close())
+
+  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
+  assert.equal(capture.options.fileWriteRoots, null)
+  assert.equal(capture.options.fileEnableWrites, false)
+})
+
+test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
+  const { root } = makeFixture()
+  const envNames = ['MATRON_FILE_WRITE_ROOTS', 'MATRON_FILE_ENABLE_WRITES', 'MATRON_FILE_WRITES_DRYRUN']
+  const previous = new Map(envNames.map((name) => [name, process.env[name]]))
+  t.after(() => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+  process.env.MATRON_FILE_WRITE_ROOTS = `${path.join(root, 'src')}:${path.join(root, 'node_modules')}`
+  process.env.MATRON_FILE_ENABLE_WRITES = '1'
+  process.env.MATRON_FILE_WRITES_DRYRUN = '1'
+
+  const capture = captureHttpHandlerOptions()
+  const s = await startTestServer({ fileReadRoots: [root], httpHandlerFactory: capture.factory })
+  t.after(() => s.close())
+  assert.deepEqual(
+    capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath),
+    [path.join(root, 'src'), path.join(root, 'node_modules')],
+  )
+  assert.equal(capture.options.fileEnableWrites, true)
+  assert.equal(capture.options.fileWritesDryRun, true)
+})
+
+test('T-1.1: broad write-root identities reject synthetic bind-mount aliases', () => {
+  const { root, outside } = makeFixture()
+  const broadRoots = [root, path.join(root, 'src'), path.join(root, 'node_modules')]
+  const missingRoot = path.join(root, 'host-path-not-present')
+  const prohibitedRoots = pinProhibitedFileWriteRootsSync([...broadRoots, missingRoot])
+  assert.deepEqual(prohibitedRoots.roots.map((pinned) => pinned.realPath), broadRoots)
+
+  for (const [index, broadRoot] of broadRoots.entries()) {
+    const pinnedWriteRoots = pinAllowedRootsSync([broadRoot])
+    const aliasPath = path.join(outside, `synthetic-bind-alias-${index}`)
+    const aliasedWriteRoots = {
+      roots: pinnedWriteRoots.roots.map((pinned) => ({ ...pinned, realPath: aliasPath })),
+    }
+    assert.throws(
+      () => assertNoProhibitedFileWriteRoots(aliasedWriteRoots, prohibitedRoots),
+      (err) => err?.message === `file writes: configured write-root is prohibited because it is too broad: ${aliasPath}`,
+      aliasPath,
+    )
+  }
+})
+
+test('T-1.1: a write-root outside all read-roots fails visibly at boot', async () => {
+  const { root, outside } = makeFixture()
+  await assert.rejects(
+    startTestServer({ fileReadRoots: [root], fileWriteRoots: [outside] }),
+    /every configured write-root must be contained in a configured read-root/,
+  )
+})
+
+test('T-1.1: an unreadable configured write-root fails visibly while pinning', async () => {
+  const { root } = makeFixture()
+  await assert.rejects(
+    startTestServer({
+      fileReadRoots: [root],
+      fileWriteRoots: [path.join(root, 'missing-' + crypto.randomBytes(6).toString('hex'))],
+    }),
+    (e) => e && e.reason === 'bad-workdir',
+  )
 })
