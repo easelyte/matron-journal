@@ -156,9 +156,17 @@ agent_boxes()
                  default_workdir, folders: [{path, last_used}] } ] }
 ```
 
-Self is excluded, and the list is withheld entirely when the bridge's own
-identity is unknown — the same fail-closed stance `agent_roster` takes,
-for the same reason (a self-entry is a self-spawn trap).
+The list is withheld entirely when the bridge's own identity is unknown — the
+same fail-closed stance `agent_roster` takes.
+
+> **UPDATED (loop #690 — easelyte fork divergence).** Self is **no longer
+> excluded**: same-box spawn is now a supported flow (a session spawning
+> another session on its own box, seeded with a prompt — the copy-paste
+> elimination). The journal's `spawn_targets` returns the caller's own device
+> tagged `self: true` with its name suffixed `" (this box)"`, and
+> `spawn_request` accepts a self-target (still consent-card-gated; no silent
+> same-box spawn). Upstream retains the original self-exclusion; this is a
+> candidate to offer upstream later.
 
 ```
 agent_session_start({ device_id, workdir, task, topic? })
