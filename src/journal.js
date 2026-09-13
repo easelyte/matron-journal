@@ -164,6 +164,19 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     if (title != null && title !== existing.title) metaChanged = true
+    // A summary change is metadata a live client must learn mid-conversation,
+    // not just roster-read material (spec: pinned-summary surface, loop #554).
+    // The operator's pinned digest would otherwise only refresh at /snapshot,
+    // i.e. show the first five messages of a six-hour session. It rides the
+    // existing convo_meta event rather than a new type — see docs/protocol.md.
+    //
+    // Compared against the STORED value, not merely against null: the bridge
+    // republishes its digest on reconnect and on every pass that did not grow
+    // a bullet, and an unchanged value is not a change. This guard is what
+    // keeps summary_updated_at honest and keeps convo_meta off the wire when
+    // nothing happened.
+    const summaryChanged = summary != null && summary !== existing.summary
+    if (summaryChanged) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
     // recorded owner untouched.
@@ -189,9 +202,12 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && existing.agent_device_id !== agentDeviceId
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
+    // summary_updated_at binds null — i.e. COALESCE keeps the stored stamp —
+    // on every upsert that did not actually change the summary, including an
+    // identical re-send. Only a real change moves it.
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, agentKind ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
   } else {
     const initialTitle = title || ''
     // Missions (spec 2026-09-10): a spawned conversation inherits its
@@ -199,9 +215,15 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // inheritableMission above. Set once here and never on the update path
     // — same immutability as parent_convo_id.
     const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
+    // A creation that carries a summary stamps it now; one that doesn't gets
+    // 0 ("never"), the same value every pre-existing row has.
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', agentKind ?? null, inheritedMission, Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? Date.now() : 0, agentKind ?? null, inheritedMission, Date.now())
+    // Deliberately NOT metaChanged on a summary-carrying insert: a brand-new
+    // conversation is not a rename, the row arrives whole at the next
+    // /snapshot, and in practice the bridge always sends a title first (which
+    // does set the flag, and whose convo_meta now carries the summary anyway).
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
@@ -347,7 +369,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, created_at, agent_device_id, agent_kind,
+            parent_convo_id, summary, summary_updated_at, created_at, agent_device_id, agent_kind,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts

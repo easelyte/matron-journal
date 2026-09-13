@@ -1608,6 +1608,23 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               // session_outcome on session_status) so it agrees with the
               // snapshot; omitted-null when the bridge sent no kind.
               agent_kind: convo.agent_kind ?? null,
+              // summary rides convo_meta so the operator's pinned-summary
+              // surface refreshes live instead of only at /snapshot (spec:
+              // pinned-summary surface, loop #554). Read back from the stored
+              // row like agent_kind, so the event can never disagree with the
+              // snapshot — this event also fires for a title-only change, and
+              // then it simply restates the summary already stored.
+              //
+              // Always present (like title/agent_kind, unlike session_status's
+              // omitted-when-absent session_outcome) for two reasons: it makes
+              // the payload self-describing for field-presence feature
+              // detection — the only mechanism available, since /snapshot
+              // advertises no capabilities array — and it lets a bridge CLEAR
+              // a summary (upsert `summary: ""`) and have the clear actually
+              // reach live clients instead of being indistinguishable from
+              // "this event carries no summary news".
+              summary: convo.summary ?? '',
+              summary_updated_at: convo.summary_updated_at ?? 0,
             },
           })
         }

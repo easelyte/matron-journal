@@ -405,14 +405,20 @@ an agent token, selected by which query parameter is present:
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, parent_convo_id, agent_device_id}`, sender = the agent device, e.g.
+  (`payload:{title, parent_convo_id, agent_device_id, agent_kind, summary,
+  summary_updated_at}`, sender = the agent device, e.g.
   `agent:dev-2`) whenever it changes an existing conversation's title, sets
-  a non-empty title at creation, or creates a child (`parent_convo_id` set,
+  a non-empty title at creation, changes the stored `summary` (see
+  "`convo_upsert` accepts an optional `summary`" below), or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
   list the child as a normal conversation until its next `/snapshot`) — so
-  other devices learn renames and child linkage live instead of only via
-  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
-  upserts on existing conversations). `agent_device_id` is the upserting
+  other devices learn renames, summary refreshes and child linkage live
+  instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title AND
+  unchanged/omitted summary, state-only
+  upserts on existing conversations) — in particular, a bridge that
+  re-sends the summary it already stored appends nothing, so a reconnect
+  backfill is not an event storm. `agent_device_id` is the upserting
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
@@ -455,9 +461,36 @@ an agent token, selected by which query parameter is present:
   "Agent chat rooms" below). Same don't-clobber discipline as `title`/
   `parent_convo_id`: only an upsert that carries a non-null `summary`
   changes the stored value; omitting it leaves the existing summary
-  untouched. Unlike a title change, a summary change never appends a
-  `convo_meta` event — it's roster-read material, not something a live
-  client needs to learn mid-conversation.
+  untouched. A summary change sets the same meta-changed condition a title
+  change does, and therefore appends a `convo_meta` event carrying
+  `payload.summary` and `payload.summary_updated_at` (see below). This
+  reverses an earlier rule that a summary change never appended one: the
+  summary stopped being roster-read-only material when it became the source
+  for a client's pinned-summary surface, and a digest that only refreshes at
+  `/snapshot` shows the first few messages of an hours-long session in a bar
+  labelled "Summary" above a live timeline. A stale digest presented as
+  current is worse than none, so the refresh rides the event that already
+  means "conversation metadata changed" rather than a new event type.
+- `summary_updated_at` (integer, epoch-ms; `0` = never) accompanies the
+  summary on each `convo_meta` payload and on each `/snapshot` conversation
+  row. It advances **only when the stored summary actually changes** —
+  never on an upsert that omits the summary, and never on one that re-sends
+  a byte-identical value. That guarantee is the point of the field: a bridge
+  republishing its saved digests after a reconnect must not stamp old text
+  as fresh, which would make an age label ("updated 2m ago") lie about
+  exactly the staleness it exists to disclose. Conversations that never had
+  a summary, and every row predating the column, read `0`.
+- Both fields are **additive and always present on `convo_meta`**, like
+  `title`/`agent_kind` and unlike `session_status`'s omitted-when-absent
+  `session_outcome`. Always-present lets a bridge CLEAR a summary (upsert
+  `summary: ""`) and have the clear reach live clients, instead of being
+  indistinguishable from an event that carries no summary news. A client
+  that does not know the keys ignores them, exactly as it already ignores
+  any unknown `convo_meta` key; a client that does know them degrades
+  cleanly against a server that never sends them (no summary → no surface,
+  no `summary_updated_at` → no age label). There is no capability
+  negotiation for this — `/snapshot` advertises no `capabilities` array, so
+  field presence is the detection mechanism.
 - Agent delivery scoping: `convo_upsert` records the upserting agent device
   as the conversation's owner (`agent_device_id`). Ownership is
   last-writer-wins **except** for a guest: a device that has ever appeared
