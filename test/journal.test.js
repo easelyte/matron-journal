@@ -412,6 +412,29 @@ test('summary_updated_at: stamped at creation when the insert carries a summary,
   assert.equal(bare.summary_updated_at, 0)
 })
 
+// Regression (Codex adversarial F2): a conversation minted by a summary-only
+// upsert — no title, no parent, no state — used to append no event at all, so
+// live clients could not learn the conversation OR its digest existed until
+// their next /snapshot. "The bridge always sends a title first" is a property
+// of today's producer, not of this contract.
+test('summary_updated_at: a titleless summary-only creation still counts as meta-changed', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+
+  const born = upsertConversation(db, { id: 'quiet', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• minted by a digest' })
+  assert.equal(born.metaChanged, true, 'a summary-only creation must fan a convo_meta')
+  assert.equal(born.title, '')
+  assert.ok(born.summary_updated_at > 0)
+
+  // An EMPTY summary is not news, so a bare creation stays silent exactly as
+  // it did before — the only way to create without an event.
+  const silent = upsertConversation(db, { id: 'silent', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' })
+  assert.equal(silent.metaChanged, false)
+  const alsoSilent = upsertConversation(db, { id: 'silent2', ownerUserId: dan.id, agentDeviceId: ag.deviceId })
+  assert.equal(alsoSilent.metaChanged, false)
+})
+
 test('agent_chat permission_request is client-only; everything else is not', () => {
   assert.equal(isClientOnlyEvent('permission_request', { kind: 'agent_chat' }), true)
   assert.equal(isClientOnlyEvent('permission_request', { kind: 'tool_use' }), false)

@@ -220,11 +220,16 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     db.prepare(
       'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
     ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? Date.now() : 0, agentKind ?? null, inheritedMission, Date.now())
-    // Deliberately NOT metaChanged on a summary-carrying insert: a brand-new
-    // conversation is not a rename, the row arrives whole at the next
-    // /snapshot, and in practice the bridge always sends a title first (which
-    // does set the flag, and whose convo_meta now carries the summary anyway).
-    if (initialTitle || parentConvoId) metaChanged = true
+    // A non-empty creation summary counts, for the same reason a creation
+    // title does: without it, a conversation minted by a summary-only upsert
+    // (no title, no parent, no state) appends NO event at all, so live clients
+    // would not learn the conversation — let alone its digest — exists until
+    // their next /snapshot. "The bridge always sends a title first" is true of
+    // today's producer, but it is a property of the caller, not a guarantee of
+    // this contract, and relying on it reintroduces exactly the snapshot-only
+    // staleness this change exists to remove. An empty summary is not a
+    // change and stays silent.
+    if (initialTitle || parentConvoId || summary) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   return { ...convo, metaChanged, prevSessionState }

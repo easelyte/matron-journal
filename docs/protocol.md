@@ -472,25 +472,35 @@ an agent token, selected by which query parameter is present:
   current is worse than none, so the refresh rides the event that already
   means "conversation metadata changed" rather than a new event type.
 - `summary_updated_at` (integer, epoch-ms; `0` = never) accompanies the
-  summary on each `convo_meta` payload and on each `/snapshot` conversation
-  row. It advances **only when the stored summary actually changes** —
+  summary on each `convo_upsert`-generated `convo_meta` payload and on every
+  `/snapshot` conversation row. It advances **only when the stored summary actually changes** —
   never on an upsert that omits the summary, and never on one that re-sends
   a byte-identical value. That guarantee is the point of the field: a bridge
   republishing its saved digests after a reconnect must not stamp old text
   as fresh, which would make an age label ("updated 2m ago") lie about
   exactly the staleness it exists to disclose. Conversations that never had
   a summary, and every row predating the column, read `0`.
-- Both fields are **additive and always present on `convo_meta`**, like
-  `title`/`agent_kind` and unlike `session_status`'s omitted-when-absent
-  `session_outcome`. Always-present lets a bridge CLEAR a summary (upsert
-  `summary: ""`) and have the clear reach live clients, instead of being
-  indistinguishable from an event that carries no summary news. A client
-  that does not know the keys ignores them, exactly as it already ignores
-  any unknown `convo_meta` key; a client that does know them degrades
+- Both fields are **additive, and always present on a `convo_upsert`-generated
+  `convo_meta`** — like `title`/`agent_kind` on that same event, and unlike
+  `session_status`'s omitted-when-absent `session_outcome`. Always-present
+  *there* is what lets a bridge CLEAR a summary (upsert `summary: ""`) and
+  have the clear reach live clients, instead of being indistinguishable from
+  an event that carries no summary news.
+  **The guarantee is scoped to that producer, not to the event type.** The
+  server-authored `convo_meta` variants deliberately carry only what changed
+  — a membership fan sends `{participants}` alone, a spawn-room creation
+  sends `{title, parent_convo_id, participants}` — and neither gains these
+  keys. That follows the standing rule for this event, stated above: clients
+  treat every `convo_meta` key independently, and an absent key means "no
+  news", never "cleared". A client must therefore **not** read the absence of
+  `summary` on an arbitrary `convo_meta` as "this server lacks the feature":
+  do feature detection on the `/snapshot` conversation row, where both fields
+  are unconditional. (There is no capability negotiation to use instead —
+  `/snapshot` advertises no `capabilities` array.)
+- A client that does not know the keys ignores them, exactly as it already
+  ignores any unknown `convo_meta` key; a client that does know them degrades
   cleanly against a server that never sends them (no summary → no surface,
-  no `summary_updated_at` → no age label). There is no capability
-  negotiation for this — `/snapshot` advertises no `capabilities` array, so
-  field presence is the detection mechanism.
+  no `summary_updated_at` → no age label).
 - Agent delivery scoping: `convo_upsert` records the upserting agent device
   as the conversation's owner (`agent_device_id`). Ownership is
   last-writer-wins **except** for a guest: a device that has ever appeared

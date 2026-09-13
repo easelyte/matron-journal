@@ -301,6 +301,16 @@ test('convo_upsert: a summary change fans convo_meta with summary + summary_upda
   assert.equal(bare.payload.summary, '')
   assert.equal(bare.payload.summary_updated_at, 0)
 
+  // Regression (Codex adversarial F2): a conversation created by a
+  // summary-only frame — no title, no parent, no state — must still announce
+  // itself, or a live client cannot learn it or its digest exists at all
+  // until its next /snapshot.
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-quiet', summary: '• minted by a digest' })
+  const quiet = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-quiet' && f.type === 'convo_meta')
+  assert.equal(quiet.payload.title, '')
+  assert.equal(quiet.payload.summary, '• minted by a digest')
+  assert.ok(quiet.payload.summary_updated_at > 0)
+
   agent.close(); client.close()
 })
 
