@@ -476,10 +476,23 @@ an agent token, selected by which query parameter is present:
   `/snapshot` conversation row. It advances **only when the stored summary actually changes** —
   never on an upsert that omits the summary, and never on one that re-sends
   a byte-identical value. That guarantee is the point of the field: a bridge
-  republishing its saved digests after a reconnect must not stamp old text
-  as fresh, which would make an age label ("updated 2m ago") lie about
+  republishing its saved digests — which it does on every reconnect — must
+  not restamp them, or an age label ("updated 2m ago") would lie about
   exactly the staleness it exists to disclose. Conversations that never had
   a summary, and every row predating the column, read `0`.
+- **What the stamp measures, precisely: when this server first observed this
+  text — not when the producer generated it.** The two coincide in steady
+  state, because a bridge publishes a digest as soon as it makes one. They
+  diverge on the *first* delivery of text the producer has been holding: a
+  backfill of already-generated digests onto a server that has none (the
+  rollout case), or a restore onto a server whose stored copy is older.
+  There the stamp reads "now" for text that may be considerably older. The
+  divergence is one-shot per conversation and self-correcting — every later
+  change is one this server genuinely witnessed — so consumers should treat
+  the value as a *lower* bound on the digest's age. Closing the gap properly
+  means the producer owning its generation time and sending it
+  (canonical-source); this server does not accept such a field yet,
+  deliberately, since it would be inert until a bridge supplies one.
 - Both fields are **additive, and always present on a `convo_upsert`-generated
   `convo_meta`** — like `title`/`agent_kind` on that same event, and unlike
   `session_status`'s omitted-when-absent `session_outcome`. Always-present
