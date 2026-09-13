@@ -193,3 +193,47 @@ test('appendAudit: creating the log fsyncs its parent directory, not just the fi
   appendAudit(dir, { ts: 2, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
   assert.deepEqual(synced, ['file'])
 })
+
+test('R3-F4: the short-write rollback refuses to truncate over a concurrent append', (t) => {
+  const dir = tmpDir()
+  appendAudit(dir, { ts: 1, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
+
+  // A competing writer lands a COMPLETE record between our snapshot and our
+  // rollback. Truncating back to the snapshot would erase it, so we must not.
+  const realWriteSync = fs.writeSync
+  t.mock.method(fs, 'writeSync', (fd, buf, ...rest) => {
+    if (!Buffer.isBuffer(buf)) return realWriteSync(fd, buf, ...rest)
+    const short = realWriteSync(fd, buf.subarray(0, 5), ...rest)
+    fs.appendFileSync(path.join(dir, FILE_AUDIT_BASENAME), JSON.stringify({ other: 'process' }) + '\n')
+    return short
+  })
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/b', result: 'attempt' }),
+    /COULD NOT BE REPAIRED/,
+  )
+  t.mock.restoreAll()
+  const raw = fs.readFileSync(path.join(dir, FILE_AUDIT_BASENAME), 'utf8')
+  assert.ok(raw.includes('"other":"process"'), 'the other writer\'s record survives')
+  // And the log is fail-closed from here, since its tail is now a fragment.
+  assert.throws(() => appendAudit(dir, { ts: 3, deviceId: 1, op: 'write', path: '/w/c', result: 'ok' }), /refusing to append/)
+})
+
+test('R3-F5: a log left with a partial tail by a dead process is refused, not appended to', () => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  // Exactly what a process killed between write() and rollback leaves behind.
+  fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'delete' })}\n{"ts":2,"op":"del`)
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 3, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /partial line/,
+  )
+  // Nothing was welded onto the fragment.
+  assert.ok(fs.readFileSync(target, 'utf8').endsWith('{"ts":2,"op":"del'))
+  // A well-formed log is accepted, so the check is about the tail and not about
+  // simply refusing every pre-existing file.
+  const clean = tmpDir()
+  fs.writeFileSync(path.join(clean, FILE_AUDIT_BASENAME), `${JSON.stringify({ ts: 1 })}\n`)
+  appendAudit(clean, { ts: 2, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
+  assert.equal(lines(clean).length, 2)
+})

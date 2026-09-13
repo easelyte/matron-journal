@@ -792,3 +792,50 @@ test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) =
   }
   assert.deepEqual(treeOf(f.root), before, 'neither server mutated anything')
 })
+
+// --- Codex round-3 findings ------------------------------------------------
+
+test('R3-F1: enabling writes on a multi-user journal warns that the roots are global', async (t) => {
+  const f = makeFixture()
+  const warn = t.mock.method(console, 'warn', () => {})
+  const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-db-')), 'matron.db')
+  const boot = (extra = {}) => startTestServer({
+    dbPath, fileReadRoots: [f.root], fileWriteRoots: [f.writeRoot], fileAuditDir: f.auditDir, ...extra,
+  })
+
+  const single = await boot({ fileEnableWrites: true })
+  await createUser(single.db, 'one', 'pw')
+  assert.ok(!warn.mock.calls.some((c) => /file writes are enabled on a journal with/.test(c.arguments[0])))
+  single.close()
+
+  // A second user makes the global scope a real exposure, and the operator is
+  // told before it bites. (Per-user write scoping is a product decision the
+  // read API does not make either — spec §11's single-operator model.)
+  const seeding = await boot()
+  await createUser(seeding.db, 'two', 'pw')
+  seeding.close()
+
+  const shared = await boot({ fileEnableWrites: true })
+  t.after(() => shared.close())
+  assert.ok(warn.mock.calls.some((c) => /file writes are enabled on a journal with 2 users/.test(c.arguments[0])))
+})
+
+test('R3-F2: an over-long path component is rejected before any directory is created', async (t) => {
+  const f = makeFixture()
+  const dry = await startWrites(f, { fileWritesDryRun: true })
+  const live = await startWrites(f)
+  t.after(() => { dry.close(); live.close() })
+  const dryToken = (await clientToken(dry)).token
+  const liveToken = (await clientToken(live)).token
+
+  // Recursive mkdir would create `created/` and only THEN fail ENAMETOOLONG on
+  // the next component, leaving unreported partial state and a 500.
+  const target = path.join(f.writeRoot, 'created', 'x'.repeat(300))
+  const before = treeOf(f.writeRoot)
+
+  for (const [server, token] of [[live, liveToken], [dry, dryToken]]) {
+    const r = await call(server, '/files/mkdir', { token, body: { path: target } })
+    assert.equal(r.status, 400)
+  }
+  assert.deepEqual(treeOf(f.writeRoot), before, 'not even the parent component is created')
+})

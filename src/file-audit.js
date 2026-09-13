@@ -44,6 +44,24 @@ const RESULTS = new Set(['attempt', 'ok', 'denied', 'error'])
 // unauditable. Recovery is an operator action (repair or rotate the file, then
 // restart), deliberately not something the server decides for itself.
 const poisoned = new Set()
+// Targets whose existing tail this process has already checked. The check is
+// per file, not per append: it answers "did a previous process die mid-write",
+// which can only change when the file is replaced.
+const tailChecked = new Set()
+
+// A log whose last byte is not a newline ends in a fragment — a previous
+// process died between its write() and the rollback. Appending onto it would
+// weld the next intent record to that fragment and make BOTH unparsable, so the
+// tail is checked once per process before this one ever appends (Codex R3-F5).
+function assertIntactTail(fd, target, size) {
+  if (size === 0) return
+  const last = Buffer.alloc(1)
+  const read = fs.readSync(fd, last, 0, 1, size - 1)
+  if (read !== 1 || last[0] !== 0x0a) {
+    poisoned.add(target)
+    throw new FileAuditFailed(`${target} ends in a partial line (a previous process died mid-append); repair or rotate it and restart`)
+  }
+}
 
 export class FileAuditFailed extends Error {
   constructor(message, cause) {
@@ -132,6 +150,12 @@ export function appendAudit(dir, entry) {
     }
     // The offset this append must roll back to if it only partly lands.
     sizeBefore = fs.fstatSync(fd).size
+    if (!created && !tailChecked.has(target)) {
+      // O_WRONLY cannot read, so inspect the tail through a separate handle.
+      const readFd = fs.openSync(target, fs.constants.O_RDONLY)
+      try { assertIntactTail(readFd, target, sizeBefore) } finally { fs.closeSync(readFd) }
+    }
+    tailChecked.add(target)
     const written = fs.writeSync(fd, line)
     // A short write (ENOSPC, an I/O fault) cannot be finished with a second
     // write(): under O_APPEND a concurrent writer's line could land between the
@@ -142,8 +166,16 @@ export function appendAudit(dir, entry) {
     if (written !== line.length) {
       let repaired = false
       try {
-        fs.ftruncateSync(fd, sizeBefore)
-        repaired = fs.fstatSync(fd).size === sizeBefore
+        // Truncating a SHARED log is only safe if nothing else appended in the
+        // meantime — otherwise the rollback would delete another writer's
+        // complete intent record and let its mutation proceed unlogged (Codex
+        // R3-F4). If the file is not exactly our fragment past the snapshot,
+        // refuse to truncate and poison instead.
+        const current = fs.fstatSync(fd).size
+        if (current === sizeBefore + written) {
+          fs.ftruncateSync(fd, sizeBefore)
+          repaired = fs.fstatSync(fd).size === sizeBefore
+        }
       } catch { repaired = false }
       if (!repaired) poisoned.add(target)
       badRecord(`short write (${written}/${line.length} bytes)${repaired ? ', partial line rolled back' : '; THE LOG TAIL COULD NOT BE REPAIRED — auditing is now refused'}`)

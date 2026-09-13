@@ -1533,33 +1533,30 @@ test('F5: an overwrite backup preserves the original inode rather than a copy of
   }
 })
 
-test('F5: a copy-fallback overwrite backup refuses when the source changes underneath', async (t) => {
+test('F5/R3-F6: an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
   const f = makeWriteFixture()
   try {
-    const target = path.join(f.root, 'growing.txt')
-    writeFileSync(target, 'a'.repeat(128 * 1024))
-    // Force the copy fallback: the hard link into the trash is unavailable.
+    const target = path.join(f.root, 'doc.txt')
+    writeFileSync(target, 'original')
+    // A byte copy would be a snapshot with a race window between it and the
+    // replacement; refusing keeps the guarantee that an overwrite is always
+    // recoverable from the exact bytes that were replaced.
     const realLink = fs.linkSync
-    t.mock.method(fs, 'linkSync', (from, to) => {
-      if (from === target) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
-      return realLink(from, to)
-    })
-    const realRead = fs.readSync
-    let appended = false
-    t.mock.method(fs, 'readSync', (fd, buffer, offset, length, position) => {
-      const read = realRead(fd, buffer, offset, length, position)
-      if (!appended) { appended = true; fs.appendFileSync(target, 'LATE') }
-      return read
-    })
-
-    assert.equal(
-      await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })),
-      'source-changed',
-    )
-    assert.equal(appended, true)
-    assert.ok(fs.readFileSync(target, 'utf8').endsWith('LATE'), 'the original is intact')
-    const trashDir = path.join(f.root, '.matron-trash')
-    assert.deepEqual(fs.existsSync(trashDir) ? fs.readdirSync(trashDir) : [], [], 'no partial backup is kept')
+    for (const code of ['EXDEV', 'EPERM', 'EMLINK']) {
+      t.mock.restoreAll()
+      t.mock.method(fs, 'linkSync', (from, to) => {
+        if (from === target) throw Object.assign(new Error(code), { code })
+        return realLink(from, to)
+      })
+      assert.equal(
+        await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })),
+        'trash-write-failed', code,
+      )
+      assert.equal(fs.readFileSync(target, 'utf8'), 'original', code)
+      const trashDir = path.join(f.root, '.matron-trash')
+      assert.equal(fs.existsSync(trashDir), false, `${code}: no trash directory is left behind`)
+      assert.deepEqual(fs.readdirSync(f.root), ['doc.txt'], `${code}: no temp file is left behind`)
+    }
   } finally {
     f.cleanup()
   }

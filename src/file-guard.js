@@ -112,6 +112,13 @@ export class FileLinkDenied extends Error {
 // Uniform denial->status so the denial reason never leaks which check tripped.
 // Mirrors the bridge's lib/show-file.js:denialToStatus, plus 'not-a-dir'
 // (listing a non-directory) which lands with the other 404 reasons.
+// NAME_MAX on every filesystem we run on. A single component longer than this
+// is ENAMETOOLONG at mkdir/open time — which, on a recursive mkdir, can happen
+// AFTER earlier components were already created. Rejecting it up front keeps
+// dry-run and live in agreement and keeps a client-controlled path from
+// leaving half a directory tree behind (Codex R3-F2).
+export const MAX_NAME_BYTES = 255;
+
 export function denialToStatus(reason) {
   if (reason === 'sensitive'
       || reason === 'outside-scope'
@@ -130,6 +137,9 @@ export function denialToStatus(reason) {
       || reason === 'source-changed'
       || reason === 'idem-key-conflict') return 409;
   if (reason === 'too-large') return 413;
+  // A malformed request, not a policy refusal: the caller fixes it by sending
+  // a shorter name, and no state on the server is in the way.
+  if (reason === 'name-too-long') return 400;
   // Storage-side refusals: the request was well-formed and authorized, but the
   // server could not complete it SAFELY (no recoverable copy in the trash, no
   // durable audit record). 507 keeps them distinct from a 5xx bug.
@@ -380,6 +390,9 @@ function prepareWriteTarget(targetPath, writeRoots) {
     if (isSensitivePath(canonicalTarget)) throw new FileLinkDenied('sensitive');
     assertTrashProtected(canonicalTarget);
     assertNotProtected(canonicalTarget, writeRoots.protectedPaths || []);
+    for (const segment of relativeTarget.split(path.sep)) {
+      if (Buffer.byteLength(segment) > MAX_NAME_BYTES) throw new FileLinkDenied('name-too-long');
+    }
     const targetStat = lstatIfPresent(canonicalTarget);
     if (targetStat?.isSymbolicLink()) throw new FileLinkDenied('symlink');
     return {
@@ -614,7 +627,15 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
         }
         throw err;
       }
-      fs.unlinkSync(tmpPath);
+      // linkNoReplace succeeded, so the caller's file EXISTS and this write is
+      // committed. Removing the temp name is housekeeping: failing the request
+      // on it would report a 500 for a file that is there, and the retry would
+      // then hit overwrite-conflict (Codex R3-F3).
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (err) {
+        console.error(`file-guard: could not remove the temp name after committing ${prepared.target}; an orphan temp file remains`, err);
+      }
     }
     tmpPath = undefined;
     overwriteBackup = undefined;
@@ -1026,15 +1047,24 @@ function trashName(sourcePath) {
   return `${utc}-${random}-${path.basename(sourcePath)}`;
 }
 
+// Preserves the file about to be replaced by linking its INODE into the trash.
+// Not a byte copy: a copy is a photograph taken at one instant, and a writer
+// touching the file between the snapshot and the replacement would have those
+// bytes destroyed with only the stale copy left behind (Codex R3-F6). A link
+// has no such window — the backup IS the file.
+//
+// When the link cannot be made (a write root spanning a bind mount -> EXDEV, a
+// filesystem without hard links -> EPERM, an inode at its link limit ->
+// EMLINK), the overwrite is REFUSED rather than downgraded to a racy copy:
+// "we could not make this recoverable" is a 507 the operator can see, and
+// silently trading recoverability for convenience is the one thing the trash
+// exists to prevent. .matron-trash lives inside the file's own write root, so
+// in every ordinary deployment this is same-device by construction.
 function preserveFileForOverwrite(prepared) {
   if (!prepared.targetStat.isFile()) throw new FileLinkDenied('unreadable');
   const trash = ensureTrashDirectory(prepared);
-  let sourceFd;
   let trashFd;
-  let backupFd;
-  let backupPath;
-  let backupStat;
-  let backupDurable = false;
+  let linked = false;
   try {
     trashFd = fs.openSync(
       trash.trashDir,
@@ -1042,91 +1072,30 @@ function preserveFileForOverwrite(prepared) {
     );
     const trashStat = fs.fstatSync(trashFd);
     assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
-    sourceFd = fs.openSync(prepared.target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const sourceStat = fs.fstatSync(sourceFd);
     assertTargetIdentity(prepared, prepared.targetStat);
-    if (!sourceStat.isFile()
-        || sourceStat.dev !== prepared.targetStat.dev
-        || sourceStat.ino !== prepared.targetStat.ino) {
-      throw new FileLinkDenied('unreadable');
-    }
-    backupPath = path.join(trash.trashDir, trashName(prepared.target));
-    // Preferred: link the ORIGINAL inode into the trash. It is atomic, it costs
-    // nothing, and — unlike a byte copy — it cannot lose writes that land
-    // between the snapshot and the replacement, because the backup IS the
-    // original file rather than a photograph of it (Codex F5).
+    const backupPath = path.join(trash.trashDir, trashName(prepared.target));
+    let installed;
     try {
-      const linked = linkNoReplace(prepared.target, backupPath, prepared.targetStat);
-      fs.fsyncSync(trashFd);
-      backupDurable = true;
-      return { path: backupPath, dev: linked.dev, ino: linked.ino, trash };
+      installed = linkNoReplace(prepared.target, backupPath, prepared.targetStat);
     } catch (err) {
-      // EXDEV only happens if a write-root spans a bind mount, EMLINK if the
-      // inode is at its link limit; both fall back to the copy below.
-      if (err?.code !== 'EXDEV' && err?.code !== 'EMLINK' && err?.code !== 'EPERM') throw err;
+      if (err instanceof FileLinkDenied) throw err;
+      throw new FileLinkDenied('trash-write-failed');
     }
-    backupFd = fs.openSync(
-      backupPath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-      prepared.targetStat.mode & 0o777,
-    );
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    let position = 0;
-    while (position < sourceStat.size) {
-      const read = fs.readSync(
-        sourceFd,
-        buffer,
-        0,
-        Math.min(buffer.length, sourceStat.size - position),
-        position,
-      );
-      if (read === 0) throw new FileLinkDenied('unreadable');
-      writeAllSync(backupFd, buffer.subarray(0, read));
-      position += read;
-    }
-    // The copy read the byte count fstat reported at open. A writer that
-    // changed the file underneath would leave an INCOMPLETE backup, and the
-    // replacement that follows would then be unrecoverable — so verify through
-    // the same fd and refuse rather than destroy bytes we did not preserve.
-    const afterCopyStat = fs.fstatSync(sourceFd);
-    if (afterCopyStat.size !== sourceStat.size
-        || afterCopyStat.mtimeMs !== sourceStat.mtimeMs
-        || afterCopyStat.ctimeMs !== sourceStat.ctimeMs) {
-      throw new FileLinkDenied('source-changed');
-    }
-    fs.fsyncSync(backupFd);
-    backupStat = fs.fstatSync(backupFd);
-    fs.closeSync(backupFd);
-    backupFd = undefined;
-    reverifyPrepared(prepared);
-    assertTargetIdentity(prepared, prepared.targetStat);
-    assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
     fs.fsyncSync(trashFd);
-    backupDurable = true;
-    return {
-      path: backupPath,
-      dev: backupStat.dev,
-      ino: backupStat.ino,
-      trash,
-    };
+    linked = true;
+    return { path: backupPath, dev: installed.dev, ino: installed.ino, trash };
   } finally {
-    if (sourceFd !== undefined) try { fs.closeSync(sourceFd); } catch {}
-    if (backupFd !== undefined) try { fs.closeSync(backupFd); } catch {}
-    let backupRemoved = false;
-    if (!backupDurable && backupPath) {
-      try {
-        fs.unlinkSync(backupPath);
-        backupRemoved = true;
-      } catch {}
-    }
-    if (backupRemoved && trashFd !== undefined) try { fs.fsyncSync(trashFd); } catch {}
     if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
-    if (!backupDurable && removeCreatedTrashDirectory(trash)) {
+    if (!linked && removeCreatedTrashDirectory(trash)) {
       try { fsyncDirectoryPathSync(prepared.root.realPath); } catch {}
     }
   }
 }
 
+// The overwrite backup is made BEFORE the replacement commits, so a commit that
+// fails must take the backup with it — otherwise the trash accumulates a
+// "previous version" of a write that never happened. Identity-checked, so a
+// racer that replaced the backup name is never the thing we delete.
 function removeOverwriteBackup(prepared, backup) {
   assertPinnedRootIdentitySync(prepared.pinnedRoots);
   let trashFd;
