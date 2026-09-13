@@ -1,5 +1,6 @@
 import http from 'node:http'
-import { realpathSync, readlinkSync } from 'node:fs'
+import { accessSync, constants as fsConstants, realpathSync, readlinkSync } from 'node:fs'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
@@ -15,6 +16,7 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { contains, pinAllowedRootsSync } from './file-guard.js'
+import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
@@ -311,7 +313,7 @@ export function startServer({
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileListMax, procSelfFdAvailable, httpHandlerFactory = makeHttpHandler,
+  fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, httpHandlerFactory = makeHttpHandler,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -403,9 +405,30 @@ export function startServer({
       throw new Error('file writes: every configured write-root must be contained in a configured read-root')
     }
   }
-  const resolvedFileEnableWrites = writesRequested && resolvedFileWriteRoots !== null
+  // The write audit (plan T-1.3) is a PRECONDITION for writes, not a
+  // decoration: every destructive op writes its intent line before the first
+  // irreversible fs call and refuses if that append fails. So a deploy with
+  // nowhere to put the log (an in-memory DB has no data directory) must not
+  // enable writes at all, and a data directory the process cannot write is an
+  // operator misconfiguration that fails VISIBLY at boot rather than turning
+  // every write into a runtime 507.
+  const auditPath = auditPathFor(resolvedDbPath)
+  const resolvedFileAuditDir = fileAuditDir !== undefined
+    ? fileAuditDir
+    : (auditPath ? path.dirname(auditPath) : null)
+  const resolvedFileEnableWrites = writesRequested
+    && resolvedFileWriteRoots !== null
+    && resolvedFileAuditDir !== null
   if (writesRequested && resolvedFileWriteRoots === null) {
     console.warn('file writes: disabled — MATRON_FILE_ENABLE_WRITES=1 but MATRON_FILE_WRITE_ROOTS is unset or empty')
+  } else if (writesRequested && resolvedFileAuditDir === null) {
+    console.warn(`file writes: disabled — no data directory to hold ${FILE_AUDIT_BASENAME}, and writes are never served unaudited`)
+  } else if (resolvedFileEnableWrites) {
+    try {
+      accessSync(resolvedFileAuditDir, fsConstants.W_OK)
+    } catch (err) {
+      throw new Error(`file writes: the audit directory ${resolvedFileAuditDir} is not writable, so ${FILE_AUDIT_BASENAME} cannot be kept: ${err.message}`)
+    }
   }
   const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
@@ -428,7 +451,7 @@ export function startServer({
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker,
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
-    fileWritesDryRun: resolvedFileWritesDryRun,
+    fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,

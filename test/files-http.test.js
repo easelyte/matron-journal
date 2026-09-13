@@ -514,7 +514,11 @@ test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated 
   process.env.MATRON_FILE_WRITES_DRYRUN = '1'
 
   const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({ fileReadRoots: [root], httpHandlerFactory: capture.factory })
+  const s = await startTestServer({
+    fileReadRoots: [root],
+    fileAuditDir: fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-audit-')),
+    httpHandlerFactory: capture.factory,
+  })
   t.after(() => s.close())
   assert.deepEqual(
     capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath),
