@@ -113,9 +113,24 @@ export class FileLinkDenied extends Error {
 // Mirrors the bridge's lib/show-file.js:denialToStatus, plus 'not-a-dir'
 // (listing a non-directory) which lands with the other 404 reasons.
 export function denialToStatus(reason) {
-  if (reason === 'sensitive' || reason === 'outside-scope') return 403;
-  if (reason === 'dest-exists') return 409;
+  if (reason === 'sensitive' || reason === 'outside-scope' || reason === 'trash-protected') return 403;
+  // Phase-2 write conflicts. Each names a state the caller can resolve by
+  // choosing differently (pick another name, pass overwrite/confirm, empty the
+  // directory, retry a changed source) — a 409, never the 502 fallback, which
+  // would read as "the server is broken" for an ordinary user-resolvable
+  // conflict (plan T-2.0 / Claude B3 / Codex F6).
+  if (reason === 'dest-exists'
+      || reason === 'dir-not-empty'
+      || reason === 'overwrite-conflict'
+      || reason === 'cross-device-dir'
+      || reason === 'confirm-required'
+      || reason === 'source-changed'
+      || reason === 'idem-key-conflict') return 409;
   if (reason === 'too-large') return 413;
+  // Storage-side refusals: the request was well-formed and authorized, but the
+  // server could not complete it SAFELY (no recoverable copy in the trash, no
+  // durable audit record). 507 keeps them distinct from a 5xx bug.
+  if (reason === 'trash-write-failed' || reason === 'audit-fail-closed') return 507;
   if (reason === 'not-a-file'
       || reason === 'not-a-dir'
       || reason === 'unreadable'
@@ -400,6 +415,20 @@ function writeAllSync(fd, bytes) {
   }
 }
 
+// A durability barrier that runs AFTER the operation's commit point (the
+// rename/link that made the change visible). The change has already happened,
+// so a failure here cannot be "returned as an error" without lying: the caller
+// would retry an operation that already succeeded and get a 404 on a source
+// that is legitimately gone (Codex F4). Report success, and make the lost
+// durability loud in the server log instead.
+function postCommitFsync(fd, what) {
+  try {
+    fs.fsyncSync(fd);
+  } catch (err) {
+    console.error(`file-guard: post-commit fsync failed after ${what} — the change is applied but may not survive a crash`, err);
+  }
+}
+
 function fsyncDirectoryPathSync(dirPath) {
   const fd = fs.openSync(
     dirPath,
@@ -420,7 +449,12 @@ function fixedBytes(value) {
   return null;
 }
 
-export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity } = {}) {
+// `overwrite` defaults to FALSE: replacing an existing file is a destructive
+// act, so the caller has to say so explicitly (plan T-2.4's server-enforced
+// confirm). When it is allowed, the previous content is copied into the
+// write-root's .matron-trash/ and fsynced BEFORE the replacement lands, so an
+// overwrite is always recoverable.
+export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity, overwrite = false } = {}) {
   if (!(maxBytes === Infinity || (Number.isSafeInteger(maxBytes) && maxBytes >= 0))) {
     throw new TypeError('maxBytes must be a non-negative safe integer or Infinity');
   }
@@ -436,6 +470,9 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
   let tmpFd;
   let overwriteBackup;
   try {
+    // P19a: every rejection is decided before the first byte touches the disk.
+    if (prepared.targetStat && !overwrite) throw new FileLinkDenied('overwrite-conflict');
+    if (prepared.targetStat && !prepared.targetStat.isFile()) throw new FileLinkDenied('dest-exists');
     assertImmediateParent(prepared);
     reverifyPrepared(prepared);
     const tmpName = path.basename(randomSibling(prepared.target));
@@ -465,10 +502,15 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     if (prepared.targetStat) overwriteBackup = preserveFileForOverwrite(prepared);
     reverifyPrepared(prepared);
     if (prepared.targetStat) assertTargetIdentity(prepared, prepared.targetStat);
+    // Narrow the create-vs-replace race: a name that appeared while the body
+    // was streaming must not be clobbered by a create-only write. The window
+    // cannot be closed without renameat2(RENAME_NOREPLACE) (see the header
+    // note), but it shrinks to the gap between this check and the rename.
+    else if (!overwrite && lstatIfPresent(prepared.target)) throw new FileLinkDenied('overwrite-conflict');
     fs.renameSync(tmpPath, childPathThroughParentFd(prepared, path.basename(prepared.target)));
     tmpPath = undefined;
     overwriteBackup = undefined;
-    fs.fsyncSync(prepared.parentFd);
+    postCommitFsync(prepared.parentFd, 'an atomic write');
     return prepared.target;
   } catch (err) {
     if (overwriteBackup) {
@@ -499,7 +541,7 @@ export async function mkdirGuarded(targetPath, { writeRoots } = {}) {
     }
     reverifyPrepared(prepared);
     fs.mkdirSync(prepared.target, { recursive: true });
-    fs.fsyncSync(prepared.parentFd);
+    postCommitFsync(prepared.parentFd, 'a mkdir');
     return prepared.target;
   } finally {
     closePrepared(prepared);
@@ -625,6 +667,29 @@ function copyRegularFileForMove(
       writeAllSync(tmpFd, buffer.subarray(0, read));
       position += read;
     }
+    // F3: the copy loop read exactly the byte count fstat reported when the
+    // source was opened. A writer that appended (or rewrote) the file while we
+    // were copying would have those bytes silently dropped by the unlink that
+    // follows, so re-read the identity through the SAME fd and refuse rather
+    // than destroy data we did not copy.
+    const afterCopyStat = fs.fstatSync(sourceFd);
+    if (afterCopyStat.size !== sourceStat.size
+        || afterCopyStat.mtimeMs !== sourceStat.mtimeMs
+        || afterCopyStat.ctimeMs !== sourceStat.ctimeMs) {
+      throw new FileLinkDenied('source-changed');
+    }
+    // F2: a move must not quietly rewrite the file's metadata. The same-device
+    // path preserves everything because it keeps the inode; the cross-device
+    // copy has to restore it by hand. Ownership needs privilege we may not
+    // have (and is already correct whenever the copy runs as the owner), so it
+    // is best-effort; mode came from the open above and mtime/atime are set
+    // last, after the final write that would otherwise bump them.
+    try {
+      if (sourceStat.uid !== undefined) fs.fchownSync(tmpFd, sourceStat.uid, sourceStat.gid);
+    } catch (err) {
+      if (err?.code !== 'EPERM' && err?.code !== 'EINVAL' && err?.code !== 'ENOSYS') throw err;
+    }
+    fs.futimesSync(tmpFd, sourceStat.atime, sourceStat.mtime);
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = undefined;
@@ -643,7 +708,7 @@ function copyRegularFileForMove(
       fs.fsyncSync(destinationPrepared.parentFd);
       fs.unlinkSync(source);
       sourceUnlinked = true;
-      fs.fsyncSync(sourcePrepared.parentFd);
+      postCommitFsync(sourcePrepared.parentFd, 'a cross-device move');
     } catch (err) {
       if (!sourceUnlinked) {
         try {
@@ -694,8 +759,8 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
         throw err;
       }
       reservation = undefined;
-      fs.fsyncSync(destination.parentFd);
-      if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
+      postCommitFsync(destination.parentFd, 'a directory move');
+      if (source.parentPath !== destination.parentPath) postCommitFsync(source.parentFd, 'a directory move');
     } else {
       assertTargetIdentity(source, source.targetStat);
       reverifyPrepared(source);
@@ -724,7 +789,7 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
         assertTargetIdentity(source, source.targetStat);
         fs.unlinkSync(source.target);
         sourceUnlinked = true;
-        fs.fsyncSync(source.parentFd);
+        postCommitFsync(source.parentFd, 'a move');
       } catch (err) {
         const currentSource = lstatIfPresent(source.target);
         const sourceStillOriginal = currentSource
@@ -1003,8 +1068,6 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
       fs.renameSync(source.target, destination);
       reservation = undefined;
       trashCommitted = true;
-      fs.fsyncSync(trashFd);
-      fs.fsyncSync(source.parentFd);
     } catch (err) {
       if (err?.code !== 'EXDEV' || source.targetStat.isDirectory()) {
         throw new FileLinkDenied('trash-write-failed');
@@ -1033,6 +1096,8 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
         throw new FileLinkDenied('trash-write-failed');
       }
     }
+    postCommitFsync(trashFd, 'a delete');
+    postCommitFsync(source.parentFd, 'a delete');
     return { path: source.target, trashed: destination, already_missing: false };
   } finally {
     if (destination && reservation) removeReservation(destination, reservation);

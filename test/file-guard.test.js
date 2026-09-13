@@ -639,7 +639,7 @@ test('writeFileAtomic preserves a successful overwrite in durable trash', async 
     })
 
     assert.equal(
-      await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20 }),
+      await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20, overwrite: true }),
       target,
     )
     assert.equal(fs.readFileSync(target, 'utf8'), 'replacement')
@@ -691,7 +691,7 @@ test('writeFileAtomic removes its durable backup and new trash directory when ov
     })
 
     await assert.rejects(
-      writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20 }),
+      writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20, overwrite: true }),
       /commit failed/,
     )
     assert.equal(fs.readFileSync(target, 'utf8'), 'previous version')
@@ -965,7 +965,12 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
   }
 })
 
-test('moveGuarded cross-device fallback retains the destination after post-unlink fsync failure', async (t) => {
+// F4: the post-unlink fsync is a durability barrier AFTER the move committed.
+// It used to reject, which left the caller with an error describing a move
+// that had in fact happened — and a retry would 404 on the vanished source.
+// The contract now: report success, keep the destination, log the lost
+// durability server-side.
+test('moveGuarded cross-device fallback reports success when the post-unlink fsync fails', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'source.txt')
@@ -986,9 +991,9 @@ test('moveGuarded cross-device fallback retains the destination after post-unlin
       return realFsync(fd)
     })
 
-    await assert.rejects(
-      moveGuarded(source, destination, { writeRoots: f.writeRoots }),
-      /source parent fsync failed/,
+    assert.deepEqual(
+      await moveGuarded(source, destination, { writeRoots: f.writeRoots }),
+      { from: source, to: destination },
     )
     assert.equal(fs.existsSync(source), false)
     assert.equal(fs.readFileSync(destination, 'utf8'), 'only-surviving-copy')
@@ -1203,6 +1208,227 @@ test('an interleaved same-basename delete survives and delete-missing is idempot
       trashed: null,
       already_missing: true,
     })
+  } finally {
+    f.cleanup()
+  }
+})
+
+// --- Carried Codex findings F2/F3/F4 ----------------------------------------
+// The same-device path is an inode-preserving link()+unlink(), so metadata,
+// concurrent appends, and post-commit durability are only at risk on the
+// cross-device (EXDEV) copy fallback and the crash-window fsyncs around a
+// committed rename. Each is forced here by injecting the failure Linux would
+// otherwise only produce across a real mount boundary.
+
+const forceExdev = (t, predicate) => {
+  const realLink = fs.linkSync
+  const realRename = fs.renameSync
+  t.mock.method(fs, 'linkSync', (from, to) => {
+    if (predicate(from, to)) throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' })
+    return realLink(from, to)
+  })
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (predicate(from, to)) throw Object.assign(new Error('cross-device rename'), { code: 'EXDEV' })
+    return realRename(from, to)
+  })
+}
+
+test('F2: the cross-device move fallback preserves mode and mtime', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'payload.bin')
+    const destination = path.join(f.root, 'moved.bin')
+    writeFileSync(source, 'payload')
+    fs.chmodSync(source, 0o640)
+    const mtime = new Date('2021-03-04T05:06:07.000Z')
+    fs.utimesSync(source, mtime, mtime)
+    const before = fs.lstatSync(source)
+
+    forceExdev(t, (from) => from === source)
+    const moved = await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+
+    assert.equal(moved.to, destination)
+    assert.equal(fs.existsSync(source), false)
+    const after = fs.lstatSync(destination)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'payload')
+    assert.equal(after.mode & 0o777, before.mode & 0o777)
+    assert.equal(Math.floor(after.mtimeMs), Math.floor(before.mtimeMs))
+    assert.equal(after.uid, before.uid)
+    assert.equal(after.gid, before.gid)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F3: a concurrent append during the cross-device copy aborts instead of losing bytes', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'growing.log')
+    const destination = path.join(f.root, 'moved.log')
+    writeFileSync(source, 'a'.repeat(128 * 1024))
+    forceExdev(t, (from) => from === source)
+
+    const realRead = fs.readSync
+    let appended = false
+    t.mock.method(fs, 'readSync', (fd, buffer, offset, length, position) => {
+      const read = realRead(fd, buffer, offset, length, position)
+      if (!appended) {
+        appended = true
+        fs.appendFileSync(source, 'LATE-APPEND')
+      }
+      return read
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'source-changed',
+    )
+    assert.equal(appended, true)
+    // Nothing lost: the source keeps every byte and no partial copy survives.
+    assert.ok(fs.readFileSync(source, 'utf8').endsWith('LATE-APPEND'))
+    assert.equal(fs.existsSync(destination), false)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure reports success rather than a lying error', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'committed.txt')
+    const destination = path.join(f.root, 'committed-moved.txt')
+    writeFileSync(source, 'committed')
+
+    const realFsync = fs.fsyncSync
+    const realUnlink = fs.unlinkSync
+    let sourceUnlinked = false
+    t.mock.method(fs, 'unlinkSync', (target) => {
+      const result = realUnlink(target)
+      if (target === source) sourceUnlinked = true
+      return result
+    })
+    // Only the durability barrier AFTER the move is committed fails.
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (sourceUnlinked) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    const moved = await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+    assert.deepEqual(moved, { from: source, to: destination })
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'committed')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure does not un-commit a trashed file', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const doomed = path.join(f.root, 'doomed.txt')
+    writeFileSync(doomed, 'doomed')
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    let renamed = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      const result = realRename(from, to)
+      if (from === doomed) renamed = true
+      return result
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (renamed) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    const trashed = await trashGuarded(doomed, { writeRoots: f.writeRoots })
+    assert.equal(trashed.already_missing, false)
+    assert.equal(fs.existsSync(doomed), false)
+    assert.equal(fs.readFileSync(trashed.trashed, 'utf8'), 'doomed')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure does not un-commit an atomic write', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'note.txt')
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    let renamed = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      const result = realRename(from, to)
+      if (to.endsWith('note.txt')) renamed = true
+      return result
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (renamed) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    assert.equal(await writeFileAtomic(target, Buffer.from('body'), { writeRoots: f.writeRoots }), target)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'body')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('denialToStatus maps every Phase-2 write reason without falling back to 502', () => {
+  const expected = {
+    sensitive: 403, 'outside-scope': 403, 'trash-protected': 403,
+    'dest-exists': 409, 'dir-not-empty': 409, 'overwrite-conflict': 409,
+    'cross-device-dir': 409, 'confirm-required': 409, 'source-changed': 409,
+    'idem-key-conflict': 409,
+    'too-large': 413,
+    'trash-write-failed': 507, 'audit-fail-closed': 507,
+    'not-a-file': 404, 'not-a-dir': 404, unreadable: 404, symlink: 404,
+    'relative-path': 404, 'bad-workdir': 404,
+  }
+  for (const [reason, status] of Object.entries(expected)) {
+    assert.equal(denialToStatus(reason), status, reason)
+  }
+  assert.equal(denialToStatus('something-unmapped'), 502)
+})
+
+test('writeFileAtomic refuses to replace an existing file without an explicit overwrite', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'existing.txt')
+    const directory = path.join(f.root, 'a-directory')
+    writeFileSync(target, 'original')
+    mkdirSync(directory)
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots })),
+      'overwrite-conflict',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'original')
+    assert.equal(fs.existsSync(path.join(f.root, '.matron-trash')), false)
+    // A directory is never a write target, with or without the flag.
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(directory, Buffer.from('x'), { writeRoots: f.writeRoots, overwrite: true })),
+      'dest-exists',
+    )
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic rejects a create-only write whose target appears mid-stream', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'raced.txt')
+    let raced = false
+    async function* slowStream() {
+      yield Buffer.from('new-')
+      if (!raced) { raced = true; writeFileSync(target, 'sneaked-in') }
+      yield Buffer.from('content')
+    }
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, slowStream(), { writeRoots: f.writeRoots })),
+      'overwrite-conflict',
+    )
+    assert.equal(raced, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'sneaked-in')
   } finally {
     f.cleanup()
   }
