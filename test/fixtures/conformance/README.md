@@ -44,7 +44,7 @@ One JSON file per scenario:
   "seed": {
     "users":         [{ "as": "dan", "name": "dan", "password": "..." }],
     "agents":        [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
-    "conversations": [{ "id": "c1", "owner": "dan", "title": "T", "sessionState": "running" }],
+    "conversations": [{ "id": "c1", "owner": "dan", "title": "T", "sessionState": "running", "agent": "bridge" }],
     "events":        [{ "convo": "c1", "sender": "agent:a", "type": "text", "payload": { "body": "hi" } }]
   },
 
@@ -58,7 +58,14 @@ Seeding an `as: "dan"` user automatically binds `dan.user_id`; seeding an
 tokens are minted at seed time, unlike client tokens, which only exist after
 a `POST /login` step — see "Bindings" below). `seed.events[].convo` must
 name a conversation already listed in `seed.conversations`; its owner is
-inferred from that conversation, not repeated per event.
+inferred from that conversation, not repeated per event. A conversation's
+optional `agent` names a `seed.agents[].as` value, resolved to that agent's
+`device_id` and passed as `upsertConversation`'s `agentDeviceId` — i.e. that
+agent *manages* the conversation, the same as it would after the bridge's
+own `convo_upsert`. Needed by any fixture step where an agent caller must
+clear `authorizeAgentWrite` against this convo (e.g. filing an item).
+Omitted, the conversation is seeded with no manager, same as before this
+field existed.
 
 ## Step kinds
 

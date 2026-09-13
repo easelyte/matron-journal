@@ -557,5 +557,10 @@ test('GET /snapshot exposes each convo agent_device_id and the agents id->name l
   assert.equal(owned.agent_device_id, agent.deviceId)
   assert.equal(orphan.agent_device_id, null)
   // agents: agent devices only — the client device is not a box
-  assert.deepEqual(r.json.agents, [{ device_id: agent.deviceId, name: 'dev-y' }])
+  assert.deepEqual(r.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: null }])
+
+  // a stored tag character rides the same list
+  s.db.prepare('UPDATE devices SET tag_char=? WHERE id=?').run('y', agent.deviceId)
+  const tagged = await s.http('/snapshot', { token: login.json.token })
+  assert.deepEqual(tagged.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: 'y' }])
 })

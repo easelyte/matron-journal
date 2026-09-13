@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
-import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
@@ -11,7 +11,11 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { handleItemsRoute } from './items-http.js'
+import { handleMissionsRoute } from './missions-http.js'
+import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -24,51 +28,37 @@ const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAM
 // label in the apps, and 40 chars is already more than a chip can show.
 const DEVICE_NAME_MAX = 40
 
-const json = (res, status, obj) => {
-  if (res.writableEnded || res.destroyed) return
-  res.writeHead(status, { 'content-type': 'application/json' })
-  res.end(JSON.stringify(obj))
+// A roster tag is ONE grapheme by contract — the letter beside the box name.
+// Same control-char sieve names go through, then the first grapheme so a
+// compound emoji survives whole. Nothing left over means "clear" (null).
+// Two extra sieves guard the contract: a grapheme cluster is not one code
+// point, so a Zalgo combining stack or a ZWJ chain can ride in as "one
+// character" up to the sanitiser's 80-unit cap — 16 code points clears every
+// real emoji sequence (family-of-4 with skin tones is 11, a subdivision flag
+// is 7) and drops the rest. And a cluster made only of format/space
+// characters (RLO, LRI, ZWSP, soft hyphen) is a non-null tag that renders as
+// nothing — worse than null, because null is what tells clients to derive
+// the automatic letter. Both sieve to null, the documented "clear" outcome.
+const graphemes = new Intl.Segmenter()
+const TAG_CODEPOINT_MAX = 16
+const tagChar = (raw) => {
+  // Owner-set (authenticated), NOT untrusted peer text — so it may legitimately
+  // carry a ZWJ compound emoji (👩‍💻). Sanitize C0 controls + collapse
+  // whitespace here, but do NOT apply deviceName/sanitizePeerText's \p{Cf} sieve
+  // (our fork's peer-forgery hardening), which would split the ZWJ cluster into
+  // its first code point (👩) before segmentation. The grapheme + format-only
+  // checks below still enforce "one visible grapheme" and reject an invisible tag.
+  if (raw == null) return null
+  const clean = String(raw).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, PEER_NAME_CAP)
+  if (!clean) return null
+  let first = null
+  for (const g of graphemes.segment(clean)) { first = g.segment; break }
+  if (!first || [...first].length > TAG_CODEPOINT_MAX) return null
+  // Visibility test only — the ZWJ inside a legitimate 👩‍💻 stays in the
+  // returned value; a cluster that strips to nothing is invisible.
+  if (!first.replace(/[\p{Cf}\p{Cc}\p{Zs}]/gu, '')) return null
+  return first
 }
-
-const readBody = (req) => new Promise((resolve, reject) => {
-  let data = ''
-  let settled = false
-  const fail = (err) => { if (!settled) { settled = true; reject(err) } }
-  req.setEncoding('utf8')
-  req.on('data', (c) => {
-    data += c
-    if (data.length > 1e6) {
-      req.removeAllListeners('data')
-      req.pause()
-      fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
-    }
-  })
-  req.on('end', () => {
-    if (settled) return
-    settled = true
-    if (!data) { resolve({}); return }
-    let parsed
-    try {
-      parsed = JSON.parse(data)
-    } catch {
-      reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }))
-      return
-    }
-    // Shared guard for every POST handler below: any JSON value that isn't a
-    // plain object (literal `null`, an array, or a bare string/number/bool)
-    // would otherwise reach a handler's `const {x} = body` destructure and
-    // either throw outright (null → 500) or silently produce `undefined`
-    // fields that fail deeper and less legibly (e.g. as a DB bind-type
-    // error → 500).
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      reject(Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 }))
-      return
-    }
-    resolve(parsed)
-  })
-  req.on('close', () => fail(new Error('connection closed')))
-  req.on('error', fail)
-})
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
@@ -103,7 +93,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -176,7 +166,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // Mint at claim (spec): the devices row first exists HERE. The pair
         // is already deleted; if createAgent somehow threw, the box retries
         // with a fresh code and no orphan row exists either way.
-        const d = createAgent(db, c.userId, c.agentName)
+        const d = createAgent(db, c.userId, c.agentName, c.tagChar)
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
       }
       if (req.method === 'POST' && url.pathname === '/link/claim') {
@@ -442,6 +432,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           throw e
         }
       }
+      // The tracker's own surface (src/items-http.js) — mounted first so
+      // its /items* paths never collide with the chain below, and inside the
+      // outer try/catch so readBody's 400/413 map like every other route's.
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (req.method === 'GET' && url.pathname === '/help') {
+        // API discovery for agent callers (see src/help.js). Behind auth like
+        // the rest of the device surface: it describes the API, and the
+        // unauthenticated internet doesn't need a map of it.
+        return serveHelp(res)
+      }
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         // Two independent rules layered on top of the client shape (spec:
         // agent visibility & privacy, task 8):
@@ -698,6 +699,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
         const renamedId = Number(rn[1])
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        // The frame carries the standing tag too — device_meta is "here is
+        // this device's current meta", not a name-only delta, so a roster
+        // built from frames alone never loses the letter.
+        const renamedTag = db.prepare('SELECT tag_char FROM devices WHERE id=?').get(renamedId).tag_char
         for (const c of hub.connsOf(who.userId)) {
           // A live socket carries the device name it authenticated with
           // (ws.js hello: `conn = { ws, ...who }`), and everything that
@@ -713,19 +718,44 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           // client that was offline picks the new name up from its next
           // /snapshot `agents` list. Clients only — an agent keeps no roster.
           if (c.kind === 'client' && c.ws.readyState === 1) {
-            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean }))
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag }))
           }
         }
-        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean } })
+        // The 200 body carries the trio like the frame does — device_meta is
+        // "current meta", and rename's own response shouldn't disagree.
+        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean, tag_char: renamedTag } })
+      }
+      const tg = url.pathname.match(/^\/devices\/(\d+)\/tag$/)
+      if (req.method === 'POST' && tg) {
+        // Rename's twin (spec: box tag characters): client-gated, owner-
+        // scoped, and fanned out the same way. `tag_char: null` (or an
+        // input that sieves to nothing) clears back to automatic; an absent
+        // key is a 400, so "clear" is always said out loud.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { tag_char } = await readBody(req)
+        if (tag_char !== null && typeof tag_char !== 'string') return json(res, 400, { error: 'bad_request' })
+        const cleanTag = tagChar(tag_char)
+        const taggedId = Number(tg[1])
+        if (!setOwnedDeviceTag(db, who.userId, taggedId, cleanTag)) return json(res, 404, { error: 'not_found' })
+        // No live-socket name patch here — the tag never appears in journal
+        // sender strings or consent cards, only in client rosters.
+        const taggedName = deviceName(db.prepare('SELECT name FROM devices WHERE id=?').get(taggedId).name)
+        for (const c of hub.connsOf(who.userId)) {
+          if (c.kind === 'client' && c.ws.readyState === 1) {
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: taggedId, name: taggedName, tag_char: cleanTag }))
+          }
+        }
+        return json(res, 200, { ok: true, device: { device_id: taggedId, name: taggedName, tag_char: cleanTag } })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { pair_code, agent_name } = await readBody(req)
+        const { pair_code, agent_name, tag_char } = await readBody(req)
         if (typeof pair_code !== 'string' || !pair_code ||
-            typeof agent_name !== 'string' || !agent_name) {
+            typeof agent_name !== 'string' || !agent_name ||
+            (tag_char != null && typeof tag_char !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
-        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name })
+        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
         // conflict (already approved) is distinguishable — the caller is
         // authenticated, so this leaks nothing exploitable and tells a
         // double-tapping user the truth. Unknown and expired stay merged

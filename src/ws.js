@@ -8,6 +8,7 @@ import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParti
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -89,6 +90,12 @@ const INVITE_TEXT_MAX_CHARS = 1000
 // the text the user reads is the text that takes effect.
 const SPAWN_TASK_MAX_CHARS = 2000
 const SPAWN_WORKDIR_MAX_CHARS = 1024
+// The optional model a spawn may request — an alias ('opus') or a full model
+// id ('claude-opus-4-20250514'). The vocabulary belongs to the target bridge,
+// so this is a length bound only, not an allowlist: a bridge that learns a new
+// alias must work against an older journal. 64 is the same cap RPC method and
+// error-code names get — identifier-shaped peer text, not body copy.
+const SPAWN_MODEL_MAX_CHARS = 64
 // Conversation titles quoted on a consent card to say WHICH session is
 // asking and which is being asked (spec: agent chat request naming). Titles
 // are agent-written, so they are peer text like from_name and get the same
@@ -740,29 +747,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
     return !!row && row.parent_convo_id != null
   }
-  // Wake-on-message (src/wake.js): when traffic targets an agent device with
-  // no live socket, ask the infra layer to start its (possibly idle-stopped)
-  // box. Purely additive: every op keeps its existing answer — the journal
-  // already persists what matters (send/prompt_reply) or refuses cleanly
-  // (agent_unreachable), and the bridge catches up from its cursor once the
-  // box is back. Same-user scoping mirrors the anti-enumeration stance of
-  // the call sites: a foreign device id never reaches the waker.
-  const wakeIfOffline = (agentDeviceId) => {
-    if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
-    const online = hub.connsOf(conn.userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
-    if (online) return
-    const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, conn.userId)
-    if (!dev || dev.kind !== 'agent') return
-    waker.wake(dev.name)
-  }
-  // The send/prompt_reply variant: those ops name a conversation, not a
-  // device, so resolve the managing agent first (null for legacy rows and
-  // client-broadcast convos — nothing to wake).
-  const wakeConvoAgent = (convoId) => {
-    if (!waker || !waker.enabled) return
-    const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
-    if (row && row.agent_device_id != null) wakeIfOffline(row.agent_device_id)
-  }
+  // Wake-on-message: when traffic targets an agent device with no live
+  // socket, ask the infra layer to start its (possibly idle-stopped) box.
+  // Purely additive: every op keeps its existing answer. Shared with the
+  // HTTP items routes — see src/wake.js for the full rationale.
+  const wakeIfOffline = (agentDeviceId) => wakeIfOfflineShared({ db, hub, waker }, conn.userId, agentDeviceId)
+  const wakeConvoAgent = (convoId) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId)
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
   // other post-commit notification in the invite lifecycle — by the time
@@ -978,27 +968,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (typeof msg.workdir !== 'string' || !msg.workdir || msg.workdir.length > SPAWN_WORKDIR_MAX_CHARS) return fail('bad_request', 'bad workdir')
         if (typeof msg.task !== 'string' || !msg.task || msg.task.length > SPAWN_TASK_MAX_CHARS) return fail('bad_request', 'bad task')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+        // Optional, same shape rule as topic: absent is fine, present must be
+        // a bounded string. Deliberately NOT re-checked for emptiness after
+        // sanitisation the way workdir/task are — a model that sieves down to
+        // nothing means "no model named", which is a legal ask, not a bad one.
+        if (msg.model != null && (typeof msg.model !== 'string' || msg.model.length > SPAWN_MODEL_MAX_CHARS)) return fail('bad_request', 'bad model')
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
-        // Same-box spawn is ALLOWED (loop #690 — fork divergence from
-        // upstream's deliberate self-spawn exclusion): a session may spawn
-        // another session on its OWN box, seeded with this task, so the
-        // operator no longer has to copy-paste a start prompt into a new
-        // window. Every safeguard below still applies to a self-target: the
-        // ownership/privacy gate (the caller's own device passes its own
-        // privacy check), the liveness check (the caller's own connection is
-        // online), the child-convo guard (a sub-chat / subagent-transcript
-        // convo, parent_convo_id set, still cannot originate a spawn — see
-        // below), the shared pending-ask cap, and — above all — the
-        // journal-brokered consent card the operator must tap. There is no
-        // silent same-box spawn.
-        // NOTE on depth: the child-convo guard does NOT by itself bound spawn
-        // DEPTH. A spawned session's own top-level conversation is a ROOT convo
-        // (the bridge's RPC-start creates it with parent_convo_id NULL), so it
-        // could in principle spawn again. Depth is bounded by the human consent
-        // gate — every hop, same-box or cross-box, mints a card the operator
-        // must tap — not by an automatic counter. Per operator decision (#690)
-        // no automatic depth/fan-out cap is added here; the consent gate plus
-        // MAX_AWAITING_PER_REQUESTER are the controls.
+        // Spawning on the caller's own box is allowed: the start rpc lands on
+        // the same bridge, which already runs several sessions side by side
+        // (same-bridge rooms), and the user's consent card gates it like any
+        // other spawn.
         // Ownership stance copied from agent_request/agent_invite: unknown
         // id, another user's device, a client device — and a private device
         // seen by an ordinary agent — are indistinguishable not_found.
@@ -1030,6 +1009,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
         if (!task) return fail('bad_request', 'bad task')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const model = sanitizePeerText(msg.model, SPAWN_MODEL_MAX_CHARS)
         // Shared attention throttle — counts chat asks AND spawn asks.
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
@@ -1038,7 +1018,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic,
+          workdir, task, topic, model,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1062,6 +1042,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
           target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
           workdir, task, topic,
+          // Omitted rather than sent empty (the capacity blocks' stance, not
+          // topic's): a client renders this as a "will run on <model>" chip,
+          // and an empty one would read as a model named "".
+          ...(model ? { model } : {}),
         }
         let cardAppend
         try {
@@ -1098,12 +1082,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // 'conflict' the pending-ask cap uses.
         if (conn.spawnTargetsInflight) return fail('conflict', 'spawn_targets already in flight')
         conn.spawnTargetsInflight = true
-        // Self is now INCLUDED (loop #690 — fork divergence from upstream,
-        // whose roster excludes self as "a self-spawn trap"): same-box spawn is
-        // a supported flow, so the caller's own device must be a pickable
-        // target, tagged "(this box)" in the map below so agent_boxes can label
-        // it. Private boxes stay hidden from an ordinary agent; the caller's own
-        // box always passes that filter (callerPrivate mirrors self.private).
+        // Private boxes hidden from ordinary agents, as the roster does. Unlike
+        // the roster, the caller's OWN box is listed (flagged self:true): the
+        // user may want the new session on the machine they are already
+        // talking to — the one with InDesign on it, say. The "self-spawn
+        // trap" (a looping agent spawning copies of itself) is fenced by the
+        // consent card every spawn goes through and the per-requester
+        // pending cap, not by hiding the box.
         const callerPrivate = isPrivateDevice(db, conn.deviceId)
         const boxes = db.prepare(
           "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent'"
@@ -1143,10 +1128,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // detect the same-box entry without string-matching the tag.
             const baseName = sanitizePeerText(d.name, isSelf ? PEER_NAME_CAP - SELF_TAG.length : PEER_NAME_CAP)
             return {
-              device_id: d.device_id,
-              name: isSelf ? `${baseName}${SELF_TAG}` : baseName,
-              ...(isSelf ? { self: true } : {}),
-              online, folders,
+              device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
+              ...(d.device_id === conn.deviceId ? { self: true } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),

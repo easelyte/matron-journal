@@ -10,6 +10,10 @@
 // new prose-bearing event type is ever added, extend HERE and nowhere else.
 export function indexableBody(type, payload) {
   const p = payload && typeof payload === 'object' ? payload : {}
+  // Old-client fallback (spec: "Old-client fallback"): a flagged mirror of
+  // an item marker that new clients hide — a hit here would surface a row
+  // that half the fleet never sees.
+  if (p.fallback_for) return null
   if (type === 'text') {
     const body = typeof p.body === 'string' ? p.body : ''
     return body.trim() ? body : null

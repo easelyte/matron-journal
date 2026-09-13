@@ -18,10 +18,10 @@ async function seed() {
   return { db, dan, parent, target }
 }
 
-function makeRow(db, dan, parent, target, id = 'spawn-1', now = 1000) {
+function makeRow(db, dan, parent, target, id = 'spawn-1', now = 1000, model = '') {
   createSpawnRequest(db, {
     id, userId: dan.id, fromDeviceId: parent.deviceId, fromConvoId: 'parent-convo',
-    targetDeviceId: target.deviceId, workdir: '/home/dan/proj', task: 'do the thing', topic: 'thing', now,
+    targetDeviceId: target.deviceId, workdir: '/home/dan/proj', task: 'do the thing', topic: 'thing', model, now,
   })
 }
 
@@ -37,9 +37,49 @@ test('createSpawnRequest lands in awaiting_user with every field', async () => {
   assert.equal(row.workdir, '/home/dan/proj')
   assert.equal(row.task, 'do the thing')
   assert.equal(row.topic, 'thing')
+  assert.equal(row.model, '') // no model asked for — stored empty, never null-vs-'' ambiguous
   assert.equal(row.created_at, 1000)
   assert.equal(row.answered_at, null)
   assert.equal(row.resolved_at, null)
+})
+
+// The model alias rides the same optional-field discipline as from_name: it
+// reaches the target bridge only when the requester actually asked for one,
+// so a bridge that predates the field sees exactly the params it always saw.
+test('approveSpawn relays a requested model in the start params and omits the key when none was asked for', async () => {
+  const { db, dan, parent, target } = await seed()
+  const hub = { sendToDevice: () => true, broadcastJournal: () => {} }
+  const params = []
+  const broker = {
+    issue: async (h, userId, deviceId, method, p) => { params.push(p); return { ok: true, result: { convo_id: 'child-1' } } },
+  }
+
+  makeRow(db, dan, parent, target, 's-model', 1000, 'opus')
+  claimApprove(db, 's-model')
+  assert.equal(await approveSpawn({ db, hub, broker, startTimeoutMs: 50, roomId: 'room-model' }, getSpawn(db, 's-model')), 'started')
+  assert.equal(params[0].model, 'opus')
+
+  makeRow(db, dan, parent, target, 's-plain')
+  claimApprove(db, 's-plain')
+  assert.equal(await approveSpawn({ db, hub, broker, startTimeoutMs: 50, roomId: 'room-plain' }, getSpawn(db, 's-plain')), 'started')
+  assert.ok(!('model' in params[1]), 'no model asked for — the key must be absent, not empty')
+})
+
+// Rows written before the column existed read NULL, not '' — the same
+// falsy-omit path has to cover them or an ALTER'd database would relay
+// `model: null` to every target bridge.
+test('approveSpawn omits model for a pre-migration row whose column is NULL', async () => {
+  const { db, dan, parent, target } = await seed()
+  makeRow(db, dan, parent, target, 's-null')
+  db.prepare('UPDATE agent_spawn_requests SET model=NULL WHERE id=?').run('s-null')
+  claimApprove(db, 's-null')
+  const params = []
+  const hub = { sendToDevice: () => true, broadcastJournal: () => {} }
+  const broker = {
+    issue: async (h, userId, deviceId, method, p) => { params.push(p); return { ok: true, result: { convo_id: 'child-1' } } },
+  }
+  assert.equal(await approveSpawn({ db, hub, broker, startTimeoutMs: 50, roomId: 'room-null' }, getSpawn(db, 's-null')), 'started')
+  assert.ok(!('model' in params[0]))
 })
 
 test('claimApprove wins exactly once; denySpawn cannot follow a claim', async () => {

@@ -1,0 +1,46 @@
+{
+  "name": "missions: agent starts a mission, posts a milestone whose marker seq is the anchor, closes it; markers land in the right conversations",
+  "description": "Exercises POST /missions, POST /milestones (201 then a 409 no_mission on a second conversation), POST /missions/:id/close, and the 'mission'/'milestone' marker events a client sees on the HTTP read. Numbers are shared with items: the mission is #1, the milestone #2.",
+  "server": { "tmpDb": true },
+  "seed": {
+    "users": [ { "as": "dan", "name": "dan", "password": "fixture-pw-16" } ],
+    "agents": [ { "as": "bridge", "user": "dan", "name": "dev-2" } ],
+    "conversations": [
+      { "id": "c1", "owner": "dan", "title": "Session", "sessionState": "running", "agent": "bridge" },
+      { "id": "c2", "owner": "dan", "title": "Other", "sessionState": "running", "agent": "bridge" }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/missions", "token": { "$ref": "bridge.token" },
+      "body": { "title": "Missions & milestones", "body": "Ship it", "convo_id": "c1" },
+      "expect": { "status": 201, "body": { "mission": {
+        "id": { "$bind": "mission_id" }, "user_id": { "$ref": "dan.user_id" }, "num": 1, "state": "open",
+        "title": "Missions & milestones", "body": "Ship it", "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+        "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
+        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "last_milestone_at": null, "closed_at": null,
+        "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 0, "last_milestone": null } } } },
+    { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
+      "body": { "convo_id": "c2", "kind": "progress", "title": "nope" },
+      "expect": { "status": 409, "body": { "error": "conflict", "blocked_by": "no_mission" } } },
+    { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
+      "body": { "convo_id": "c1", "kind": "user_input", "title": "Dan asked for missions", "body": "the brief" },
+      "expect": { "status": 201, "body": {
+        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "mission_id" }, "num": 2, "kind": "user_input",
+          "title": "Dan asked for missions", "body": "the brief", "convo_id": "c1", "seq": { "$bind": "anchor_seq" },
+          "device_id": { "$ref": "bridge.device_id" }, "created_by": "agent", "created_at": { "$type": "integer" } },
+        "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "POST", "path": "/missions/1/close", "token": { "$ref": "bridge.token" },
+      "body": { "summary": "Done." },
+      "expect": { "status": 200, "body": { "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "GET", "path": "/convo/c1/messages?limit=10", "token": { "$ref": "bridge.token" },
+      "expect": { "status": 200, "body": { "events": [
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "mission_id" }, "num": 1, "title": "Missions & milestones", "action": "created", "by": "agent" } },
+        { "seq": { "$ref": "anchor_seq" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "milestone",
+          "payload": { "milestone_id": { "$ref": "milestone_id" }, "num": 2, "kind": "user_input", "title": "Dan asked for missions", "body": "the brief",
+            "mission_id": { "$ref": "mission_id" }, "mission_num": 1, "mission_title": "Missions & milestones", "by": "agent" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "mission_id" }, "num": 1, "title": "Missions & milestones", "action": "closed", "by": "agent" } }
+      ] } } }
+  ]
+}

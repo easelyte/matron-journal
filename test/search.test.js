@@ -16,6 +16,13 @@ test('indexableBody: text with empty/whitespace/missing/non-string body is not i
   assert.equal(indexableBody('text', { body: 42 }), null)
 })
 
+// Old-client fallback (spec: "Old-client fallback"): a flagged fallback text
+// mirrors a card new clients already render from the marker — indexing it
+// too would land a search hit on a row new clients hide.
+test('indexableBody: a flagged item fallback text is never indexed', () => {
+  assert.equal(indexableBody('text', { body: 'x', fallback_for: 'item' }), null)
+})
+
 test('indexableBody: diff events index payload.diff, falling back to payload.snippet', () => {
   assert.equal(indexableBody('diff', { diff: '-a\n+b' }), '-a\n+b')
   assert.equal(indexableBody('diff', { snippet: 'changed StoragePaths' }), 'changed StoragePaths')

@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeWaker } from '../src/wake.js'
+import { makeWaker, wakeConvoAgent } from '../src/wake.js'
+import { makeHub } from '../src/hub.js'
+import { openDb } from '../src/db.js'
+import { upsertConversation } from '../src/journal.js'
 
 // Wake-on-message (src/wake.js): traffic addressed to an agent device with no
 // live socket fires the operator-configured wake command for that device's
@@ -54,13 +57,35 @@ test('waker appends the box name to the argv and debounces per box', async () =>
   assert.deepEqual(readFileSync(out, 'utf8').split('\n').filter(Boolean).sort(), ['henry', 'mavis'])
 })
 
-test('a failed wake clears the debounce so the next message retries', async () => {
+test('a transient wake failure retries after the failure backoff, not on the next message', async () => {
   let errors = 0
-  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(1)`, debounceMs: 60000, log: { log: () => {}, error: () => { errors++ } } })
+  let fired = 0
+  const log = { log: () => { fired++ }, error: () => { errors++ } }
+  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(1)`, debounceMs: 60000, failBackoffMs: 200, log })
   assert.equal(w.wake('henry'), true)
   await until(() => errors === 1)
-  assert.equal(w.wake('henry'), true)
+  assert.equal(w.wake('henry'), true) // still inside the backoff: suppressed
+  assert.equal(fired, 1)
+  await settle(250)
+  assert.equal(w.wake('henry'), true) // backoff elapsed: fires again
   await until(() => errors === 2)
+  assert.equal(fired, 2)
+})
+
+test('a refused wake (exit 2) keeps the full debounce window', async () => {
+  let errors = 0
+  let fired = 0
+  const log = { log: () => { fired++ }, error: () => { errors++ } }
+  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(2)`, debounceMs: 400, failBackoffMs: 50, log })
+  assert.equal(w.wake('dev-j'), true)
+  await until(() => errors === 1)
+  await settle(100) // past the failure backoff, inside the debounce
+  assert.equal(w.wake('dev-j'), true)
+  assert.equal(fired, 1, 'a refusal is not retried on the next message')
+  await settle(350)
+  assert.equal(w.wake('dev-j'), true)
+  await until(() => errors === 2)
+  assert.equal(fired, 2, 'retried once the window elapsed')
 })
 
 // --- ws integration ---------------------------------------------------------
@@ -137,4 +162,23 @@ test('spawn_request to an offline target wakes the box before refusing', async (
   assert.equal(err.code, 'agent_unreachable')
   await until(() => waker.calls.length === 1)
   assert.deepEqual(waker.calls, ['henry'])
+})
+
+// --- wakeConvoAgent (shared helper, used by ws.js and, from Task 7, the
+// HTTP items routes) ---------------------------------------------------------
+
+test('wakeConvoAgent resolves the managing agent and wakes it only when offline', async () => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  const agent = createAgent(db, dan.id, 'dev-2')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'T', agentDeviceId: agent.deviceId })
+  const calls = []
+  const waker = { enabled: true, wake: (name) => calls.push(name) }
+  wakeConvoAgent({ db, hub, waker }, dan.id, 'c1')
+  assert.deepEqual(calls, ['dev-2'])
+  wakeConvoAgent({ db, hub, waker }, dan.id + 1, 'c1') // foreign user: nothing
+  wakeConvoAgent({ db, hub, waker: { enabled: false, wake: () => calls.push('x') } }, dan.id, 'c1')
+  wakeConvoAgent({ db, hub, waker: null }, dan.id, 'c1')
+  assert.deepEqual(calls, ['dev-2'])
 })

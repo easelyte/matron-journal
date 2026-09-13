@@ -36,11 +36,11 @@ export async function changePassword(db, userId, { oldPassword, newPassword }) {
   return { ok: true }
 }
 
-function issueDevice(db, userId, kind, name) {
+function issueDevice(db, userId, kind, name, tagChar = null) {
   const token = newToken()
   const r = db.prepare(
-    'INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,?,?,?,?)'
-  ).run(userId, kind, name, sha256(token), Date.now())
+    'INSERT INTO devices(user_id, kind, name, tag_char, token_hash, created_at) VALUES(?,?,?,?,?,?)'
+  ).run(userId, kind, name, tagChar, sha256(token), Date.now())
   return { token, deviceId: r.lastInsertRowid }
 }
 
@@ -71,8 +71,8 @@ export async function login(db, { username, password, deviceName }) {
   return { ...d, userId: user.id }
 }
 
-export function createAgent(db, userId, name) {
-  return issueDevice(db, userId, 'agent', name)
+export function createAgent(db, userId, name, tagChar = null) {
+  return issueDevice(db, userId, 'agent', name, tagChar)
 }
 
 // The /link/* claimant mint: same issuance path /login uses (kind='client'),
@@ -107,6 +107,12 @@ export function revokeOwnedDevice(db, userId, deviceId) {
 // distinguish the two, same anti-enumeration stance as revoke.
 export function renameOwnedDevice(db, userId, deviceId, name) {
   return db.prepare('UPDATE devices SET name=? WHERE id=? AND user_id=?').run(name, deviceId, userId).changes > 0
+}
+
+// Tag-character twin of renameOwnedDevice: same owner scoping, same merged
+// not-owned/nonexistent false. NULL clears back to automatic.
+export function setOwnedDeviceTag(db, userId, deviceId, tagChar) {
+  return db.prepare('UPDATE devices SET tag_char=? WHERE id=? AND user_id=?').run(tagChar, deviceId, userId).changes > 0
 }
 
 // v1 owner check. Sharing later = extend this + a grants table (spec §7).

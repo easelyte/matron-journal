@@ -11,12 +11,17 @@ import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './jo
 import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
+// `model` is the optional Claude model the child session should run — an
+// alias ('opus') or a full model id, defaulted to '' like topic so a caller
+// that never mentions one writes the same falsy value rows predating the
+// column carry (NULL). approveSpawn's relay is a falsy test, so the two are
+// interchangeable there and nowhere has to distinguish them.
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, now)
+      workdir, task, topic, model, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, now)
   return { id }
 }
 
@@ -227,8 +232,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
       db.prepare('SELECT name FROM devices WHERE id=?').get(row.from_device_id)?.name,
       PEER_NAME_CAP,
     )
+    // `model` rides the same omit-when-absent rule as from_name: '' (nobody
+    // asked) and NULL (a row predating the column) are both falsy, so a
+    // target bridge only ever sees the key when the requester named a model.
+    // Already sanitised and capped at the ws boundary before it was stored.
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
-      { workdir: row.workdir, prompt: row.task, room_id: roomId, ...(fromName ? { from_name: fromName } : {}) },
+      { workdir: row.workdir, prompt: row.task, room_id: roomId, ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}) },
       { timeoutMs: startTimeoutMs })
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string

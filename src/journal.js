@@ -1,5 +1,8 @@
 import { authorize } from './auth.js'
+import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
+import { CONVOS_MAX, getMission } from './missions.js'
+import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
@@ -77,6 +80,25 @@ export function snippetOf(type, payload) {
     const m = { started: '🚀 Spawned session started', declined: '🚫 Spawn declined', expired: '⌛ Spawn request expired', failed: '❌ Spawn failed' }
     return Object.hasOwn(m, p.outcome) ? m[p.outcome] : '[spawn_outcome]'
   }
+  if (type === 'item') {
+    const glyph = p.kind === 'question' ? '❓' : p.kind === 'decision' ? '⚖' : '☐'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
+  if (type === 'milestone') {
+    const glyph = p.kind === 'user_input' ? '🚩' : '🏁'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
+  if (type === 'mission') {
+    // The title is absent whenever the marker crossed the privacy boundary
+    // (missions-marker.js's withTitle) as well as when the payload is
+    // malformed — the snippet falls back to the number, which is exactly what
+    // the boundary allows through.
+    const n = Number(p.num) || 0
+    if (p.action === 'closed') return `🏁 Mission #${n} closed`
+    if (p.action === 'created') return (p.title ? `🏁 Mission #${n} started: ${String(p.title)}` : `🏁 Mission #${n} started`).slice(0, 120)
+    if (p.action === 'joined') return `🏁 Joined mission #${n}`
+    return `🏁 Mission #${n} updated`
+  }
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   // Matches the relay's fixed 'done'-category alert (see relay.js
@@ -86,6 +108,40 @@ export function snippetOf(type, payload) {
   // ends, and calling it finished read wrong (Dan, 2026-08-02).
   if (type === 'session_status') return 'Turn finished'
   return `[${type}]`
+}
+
+// Missions (spec 2026-09-10): the mission a spawned conversation inherits
+// from its parent at creation — or null. Inheritance is a way INTO a
+// mission, so `join`'s own gates apply to it (final review, I1), all three
+// of them:
+//
+//   1. the mission must be VISIBLE to the creator, through the very sieve
+//      `getMission` applies for `GET /missions/:id` and `join` — an
+//      ordinary (non-private) agent must not be attached to a mission it
+//      can never read or write, whether it reached it through a
+//      private-owned PARENT or through a public parent the user had joined
+//      to a private-ORIGIN mission (both are ways around the sieve, and
+//      the second is invisible from the parent row alone);
+//   2. the mission must be OPEN — a closed mission accepts no joins;
+//   3. it must hold fewer than CONVOS_MAX conversations — a spawn must
+//      never push a mission past a cap `join` refuses at.
+//
+// A child that fails any gate simply starts with no mission. A creator with
+// no device id (an internal or test upsert) counts as unfiltered, like
+// every other privacy predicate.
+function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
+  const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?')
+    .get(parentConvoId, ownerUserId)?.mission_id ?? null
+  if (!missionId) return null
+  const filtered = agentDeviceId != null && !isPrivateDevice(db, agentDeviceId)
+  if (filtered && privateOwnedConvo(db, parentConvoId)) return null
+  const mission = getMission(db, ownerUserId, missionId, { excludePrivateOwned: filtered })
+  if (!mission || mission.state !== 'open') return null
+  // The RAW count, never the row's `conversations` — that one is sieved for
+  // a filtered caller, and the cap is a limit on the table, not on what
+  // this creator happens to be allowed to see.
+  if (db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(missionId).n >= CONVOS_MAX) return null
+  return missionId
 }
 
 // Returns the conversation row plus `metaChanged` and `prevSessionState`.
@@ -138,9 +194,14 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, agentKind ?? null, id)
   } else {
     const initialTitle = title || ''
+    // Missions (spec 2026-09-10): a spawned conversation inherits its
+    // parent's mission at creation, subject to the gates in
+    // inheritableMission above. Set once here and never on the update path
+    // — same immutability as parent_convo_id.
+    const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, agent_kind, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', agentKind ?? null, Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', agentKind ?? null, inheritedMission, Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
@@ -222,13 +283,20 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
   const r = append(db, { userId, convoId, sender, type, payload })
   if (r.duplicate) return r
-  const frame = { kind: 'journal', ...toEventShape({ seq: r.seq, convo_id: convoId, ts: r.ts, sender, type, payload }) }
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  return r
+}
+
+// The fan-out half of appendAndBroadcast, for callers that must append
+// INSIDE their own transaction (a milestone's marker seq is the row's
+// anchor) and broadcast only after it commits. Same targeting rules.
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+  const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
   const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
   const targets = isClientOnlyEvent(type, payload)
     ? new Set()
     : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)]))
   hub.broadcastJournal(userId, frame, targets)
-  return r
 }
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
@@ -325,11 +393,14 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // rename endpoint's validation, so a stored name can still carry newlines
   // or control characters.
   const agents = db.prepare(
-    `SELECT id AS device_id, name FROM devices
+    `SELECT id AS device_id, name, tag_char FROM devices
      WHERE user_id=? AND kind='agent'${excludePrivateOwned ? ' AND private=0' : ''} ORDER BY id`
   ).all(userId).map((a) => ({
     device_id: a.device_id,
     name: a.name == null ? null : sanitizePeerText(a.name, PEER_NAME_CAP),
+    // tag_char is born validated (the /tag and /pair/approve sieves are the
+    // only writers), so it goes out as stored — no pairing-era legacy here.
+    tag_char: a.tag_char ?? null,
   }))
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   return { conversations, agents, seq: head ? head.seq : 0 }

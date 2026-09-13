@@ -74,3 +74,11 @@ counting chars not bytes; edit/summary events don't update snippet/unread
 opts out of APNs push (like `convo_meta`), whereas `edit` pushes normally —
 a known inconsistency in scope (edit's push inclusion predates the push-opt-out
 pattern) and never replicated to other event kinds.
+
+## General / features
+
+- Items tracker v2: due dates, assignees, GitHub sync — see spec non-goals.
+- Item attachments are never reaped but still count toward the media quota:
+  a user whose bytes are mostly item attachments stops being reaped at all
+  (the reaper has nothing eligible left to free). Needs item deletion, or a
+  separate quota for item-held blobs, in v2.

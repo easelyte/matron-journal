@@ -26,7 +26,7 @@ test('GET /devices lists only the caller user devices, marks is_self, gates agen
   assert.equal(agentRow.name, 'dev-9')
   // roster shape: exactly these keys, no token_hash/user_id leakage
   assert.deepEqual(Object.keys(agentRow).sort(),
-    ['connected', 'created_at', 'cursor', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name', 'push_prefs'])
+    ['connected', 'created_at', 'cursor', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name', 'push_prefs', 'tag_char'])
 
   // agent bearers are gated like /password: 403 forbidden
   const asAgent = await s.http('/devices', { token: agent.token })
@@ -117,7 +117,7 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   // happy path
   const ok = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y' } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).name, 'dev-y')
 
@@ -184,12 +184,119 @@ test('rename fans out device_meta to client sockets only', async (t) => {
   assert.equal(r.status, 200)
 
   const frame = await client.waitFor((f) => f.kind === 'device_meta')
-  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y' })
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: null })
   // agents never receive it (a box has no roster to update), and another
   // user's socket never sees it at all
   await new Promise((res) => setTimeout(res, 150))
   assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
   assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
+})
+
+test('POST /devices/:id/tag: sets, clears, keeps one grapheme, owner-scoped, client-gated', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-a')
+  await createUser(s.db, 'pat', 'password')
+  const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'x' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'dan-mac' } })
+  const token = login.json.token
+
+  // happy path — the response echoes the device's current name alongside
+  const ok = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'a' } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-a', tag_char: 'a' } })
+  const roster = await s.http('/devices', { token })
+  assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).tag_char, 'a')
+
+  // client devices may carry a tag too (the roster is one namespace)
+  const self = await s.http(`/devices/${login.json.device_id}/tag`, { method: 'POST', token, body: { tag_char: 'm' } })
+  assert.equal(self.status, 200)
+  assert.equal(self.json.device.tag_char, 'm')
+
+  // surrounding space trimmed, only the FIRST grapheme kept — a compound
+  // emoji is one grapheme and survives whole
+  const emoji = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: ' 👩‍💻xy ' } })
+  assert.equal(emoji.status, 200)
+  assert.equal(emoji.json.device.tag_char, '👩‍💻')
+
+  // a grapheme cluster is not one code point: a Zalgo combining stack or a
+  // ZWJ chain is "one grapheme" up to the sanitiser's cap — over 16 code
+  // points sieves to null (clear), it never rides in as a tag
+  const zalgo = 'a' + '\u0301'.repeat(60)
+  const zwjChain = Array(27).fill('👩').join('\u200D')
+  // an invisible cluster (RLO, ZWSP, LRI, soft hyphen lead) is a non-null
+  // tag that renders as nothing and defeats the null-means-automatic
+  // fallback — it sieves to null too
+  const invisible = ['\u202Eevil', '\u200Bx', '\u2066abc', '\u00ADabc']
+  for (const junk of [zalgo, zwjChain, ...invisible]) {
+    await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'z' } })
+    const r = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: junk } })
+    assert.equal(r.status, 200, `expected 200 for ${JSON.stringify(junk)}`)
+    assert.equal(r.json.device.tag_char, null, `expected null for ${JSON.stringify(junk)}`)
+  }
+
+  // null / empty / whitespace-only clear back to automatic
+  for (const cleared of [null, '', '   ']) {
+    await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'z' } })
+    const r = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: cleared } })
+    assert.equal(r.status, 200, `expected 200 for ${JSON.stringify(cleared)}`)
+    assert.equal(r.json.device.tag_char, null)
+  }
+  assert.equal((await s.http('/devices', { token })).json.devices
+    .find((d) => d.device_id === agent.deviceId).tag_char, null)
+
+  // absent key / non-string non-null -> 400
+  for (const body of [{}, { tag_char: 42 }, { tag_char: {} }, { tag_char: ['a'] }]) {
+    const r = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body })
+    assert.equal(r.status, 400, `expected 400 for ${JSON.stringify(body)}`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+
+  // not owned / nonexistent -> 404, indistinguishable
+  const notOwned = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token: pat.json.token, body: { tag_char: 'p' } })
+  assert.equal(notOwned.status, 404)
+  assert.deepEqual(notOwned.json, { error: 'not_found' })
+  assert.equal((await s.http('/devices/999999/tag', { method: 'POST', token, body: { tag_char: 'x' } })).status, 404)
+
+  // agent bearers are gated like /password; unauthenticated -> 401
+  const asAgent = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token: agent.token, body: { tag_char: 's' } })
+  assert.equal(asAgent.status, 403)
+  assert.deepEqual(asAgent.json, { error: 'forbidden' })
+  assert.equal((await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', body: { tag_char: 'x' } })).status, 401)
+})
+
+test('tag change fans out device_meta (name + tag_char) to client sockets only', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-9')
+  await createUser(s.db, 'pat', 'password')
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'pat-phone' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  t.after(() => client.close())
+  const box = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  t.after(() => box.close())
+  const stranger = await makeWsClient(s.base, { token: patLogin.json.token, cursor: 0 })
+  t.after(() => stranger.close())
+
+  const r = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token: login.json.token, body: { tag_char: '9' } })
+  assert.equal(r.status, 200)
+
+  const frame = await client.waitFor((f) => f.kind === 'device_meta')
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-9', tag_char: '9' })
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
+  assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
+
+  // a later rename carries the standing tag along, so a roster built from
+  // frames alone never loses the letter
+  const rn = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: login.json.token, body: { name: 'dev-y' } })
+  assert.equal(rn.status, 200)
+  const renamed = await client.waitFor((f) => f.kind === 'device_meta' && f.name === 'dev-y')
+  assert.deepEqual(renamed, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: '9' })
 })
 
 test('rename patches the live socket, so a connected box mints the new name at once', async (t) => {

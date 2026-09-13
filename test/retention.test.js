@@ -9,6 +9,7 @@ import { upsertConversation, append, markRead } from '../src/journal.js'
 import { runOffload, runExpireLogs, runReapMedia } from '../src/retention.js'
 import { resolveReapPcts } from '../src/server.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
+import { createItem, addComment } from '../src/items.js'
 
 function tmpMediaDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-'))
@@ -428,19 +429,42 @@ test('default TTL (no override, no env) is enabled at 24h — an old live_log ro
 // runReapMedia — quota-pressure attachment reaper
 // ---------------------------------------------------------------------------
 
+// Writes bytes to a fresh blob file under mediaDir and inserts its blobs
+// row — the disk + row half of every reap fixture. seedAttachment layers a
+// referencing event on top; reapFixture's blob B stays here, never attached
+// to any event.
+function seedBlob(db, mediaDir, { userId, bytes, contentType = 'application/pdf', fill = 1 }) {
+  const blob = writeBlobSync(mediaDir, Buffer.alloc(bytes, fill))
+  insertBlob(db, {
+    id: blob.id, ownerUserId: userId, contentType,
+    size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath,
+  })
+  return blob
+}
+
 // Seeds a real blob on disk + its blobs row + a file/image event referencing
 // it (both events.blob_ref and payload.blob_ref, mirroring ws.js sends).
 function seedAttachment(db, mediaDir, { userId, convoId = 'c1', type = 'file', name = 'doc.pdf', bytes = 100, daysAgo = 0, caption }) {
-  const blob = writeBlobSync(mediaDir, Buffer.alloc(bytes, 1))
-  insertBlob(db, {
-    id: blob.id, ownerUserId: userId, contentType: 'application/pdf',
-    size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath,
-  })
+  const blob = seedBlob(db, mediaDir, { userId, bytes, contentType: 'application/pdf' })
   const payload = { blob_ref: blob.id, name, content_type: 'application/pdf', size: bytes }
   if (caption) payload.caption = caption
   const r = append(db, { userId, convoId, sender: 'user:dan', type, payload, blobRef: blob.id })
   if (daysAgo) backdate(db, r.seq, userId, daysAgo)
   return { blob, seq: r.seq }
+}
+
+// Shared base for tests that need real quota pressure without hand-tuning
+// four attachments: one user, a media dir, and blob A (a 500-byte image
+// event — a genuine reap candidate) sized against quota=1000/highPct=50/
+// lowPct=10 so reaping A alone clears the high-water mark back under
+// target. Callers add more blobs (e.g. a comment-only B) before calling
+// runReapMedia(db, { quotaBytes: quota, highPct: 50, lowPct: 10 }).
+async function reapFixture() {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const a = seedAttachment(db, mediaDir, { userId: dan.id, type: 'image', bytes: 500, daysAgo: 10 })
+  const b = seedBlob(db, mediaDir, { userId: dan.id, bytes: 50, contentType: 'image/png', fill: 3 })
+  return { db, dan, mediaDir, blobA: a.blob.id, blobB: b.id, quota: 1000 }
 }
 
 test('runReapMedia is a no-op below the high-water mark', async () => {
@@ -690,6 +714,24 @@ test('runReapMedia tolerates a blob file already missing on disk', async () => {
   const row = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, file.seq)
   assert.equal(JSON.parse(row.payload).expired, true)
   assert.equal(row.blob_ref, null)
+})
+
+test('media reap never touches a blob referenced only by an item comment', async () => {
+  // reapFixture's quota/pcts are chosen so exactly one blob (A) must go.
+  // Blob A is attached to an image event; blob B only to an item comment.
+  const { db, dan, blobA, blobB, mediaDir, quota } = await reapFixture()
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'T' })
+  const it = createItem(db, { userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  addComment(db, { userId: dan.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: blobB, mime: 'image/png', name: 'p', size: 10 }] })
+  const r = runReapMedia(db, { quotaBytes: quota, highPct: 50, lowPct: 10 })
+  // The discriminating assertion: the pass must actually have reaped A, not
+  // silently no-op'd (a broken quota threshold or a misfiring floor
+  // pre-check would otherwise leave blob B untouched trivially, and the
+  // count-1 assertion below would pass vacuously).
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 500 })
+  assert.equal(getBlob(db, blobA), undefined, 'blob A (the real candidate) must be gone')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM blobs WHERE id=?').get(blobB).n, 1)
+  void mediaDir
 })
 
 test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garbage or inverted marks', (t) => {

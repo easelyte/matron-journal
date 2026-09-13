@@ -55,6 +55,36 @@ test('happy path: start → approve → claim mints the device at claim; token w
   ws.close()
 })
 
+test('approve with tag_char mints the device carrying it; bad tag_char is 400', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const me = await loggedInClient(s)
+
+  const start = await s.http('/pair/start', { method: 'POST', body: {} })
+  // a non-string non-null tag_char rejects the approve outright, and the
+  // pair stays pending — nothing half-approved
+  const bad = await s.http('/pair/approve', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code, agent_name: 'dev-a', tag_char: 42 } })
+  assert.equal(bad.status, 400)
+  assert.deepEqual((await s.http('/pair/claim', { method: 'POST', body: { poll_token: start.json.poll_token } })).json, { status: 'pending' })
+
+  const approve = await s.http('/pair/approve', { method: 'POST', token: me.token, body: { pair_code: start.json.pair_code, agent_name: 'dev-a', tag_char: ' a ' } })
+  assert.equal(approve.status, 200)
+  const claim = await s.http('/pair/claim', { method: 'POST', body: { poll_token: start.json.poll_token } })
+  assert.equal(claim.json.status, 'approved')
+
+  const roster = await s.http('/devices', { token: me.token })
+  const minted = roster.json.devices.find((d) => d.device_id === claim.json.device_id)
+  assert.equal(minted.name, 'dev-a')
+  assert.equal(minted.tag_char, 'a')
+
+  // omitting tag_char stays the default: automatic (null)
+  const start2 = await s.http('/pair/start', { method: 'POST', body: {} })
+  await s.http('/pair/approve', { method: 'POST', token: me.token, body: { pair_code: start2.json.pair_code, agent_name: 'dev-b' } })
+  const claim2 = await s.http('/pair/claim', { method: 'POST', body: { poll_token: start2.json.poll_token } })
+  const roster2 = await s.http('/devices', { token: me.token })
+  assert.equal(roster2.json.devices.find((d) => d.device_id === claim2.json.device_id).tag_char, null)
+})
+
 test('double-approve is 409; exactly one device row after the eventual claim', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

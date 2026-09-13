@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   workdir           TEXT NOT NULL,
   task              TEXT NOT NULL,
   topic             TEXT NOT NULL DEFAULT '',
+  model             TEXT,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -115,6 +116,101 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   resolved_at       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_spawn_state ON agent_spawn_requests(state, from_device_id);
+-- Task & decision tracker (spec: 2026-09-08 task-decision-tracker). Tables
+-- are the source of truth; the conversation log only carries 'item' marker
+-- events written by src/items-http.js. CHECKs list every value src/items.js
+-- writes (the convo_agents lesson: an unlisted value fails silently).
+CREATE TABLE IF NOT EXISTS items(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  num              INTEGER NOT NULL,
+  kind             TEXT NOT NULL CHECK(kind IN ('task','question','decision')),
+  state            TEXT NOT NULL CHECK(state IN ('open','closed')),
+  resolution       TEXT CHECK(resolution IN ('done','answered','decided','reversed','cancelled')),
+  awaiting         TEXT CHECK(awaiting IN ('user','agent')),
+  rank             REAL NOT NULL,
+  title            TEXT NOT NULL,
+  body             TEXT NOT NULL DEFAULT '',
+  labels           TEXT NOT NULL DEFAULT '[]',
+  links            TEXT NOT NULL DEFAULT '[]',
+  supersedes       TEXT REFERENCES items(id),
+  origin_convo_id  TEXT NOT NULL,
+  origin_device_id INTEGER NOT NULL,
+  created_by       TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key         TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  closed_at        INTEGER,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_items_user_state ON items(user_id, state, rank);
+CREATE INDEX IF NOT EXISTS idx_items_convo ON items(origin_convo_id, state);
+CREATE INDEX IF NOT EXISTS idx_items_updated ON items(user_id, updated_at);
+CREATE TABLE IF NOT EXISTS item_comments(
+  id          TEXT PRIMARY KEY,
+  item_id     TEXT NOT NULL REFERENCES items(id),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  author      TEXT NOT NULL CHECK(author IN ('user','agent')),
+  device_id   INTEGER NOT NULL,
+  kind        TEXT NOT NULL CHECK(kind IN ('comment','status')),
+  body        TEXT NOT NULL DEFAULT '',
+  attachments TEXT NOT NULL DEFAULT '[]',
+  meta        TEXT,
+  idem_key    TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_item_comments_item ON item_comments(item_id, created_at);
+CREATE TABLE IF NOT EXISTS item_counters(
+  user_id  INTEGER PRIMARY KEY,
+  next_num INTEGER NOT NULL
+);
+-- Missions & milestones (spec: 2026-09-10 missions-milestones). Tables are
+-- the source of truth; the conversation log carries 'mission' and
+-- 'milestone' marker events written only by src/missions-http.js. Numbers
+-- come from item_counters, the same counter as items (#61 names one thing).
+CREATE TABLE IF NOT EXISTS missions(
+  id                     TEXT PRIMARY KEY,
+  user_id                INTEGER NOT NULL REFERENCES users(id),
+  num                    INTEGER NOT NULL,
+  state                  TEXT NOT NULL CHECK(state IN ('open','closed')),
+  title                  TEXT NOT NULL,
+  body                   TEXT NOT NULL DEFAULT '',
+  close_summary          TEXT,
+  closed_by              TEXT CHECK(closed_by IN ('user','agent')),
+  closed_over_open_items INTEGER NOT NULL DEFAULT 0,
+  origin_convo_id        TEXT NOT NULL,
+  origin_device_id       INTEGER NOT NULL,
+  created_by             TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key               TEXT,
+  created_at             INTEGER NOT NULL,
+  updated_at             INTEGER NOT NULL,
+  last_milestone_at      INTEGER,
+  closed_at              INTEGER,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_missions_user_state ON missions(user_id, state, last_milestone_at);
+CREATE TABLE IF NOT EXISTS milestones(
+  id          TEXT PRIMARY KEY,
+  mission_id  TEXT NOT NULL REFERENCES missions(id),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  num         INTEGER NOT NULL,
+  kind        TEXT NOT NULL CHECK(kind IN ('user_input','progress')),
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  convo_id    TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  device_id   INTEGER NOT NULL,
+  created_by  TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key    TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_milestones_mission ON milestones(mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_milestones_convo ON milestones(convo_id, seq);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
 -- DELETE anywhere, and the only paths that rewrite an event's payload are
@@ -187,7 +283,8 @@ export function openDb(path) {
   // the user's own client devices, which see everything unchanged. Enforced
   // at: GET /roster, GET /search, around_seq context reads, room ops (via
   // loadRoom) and invite targeting, read_marker, convo_upsert's
-  // private-owner takeover guard, GET /snapshot, and GET /metrics — see
+  // private-owner takeover guard, GET /snapshot, GET /metrics, and
+  // GET /missions, GET /missions/:id, GET /milestones — see
   // docs/protocol.md "Device privacy" for the full enumeration.
   // `private_pinned=1` records that
   // matron-admin owns the flag: the bridge's per-hello assertion is ignored
@@ -244,6 +341,13 @@ export function openDb(path) {
     if (dropped > 0) {
       console.log(`agent_idem: dropped ${dropped} row(s) whose device was already revoked`)
     }
+  }
+  // User-chosen roster tag character (spec: box tag characters). ONE grapheme,
+  // NULL = automatic (clients derive a letter from the name). Journal-held so
+  // the same letter shows on every device — it used to live in each app's
+  // local defaults, which is exactly why it never followed the user.
+  if (!deviceCols.some((c) => c.name === 'tag_char')) {
+    db.exec('ALTER TABLE devices ADD COLUMN tag_char TEXT')
   }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
@@ -412,6 +516,38 @@ export function openDb(path) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
   }
+  // Which Claude model the spawned session should run (spec: agent-spawned
+  // sessions). An alias like 'opus' or a full model id — the target bridge's
+  // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
+  // alias must not start failing against an older server, exactly the
+  // session_outcome stance above. Shape is bounded at the ws boundary
+  // (SPAWN_MODEL_MAX_CHARS) and relayed only when non-empty, so a target that
+  // predates the field sees the same `start` params it always saw.
+  //
+  // Nullable rather than NOT NULL DEFAULT '' (topic's shape) because rows
+  // predating this column read NULL and no backfill can invent an answer for
+  // them; every reader is a falsy test, so '' and NULL mean the same thing —
+  // "the requester named no model".
+  const spawnCols = db.prepare('PRAGMA table_info(agent_spawn_requests)').all()
+  if (!spawnCols.some((c) => c.name === 'model')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
+  }
+  // Missions (spec 2026-09-10): a conversation belongs to at most one
+  // mission, set once and never changed; an item follows its origin
+  // conversation but can be moved (PATCH /items/:id {mission}). Both are
+  // NULL for every row predating the column. Placed here, after every
+  // table-rebuild block, so a rebuild can never drop them. Not foreign
+  // keys — same stance as parent_convo_id.
+  const missionConvoCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!missionConvoCols.some((c) => c.name === 'mission_id')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN mission_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_mission ON conversations(mission_id)')
+  const itemMissionCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemMissionCols.some((c) => c.name === 'mission_id')) {
+    db.exec('ALTER TABLE items ADD COLUMN mission_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id, state, awaiting)')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security
@@ -527,7 +663,7 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
 }
 

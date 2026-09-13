@@ -34,6 +34,12 @@ export function classify(type, payload, sender, prevState) {
   // background-push branch in onAppend, never reaches classify()) and keeps
   // its existing behavior regardless of sender.
   if (typeof sender === 'string' && sender.startsWith('user:')) return null
+  // Old-client fallback (spec: "Old-client fallback"): a flagged text
+  // mirrors a marker that already made its own push decision — this rule
+  // has to check the agent sender too, since a `commented`/`closed`/
+  // `reopened` fallback from an agent would otherwise read as a normal
+  // agent-authored text and push a second time for one event.
+  if (type === 'text' && payload && typeof payload === 'object' && payload.fallback_for) return null
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
     const state = payload && payload.state
@@ -44,6 +50,24 @@ export function classify(type, payload, sender, prevState) {
   // TOC summary events are derived metadata, not new activity — journal-sync only.
   if (type === 'summary') return null
   if (type === 'peer_message') return { priority: 5, coalesce: true, kind: 'activity' }
+  // Tracker markers (spec: task-decision-tracker ~:207-210). Only "the
+  // agent needs you" pushes: an agent-authored create, comment, or reopen
+  // that leaves the item awaiting the user. The `by === 'agent'` guard
+  // applies to EVERY action, `created` included — an agent filing on the
+  // user's behalf (`on_behalf_of:'user'`, the queued-card "Make task" tap)
+  // writes `by:'user'`, and buzzing someone's pocket about the item they
+  // just asked for is the same self-notification the user:* rule above
+  // exists to prevent (that rule doesn't catch it: the sender is the agent
+  // device). Agent closes, reorders, updates, and every user-authored
+  // marker are journal-sync only.
+  if (type === 'item') {
+    const p = payload && typeof payload === 'object' ? payload : {}
+    const needsUser = p.awaiting === 'user' && p.by === 'agent'
+      && (p.action === 'created' || p.action === 'commented' || p.action === 'reopened')
+    return needsUser ? { priority: 10, coalesce: false, kind: 'attention' } : null
+  }
+  // Missions and milestones are navigation, never a push (spec: Marker events).
+  if (type === 'milestone' || type === 'mission') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }

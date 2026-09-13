@@ -61,7 +61,7 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
       }
       return null
     },
-    approve(codeInput, { userId, agentName }) {
+    approve(codeInput, { userId, agentName, tagChar = null }) {
       const now = Date.now()
       const code = normalizeCode(codeInput)
       for (const p of pairs.values()) {
@@ -71,6 +71,7 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
         p.approved = true
         p.userId = userId
         p.agentName = agentName
+        p.tagChar = tagChar
         return 'approved'
       }
       return 'not_found'
@@ -83,7 +84,7 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
       }
       if (!p.approved) return { status: 'pending' }
       pairs.delete(pollToken) // one-shot: the pair is gone before the caller sees the identity
-      return { status: 'approved', userId: p.userId, agentName: p.agentName }
+      return { status: 'approved', userId: p.userId, agentName: p.agentName, tagChar: p.tagChar ?? null }
     },
     size() { return pairs.size },
   }

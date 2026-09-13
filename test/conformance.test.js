@@ -173,7 +173,14 @@ async function applySeed(s, seed = {}) {
     const owner = usersByAs[c.owner]
     if (!owner) throw new Error(`seed.conversations: unknown user '${c.owner}'`)
     convoOwnerAs[c.id] = c.owner
-    upsertConversation(s.db, { id: c.id, ownerUserId: owner.id, title: c.title, sessionState: c.sessionState })
+    // `agent` (an `as` name from seed.agents, already bound above) makes
+    // that agent the conversation's manager (agent_device_id) — needed by
+    // any fixture step where an agent caller must pass authorizeAgentWrite
+    // against this convo. Omitted/undefined leaves ownership unset, same as
+    // before this field existed.
+    const agentDeviceId = c.agent ? bindings[`${c.agent}.device_id`] : undefined
+    if (c.agent && agentDeviceId === undefined) throw new Error(`seed.conversations: unknown agent '${c.agent}'`)
+    upsertConversation(s.db, { id: c.id, ownerUserId: owner.id, title: c.title, sessionState: c.sessionState, agentDeviceId })
   }
   for (const e of seed.events || []) {
     const ownerAs = convoOwnerAs[e.convo]
