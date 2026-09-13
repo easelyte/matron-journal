@@ -190,6 +190,72 @@ test('openDb adds agent_kind to legacy conversations and codex upserts round-tri
   }
 })
 
+// Migration guard for the pinned-summary surface (spec: loop #554). Two
+// distinct failure modes are being excluded: a cold start on a FRESH database
+// (where the base CREATE TABLE has no such column, so the ALTER must run and
+// must not fail) and a restart on a database that already carries it (where
+// re-running the ALTER would throw "duplicate column name" and take the
+// process down at boot). The live journal DB is the second case on every
+// restart after the first, so re-runnability is not academic.
+test('openDb adds summary_updated_at to legacy conversations, is re-runnable, and cold-starts fresh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-summary-stamp-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('legacy',1,'pre-stamp',0)"
+  ).run()
+  raw.close()
+
+  let db = openDb(dbPath)
+  try {
+    const cols = db.prepare('PRAGMA table_info(conversations)').all()
+    const col = cols.find((c) => c.name === 'summary_updated_at')
+    assert.ok(col, 'summary_updated_at column missing after migration')
+    assert.equal(col.notnull, 1, 'must be NOT NULL so no row ever reads null')
+    assert.equal(col.dflt_value, '0')
+    assert.equal(cols.filter((c) => c.name === 'summary_updated_at').length, 1, 'added exactly once')
+
+    // The backfilled value for a row that predates the column is the same
+    // "never" sentinel a summary-less new row gets — so an old conversation
+    // renders no age label rather than claiming to be fresh.
+    assert.equal(db.prepare("SELECT summary_updated_at FROM conversations WHERE id='legacy'").get().summary_updated_at, 0)
+    assert.equal(db.prepare("SELECT summary FROM conversations WHERE id='legacy'").get().summary, '')
+  } finally {
+    db.close()
+  }
+
+  // Re-open the SAME file: the migration block runs again against a database
+  // that already has the column. Idempotent or the server cannot restart.
+  try {
+    db = openDb(dbPath)
+    const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.equal(cols.filter((c) => c === 'summary_updated_at').length, 1, 're-open must not re-add the column')
+    db.close()
+
+    // Fresh/empty database: the column must exist after a cold start too,
+    // since the base CREATE TABLE does not declare it.
+    const fresh = openDb(':memory:')
+    const freshCols = fresh.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.ok(freshCols.includes('summary_updated_at'), 'cold start must create the column')
+    fresh.close()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // WAL mitigation, openDb half (docs/wal-checkpoint-profile.md): the WAL file
 // truncates back to <=4MiB on reset for every opener, but the inline
 // auto-checkpoint must stay at SQLite's stock default here — only the server

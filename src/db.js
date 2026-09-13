@@ -427,6 +427,18 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'summary')) {
     db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
   }
+  // Epoch-ms of the last summary CHANGE (0 = never, including every row that
+  // predates this column). The operator's pinned-summary surface needs
+  // freshness: the bridge's digest lags the conversation by up to five
+  // messages, and a stale digest rendered in a bar labelled "Summary" above a
+  // live timeline reads as current when it isn't. Written ONLY when the
+  // summary actually changes (see upsertConversation), never on an upsert
+  // that merely re-sends the value it already stored — a bridge backfilling
+  // its saved digests on reconnect must not stamp months-old text as fresh,
+  // which is the precise lie this column exists to prevent.
+  if (!convoCols.some((c) => c.name === 'summary_updated_at')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN summary_updated_at INTEGER NOT NULL DEFAULT 0')
+  }
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

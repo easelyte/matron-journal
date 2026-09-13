@@ -249,6 +249,98 @@ test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it;
   agent.close(); client.close()
 })
 
+// Pinned-summary live push (spec: loop #554). The surface's whole value is
+// that it refreshes mid-conversation; before this, a summary change stored
+// silently and a client learned it only at its next /snapshot.
+test('convo_upsert: a summary change fans convo_meta with summary + summary_updated_at; an identical re-send fans nothing', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  const metaCount = () => s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='sess-sum' AND type='convo_meta'").get().n
+
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-sum', title: 'work', summary: '• opened the repo' })
+  const first = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-sum' && f.type === 'convo_meta')
+  assert.equal(first.payload.summary, '• opened the repo')
+  assert.ok(first.payload.summary_updated_at > 0, 'a real summary must carry a real stamp')
+  assert.equal(metaCount(), 1)
+  const stamp1 = first.payload.summary_updated_at
+
+  // Byte-identical re-send (the reconnect-backfill shape): no event at all.
+  // Barrier: the following title change's convo_meta proves this frame was
+  // processed, so the count assertion is not racing an unprocessed frame.
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-sum', summary: '• opened the repo' })
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-sum', title: 'renamed' })
+  const renamed = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-sum' && f.type === 'convo_meta' && f.payload.title === 'renamed')
+  assert.equal(metaCount(), 2, 'the identical re-send must not have appended an event')
+  // A title-only change restates the stored summary (read back from the row,
+  // like agent_kind) and leaves the stamp exactly where it was.
+  assert.equal(renamed.payload.summary, '• opened the repo')
+  assert.equal(renamed.payload.summary_updated_at, stamp1)
+
+  // A genuine growth fans again.
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-sum', summary: '• opened the repo\n• fixed the parser' })
+  const grown = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-sum' && f.type === 'convo_meta' && f.payload.summary.includes('parser'))
+  assert.ok(grown.payload.summary_updated_at >= stamp1)
+
+  // The event can never disagree with the snapshot: both read the same row.
+  const snap = await s.http('/snapshot', { token: login.json.token })
+  const row = snap.json.conversations.find((c) => c.id === 'sess-sum')
+  assert.equal(row.summary, '• opened the repo\n• fixed the parser')
+  assert.equal(row.summary_updated_at, grown.payload.summary_updated_at)
+
+  // A conversation that never had a summary reads the additive defaults, so
+  // a client renders nothing for it rather than an empty box.
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-bare', title: 'no digest' })
+  const bare = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-bare' && f.type === 'convo_meta')
+  assert.equal(bare.payload.summary, '')
+  assert.equal(bare.payload.summary_updated_at, 0)
+
+  // Regression (Codex adversarial F2): a conversation created by a
+  // summary-only frame — no title, no parent, no state — must still announce
+  // itself, or a live client cannot learn it or its digest exists at all
+  // until its next /snapshot.
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-quiet', summary: '• minted by a digest' })
+  const quiet = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'sess-quiet' && f.type === 'convo_meta')
+  assert.equal(quiet.payload.title, '')
+  assert.equal(quiet.payload.summary, '• minted by a digest')
+  assert.ok(quiet.payload.summary_updated_at > 0)
+
+  agent.close(); client.close()
+})
+
+// The 1000-char cap is a backstop the producer is expected never to reach
+// (the bridge clamps first). Guard it anyway: it rejects the WHOLE frame, so
+// a regression here silently drops the title and session_state riding along.
+test('convo_upsert: an over-cap summary is rejected whole, mutating nothing', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({ op: 'convo_upsert', convo_id: 'capped', title: 'established', summary: 'ok' })
+  await agent.waitFor((f) => f.kind === 'journal' && f.convo_id === 'capped' && f.type === 'convo_meta')
+  const before = s.db.prepare("SELECT title, summary, summary_updated_at FROM conversations WHERE id='capped'").get()
+
+  agent.send({ op: 'convo_upsert', convo_id: 'capped', title: 'SHOULD NOT LAND', summary: 'x'.repeat(1001) })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'convo_upsert')
+  const after = s.db.prepare("SELECT title, summary, summary_updated_at FROM conversations WHERE id='capped'").get()
+  assert.deepEqual(after, before, 'a rejected frame must mutate nothing — title included')
+
+  // Exactly at the cap is accepted (off-by-one guard on the boundary).
+  agent.send({ op: 'convo_upsert', convo_id: 'capped', summary: 'y'.repeat(1000) })
+  await agent.waitFor((f) => f.kind === 'journal' && f.convo_id === 'capped' && f.type === 'convo_meta' && f.payload.summary.length === 1000)
+  assert.equal(agent.ws.readyState, 1)
+  agent.close()
+})
+
 test('convo_upsert rejects a malformed agent_kind with bad_request, connection survives', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
