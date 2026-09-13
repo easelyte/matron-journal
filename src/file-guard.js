@@ -114,6 +114,7 @@ export class FileLinkDenied extends Error {
 // (listing a non-directory) which lands with the other 404 reasons.
 export function denialToStatus(reason) {
   if (reason === 'sensitive' || reason === 'outside-scope') return 403;
+  if (reason === 'dest-exists') return 409;
   if (reason === 'too-large') return 413;
   if (reason === 'not-a-file'
       || reason === 'not-a-dir'
@@ -216,11 +217,11 @@ function assertPinnedRootIdentitySync(pinnedRoots) {
 // The remaining race requires a concurrent local writer able to alter an
 // ancestor inside these root-owned write roots; that actor is outside the
 // single-operator threat model (the same class as P1's accepted hard-link
-// residual). Node also lacks renameat2(RENAME_NOREPLACE), so moveGuarded must
-// precheck destination absence before an atomic same-device rename; a local
-// racer can still create and have that name replaced between those operations,
-// and a crash before the parent fsync leaves rename durability uncertain. A
-// native *at-family binding would be required to close these residuals fully.
+// residual). Node also lacks renameat2(RENAME_NOREPLACE), so regular-file moves
+// use link()+unlink(): link is an atomic no-clobber install, preserves the inode,
+// and leaves both names safely reachable if the process dies before unlink.
+// Directory moves reserve the destination before rename. A native *at-family
+// binding would still be required to close the remaining ancestor-path races.
 
 function fdRealPathSync(fd, fallbackPath) {
   if (process.platform === 'linux') return fs.readlinkSync(`/proc/self/fd/${fd}`);
@@ -433,6 +434,7 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
   const prepared = prepareWriteTarget(targetPath, writeRoots);
   let tmpPath;
   let tmpFd;
+  let overwriteBackup;
   try {
     assertImmediateParent(prepared);
     reverifyPrepared(prepared);
@@ -460,13 +462,23 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     fs.closeSync(tmpFd);
     tmpFd = undefined;
     reverifyPrepared(prepared);
-    if (prepared.targetStat) preserveFileForOverwrite(prepared);
+    if (prepared.targetStat) overwriteBackup = preserveFileForOverwrite(prepared);
     reverifyPrepared(prepared);
     if (prepared.targetStat) assertTargetIdentity(prepared, prepared.targetStat);
     fs.renameSync(tmpPath, childPathThroughParentFd(prepared, path.basename(prepared.target)));
     tmpPath = undefined;
+    overwriteBackup = undefined;
     fs.fsyncSync(prepared.parentFd);
     return prepared.target;
+  } catch (err) {
+    if (overwriteBackup) {
+      try {
+        removeOverwriteBackup(prepared, overwriteBackup);
+      } catch (cleanupErr) {
+        err.cleanupError = cleanupErr;
+      }
+    }
+    throw err;
   } finally {
     if (tmpFd !== undefined) {
       try { fs.closeSync(tmpFd); } catch {}
@@ -685,12 +697,14 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
       fs.fsyncSync(destination.parentFd);
       if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
     } else {
-      if (lstatIfPresent(destination.target)) throw new FileLinkDenied('dest-exists');
       assertTargetIdentity(source, source.targetStat);
       reverifyPrepared(source);
+      // Keep this destination check last: link() is the atomic no-replace
+      // mutation. Unlike rename(), it cannot clobber a name raced into place.
       reverifyPrepared(destination);
+      let installedStat;
       try {
-        fs.renameSync(source.target, destination.target);
+        installedStat = linkNoReplace(source.target, destination.target, source.targetStat);
       } catch (err) {
         if (err?.code !== 'EXDEV') throw err;
         reservation = reserveDestination(destination, false);
@@ -704,8 +718,29 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
         );
         return { from: source.target, to: destination.target };
       }
-      fs.fsyncSync(destination.parentFd);
-      if (source.parentPath !== destination.parentPath) fs.fsyncSync(source.parentFd);
+      let sourceUnlinked = false;
+      try {
+        fs.fsyncSync(destination.parentFd);
+        assertTargetIdentity(source, source.targetStat);
+        fs.unlinkSync(source.target);
+        sourceUnlinked = true;
+        fs.fsyncSync(source.parentFd);
+      } catch (err) {
+        const currentSource = lstatIfPresent(source.target);
+        const sourceStillOriginal = currentSource
+          && !currentSource.isSymbolicLink()
+          && currentSource.dev === source.targetStat.dev
+          && currentSource.ino === source.targetStat.ino;
+        if (!sourceUnlinked && sourceStillOriginal) {
+          try {
+            removeInstalledFile(destination.target, installedStat);
+            fs.fsyncSync(destination.parentFd);
+          } catch (rollbackErr) {
+            err.rollbackError = rollbackErr;
+          }
+        }
+        throw err;
+      }
     }
     return { from: source.target, to: destination.target };
   } finally {
@@ -758,15 +793,18 @@ function ensureTrashDirectory(prepared) {
 }
 
 function removeCreatedTrashDirectory(trash) {
-  if (!trash?.created) return;
+  if (!trash?.created) return false;
   try {
     const current = fs.lstatSync(trash.trashDir);
     if (current.isSymbolicLink()
         || !current.isDirectory()
         || current.dev !== trash.dev
-        || current.ino !== trash.ino) return;
+        || current.ino !== trash.ino) return false;
     fs.rmdirSync(trash.trashDir);
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function assertTrashDirectoryIdentity(root, trashDir, trashFd, expectedStat) {
@@ -805,6 +843,7 @@ function preserveFileForOverwrite(prepared) {
   let trashFd;
   let backupFd;
   let backupPath;
+  let backupStat;
   let backupDurable = false;
   try {
     trashFd = fs.openSync(
@@ -842,6 +881,7 @@ function preserveFileForOverwrite(prepared) {
       position += read;
     }
     fs.fsyncSync(backupFd);
+    backupStat = fs.fstatSync(backupFd);
     fs.closeSync(backupFd);
     backupFd = undefined;
     reverifyPrepared(prepared);
@@ -849,14 +889,59 @@ function preserveFileForOverwrite(prepared) {
     assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
     fs.fsyncSync(trashFd);
     backupDurable = true;
-    return backupPath;
+    return {
+      path: backupPath,
+      dev: backupStat.dev,
+      ino: backupStat.ino,
+      trash,
+    };
   } finally {
     if (sourceFd !== undefined) try { fs.closeSync(sourceFd); } catch {}
     if (backupFd !== undefined) try { fs.closeSync(backupFd); } catch {}
+    let backupRemoved = false;
     if (!backupDurable && backupPath) {
-      try { fs.unlinkSync(backupPath); } catch {}
+      try {
+        fs.unlinkSync(backupPath);
+        backupRemoved = true;
+      } catch {}
     }
+    if (backupRemoved && trashFd !== undefined) try { fs.fsyncSync(trashFd); } catch {}
     if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
+    if (!backupDurable && removeCreatedTrashDirectory(trash)) {
+      try { fsyncDirectoryPathSync(prepared.root.realPath); } catch {}
+    }
+  }
+}
+
+function removeOverwriteBackup(prepared, backup) {
+  assertPinnedRootIdentitySync(prepared.pinnedRoots);
+  let trashFd;
+  try {
+    trashFd = fs.openSync(
+      backup.trash.trashDir,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    const trashStat = fs.fstatSync(trashFd);
+    assertTrashDirectoryIdentity(prepared.root, backup.trash.trashDir, trashFd, trashStat);
+    if (trashStat.dev !== backup.trash.dev || trashStat.ino !== backup.trash.ino) {
+      throw new FileLinkDenied('trash-write-failed');
+    }
+    const current = lstatIfPresent(backup.path);
+    if (current) {
+      if (current.isSymbolicLink()
+          || !current.isFile()
+          || current.dev !== backup.dev
+          || current.ino !== backup.ino) {
+        throw new FileLinkDenied('trash-write-failed');
+      }
+      fs.unlinkSync(backup.path);
+      fs.fsyncSync(trashFd);
+    }
+  } finally {
+    if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
+  }
+  if (removeCreatedTrashDirectory(backup.trash)) {
+    fsyncDirectoryPathSync(prepared.root.realPath);
   }
 }
 
@@ -875,7 +960,9 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
     if (!source.targetStat.isFile() && !source.targetStat.isDirectory()) {
       throw new FileLinkDenied('unreadable');
     }
-    if (source.target === source.root.realPath) throw new FileLinkDenied('outside-scope');
+    if (source.pinnedRoots.some((root) => contains(source.target, root.realPath))) {
+      throw new FileLinkDenied('outside-scope');
+    }
     validateTrashDirectory(source.root);
     reverifyPrepared(source);
     assertTargetIdentity(source, source.targetStat);
