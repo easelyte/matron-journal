@@ -16,7 +16,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { contains, pinAllowedRootsSync, withProtectedPaths } from './file-guard.js'
+import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
@@ -86,11 +86,15 @@ export function pinProhibitedFileWriteRootsSync(rootPaths = PROHIBITED_FILE_WRIT
 export function assertWriteRootsExcludeServerState(fileWriteRoots, paths) {
   for (const candidate of paths) {
     if (!candidate) continue
+    // Both the configured spelling and the one the filesystem resolves to. A
+    // protected path often does not exist yet (the audit log is created on the
+    // first write), and realpath() refuses a missing final component — so
+    // resolve through the deepest existing ancestor instead, or a state path
+    // under a symlink that points INTO a write root reads as external here and
+    // becomes internal the moment it is created.
     const spellings = [resolve(candidate)]
-    try {
-      const real = realpathSync(spellings[0])
-      if (real !== spellings[0]) spellings.push(real)
-    } catch { /* not created yet */ }
+    const canonical = canonicalizeThroughExistingAncestor(candidate)
+    if (canonical !== spellings[0]) spellings.push(canonical)
     for (const statePath of spellings) {
       const clash = fileWriteRoots.roots.find((writeRoot) =>
         contains(writeRoot.realPath, statePath) || contains(statePath, writeRoot.realPath))
@@ -422,9 +426,13 @@ export function startServer({
     ? fileWritesDryRun === true || fileWritesDryRun === 1 || fileWritesDryRun === '1'
     : process.env.MATRON_FILE_WRITES_DRYRUN === '1'
   const auditPath = auditPathFor(resolvedDbPath)
-  const resolvedFileAuditDir = fileAuditDir !== undefined
+  // Canonical, so the writer and the protected-path set name the same file.
+  const configuredAuditDir = fileAuditDir !== undefined
     ? fileAuditDir
     : (auditPath ? path.dirname(auditPath) : null)
+  const resolvedFileAuditDir = configuredAuditDir
+    ? canonicalizeThroughExistingAncestor(configuredAuditDir)
+    : null
   // Everything the server owns on disk and must never expose to a write route.
   const serverStatePaths = [
     resolvedDbPath === ':memory:' ? null : resolvedDbPath,

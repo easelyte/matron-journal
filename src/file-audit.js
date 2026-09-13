@@ -36,6 +36,15 @@ const OPS = new Set(['upload', 'mkdir', 'move', 'write', 'delete'])
 // attempt = the write-ahead intent line; ok/denied/error = the outcome.
 const RESULTS = new Set(['attempt', 'ok', 'denied', 'error'])
 
+// A log whose tail could not be repaired after a short write is POISONED: its
+// last line may be a fragment, so every later append would concatenate onto it
+// and produce unparsable JSON exactly where the evidence matters most. Once
+// poisoned, this process refuses to append at all — which, because callers map
+// a throw to 507-with-no-mutation, means writes stop rather than proceed
+// unauditable. Recovery is an operator action (repair or rotate the file, then
+// restart), deliberately not something the server decides for itself.
+const poisoned = new Set()
+
 export class FileAuditFailed extends Error {
   constructor(message, cause) {
     super(`file audit failed: ${message}`)
@@ -99,8 +108,12 @@ export function appendAudit(dir, entry) {
   const line = Buffer.from(`${JSON.stringify(record)}\n`, 'utf8')
   if (line.length > MAX_LINE_BYTES) badRecord('record exceeds the line size bound')
   const target = path.join(dir, FILE_AUDIT_BASENAME)
+  if (poisoned.has(target)) {
+    throw new FileAuditFailed(`${target} has an unrepaired partial line; refusing to append (repair or rotate the file and restart)`)
+  }
   let fd
   let created = false
+  let sizeBefore = 0
   try {
     // O_APPEND, never O_TRUNC: the log is append-only by construction, so a
     // bug here cannot erase history. 0o600 — it names paths the operator
@@ -117,10 +130,24 @@ export function appendAudit(dir, entry) {
       if (err?.code !== 'EEXIST') throw err
       fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND, 0o600)
     }
+    // The offset this append must roll back to if it only partly lands.
+    sizeBefore = fs.fstatSync(fd).size
     const written = fs.writeSync(fd, line)
-    // A short write cannot be completed with a second write() without risking
-    // a concurrent writer's line landing between the halves. Fail instead.
-    if (written !== line.length) badRecord(`short write (${written}/${line.length} bytes)`)
+    // A short write (ENOSPC, an I/O fault) cannot be finished with a second
+    // write(): under O_APPEND a concurrent writer's line could land between the
+    // halves. Worse, leaving the fragment in place would corrupt the NEXT
+    // record too, since it would be appended directly onto an unterminated
+    // line. So roll the fragment back to the byte offset the file had before
+    // this attempt, verify the rollback, and only then report the failure.
+    if (written !== line.length) {
+      let repaired = false
+      try {
+        fs.ftruncateSync(fd, sizeBefore)
+        repaired = fs.fstatSync(fd).size === sizeBefore
+      } catch { repaired = false }
+      if (!repaired) poisoned.add(target)
+      badRecord(`short write (${written}/${line.length} bytes)${repaired ? ', partial line rolled back' : '; THE LOG TAIL COULD NOT BE REPAIRED — auditing is now refused'}`)
+    }
     fs.fsyncSync(fd)
     // fsync on the FILE does not make a brand-new directory ENTRY durable. On
     // the very first write after a deploy (or after the log is rotated away) a

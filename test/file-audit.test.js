@@ -98,12 +98,53 @@ test('appendAudit: each record is written in a SINGLE write() syscall', (t) => {
   assert.equal(raw[raw.length - 1], 0x0a)
 })
 
-test('appendAudit: a short write is a failure, not a half-line on disk', (t) => {
+test('appendAudit: a short write is rolled back, not left as a half-line on disk', (t) => {
   const dir = tmpDir()
-  t.mock.method(fs, 'writeSync', () => 3)
+  appendAudit(dir, { ts: 1, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
+  const intact = fs.readFileSync(path.join(dir, FILE_AUDIT_BASENAME))
+
+  // A REAL short write: the fragment actually reaches the file, which is the
+  // condition that would otherwise corrupt the next record appended after it.
+  const realWriteSync = fs.writeSync
+  let shortened = false
+  t.mock.method(fs, 'writeSync', (fd, buf, ...rest) => {
+    if (!shortened && Buffer.isBuffer(buf)) {
+      shortened = true
+      return realWriteSync(fd, buf.subarray(0, 5), ...rest)
+    }
+    return realWriteSync(fd, buf, ...rest)
+  })
   assert.throws(
-    () => appendAudit(dir, { ts: 1, deviceId: 1, op: 'write', path: '/w/a', result: 'attempt' }),
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'write', path: '/w/b', result: 'attempt' }),
     FileAuditFailed,
+  )
+  assert.equal(shortened, true)
+  t.mock.restoreAll()
+
+  // The fragment is gone and the log is still valid JSONL.
+  assert.deepEqual(fs.readFileSync(path.join(dir, FILE_AUDIT_BASENAME)), intact)
+  appendAudit(dir, { ts: 3, deviceId: 1, op: 'write', path: '/w/c', result: 'ok' })
+  const rows = lines(dir)
+  assert.deepEqual(rows.map((r) => r.ts), [1, 3])
+})
+
+test('appendAudit: an unrepairable short write poisons the log and refuses every later append', (t) => {
+  const dir = tmpDir()
+  const realWriteSync = fs.writeSync
+  t.mock.method(fs, 'writeSync', (fd, buf, ...rest) =>
+    (Buffer.isBuffer(buf) ? realWriteSync(fd, buf.subarray(0, 4), ...rest) : realWriteSync(fd, buf, ...rest)))
+  t.mock.method(fs, 'ftruncateSync', () => { throw Object.assign(new Error('io'), { code: 'EIO' }) })
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 1, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /COULD NOT BE REPAIRED/,
+  )
+  t.mock.restoreAll()
+  // Fail-closed for good: callers map this to 507, so writes stop rather than
+  // proceed unauditable.
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /refusing to append/,
   )
 })
 

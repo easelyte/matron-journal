@@ -192,20 +192,41 @@ export function pinAllowedRootsSync(allowedRoots) {
 // from under the running process. So the server pins that set alongside the
 // roots and the guards refuse it, belt-and-braces with the boot-time check that
 // rejects the overlapping configuration outright.
+// realpath() fails outright when the final component does not exist, and a
+// protected path routinely does not exist yet (the audit log is created on the
+// first write; a media directory on the first upload). Falling back to the
+// LEXICAL spelling in that case is a hole: /outside/link/new-media, where
+// `link` is a symlink into a write root, looks external at boot and becomes
+// internal the moment the directory is created. So resolve the deepest ancestor
+// that DOES exist and re-attach the unresolved suffix to it.
+export function canonicalizeThroughExistingAncestor(targetPath) {
+  const resolved = path.resolve(targetPath);
+  let existing = resolved;
+  const suffix = [];
+  while (true) {
+    try {
+      return path.join(fs.realpathSync(existing), ...suffix);
+    } catch (err) {
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') return resolved;
+      const parent = path.dirname(existing);
+      if (parent === existing) return resolved;
+      suffix.unshift(path.basename(existing));
+      existing = parent;
+    }
+  }
+}
+
 export function withProtectedPaths(pinnedRoots, protectedPaths) {
   const { isPinnedApi } = pinnedRootsOf(pinnedRoots);
   if (!isPinnedApi) throw new FileLinkDenied('bad-workdir');
   const resolved = [];
   for (const candidate of protectedPaths || []) {
     if (!candidate) continue;
-    const absolute = path.resolve(candidate);
-    if (!resolved.includes(absolute)) resolved.push(absolute);
-    // A path that exists may also be reachable under a different spelling
-    // (symlinked data dir); pin the real one too so neither name slips past.
-    try {
-      const real = fs.realpathSync(absolute);
-      if (!resolved.includes(real)) resolved.push(real);
-    } catch { /* not created yet — the resolved spelling is what we can pin */ }
+    // Both spellings: the lexical one the operator configured, and the one the
+    // filesystem will actually produce once every existing link is followed.
+    for (const spelling of [path.resolve(candidate), canonicalizeThroughExistingAncestor(candidate)]) {
+      if (!resolved.includes(spelling)) resolved.push(spelling);
+    }
   }
   return Object.freeze({
     [PINNED_ROOTS]: true,
@@ -503,7 +524,12 @@ function fixedBytes(value) {
 // confirm). When it is allowed, the previous content is copied into the
 // write-root's .matron-trash/ and fsynced BEFORE the replacement lands, so an
 // overwrite is always recoverable.
-export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity, overwrite = false } = {}) {
+// `dryRun` runs every check the live call runs and returns at the irreversibility
+// boundary, immediately before the first mutating syscall. It deliberately does
+// NOT get its own reduced validation path: a rollout validator that approves
+// what the real call rejects is worse than no validator, and two code paths
+// drift the moment either is edited.
+export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity, overwrite = false, dryRun = false } = {}) {
   if (!(maxBytes === Infinity || (Number.isSafeInteger(maxBytes) && maxBytes >= 0))) {
     throw new TypeError('maxBytes must be a non-negative safe integer or Infinity');
   }
@@ -524,6 +550,22 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     if (prepared.targetStat && !prepared.targetStat.isFile()) throw new FileLinkDenied('dest-exists');
     assertImmediateParent(prepared);
     reverifyPrepared(prepared);
+    if (dryRun) {
+      // A streamed body's size is only knowable by reading it, and the cap is
+      // part of what dry-run has to be able to answer — so consume and count,
+      // discarding the bytes. This also drains the HTTP request body, which the
+      // caller needs anyway to keep the connection reusable.
+      if (isStream) {
+        let size = 0;
+        for await (const chunk of bytesOrStream) {
+          const buffer = fixedBytes(chunk);
+          if (buffer === null) throw new TypeError('stream chunks must be bytes');
+          size += buffer.length;
+          if (size > maxBytes) throw new FileLinkDenied('too-large');
+        }
+      }
+      return prepared.target;
+    }
     const tmpName = path.basename(randomSibling(prepared.target));
     tmpPath = childPathThroughParentFd(prepared, tmpName);
     tmpFd = fs.openSync(
@@ -598,7 +640,7 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
   }
 }
 
-export async function mkdirGuarded(targetPath, { writeRoots } = {}) {
+export async function mkdirGuarded(targetPath, { writeRoots, dryRun = false } = {}) {
   const prepared = prepareWriteTarget(targetPath, writeRoots);
   try {
     if (prepared.targetStat) {
@@ -606,6 +648,7 @@ export async function mkdirGuarded(targetPath, { writeRoots } = {}) {
       return prepared.target;
     }
     reverifyPrepared(prepared);
+    if (dryRun) return prepared.target;
     fs.mkdirSync(prepared.target, { recursive: true });
     postCommitFsync(prepared.parentFd, 'a mkdir');
     return prepared.target;
@@ -805,7 +848,7 @@ function copyRegularFileForMove(
   }
 }
 
-export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
+export async function moveGuarded(fromPath, toPath, { writeRoots, dryRun = false } = {}) {
   const source = prepareWriteTarget(fromPath, writeRoots);
   let destination;
   let reservation;
@@ -824,6 +867,10 @@ export async function moveGuarded(fromPath, toPath, { writeRoots } = {}) {
     reverifyPrepared(source);
     reverifyPrepared(destination);
     assertTargetIdentity(source, source.targetStat);
+    // The irreversibility boundary: everything above is a check, everything
+    // below mutates. (A cross-device move is the one outcome dry-run cannot
+    // predict — only the kernel's EXDEV tells us, and asking costs the move.)
+    if (dryRun) return { from: source.target, to: destination.target };
     if (source.targetStat.isDirectory()) {
       reservation = reserveDestination(destination, true);
       assertReservationIdentity(destination.target, reservation);
@@ -1112,7 +1159,7 @@ function removeOverwriteBackup(prepared, backup) {
   }
 }
 
-export async function trashGuarded(targetPath, { writeRoots, recursive = false } = {}) {
+export async function trashGuarded(targetPath, { writeRoots, recursive = false, dryRun = false } = {}) {
   const source = prepareWriteTarget(targetPath, writeRoots);
   let trash;
   let trashFd;
@@ -1138,6 +1185,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false }
     }
     reverifyPrepared(source);
     assertTargetIdentity(source, source.targetStat);
+    if (dryRun) return { path: source.target, trashed: null, already_missing: false };
     trash = ensureTrashDirectory(source);
     trashFd = fs.openSync(
       trash.trashDir,

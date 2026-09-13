@@ -738,3 +738,57 @@ test('F6: an in-flight reservation is never swept or evicted out from under itse
   clock += 10_000
   assert.equal(store.reserve('slow', 'fp', async () => 'fresh').replay, false)
 })
+
+// --- Codex round-2 findings ------------------------------------------------
+
+test('R2-F1: a state path reached through a symlinked ancestor is still protected', async () => {
+  const f = makeFixture()
+  const elsewhere = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-link-')))
+  // `link` points INTO the write root, and the final component does not exist
+  // yet — the case a plain realpath() cannot resolve and would wave through.
+  fs.symlinkSync(f.writeRoot, path.join(elsewhere, 'link'))
+  const mediaDir = path.join(elsewhere, 'link', 'not-created-yet')
+  const dbDir = path.join(f.root, 'db')
+  fs.mkdirSync(dbDir)
+
+  await assert.rejects(
+    startTestServer({
+      dbPath: path.join(dbDir, 'matron.db'), mediaDir,
+      fileReadRoots: [f.root], fileWriteRoots: [f.writeRoot], fileEnableWrites: true,
+      fileAuditDir: f.auditDir,
+    }),
+    /overlaps server-owned state/,
+  )
+})
+
+test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) => {
+  const f = makeFixture()
+  const dry = await startWrites(f, { fileWritesDryRun: true, fileWriteMaxBytes: 1024 })
+  const live = await startWrites(f, { fileWriteMaxBytes: 1024 })
+  t.after(() => { dry.close(); live.close() })
+  const dryToken = (await clientToken(dry)).token
+  const liveToken = (await clientToken(live)).token
+
+  const existing = path.join(f.writeRoot, 'existing.txt')
+  const sub = path.join(f.writeRoot, 'sub')
+  const attempts = [
+    // [method, route, body, raw] — each is a request the LIVE path refuses.
+    ['POST', `/files/upload?path=${encodeURIComponent(existing)}`, undefined, 'x'],            // 409 overwrite
+    ['POST', `/files/upload?path=${encodeURIComponent(path.join(f.writeRoot, 'big.bin'))}`, undefined, Buffer.alloc(4096)], // 413
+    ['POST', '/files/write', { path: existing, content: 'x' }, undefined],                      // 409 overwrite
+    ['POST', '/files/move', { from: path.join(f.writeRoot, 'gone.txt'), to: path.join(f.writeRoot, 'x.txt') }, undefined], // 404 missing
+    ['POST', '/files/move', { from: existing, to: path.join(sub, 'nested.txt') }, undefined],   // 409 dest-exists
+    ['POST', '/files/mkdir', { path: existing }, undefined],                                    // 409 over a file
+    ['DELETE', `/files?path=${encodeURIComponent(sub)}&confirm=1`, undefined, undefined],        // 409 dir-not-empty
+    ['DELETE', `/files?path=${encodeURIComponent(f.writeRoot)}&confirm=1&recursive=1`, undefined, undefined], // 403 root
+  ]
+
+  const before = treeOf(f.root)
+  for (const [method, route, body, raw] of attempts) {
+    const liveResponse = await call(live, route, { method, token: liveToken, body, raw })
+    const dryResponse = await call(dry, route, { method, token: dryToken, body, raw })
+    assert.notEqual(liveResponse.status, 200, `${method} ${route} should be refused live`)
+    assert.equal(dryResponse.status, liveResponse.status, `${method} ${route}: dry-run must agree with live`)
+  }
+  assert.deepEqual(treeOf(f.root), before, 'neither server mutated anything')
+})

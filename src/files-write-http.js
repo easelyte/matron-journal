@@ -26,7 +26,7 @@ import crypto from 'node:crypto'
 import path from 'node:path'
 import {
   FileLinkDenied, contains, denialToStatus,
-  validateWriteTarget, writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
+  writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
 } from './file-guard.js'
 import { json, readBody } from './http-body.js'
 import { idemKeyOf } from './http-who.js'
@@ -322,13 +322,11 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     const target = path.join(path.dirname(requested), name)
 
     const run = () => audited(ctx, who, { op: 'upload', path: target }, async () => {
-      if (dryRun) {
-        // Validate exactly as the real path would, then drain rather than
-        // mutate. An early 200 over an unread body desyncs the socket.
-        const canonical = validateWriteTarget(target, { writeRoots })
-        const drained = await consumeBody(req, uploadMax)
-        return { status: 200, body: { path: canonical, dry_run: true }, close: !drained.complete }
-      }
+      // Dry-run goes through the SAME primitive with the same options and
+      // stops at its irreversibility boundary — it drains and counts the body
+      // (so the size cap is answered and the socket stays reusable) but opens
+      // no file. A reduced validator here is how a rollout check ends up
+      // approving what the live request rejects.
       // The target is validated INSIDE writeFileAtomic before it opens its
       // temp file, so a denied destination never lands a single byte on disk;
       // the temp file is a sibling of the destination, so the commit is a
@@ -339,8 +337,9 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
         for await (const chunk of req) { bytes += chunk.length; digest.update(chunk); yield chunk }
       }
       const canonical = await writeFileAtomic(target, counted(), {
-        writeRoots, maxBytes: uploadMax, overwrite,
+        writeRoots, maxBytes: uploadMax, overwrite, dryRun,
       })
+      if (dryRun) return { status: 200, body: { path: canonical, bytes, dry_run: true } }
       return {
         status: 200,
         body: { path: canonical, bytes },
@@ -359,10 +358,10 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     if (!absolutePath(target)) return badRequest(res)
 
     const run = () => audited(ctx, who, { op: 'mkdir', path: target }, async () => {
-      if (dryRun) return { status: 200, body: { path: validateWriteTarget(target, { writeRoots }), dry_run: true } }
       // mkdir-p, and an existing directory is the state the caller asked for:
       // idempotent 200, not a conflict.
-      const canonical = await mkdirGuarded(target, { writeRoots })
+      const canonical = await mkdirGuarded(target, { writeRoots, dryRun })
+      if (dryRun) return { status: 200, body: { path: canonical, dry_run: true } }
       return { status: 200, body: { path: canonical }, audit: { path: canonical } }
     })
 
@@ -376,17 +375,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     if (!absolutePath(from) || !absolutePath(to)) return badRequest(res)
 
     const run = () => audited(ctx, who, { op: 'move', path: from, to }, async () => {
-      if (dryRun) {
-        return {
-          status: 200,
-          body: {
-            from: validateWriteTarget(from, { writeRoots }),
-            to: validateWriteTarget(to, { writeRoots }),
-            dry_run: true,
-          },
-        }
-      }
-      const moved = await moveGuarded(from, to, { writeRoots })
+      const moved = await moveGuarded(from, to, { writeRoots, dryRun })
+      if (dryRun) return { status: 200, body: { ...moved, dry_run: true } }
       return { status: 200, body: moved, audit: { path: moved.from, to: moved.to } }
     })
 
@@ -404,16 +394,11 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     const overwrite = body.overwrite === true
 
     const run = () => audited(ctx, who, { op: 'write', path: target, bytes: content.length }, async () => {
-      if (dryRun) {
-        return {
-          status: 200,
-          body: { path: validateWriteTarget(target, { writeRoots }), bytes: content.length, dry_run: true },
-        }
-      }
       // Replacing an existing file needs overwrite:true, and the guard copies
       // the previous content into .matron-trash/ (fsynced) before the
       // replacement lands — so even a direct API client cannot lose data.
-      const canonical = await writeFileAtomic(target, content, { writeRoots, overwrite })
+      const canonical = await writeFileAtomic(target, content, { writeRoots, overwrite, dryRun })
+      if (dryRun) return { status: 200, body: { path: canonical, bytes: content.length, dry_run: true } }
       return {
         status: 200,
         body: { path: canonical, bytes: content.length },
@@ -437,11 +422,11 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     // caller must say so. Checked inside the funnel so the refusal is audited
     // like every other denial.
     if (!confirmed) throw new FileLinkDenied('confirm-required')
-    if (dryRun) return { status: 200, body: { path: validateWriteTarget(requested, { writeRoots }), dry_run: true } }
     // Never unlink: the entry moves into <write-root>/.matron-trash/ under a
     // collision-resistant name. Deleting what is already gone is the state the
     // caller asked for, so it answers 200 with trashed:null — no invented path.
-    const result = await trashGuarded(requested, { writeRoots, recursive })
+    const result = await trashGuarded(requested, { writeRoots, recursive, dryRun })
+    if (dryRun) return { status: 200, body: { path: result.path, dry_run: true } }
     return {
       status: 200,
       body: result,
