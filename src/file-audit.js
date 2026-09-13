@@ -100,16 +100,37 @@ export function appendAudit(dir, entry) {
   if (line.length > MAX_LINE_BYTES) badRecord('record exceeds the line size bound')
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   let fd
+  let created = false
   try {
     // O_APPEND, never O_TRUNC: the log is append-only by construction, so a
     // bug here cannot erase history. 0o600 — it names paths the operator
-    // touched, and nothing else on the box needs to read it.
-    fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT, 0o600)
+    // touched, and nothing else on the box needs to read it. O_EXCL first so
+    // we learn whether THIS call created the file (see the directory fsync).
+    try {
+      fd = fs.openSync(
+        target,
+        fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        0o600,
+      )
+      created = true
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err
+      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND, 0o600)
+    }
     const written = fs.writeSync(fd, line)
     // A short write cannot be completed with a second write() without risking
     // a concurrent writer's line landing between the halves. Fail instead.
     if (written !== line.length) badRecord(`short write (${written}/${line.length} bytes)`)
     fs.fsyncSync(fd)
+    // fsync on the FILE does not make a brand-new directory ENTRY durable. On
+    // the very first write after a deploy (or after the log is rotated away) a
+    // power loss could otherwise keep the committed mutation and lose the
+    // filename carrying its write-ahead record — precisely the guarantee this
+    // module exists to provide. One extra fsync, once per file lifetime.
+    if (created) {
+      const dirFd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY)
+      try { fs.fsyncSync(dirFd) } finally { fs.closeSync(dirFd) }
+    }
   } catch (err) {
     if (err instanceof FileAuditFailed) throw err
     throw new FileAuditFailed(`could not append to ${target}`, err)

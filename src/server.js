@@ -1,11 +1,12 @@
 import http from 'node:http'
 import { accessSync, constants as fsConstants, realpathSync, readlinkSync } from 'node:fs'
 import path from 'node:path'
+const { resolve } = path
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
-import { ensurePreapproveKey } from './preapprove-key.js'
+import { ensurePreapproveKey, resolvePreapproveKeyPath } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
 import { makeLinkStore } from './link.js'
 import { makeHub } from './hub.js'
@@ -15,7 +16,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { contains, pinAllowedRootsSync } from './file-guard.js'
+import { contains, pinAllowedRootsSync, withProtectedPaths } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
@@ -74,6 +75,30 @@ export function pinProhibitedFileWriteRootsSync(rootPaths = PROHIBITED_FILE_WRIT
     }
   }
   return pinAllowedRootsSync(existingRootPaths)
+}
+
+// The server's own persistent state. A write root that overlaps ANY of these
+// would let an authenticated client overwrite the audit log that just recorded
+// its intent, or move the live database out from under the process — so the
+// overlap is refused at boot (fail-visible) rather than left for the per-request
+// guard to catch. `paths` are file/dir paths, not pinned roots: they may not
+// exist yet (the audit log is created on the first write).
+export function assertWriteRootsExcludeServerState(fileWriteRoots, paths) {
+  for (const candidate of paths) {
+    if (!candidate) continue
+    const spellings = [resolve(candidate)]
+    try {
+      const real = realpathSync(spellings[0])
+      if (real !== spellings[0]) spellings.push(real)
+    } catch { /* not created yet */ }
+    for (const statePath of spellings) {
+      const clash = fileWriteRoots.roots.find((writeRoot) =>
+        contains(writeRoot.realPath, statePath) || contains(statePath, writeRoot.realPath))
+      if (clash) {
+        throw new Error(`file writes: configured write-root ${clash.realPath} overlaps server-owned state (${statePath}); writes must never be able to reach the database, the preapprove key, the media store, or the audit log`)
+      }
+    }
+  }
 }
 
 export function assertNoProhibitedFileWriteRoots(fileWriteRoots, prohibitedRoots) {
@@ -396,14 +421,31 @@ export function startServer({
   const resolvedFileWritesDryRun = fileWritesDryRun !== undefined
     ? fileWritesDryRun === true || fileWritesDryRun === 1 || fileWritesDryRun === '1'
     : process.env.MATRON_FILE_WRITES_DRYRUN === '1'
+  const auditPath = auditPathFor(resolvedDbPath)
+  const resolvedFileAuditDir = fileAuditDir !== undefined
+    ? fileAuditDir
+    : (auditPath ? path.dirname(auditPath) : null)
+  // Everything the server owns on disk and must never expose to a write route.
+  const serverStatePaths = [
+    resolvedDbPath === ':memory:' ? null : resolvedDbPath,
+    resolvedDbPath === ':memory:' ? null : `${resolvedDbPath}-wal`,
+    resolvedDbPath === ':memory:' ? null : `${resolvedDbPath}-shm`,
+    resolvedDbPath === ':memory:' ? null : resolvePreapproveKeyPath(resolvedDbPath, preapproveKeyPath),
+    resolvedMediaDir,
+    resolvedFileAuditDir ? path.join(resolvedFileAuditDir, FILE_AUDIT_BASENAME) : null,
+  ].filter(Boolean)
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
     resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
     assertNoProhibitedFileWriteRoots(resolvedFileWriteRoots, pinProhibitedFileWriteRootsSync())
+    assertWriteRootsExcludeServerState(resolvedFileWriteRoots, serverStatePaths)
     if (!resolvedFileReadRoots || resolvedFileWriteRoots.roots.some((writeRoot) =>
       !resolvedFileReadRoots.roots.some((readRoot) => contains(readRoot.realPath, writeRoot.realPath)))) {
       throw new Error('file writes: every configured write-root must be contained in a configured read-root')
     }
+    // Belt-and-braces: the per-request guards refuse these paths too, so a
+    // future root-resolution change cannot quietly reopen the hole.
+    resolvedFileWriteRoots = withProtectedPaths(resolvedFileWriteRoots, serverStatePaths)
   }
   // The write audit (plan T-1.3) is a PRECONDITION for writes, not a
   // decoration: every destructive op writes its intent line before the first
@@ -412,10 +454,6 @@ export function startServer({
   // enable writes at all, and a data directory the process cannot write is an
   // operator misconfiguration that fails VISIBLY at boot rather than turning
   // every write into a runtime 507.
-  const auditPath = auditPathFor(resolvedDbPath)
-  const resolvedFileAuditDir = fileAuditDir !== undefined
-    ? fileAuditDir
-    : (auditPath ? path.dirname(auditPath) : null)
   const resolvedFileEnableWrites = writesRequested
     && resolvedFileWriteRoots !== null
     && resolvedFileAuditDir !== null

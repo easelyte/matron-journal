@@ -113,7 +113,10 @@ export class FileLinkDenied extends Error {
 // Mirrors the bridge's lib/show-file.js:denialToStatus, plus 'not-a-dir'
 // (listing a non-directory) which lands with the other 404 reasons.
 export function denialToStatus(reason) {
-  if (reason === 'sensitive' || reason === 'outside-scope' || reason === 'trash-protected') return 403;
+  if (reason === 'sensitive'
+      || reason === 'outside-scope'
+      || reason === 'trash-protected'
+      || reason === 'protected-path') return 403;
   // Phase-2 write conflicts. Each names a state the caller can resolve by
   // choosing differently (pick another name, pass overwrite/confirm, empty the
   // directory, retry a changed source) — a 409, never the 502 fallback, which
@@ -131,6 +134,9 @@ export function denialToStatus(reason) {
   // server could not complete it SAFELY (no recoverable copy in the trash, no
   // durable audit record). 507 keeps them distinct from a 5xx bug.
   if (reason === 'trash-write-failed' || reason === 'audit-fail-closed') return 507;
+  // Every idempotency reservation is occupied by work that is still running.
+  // Transient and retryable — 503, not a conflict and not a bug.
+  if (reason === 'idem-store-full') return 503;
   if (reason === 'not-a-file'
       || reason === 'not-a-dir'
       || reason === 'unreadable'
@@ -175,6 +181,48 @@ export function pinAllowedRootsSync(allowedRoots) {
     }
   }
   return Object.freeze({ [PINNED_ROOTS]: true, roots: Object.freeze(roots) });
+}
+
+// The server's own state — the database and its WAL/SHM siblings, the
+// preapprove key, the media tree, the write audit itself — can legitimately sit
+// INSIDE a configured write root (the natural write-root for a deploy is the
+// workspace, and a deploy could point one at the data directory). Nothing in
+// the root/sensitivity checks would stop an authenticated client from
+// overwriting the audit log it was just recorded in, or moving matron.db out
+// from under the running process. So the server pins that set alongside the
+// roots and the guards refuse it, belt-and-braces with the boot-time check that
+// rejects the overlapping configuration outright.
+export function withProtectedPaths(pinnedRoots, protectedPaths) {
+  const { isPinnedApi } = pinnedRootsOf(pinnedRoots);
+  if (!isPinnedApi) throw new FileLinkDenied('bad-workdir');
+  const resolved = [];
+  for (const candidate of protectedPaths || []) {
+    if (!candidate) continue;
+    const absolute = path.resolve(candidate);
+    if (!resolved.includes(absolute)) resolved.push(absolute);
+    // A path that exists may also be reachable under a different spelling
+    // (symlinked data dir); pin the real one too so neither name slips past.
+    try {
+      const real = fs.realpathSync(absolute);
+      if (!resolved.includes(real)) resolved.push(real);
+    } catch { /* not created yet — the resolved spelling is what we can pin */ }
+  }
+  return Object.freeze({
+    [PINNED_ROOTS]: true,
+    roots: pinnedRoots.roots,
+    protectedPaths: Object.freeze(resolved),
+  });
+}
+
+// Rejects the protected path itself, anything inside it (a protected
+// directory's contents), and any ancestor of it (a recursive delete of a parent
+// would take the protected state with it).
+function assertNotProtected(canonicalTarget, protectedPaths) {
+  for (const protectedPath of protectedPaths) {
+    if (contains(protectedPath, canonicalTarget) || contains(canonicalTarget, protectedPath)) {
+      throw new FileLinkDenied('protected-path');
+    }
+  }
 }
 
 // Shared: unwrap a pinned-roots object. `isPinnedApi` is true when the caller
@@ -310,6 +358,7 @@ function prepareWriteTarget(targetPath, writeRoots) {
     if (!root) throw new FileLinkDenied('outside-scope');
     if (isSensitivePath(canonicalTarget)) throw new FileLinkDenied('sensitive');
     assertTrashProtected(canonicalTarget);
+    assertNotProtected(canonicalTarget, writeRoots.protectedPaths || []);
     const targetStat = lstatIfPresent(canonicalTarget);
     if (targetStat?.isSymbolicLink()) throw new FileLinkDenied('symlink');
     return {
@@ -502,12 +551,29 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     if (prepared.targetStat) overwriteBackup = preserveFileForOverwrite(prepared);
     reverifyPrepared(prepared);
     if (prepared.targetStat) assertTargetIdentity(prepared, prepared.targetStat);
-    // Narrow the create-vs-replace race: a name that appeared while the body
-    // was streaming must not be clobbered by a create-only write. The window
-    // cannot be closed without renameat2(RENAME_NOREPLACE) (see the header
-    // note), but it shrinks to the gap between this check and the rename.
-    else if (!overwrite && lstatIfPresent(prepared.target)) throw new FileLinkDenied('overwrite-conflict');
-    fs.renameSync(tmpPath, childPathThroughParentFd(prepared, path.basename(prepared.target)));
+    const targetThroughParent = childPathThroughParentFd(prepared, path.basename(prepared.target));
+    if (overwrite) {
+      // Replacing is the point: rename is the atomic swap, and the previous
+      // content is already preserved in the trash above.
+      fs.renameSync(tmpPath, targetThroughParent);
+    } else {
+      // A create must NOT clobber. rename() would silently replace a name a
+      // racer created while the body was streaming (and with no backup, since
+      // the target was absent at preparation) — link() is the atomic
+      // no-replace install Node does give us, so EEXIST becomes the conflict
+      // the caller asked for instead of unrecoverable data loss.
+      try {
+        linkNoReplace(tmpPath, targetThroughParent, fs.lstatSync(tmpPath));
+      } catch (err) {
+        // linkNoReplace's generic name for "something is already there"; for a
+        // create-only WRITE the caller's actual choice is overwrite, so say so.
+        if (err instanceof FileLinkDenied && err.reason === 'dest-exists') {
+          throw new FileLinkDenied('overwrite-conflict');
+        }
+        throw err;
+      }
+      fs.unlinkSync(tmpPath);
+    }
     tmpPath = undefined;
     overwriteBackup = undefined;
     postCommitFsync(prepared.parentFd, 'an atomic write');
@@ -706,6 +772,18 @@ function copyRegularFileForMove(
       fs.unlinkSync(tmpPath);
       tmpPath = undefined;
       fs.fsyncSync(destinationPrepared.parentFd);
+      // Last possible moment before the source is destroyed: if it changed
+      // after the copy, the destination does not carry those bytes. Roll back.
+      const beforeUnlinkStat = lstatIfPresent(source);
+      if (!beforeUnlinkStat
+          || beforeUnlinkStat.isSymbolicLink()
+          || beforeUnlinkStat.dev !== sourceStat.dev
+          || beforeUnlinkStat.ino !== sourceStat.ino
+          || beforeUnlinkStat.size !== sourceStat.size
+          || beforeUnlinkStat.mtimeMs !== sourceStat.mtimeMs
+          || beforeUnlinkStat.ctimeMs !== sourceStat.ctimeMs) {
+        throw new FileLinkDenied('source-changed');
+      }
       fs.unlinkSync(source);
       sourceUnlinked = true;
       postCommitFsync(sourcePrepared.parentFd, 'a cross-device move');
@@ -926,6 +1004,20 @@ function preserveFileForOverwrite(prepared) {
       throw new FileLinkDenied('unreadable');
     }
     backupPath = path.join(trash.trashDir, trashName(prepared.target));
+    // Preferred: link the ORIGINAL inode into the trash. It is atomic, it costs
+    // nothing, and — unlike a byte copy — it cannot lose writes that land
+    // between the snapshot and the replacement, because the backup IS the
+    // original file rather than a photograph of it (Codex F5).
+    try {
+      const linked = linkNoReplace(prepared.target, backupPath, prepared.targetStat);
+      fs.fsyncSync(trashFd);
+      backupDurable = true;
+      return { path: backupPath, dev: linked.dev, ino: linked.ino, trash };
+    } catch (err) {
+      // EXDEV only happens if a write-root spans a bind mount, EMLINK if the
+      // inode is at its link limit; both fall back to the copy below.
+      if (err?.code !== 'EXDEV' && err?.code !== 'EMLINK' && err?.code !== 'EPERM') throw err;
+    }
     backupFd = fs.openSync(
       backupPath,
       fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
@@ -944,6 +1036,16 @@ function preserveFileForOverwrite(prepared) {
       if (read === 0) throw new FileLinkDenied('unreadable');
       writeAllSync(backupFd, buffer.subarray(0, read));
       position += read;
+    }
+    // The copy read the byte count fstat reported at open. A writer that
+    // changed the file underneath would leave an INCOMPLETE backup, and the
+    // replacement that follows would then be unrecoverable — so verify through
+    // the same fd and refuse rather than destroy bytes we did not preserve.
+    const afterCopyStat = fs.fstatSync(sourceFd);
+    if (afterCopyStat.size !== sourceStat.size
+        || afterCopyStat.mtimeMs !== sourceStat.mtimeMs
+        || afterCopyStat.ctimeMs !== sourceStat.ctimeMs) {
+      throw new FileLinkDenied('source-changed');
     }
     fs.fsyncSync(backupFd);
     backupStat = fs.fstatSync(backupFd);

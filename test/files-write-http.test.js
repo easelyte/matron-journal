@@ -648,3 +648,93 @@ test('T-2.6: every attempt is audited, and no destructive 2xx exists without one
   const deleteOutcome = rows.findIndex((r) => r.op === 'delete' && r.result === 'ok')
   assert.ok(deleteIntent >= 0 && deleteIntent < deleteOutcome)
 })
+
+// --- Codex round-1 findings F2/F3/F6 ---------------------------------------
+
+test('F2: a write-root that overlaps server-owned state is refused at boot', async () => {
+  const f = makeFixture()
+  const dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-data-')))
+  const dbPath = path.join(dataDir, 'matron.db')
+
+  // The data directory itself — holds the DB, the preapprove key and the audit.
+  await assert.rejects(
+    startTestServer({ dbPath, fileReadRoots: [dataDir], fileWriteRoots: [dataDir], fileEnableWrites: true }),
+    /overlaps server-owned state/,
+  )
+  // A root INSIDE the media tree is just as bad.
+  const mediaDir = path.join(dataDir, 'media')
+  fs.mkdirSync(path.join(mediaDir, 'ab'), { recursive: true })
+  await assert.rejects(
+    startTestServer({
+      dbPath, mediaDir, fileReadRoots: [dataDir], fileWriteRoots: [path.join(mediaDir, 'ab')], fileEnableWrites: true,
+    }),
+    /overlaps server-owned state/,
+  )
+  // And an explicitly configured audit directory is protected the same way.
+  await assert.rejects(
+    startTestServer({
+      dbPath: path.join(f.root, 'elsewhere.db'), mediaDir: path.join(f.root, 'media-elsewhere'),
+      fileReadRoots: [f.root], fileWriteRoots: [f.writeRoot], fileEnableWrites: true,
+      fileAuditDir: path.join(f.writeRoot, 'sub'),
+    }),
+    /overlaps server-owned state/,
+  )
+})
+
+test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not replayed', async (t) => {
+  const f = makeFixture()
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s)
+  const target = path.join(f.writeRoot, 'payload.bin')
+  const key = crypto.randomUUID()
+  const send = (raw) => call(s, `/files/upload?path=${encodeURIComponent(target)}`, {
+    token, raw, headers: { 'idempotency-key': key },
+  })
+
+  // Same length, different content — Content-Length alone could not tell these
+  // apart, and the first body must not be reported as the second's result.
+  const first = await send(Buffer.from('AAAAAAAA'))
+  assert.equal(first.status, 200)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'AAAAAAAA')
+
+  const impostor = await send(Buffer.from('BBBBBBBB'))
+  assert.equal(impostor.status, 409)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'AAAAAAAA')
+
+  // A genuine retry of the SAME bytes still replays cleanly, and writes once.
+  const retry = await send(Buffer.from('AAAAAAAA'))
+  assert.equal(retry.status, 200)
+  assert.deepEqual(await retry.json(), { path: target, bytes: 8 })
+  assert.deepEqual(trashEntries(f.writeRoot), [], 'the replay did not re-write the file')
+  assert.equal(auditLines(f).filter((a) => a.op === 'upload' && a.result === 'attempt').length, 1)
+})
+
+test('F6: an in-flight reservation is never swept or evicted out from under itself', async () => {
+  let clock = 0
+  const store = makeIdemStore({ ttlMs: 10, max: 2, now: () => clock })
+  let release
+  const slow = () => new Promise((resolve) => { release = resolve })
+
+  const pending = store.reserve('slow', 'fp', slow)
+  assert.equal(pending.replay, false)
+  await new Promise((resolve) => setTimeout(resolve, 0))   // let the factory start
+  clock += 10_000                                  // far past the TTL
+
+  // The reservation is still live, so a retry joins it rather than starting a
+  // second concurrent mutation.
+  assert.equal(store.reserve('slow', 'fp', slow).replay, true)
+
+  // Capacity pressure must not reclaim it either.
+  store.reserve('other', 'fp', async () => 'done')
+  assert.throws(
+    () => store.reserve('third', 'fp', async () => 'nope'),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-store-full',
+  )
+
+  release('done')
+  await pending.promise
+  // Settled entries ARE reclaimable, and the TTL runs from settlement.
+  clock += 10_000
+  assert.equal(store.reserve('slow', 'fp', async () => 'fresh').replay, false)
+})

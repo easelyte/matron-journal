@@ -127,3 +127,28 @@ test('auditPathFor / makeFileAudit: the log sits beside the DB, and the maker bi
   assert.equal(lines(dir)[0].ts, 5)
   assert.equal(makeFileAudit(null), null)
 })
+
+test('appendAudit: creating the log fsyncs its parent directory, not just the file (F7)', (t) => {
+  const dir = tmpDir()
+  const synced = []
+  const realFsync = fs.fsyncSync
+  const realOpen = fs.openSync
+  const dirFds = new Set()
+  t.mock.method(fs, 'openSync', (target, flags, mode) => {
+    const fd = realOpen(target, flags, mode)
+    if (target === dir) dirFds.add(fd)
+    return fd
+  })
+  t.mock.method(fs, 'fsyncSync', (fd) => {
+    synced.push(dirFds.has(fd) ? 'dir' : 'file')
+    return realFsync(fd)
+  })
+
+  appendAudit(dir, { ts: 1, deviceId: 1, op: 'write', path: '/w/a', result: 'attempt' })
+  assert.deepEqual(synced, ['file', 'dir'], 'the new directory entry is made durable too')
+
+  // Only once per file lifetime — subsequent appends do not re-fsync the dir.
+  synced.length = 0
+  appendAudit(dir, { ts: 2, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
+  assert.deepEqual(synced, ['file'])
+})

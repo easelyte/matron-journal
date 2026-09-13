@@ -84,31 +84,46 @@ export function makeIdemStore({ ttlMs = IDEM_TTL_MS, max = IDEM_MAX_ENTRIES, now
   const entries = new Map()
   const sweep = () => {
     const t = now()
-    for (const [key, entry] of entries) if (entry.expiresAt <= t) entries.delete(key)
+    for (const [key, entry] of entries) if (!entry.pending && entry.expiresAt <= t) entries.delete(key)
   }
   return {
     size: () => entries.size,
-    // Returns the in-flight or completed promise for `key`. The RESERVATION is
-    // the promise itself, not the finished result — two concurrent retries
-    // therefore share one execution instead of racing two mutations.
-    run(key, fingerprint, factory) {
+    // Reserves `key`, or reports that it is already reserved. The RESERVATION is
+    // the promise itself, not the finished result — two concurrent retries share
+    // one execution instead of racing two mutations. `replay` tells the caller
+    // it is looking at someone else's execution, which is the hook uploads need
+    // to verify that the bytes really are the same bytes.
+    reserve(key, fingerprint, factory) {
       sweep()
       const existing = entries.get(key)
       if (existing) {
         if (existing.fingerprint !== fingerprint) throw new FileLinkDenied('idem-key-conflict')
-        return existing.promise
+        return { promise: existing.promise, replay: true }
       }
-      while (entries.size >= max) entries.delete(entries.keys().next().value)
-      const promise = Promise.resolve().then(factory)
-      const entry = { fingerprint, promise, expiresAt: now() + ttlMs }
+      // An entry whose work is still RUNNING is not a cache line to be reclaimed
+      // — dropping it would let a retry start a second concurrent mutation of
+      // the same target. Evict settled entries only, and refuse a new key rather
+      // than evict live work.
+      while (entries.size >= max) {
+        const evictable = [...entries].find(([, entry]) => !entry.pending)
+        if (!evictable) throw new FileLinkDenied('idem-store-full')
+        entries.delete(evictable[0])
+      }
+      const entry = { fingerprint, pending: true, expiresAt: Infinity }
+      entry.promise = Promise.resolve().then(factory)
       entries.set(key, entry)
-      promise.then(
-        () => { entry.expiresAt = now() + ttlMs },
+      entry.promise.then(
+        // The TTL starts when the work SETTLES, not when it started: a slow
+        // upload must not have its own reservation swept out from under it.
+        () => { entry.pending = false; entry.expiresAt = now() + ttlMs },
         // A failed attempt is not a result worth replaying: drop the key so the
         // caller can genuinely retry rather than be handed the same failure.
-        () => { if (entries.get(key) === entry) entries.delete(key) },
+        () => { entry.pending = false; if (entries.get(key) === entry) entries.delete(key) },
       )
-      return promise
+      return { promise: entry.promise, replay: false }
+    },
+    run(key, fingerprint, factory) {
+      return this.reserve(key, fingerprint, factory).promise
     },
   }
 }
@@ -119,22 +134,27 @@ function fingerprintOf(req, url, payload) {
     .digest('hex')
 }
 
-// Bounded drain so a keep-alive socket is not left with unread body bytes to
-// desync the next request's parse (the same hazard readBody's 413 path guards).
-// Returns false when the body outran the bound — the caller then closes the
-// connection instead, which is always safe.
-async function drainBody(req, limit) {
-  if (req.readableEnded || req.complete) return true
+// Bounded consume-and-hash. Two jobs at once: it drains the body so a
+// keep-alive socket is not left with unread bytes to desync the next request's
+// parse (the hazard readBody's 413 path guards), and it produces the digest an
+// idempotent upload REPLAY needs — a raw byte stream is the one part of a
+// request the fingerprint cannot cover before the work runs, so the only honest
+// way to know a replay is the same request is to read its bytes and compare.
+// `complete:false` means the body outran the bound and the connection has to be
+// closed rather than reused.
+async function consumeBody(req, limit) {
+  const digest = crypto.createHash('sha256')
   let seen = 0
   try {
     for await (const chunk of req) {
       seen += chunk.length
-      if (seen > limit) return false
+      if (seen > limit) return { complete: false, hash: null }
+      digest.update(chunk)
     }
   } catch {
-    return false
+    return { complete: false, hash: null }
   }
-  return true
+  return { complete: true, hash: digest.digest('hex') }
 }
 
 // Every reply from a body-bearing route goes through here: if the body was not
@@ -183,7 +203,12 @@ async function audited(ctx, who, intent, run) {
   try {
     const outcome = await run()
     record('ok', outcome.audit || {})
-    return { status: outcome.status, body: outcome.body, close: outcome.close === true }
+    return {
+      status: outcome.status,
+      body: outcome.body,
+      close: outcome.close === true,
+      contentHash: outcome.contentHash,
+    }
   } catch (err) {
     if (err instanceof FileLinkDenied) {
       record('denied', { reason: err.reason })
@@ -224,6 +249,51 @@ async function settle(req, res, pending, opts) {
   return answer(req, res, outcome, opts)
 }
 
+// Upload's own tail. The other four routes carry their whole request in a JSON
+// body the fingerprint hashes, so an equal fingerprint really is an equal
+// request. An upload's payload is a stream that cannot be hashed before the
+// work runs, and Content-Length is neither present for chunked bodies nor
+// distinguishing between two same-length payloads — fingerprinting it would
+// serve the first upload's 200 to a caller whose bytes were silently dropped.
+// So a REPLAY reads and hashes its own body and compares it with what the first
+// execution actually wrote; a mismatch is the same conflict a mismatched
+// fingerprint would have been.
+async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, opts) {
+  const key = idemKeyOf(req, who)
+  if (key === undefined) return badRequest(res)
+  if (key === null) return settle(req, res, run(), opts)
+
+  let reservation
+  try {
+    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run)
+  } catch (err) {
+    if (!(err instanceof FileLinkDenied)) throw err
+    return answer(req, res, { status: denialToStatus(err.reason), body: { error: 'denied' } }, opts)
+  }
+  if (!reservation.replay) return settle(req, res, reservation.promise, opts)
+
+  const replay = await consumeBody(req, uploadMax)
+  let first
+  try {
+    first = await reservation.promise
+  } catch (err) {
+    if (!(err instanceof FileLinkDenied)) throw err
+    first = { status: denialToStatus(err.reason), body: { error: 'denied' } }
+  }
+  // `contentHash` is absent when the first attempt never consumed a body (it
+  // was denied during validation), and such a result does not depend on the
+  // bytes — so it replays as-is.
+  if (first.contentHash !== undefined) {
+    if (!replay.complete) {
+      return answer(req, res, { status: denialToStatus('too-large'), body: { error: 'denied' }, close: true }, opts)
+    }
+    if (first.contentHash !== replay.hash) {
+      return answer(req, res, { status: denialToStatus('idem-key-conflict'), body: { error: 'denied' } }, opts)
+    }
+  }
+  return answer(req, res, first, opts)
+}
+
 export async function handleFilesWriteRoute(ctx, req, res, url, who) {
   // Kill switch + fail-closed roots + fail-closed audit: the routes do not
   // exist, so an attempt falls through to http.js's final 404 (feature-off
@@ -256,26 +326,30 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
         // Validate exactly as the real path would, then drain rather than
         // mutate. An early 200 over an unread body desyncs the socket.
         const canonical = validateWriteTarget(target, { writeRoots })
-        const drained = await drainBody(req, uploadMax)
-        return { status: 200, body: { path: canonical, dry_run: true }, close: !drained }
+        const drained = await consumeBody(req, uploadMax)
+        return { status: 200, body: { path: canonical, dry_run: true }, close: !drained.complete }
       }
       // The target is validated INSIDE writeFileAtomic before it opens its
       // temp file, so a denied destination never lands a single byte on disk;
       // the temp file is a sibling of the destination, so the commit is a
       // same-directory rename that cannot hit EXDEV.
       let bytes = 0
+      const digest = crypto.createHash('sha256')
       async function* counted() {
-        for await (const chunk of req) { bytes += chunk.length; yield chunk }
+        for await (const chunk of req) { bytes += chunk.length; digest.update(chunk); yield chunk }
       }
       const canonical = await writeFileAtomic(target, counted(), {
         writeRoots, maxBytes: uploadMax, overwrite,
       })
-      return { status: 200, body: { path: canonical, bytes }, audit: { path: canonical, bytes } }
+      return {
+        status: 200,
+        body: { path: canonical, bytes },
+        audit: { path: canonical, bytes },
+        contentHash: digest.digest('hex'),
+      }
     })
 
-    return settle(req, res, withIdempotency(ctx, req, who, url, {
-      target, overwrite, length: req.headers['content-length'] ?? null,
-    }, run), opts)
+    return settleUpload(ctx, req, res, who, url, { target, overwrite }, run, uploadMax, opts)
   }
 
   // --- T-2.2: POST /files/mkdir {path} -------------------------------------
