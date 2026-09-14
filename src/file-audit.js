@@ -18,6 +18,38 @@
 //     both. So the line is assembled into one Buffer and written once, and a
 //     short write is a hard failure rather than a half-record on disk.
 //
+//  3. ONE WRITER owns this sink. The server is a single `node src/server.js`
+//     (deploy/matron-journal.service, Type=simple, one ExecStart), so every
+//     append is serialized by Node's one thread and the read-check-write
+//     sequence below is atomic by construction. That is a CONTRACT, not an
+//     accident: a second appending process would race the tail check against
+//     another writer's in-flight short write — A validates an intact tail, B
+//     leaves a fragment, A's atomic append lands after it and reports success
+//     on an intent that is now unparsable, and B's rollback guard correctly
+//     refuses to truncate A's bytes but cannot revoke A's gate. Nothing here
+//     takes an interprocess lock, so a second writer is not a thing to be
+//     careful about — it is unsupported. Adding one means putting
+//     fstat -> tail -> write/rollback -> fsync under a real file lock first
+//     (Codex R7-F2). Log ROTATION from another process is supported, subject
+//     to contract 4.
+//
+//  4. Rotation is rename/create, never copytruncate. Renaming the log away and
+//     letting the next append create a fresh one is what the reachability
+//     check below is built for, and it is the only rotation method this module
+//     supports. `copytruncate` — copy the file, then truncate the SAME inode in
+//     place — can copy the archive before this record is appended and empty the
+//     original after it is fsynced, so the record survives in neither, and the
+//     identity check cannot see it because the inode never changed.
+//
+//     The post-write size check catches that, but only for a truncate that has
+//     already landed when it looks. It is a NARROWING, not a guarantee: a
+//     truncate between the check and the caller's mutation still leaves an
+//     authorized write with its intent in neither file. Closing that needs a
+//     lock held across the append AND the mutation, shared with the rotator —
+//     which contract 3 deliberately does not take (Codex R7-R2-F1, R7-R3-F1).
+//     So: configure rename/create rotation. Under copytruncate this sink is
+//     best-effort, and no amount of checking here makes it otherwise.
+//
 // Failure posture: throw. The caller maps a throw to 507 and performs NO
 // mutation (fail-closed). Silently continuing would be the one outcome this
 // module exists to prevent.
@@ -44,15 +76,20 @@ const RESULTS = new Set(['attempt', 'ok', 'denied', 'error'])
 // unauditable. Recovery is an operator action (repair or rotate the file, then
 // restart), deliberately not something the server decides for itself.
 const poisoned = new Set()
-// Targets whose existing tail this process has already checked. The check is
-// per file, not per append: it answers "did a previous process die mid-write",
-// which can only change when the file is replaced.
-const tailChecked = new Set()
 
 // A log whose last byte is not a newline ends in a fragment — a previous
 // process died between its write() and the rollback. Appending onto it would
 // weld the next intent record to that fragment and make BOTH unparsable, so the
-// tail is checked once per process before this one ever appends (Codex R3-F5).
+// tail is checked before this process appends (Codex R3-F5).
+//
+// The check runs on EVERY append, through the descriptor the line is about to
+// land on — never a memo keyed by pathname. A memo is a statement about the
+// file that WAS at that name: one rotation, restore or inode reuse later it is
+// a statement about nothing, and the append proceeds on a fragment it never
+// looked at (Codex R7). The cost of being right is a one-byte pread per audit
+// record. The tradeoff taken deliberately: a fragment another writer is
+// mid-rollback on now refuses this append instead of being welded onto, which
+// is the fail-closed side of a module that exists to refuse.
 function assertIntactTail(fd, target, size) {
   if (size === 0) return
   const last = Buffer.alloc(1)
@@ -60,6 +97,45 @@ function assertIntactTail(fd, target, size) {
   if (read !== 1 || last[0] !== 0x0a) {
     poisoned.add(target)
     throw new FileAuditFailed(`${target} ends in a partial line (a previous process died mid-append); repair or rotate it and restart`)
+  }
+}
+
+// O_APPEND + O_NOFOLLOW pin this append to ONE inode, which is what makes the
+// tail check above trustworthy — but the pathname is not pinned to it. A
+// rotation or restore landing after our open leaves the record durable in an
+// inode nothing can reach any more (close() releases the last link), while the
+// LIVE log holds no write-ahead entry for the mutation the caller is about to
+// make. Durability in an orphan is not evidence, so the name is re-resolved
+// after fsync and a mismatch REFUSES the append (Codex R7-F1).
+//
+// Not poison: rotation is a legitimate operator action, and the next call opens
+// the new file and succeeds normally. This attempt simply does not get to
+// authorize a mutation it cannot evidence. lstat, not stat, so a replacement
+// that is a symlink is a mismatch rather than something to follow.
+//
+// The check follows the write deliberately. It cannot close the window (a
+// rotation one instruction later is always possible without an interprocess
+// lock) — what it guarantees is the direction that matters: any rotation this
+// misses happened AFTER the intent was durably recorded on the log that was
+// live at the time, so no destructive op is ever authorized by a record the
+// live log never received.
+function assertRecordIsReachable(fd, target, opened, minSize) {
+  let live
+  try {
+    live = fs.lstatSync(target)
+  } catch (err) {
+    throw new FileAuditFailed(`${target} was replaced or removed while this record was being written; the live log holds no write-ahead entry, so the operation is refused`, err)
+  }
+  if (live.dev !== opened.dev || live.ino !== opened.ino) {
+    throw new FileAuditFailed(`${target} was replaced while this record was being written; the record is durable only in the rotated-away file, so the operation is refused`)
+  }
+  // Identity survives a copytruncate rotation — the bytes do not. The log is
+  // append-only, so its size can only ever GROW while this process holds the
+  // descriptor; anything shorter than our own line's end offset means the
+  // content was cut out from under it (contract 4).
+  const now = fs.fstatSync(fd)
+  if (now.size < minSize) {
+    throw new FileAuditFailed(`${target} was truncated while this record was being written (${now.size} bytes, expected at least ${minSize}); the live log no longer holds the write-ahead entry, so the operation is refused`)
   }
 }
 
@@ -155,25 +231,33 @@ export function appendAudit(dir, entry) {
       // opening a FIFO for writing BLOCKS until a reader appears. On Node's
       // single thread that is not a failed write, it is a wedged server — so
       // refuse to block at all. A no-op on a regular file (Codex R6).
+      //
+      // O_RDWR rather than O_WRONLY: the tail check has to READ the same inode
+      // this descriptor appends to. Re-opening the pathname to read it gave a
+      // rotation or restore a window to slip a clean same-sized replacement
+      // under the name — the check then passed on the replacement while the
+      // line landed on the original's fragment, and the audit gate reported
+      // success. One descriptor for fstat, tail, write and fsync is what makes
+      // check and act share guard scope (Codex R7).
       fd = fs.openSync(
         target,
-        fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
         0o600,
       )
-      const opened = fs.fstatSync(fd)
-      if (!opened.isFile()) {
-        poisoned.add(target)
-        throw new FileAuditFailed(`${target} is not a regular file; refusing to append`)
-      }
+    }
+    // One fstat on the one descriptor: type and size both describe the inode
+    // this call is about to append to, whatever the name resolves to by now.
+    const opened = fs.fstatSync(fd)
+    if (!opened.isFile()) {
+      poisoned.add(target)
+      throw new FileAuditFailed(`${target} is not a regular file; refusing to append`)
     }
     // The offset this append must roll back to if it only partly lands.
-    sizeBefore = fs.fstatSync(fd).size
-    if (!created && !tailChecked.has(target)) {
-      // O_WRONLY cannot read, so inspect the tail through a separate handle.
-      const readFd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
-      try { assertIntactTail(readFd, target, sizeBefore) } finally { fs.closeSync(readFd) }
-    }
-    tailChecked.add(target)
+    sizeBefore = opened.size
+    // A file this call created with O_EXCL is empty, and its descriptor is
+    // write-only — there is no tail to read and nothing that could have died
+    // mid-append on it.
+    if (!created) assertIntactTail(fd, target, sizeBefore)
     const written = fs.writeSync(fd, line)
     // A short write (ENOSPC, an I/O fault) cannot be finished with a second
     // write(): under O_APPEND a concurrent writer's line could land between the
@@ -199,6 +283,8 @@ export function appendAudit(dir, entry) {
       badRecord(`short write (${written}/${line.length} bytes)${repaired ? ', partial line rolled back' : '; THE LOG TAIL COULD NOT BE REPAIRED — auditing is now refused'}`)
     }
     fs.fsyncSync(fd)
+    // Durable — but durable somewhere the live log can still be read from?
+    assertRecordIsReachable(fd, target, opened, sizeBefore + line.length)
     // fsync on the FILE does not make a brand-new directory ENTRY durable. On
     // the very first write after a deploy (or after the log is rotated away) a
     // power loss could otherwise keep the committed mutation and lose the
