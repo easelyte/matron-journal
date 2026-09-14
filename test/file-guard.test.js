@@ -1611,8 +1611,12 @@ test('R4: modes survive an overwrite and a cross-device move under a restrictive
     const overwritten = path.join(f.root, 'shared.txt')
     writeFileSync(overwritten, 'v1')
     fs.chmodSync(overwritten, 0o644)
+    const ownedBefore = fs.lstatSync(overwritten)
     await writeFileAtomic(overwritten, Buffer.from('v2'), { writeRoots: f.writeRoots, overwrite: true })
-    assert.equal(fs.lstatSync(overwritten).mode & 0o777, 0o644, 'an overwrite must not narrow the file')
+    const ownedAfter = fs.lstatSync(overwritten)
+    assert.equal(ownedAfter.mode & 0o777, 0o644, 'an overwrite must not narrow the file')
+    assert.equal(ownedAfter.uid, ownedBefore.uid, 'an overwrite must not re-home the file')
+    assert.equal(ownedAfter.gid, ownedBefore.gid)
 
     const source = path.join(f.root, 'moved-me.txt')
     const destination = path.join(f.root, 'destination.txt')
@@ -1682,6 +1686,26 @@ test('R4: a recursive mkdir fsyncs every directory it creates, not just the firs
     for (const parent of [f.root, path.join(f.root, 'a'), path.join(f.root, 'a', 'b')]) {
       assert.ok(synced.includes(parent), `expected an fsync of ${parent}: ${synced}`)
     }
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('R5: an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'foreign.txt')
+    writeFileSync(target, 'owned-by-someone-else')
+    t.mock.method(fs, 'fchownSync', () => { throw Object.assign(new Error('not permitted'), { code: 'EPERM' }) })
+
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })),
+      'metadata-preserve-failed',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'owned-by-someone-else')
+    const trashDir = path.join(f.root, '.matron-trash')
+    assert.deepEqual(fs.existsSync(trashDir) ? fs.readdirSync(trashDir) : [], [], 'no backup is left for a write that did not happen')
+    assert.deepEqual(fs.readdirSync(f.root), ['foreign.txt'], 'no temp file is left behind')
   } finally {
     f.cleanup()
   }

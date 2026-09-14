@@ -593,6 +593,18 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     // UMask=0077, so a 0644 file replaced through here would come back 0600 and
     // silently cut off every other reader. fchmod is not masked (Codex R4).
     fs.fchmodSync(tmpFd, intendedMode);
+    if (prepared.targetStat) {
+      // A REPLACEMENT inherits the process identity unless it is told
+      // otherwise, so an overwrite would quietly re-home a file owned by
+      // someone else — revoking the original owner's access behind a 200. Same
+      // contract as the cross-device move: preserve it, or refuse. (A create
+      // has no prior owner; it is the server's file.)
+      try {
+        fs.fchownSync(tmpFd, prepared.targetStat.uid, prepared.targetStat.gid);
+      } catch {
+        throw new FileLinkDenied('metadata-preserve-failed');
+      }
+    }
     let size = 0;
     if (bytes) {
       writeAllSync(tmpFd, bytes);
