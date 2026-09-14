@@ -76,10 +76,11 @@ export function listingIsWritable(ctx, realDir) {
   return ctx.fileWriteRoots.roots.some((root) => contains(root.realPath, realDir))
 }
 
-// In-memory, bounded, TTL'd. DOCUMENTED RESIDUAL (plan deferred-(e)): a restart
-// drops the map, so a retry that crosses one can re-execute its write. That is
-// acceptable while Idempotency-Key is optional and the rollout is dormant-first;
-// a durable store is the follow-up if a double-write ever bites.
+// In-memory, bounded, TTL'd. NOT what the server runs: http.js wires the
+// durable store in src/file-idem.js, which survives the restart this map does
+// not. Kept because it is the reference semantics the durable store implements
+// (single-flight, fingerprinted, settled-entry eviction) and the shape the unit
+// tests pin — a database is not needed to state what a reservation means.
 export function makeIdemStore({ ttlMs = IDEM_TTL_MS, max = IDEM_MAX_ENTRIES, now = Date.now } = {}) {
   const entries = new Map()
   const sweep = () => {
@@ -223,12 +224,17 @@ async function audited(ctx, who, intent, run) {
 // Without a key there is nothing to deduplicate and the work runs directly.
 // Returns null when the header is present but unusable (the caller answers 400):
 // silently ignoring it would leave a client believing a retry was deduped.
-function withIdempotency(ctx, req, who, url, payload, work) {
+//
+// `intent` is recorded WITH the reservation, and exists for exactly one case:
+// a reservation that outlives the process executing it. The filesystem is then
+// the only witness to whether the work happened, and it can only be questioned
+// by something that knows what was attempted (see file-idem.js).
+function withIdempotency(ctx, req, who, url, payload, work, intent) {
   const key = idemKeyOf(req, who)
   if (key === undefined) return null
   if (key === null) return work()
   try {
-    return ctx.idem.run(key, fingerprintOf(req, url, payload), work)
+    return ctx.idem.run(key, fingerprintOf(req, url, payload), work, intent)
   } catch (err) {
     return Promise.reject(err)
   }
@@ -258,14 +264,14 @@ async function settle(req, res, pending, opts) {
 // So a REPLAY reads and hashes its own body and compares it with what the first
 // execution actually wrote; a mismatch is the same conflict a mismatched
 // fingerprint would have been.
-async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, opts) {
+async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, opts, intent) {
   const key = idemKeyOf(req, who)
   if (key === undefined) return badRequest(res)
   if (key === null) return settle(req, res, run(), opts)
 
   let reservation
   try {
-    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run)
+    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run, intent)
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
     return answer(req, res, { status: denialToStatus(err.reason), body: { error: 'denied' } }, opts)
@@ -348,7 +354,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       }
     })
 
-    return settleUpload(ctx, req, res, who, url, { target, overwrite }, run, uploadMax, opts)
+    return settleUpload(ctx, req, res, who, url, { target, overwrite }, run, uploadMax, opts,
+      { op: 'upload', path: target })
   }
 
   // --- T-2.2: POST /files/mkdir {path} -------------------------------------
@@ -365,7 +372,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       return { status: 200, body: { path: canonical }, audit: { path: canonical } }
     })
 
-    return settle(req, res, withIdempotency(ctx, req, who, url, { target }, run), opts)
+    return settle(req, res, withIdempotency(ctx, req, who, url, { target }, run,
+      { op: 'mkdir', path: target }), opts)
   }
 
   // --- T-2.3: POST /files/move {from,to} -----------------------------------
@@ -380,7 +388,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       return { status: 200, body: moved, audit: { path: moved.from, to: moved.to } }
     })
 
-    return settle(req, res, withIdempotency(ctx, req, who, url, { from, to }, run), opts)
+    return settle(req, res, withIdempotency(ctx, req, who, url, { from, to }, run,
+      { op: 'move', path: from, to }), opts)
   }
 
   // --- T-2.4: POST /files/write {path, content, overwrite?} ----------------
@@ -408,7 +417,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
 
     return settle(req, res, withIdempotency(ctx, req, who, url, {
       target, overwrite, contentHash: crypto.createHash('sha256').update(content).digest('hex'),
-    }, run), opts)
+    }, run, { op: 'write', path: target }), opts)
   }
 
   // --- T-2.5: DELETE /files?path=&recursive=0|1&confirm=1 ------------------
@@ -434,5 +443,6 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     }
   })
 
-  return settle(req, res, withIdempotency(ctx, req, who, url, { requested, recursive, confirmed }, run), opts)
+  return settle(req, res, withIdempotency(ctx, req, who, url, { requested, recursive, confirmed }, run,
+    { op: 'delete', path: requested }), opts)
 }

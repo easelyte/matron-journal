@@ -52,6 +52,31 @@ CREATE TABLE IF NOT EXISTS agent_idem(
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
+-- Durable idempotency for the file WRITE API (loop #644). Separate from
+-- agent_idem because the unit of replay is an HTTP OUTCOME (status + body),
+-- not an appended event seq, and because a row has to survive the process that
+-- created it: the in-memory store this replaces lost every reservation on
+-- restart, so a client retry crossing one re-executed its move/delete/upload.
+-- The key column already carries the calling device (idemKeyOf prefixes it
+-- with the device id), so there is no device column here: the 120s TTL, not a
+-- revocation cascade, is what bounds this table.
+CREATE TABLE IF NOT EXISTS file_idem(
+  key TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  -- Which server process reserved this row. A 'pending' row whose boot_id is
+  -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
+  boot_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','done')),
+  -- JSON {op, path, to?, contentHash?}: what the row was reserved to do, so a
+  -- crossed-restart retry can ask the filesystem whether it happened.
+  intent TEXT,
+  status INTEGER,
+  body TEXT,
+  content_hash TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL

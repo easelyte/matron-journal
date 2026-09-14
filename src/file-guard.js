@@ -149,6 +149,13 @@ export function denialToStatus(reason) {
   // Every idempotency reservation is occupied by work that is still running.
   // Transient and retryable — 503, not a conflict and not a bug.
   if (reason === 'idem-store-full') return 503;
+  // The reservation outlived the process executing it, and the filesystem
+  // cannot prove the work never happened. Grouped with the 507s because it is
+  // the same statement: well-formed, authorized, and NOT completed safely.
+  // Deliberately not a 409 — a conflict invites "pick another name and retry",
+  // and retrying is the one thing that must not happen while the first
+  // outcome is unknown.
+  if (reason === 'idem-indeterminate') return 507;
   if (reason === 'not-a-file'
       || reason === 'not-a-dir'
       || reason === 'unreadable'
