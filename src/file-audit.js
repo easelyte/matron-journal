@@ -44,15 +44,20 @@ const RESULTS = new Set(['attempt', 'ok', 'denied', 'error'])
 // unauditable. Recovery is an operator action (repair or rotate the file, then
 // restart), deliberately not something the server decides for itself.
 const poisoned = new Set()
-// Targets whose existing tail this process has already checked. The check is
-// per file, not per append: it answers "did a previous process die mid-write",
-// which can only change when the file is replaced.
-const tailChecked = new Set()
 
 // A log whose last byte is not a newline ends in a fragment — a previous
 // process died between its write() and the rollback. Appending onto it would
 // weld the next intent record to that fragment and make BOTH unparsable, so the
-// tail is checked once per process before this one ever appends (Codex R3-F5).
+// tail is checked before this process appends (Codex R3-F5).
+//
+// The check runs on EVERY append, through the descriptor the line is about to
+// land on — never a memo keyed by pathname. A memo is a statement about the
+// file that WAS at that name: one rotation, restore or inode reuse later it is
+// a statement about nothing, and the append proceeds on a fragment it never
+// looked at (Codex R7). The cost of being right is a one-byte pread per audit
+// record. The tradeoff taken deliberately: a fragment another writer is
+// mid-rollback on now refuses this append instead of being welded onto, which
+// is the fail-closed side of a module that exists to refuse.
 function assertIntactTail(fd, target, size) {
   if (size === 0) return
   const last = Buffer.alloc(1)
@@ -155,25 +160,33 @@ export function appendAudit(dir, entry) {
       // opening a FIFO for writing BLOCKS until a reader appears. On Node's
       // single thread that is not a failed write, it is a wedged server — so
       // refuse to block at all. A no-op on a regular file (Codex R6).
+      //
+      // O_RDWR rather than O_WRONLY: the tail check has to READ the same inode
+      // this descriptor appends to. Re-opening the pathname to read it gave a
+      // rotation or restore a window to slip a clean same-sized replacement
+      // under the name — the check then passed on the replacement while the
+      // line landed on the original's fragment, and the audit gate reported
+      // success. One descriptor for fstat, tail, write and fsync is what makes
+      // check and act share guard scope (Codex R7).
       fd = fs.openSync(
         target,
-        fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
         0o600,
       )
-      const opened = fs.fstatSync(fd)
-      if (!opened.isFile()) {
-        poisoned.add(target)
-        throw new FileAuditFailed(`${target} is not a regular file; refusing to append`)
-      }
+    }
+    // One fstat on the one descriptor: type and size both describe the inode
+    // this call is about to append to, whatever the name resolves to by now.
+    const opened = fs.fstatSync(fd)
+    if (!opened.isFile()) {
+      poisoned.add(target)
+      throw new FileAuditFailed(`${target} is not a regular file; refusing to append`)
     }
     // The offset this append must roll back to if it only partly lands.
-    sizeBefore = fs.fstatSync(fd).size
-    if (!created && !tailChecked.has(target)) {
-      // O_WRONLY cannot read, so inspect the tail through a separate handle.
-      const readFd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
-      try { assertIntactTail(readFd, target, sizeBefore) } finally { fs.closeSync(readFd) }
-    }
-    tailChecked.add(target)
+    sizeBefore = opened.size
+    // A file this call created with O_EXCL is empty, and its descriptor is
+    // write-only — there is no tail to read and nothing that could have died
+    // mid-append on it.
+    if (!created) assertIntactTail(fd, target, sizeBefore)
     const written = fs.writeSync(fd, line)
     // A short write (ENOSPC, an I/O fault) cannot be finished with a second
     // write(): under O_APPEND a concurrent writer's line could land between the

@@ -276,3 +276,41 @@ test('R6: a FIFO audit target fails closed instead of blocking the process', () 
   )
   assert.ok(Date.now() - started < 2000, 'the refusal is immediate, not a block')
 })
+
+test('R7: the tail check reads the very inode the line lands on, not the pathname', (t) => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  // The log on disk ends in a FRAGMENT — a previous process died mid-append.
+  const fragment = '{"ts":1,"op":"del'
+  fs.writeFileSync(target, fragment)
+  // A replacement of EXACTLY the same size whose last byte IS a newline. If the
+  // tail is inspected by re-opening the name instead of by reading the open
+  // descriptor, this file answers the question — and answers it "intact" — for
+  // an inode the append will never touch.
+  const rotatedIn = path.join(dir, 'rotated-in.jsonl')
+  fs.writeFileSync(rotatedIn, `${'x'.repeat(fragment.length - 1)}\n`)
+
+  // Rotation/restore lands in the window between the two opens: the append
+  // descriptor exists and still points at the fragment, while the NAME now
+  // resolves to the clean replacement.
+  const realOpen = fs.openSync
+  let swapped = false
+  t.mock.method(fs, 'openSync', (p, ...rest) => {
+    const fd = realOpen(p, ...rest)
+    if (!swapped && p === target) {
+      swapped = true
+      fs.renameSync(rotatedIn, target)
+    }
+    return fd
+  })
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /partial line/,
+    'the fragment on the descriptor we are about to append to must refuse the write',
+  )
+  t.mock.restoreAll()
+  assert.ok(swapped, 'the pathname really was replaced mid-call')
+  // And nothing was welded onto either inode.
+  assert.equal(fs.readFileSync(target, 'utf8'), `${'x'.repeat(fragment.length - 1)}\n`)
+})
