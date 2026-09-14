@@ -13,6 +13,8 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { handleFilesWriteRoute, listingIsWritable, makeIdemStore } from './files-write-http.js'
+import { makeFileAudit } from './file-audit.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { json, readBody } from './http-body.js'
@@ -88,12 +90,24 @@ const rejectEarly = (req, res, status, obj) => {
 // Default-hidden listing entries (dev noise). Hiding is a DISPLAY filter layered
 // on top of the always-on sensitive DROP in listDirGuarded — a `?all=1` toggle
 // reveals these, but never a sensitive entry (those are gone before this runs).
-const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__'])
+// '.matron-trash' is a dotfile and so already default-hidden by the rule
+// below; it is named explicitly because that is a CONTRACT (the Phase-2 trash
+// must not appear in an ordinary listing), not an accident of its spelling.
+const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__', '.matron-trash'])
 const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes }) {
+  // Server-owned, built once at the trusted boundary rather than per request:
+  // the audit binds its directory here (a handler carries a function, never a
+  // path it could be talked into changing), and the idempotency reservations
+  // have to outlive a single request to be reservations at all.
+  const fileWriteCtx = {
+    fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
+    audit: makeFileAudit(fileAuditDir),
+    idem: makeIdemStore(),
+  }
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -294,7 +308,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const parent = (containingRoot === null || listed.realDir === containingRoot)
           ? null
           : path.dirname(listed.realDir)
-        return json(res, 200, { path: listed.realDir, root: containingRoot, parent, entries: visible, truncated: listed.truncated })
+        // `writable` (Phase-2 wire contract): the UI renders write affordances
+        // only when the server says this directory accepts writes right now.
+        // Absent or false => a strictly read-only browser.
+        return json(res, 200, {
+          path: listed.realDir,
+          root: containingRoot,
+          parent,
+          entries: visible,
+          truncated: listed.truncated,
+          writable: listingIsWritable(fileWriteCtx, listed.realDir),
+        })
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
@@ -432,6 +456,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           throw e
         }
       }
+      // Phase-2 writes (src/files-write-http.js). Mounted with the read routes
+      // and inside the outer try/catch, so readBody's 400/413 map like every
+      // other route's; returns false when the kill switch is off, and the
+      // request falls through to the final 404.
+      if (await handleFilesWriteRoute(fileWriteCtx, req, res, url, who)) return
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.

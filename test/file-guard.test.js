@@ -13,7 +13,7 @@ import path from 'node:path'
 import {
   isSensitivePath, checkFileLink, validateAndOpen, openGuarded, metaGuarded, listDirGuarded,
   pinAllowedRoots, pinAllowedRootsSync, FileLinkDenied, denialToStatus,
-  validateWriteTarget, writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
+  validateWriteTarget, writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded, withProtectedPaths,
   contentTypeFor, mimeForPath, isTextPath, MAX_VIEW_BYTES,
 } from '../src/file-guard.js'
 
@@ -65,6 +65,7 @@ test('checkFileLink denylist + boundary-safe containment', () => {
 test('denialToStatus is uniform across reason families', () => {
   assert.equal(denialToStatus('sensitive'), 403)
   assert.equal(denialToStatus('outside-scope'), 403)
+  assert.equal(denialToStatus('dest-exists'), 409)
   assert.equal(denialToStatus('too-large'), 413)
   for (const r of ['not-a-file', 'not-a-dir', 'unreadable', 'symlink', 'relative-path', 'bad-workdir']) {
     assert.equal(denialToStatus(r), 404, r)
@@ -638,7 +639,7 @@ test('writeFileAtomic preserves a successful overwrite in durable trash', async 
     })
 
     assert.equal(
-      await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20 }),
+      await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20, overwrite: true }),
       target,
     )
     assert.equal(fs.readFileSync(target, 'utf8'), 'replacement')
@@ -657,25 +658,76 @@ test('writeFileAtomic preserves a successful overwrite in durable trash', async 
   }
 })
 
-test('writeFileAtomic fsyncs the temp file before rename and the parent after rename', async (t) => {
+test('writeFileAtomic removes its durable backup and new trash directory when overwrite commit fails', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'overwritten.txt')
+    const trashDir = path.join(f.root, '.matron-trash')
+    writeFileSync(target, 'previous version')
+    const realRename = fs.renameSync
+    const realUnlink = fs.unlinkSync
+    const realFsync = fs.fsyncSync
+    let backupRemoved = false
+    let removalFsynced = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from.includes('.matron-tmp-') && path.basename(to) === path.basename(target)) {
+        throw Object.assign(new Error('commit failed'), { code: 'EIO' })
+      }
+      return realRename(from, to)
+    })
+    t.mock.method(fs, 'unlinkSync', (removedPath) => {
+      const result = realUnlink(removedPath)
+      if (path.dirname(removedPath) === trashDir) backupRemoved = true
+      return result
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (backupRemoved) {
+        try {
+          const stat = fs.fstatSync(fd)
+          if (stat.isDirectory()) removalFsynced = true
+        } catch {}
+      }
+      return realFsync(fd)
+    })
+
+    await assert.rejects(
+      writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, maxBytes: 20, overwrite: true }),
+      /commit failed/,
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'previous version')
+    assert.equal(backupRemoved, true)
+    assert.equal(removalFsynced, true)
+    assert.equal(fs.existsSync(trashDir), false)
+    assert.deepEqual(fs.readdirSync(f.root).filter((name) => name.includes('.matron-tmp-')), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic fsyncs the temp file before the install and the parent after it', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'durable.txt')
     const events = []
     const realFsync = fs.fsyncSync
     const realRename = fs.renameSync
-    t.mock.method(fs, 'fsyncSync', (fd) => {
-      events.push('fsync')
-      return realFsync(fd)
-    })
-    t.mock.method(fs, 'renameSync', (from, to) => {
-      events.push('rename')
-      return realRename(from, to)
-    })
+    const realLink = fs.linkSync
+    t.mock.method(fs, 'fsyncSync', (fd) => { events.push('fsync'); return realFsync(fd) })
+    t.mock.method(fs, 'renameSync', (from, to) => { events.push('install'); return realRename(from, to) })
+    t.mock.method(fs, 'linkSync', (from, to) => { events.push('install'); return realLink(from, to) })
+
+    // A create installs with link (no-replace); an overwrite installs with
+    // rename (the atomic swap). Both owe the same durability barrier.
     await writeFileAtomic(target, Buffer.from('durable'), { writeRoots: f.writeRoots, maxBytes: 20 })
-    const renameAt = events.indexOf('rename')
-    assert.ok(renameAt > 0, `expected pre-rename fsync: ${events}`)
-    assert.ok(events.slice(renameAt + 1).includes('fsync'), `expected post-rename parent fsync: ${events}`)
+    const created = [...events]
+    events.length = 0
+    await writeFileAtomic(target, Buffer.from('replaced'), { writeRoots: f.writeRoots, maxBytes: 20, overwrite: true })
+
+    for (const [label, trace] of [['create', created], ['overwrite', events]]) {
+      const installAt = trace.lastIndexOf('install')
+      assert.ok(installAt > 0, `${label}: expected a pre-install fsync: ${trace}`)
+      assert.ok(trace.slice(installAt + 1).includes('fsync'), `${label}: expected a post-install parent fsync: ${trace}`)
+    }
   } finally {
     f.cleanup()
   }
@@ -713,6 +765,34 @@ test('moveGuarded never clobbers an existing destination and validates both side
   }
 })
 
+test('moveGuarded does not clobber a destination raced in immediately before same-device link', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'source.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'source')
+    const realLink = fs.linkSync
+    let injectedRace = false
+    t.mock.method(fs, 'linkSync', (from, to) => {
+      if (from === source && to === destination && !injectedRace) {
+        injectedRace = true
+        writeFileSync(destination, 'racer')
+      }
+      return realLink(from, to)
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'dest-exists',
+    )
+    assert.equal(injectedRace, true)
+    assert.equal(fs.readFileSync(source, 'utf8'), 'source')
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'racer')
+  } finally {
+    f.cleanup()
+  }
+})
+
 test('moveGuarded rejects a source that equals or contains a pinned write-root', async () => {
   const f = makeWriteFixture()
   try {
@@ -743,14 +823,14 @@ test('moveGuarded maps a cross-device destination reservation race to dest-exist
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'source')
-    const realRename = fs.renameSync
+    const realLink = fs.linkSync
     const realOpen = fs.openSync
     let injectedRace = false
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) {
         throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
       }
-      return realRename(from, to)
+      return realLink(from, to)
     })
     t.mock.method(fs, 'openSync', (target, flags, mode) => {
       if (target === destination && !injectedRace) {
@@ -775,36 +855,43 @@ test('moveGuarded maps a cross-device destination reservation race to dest-exist
   }
 })
 
-test('moveGuarded atomically renames a file on the same device', async (t) => {
+test('moveGuarded links then unlinks a same-device file without changing its inode', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'moved')
     const realRename = fs.renameSync
-    const realLink = fs.linkSync
-    let renamed = false
+    const realUnlink = fs.unlinkSync
+    let linkedInode
     t.mock.method(fs, 'renameSync', (from, to) => {
-      if (from === source && to === destination) renamed = true
+      if (from === source && to === destination) throw new Error('same-device file move used rename')
       return realRename(from, to)
     })
-    t.mock.method(fs, 'linkSync', (from, to) => {
-      if (from === source && to === destination) throw new Error('same-device move used a hard link')
-      return realLink(from, to)
+    t.mock.method(fs, 'unlinkSync', (target) => {
+      if (target === source) {
+        const sourceStat = fs.statSync(source)
+        const destinationStat = fs.statSync(destination)
+        assert.equal(sourceStat.dev, destinationStat.dev)
+        assert.equal(sourceStat.ino, destinationStat.ino)
+        linkedInode = destinationStat.ino
+      }
+      return realUnlink(target)
     })
     assert.deepEqual(await moveGuarded(source, destination, { writeRoots: f.writeRoots }), {
       from: source,
       to: destination,
     })
-    assert.equal(renamed, true)
+    assert.equal(typeof linkedInode, 'number')
     assert.equal(fs.existsSync(source), false)
     assert.equal(fs.readFileSync(destination, 'utf8'), 'moved')
+    assert.equal(fs.statSync(destination).ino, linkedInode)
   } finally {
     f.cleanup()
   }
 })
 
-test('moveGuarded revalidates both pinned parents immediately before rename', async (t) => {
+test('moveGuarded revalidates both pinned parents immediately before link', async (t) => {
   if (process.platform !== 'linux') {
     t.skip('the parent-fd realpath assertion uses /proc/self/fd')
     return
@@ -816,18 +903,18 @@ test('moveGuarded revalidates both pinned parents immediately before rename', as
     const writeRoots = pinAllowedRootsSync([f.root, f.out])
     writeFileSync(source, 'moved')
     const realReadlink = fs.readlinkSync
-    const realRename = fs.renameSync
+    const realLink = fs.linkSync
     const parentChecks = []
     t.mock.method(fs, 'readlinkSync', (target, options) => {
       const result = realReadlink(target, options)
       if (String(target).startsWith('/proc/self/fd/')) parentChecks.push(result)
       return result
     })
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) {
         assert.deepEqual(parentChecks.slice(-2), [f.root, f.out])
       }
-      return realRename(from, to)
+      return realLink(from, to)
     })
 
     await moveGuarded(source, destination, { writeRoots })
@@ -843,10 +930,10 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'cross-device')
-    const realRename = fs.renameSync
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    const realLink = fs.linkSync
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
-      return realRename(from, to)
+      return realLink(from, to)
     })
     assert.deepEqual(await moveGuarded(source, destination, { writeRoots: f.writeRoots }), { from: source, to: destination })
     assert.equal(fs.existsSync(source), false)
@@ -860,10 +947,10 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
     const source = path.join(rollback.root, 'source.txt')
     const destination = path.join(rollback.root, 'destination.txt')
     writeFileSync(source, 'keep-me')
-    const realRename = fs.renameSync
-    const renameMock = mock.method(fs, 'renameSync', (from, to) => {
+    const realLink = fs.linkSync
+    const linkMock = mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
-      return realRename(from, to)
+      return realLink(from, to)
     })
     const realUnlink = fs.unlinkSync
     const unlinkMock = mock.method(fs, 'unlinkSync', (target) => {
@@ -874,7 +961,7 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
       await assert.rejects(moveGuarded(source, destination, { writeRoots: rollback.writeRoots }), /busy/)
     } finally {
       unlinkMock.mock.restore()
-      renameMock.mock.restore()
+      linkMock.mock.restore()
     }
     assert.equal(fs.readFileSync(source, 'utf8'), 'keep-me')
     assert.equal(fs.existsSync(destination), false)
@@ -883,19 +970,24 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
   }
 })
 
-test('moveGuarded cross-device fallback retains the destination after post-unlink fsync failure', async (t) => {
+// F4: the post-unlink fsync is a durability barrier AFTER the move committed.
+// It used to reject, which left the caller with an error describing a move
+// that had in fact happened — and a retry would 404 on the vanished source.
+// The contract now: report success, keep the destination, log the lost
+// durability server-side.
+test('moveGuarded cross-device fallback reports success when the post-unlink fsync fails', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'source.txt')
     const destination = path.join(f.root, 'destination.txt')
     writeFileSync(source, 'only-surviving-copy')
-    const realRename = fs.renameSync
+    const realLink = fs.linkSync
     const realFsync = fs.fsyncSync
-    t.mock.method(fs, 'renameSync', (from, to) => {
+    t.mock.method(fs, 'linkSync', (from, to) => {
       if (from === source && to === destination) {
         throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
       }
-      return realRename(from, to)
+      return realLink(from, to)
     })
     t.mock.method(fs, 'fsyncSync', (fd) => {
       if (!fs.existsSync(source) && fs.existsSync(destination)) {
@@ -904,9 +996,9 @@ test('moveGuarded cross-device fallback retains the destination after post-unlin
       return realFsync(fd)
     })
 
-    await assert.rejects(
-      moveGuarded(source, destination, { writeRoots: f.writeRoots }),
-      /source parent fsync failed/,
+    assert.deepEqual(
+      await moveGuarded(source, destination, { writeRoots: f.writeRoots }),
+      { from: source, to: destination },
     )
     assert.equal(fs.existsSync(source), false)
     assert.equal(fs.readFileSync(destination, 'utf8'), 'only-surviving-copy')
@@ -958,6 +1050,32 @@ test('trashGuarded enforces the recursive guard and protects the trash tree', as
       await writeDenied(() => moveGuarded(result.trashed, path.join(f.root, 'restored'), { writeRoots: f.writeRoots })),
       'trash-protected',
     )
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('trashGuarded rejects a target that equals or contains a pinned write-root', async () => {
+  const f = makeWriteFixture()
+  try {
+    const container = path.join(f.root, 'container')
+    const nestedRoot = path.join(container, 'nested-root')
+    const nestedTrash = path.join(nestedRoot, '.matron-trash')
+    mkdirSync(nestedTrash, { recursive: true })
+    writeFileSync(path.join(nestedRoot, 'kept.txt'), 'kept')
+    const writeRoots = pinAllowedRootsSync([f.root, nestedRoot])
+
+    assert.equal(
+      await writeDenied(() => trashGuarded(container, { writeRoots, recursive: true })),
+      'outside-scope',
+    )
+    assert.equal(
+      await writeDenied(() => trashGuarded(nestedRoot, { writeRoots, recursive: true })),
+      'outside-scope',
+    )
+    assert.equal(fs.readFileSync(path.join(nestedRoot, 'kept.txt'), 'utf8'), 'kept')
+    assert.equal(fs.statSync(nestedTrash).isDirectory(), true)
+    assert.equal(fs.existsSync(path.join(f.root, '.matron-trash')), false)
   } finally {
     f.cleanup()
   }
@@ -1063,7 +1181,7 @@ test('trashGuarded removes a newly created trash directory when race validation 
   }
 })
 
-test('two same-basename deletes both survive and delete-missing is idempotent', async () => {
+test('an interleaved same-basename delete survives and delete-missing is idempotent', async (t) => {
   const f = makeWriteFixture()
   try {
     mkdirSync(path.join(f.root, 'a'))
@@ -1072,10 +1190,19 @@ test('two same-basename deletes both survive and delete-missing is idempotent', 
     const second = path.join(f.root, 'b', 'same.txt')
     writeFileSync(first, 'first')
     writeFileSync(second, 'second')
-    const [one, two] = await Promise.all([
-      trashGuarded(first, { writeRoots: f.writeRoots }),
-      trashGuarded(second, { writeRoots: f.writeRoots }),
-    ])
+    const realRename = fs.renameSync
+    let secondDelete
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from === first && !secondDelete) {
+        // Pause the first operation at its mutation boundary and let the
+        // competing delete complete against the same trash directory.
+        secondDelete = trashGuarded(second, { writeRoots: f.writeRoots })
+      }
+      return realRename(from, to)
+    })
+    const one = await trashGuarded(first, { writeRoots: f.writeRoots })
+    const two = await secondDelete
+    assert.ok(secondDelete)
     assert.notEqual(one.trashed, two.trashed)
     assert.deepEqual(
       new Set([fs.readFileSync(one.trashed, 'utf8'), fs.readFileSync(two.trashed, 'utf8')]),
@@ -1086,6 +1213,499 @@ test('two same-basename deletes both survive and delete-missing is idempotent', 
       trashed: null,
       already_missing: true,
     })
+  } finally {
+    f.cleanup()
+  }
+})
+
+// --- Carried Codex findings F2/F3/F4 ----------------------------------------
+// The same-device path is an inode-preserving link()+unlink(), so metadata,
+// concurrent appends, and post-commit durability are only at risk on the
+// cross-device (EXDEV) copy fallback and the crash-window fsyncs around a
+// committed rename. Each is forced here by injecting the failure Linux would
+// otherwise only produce across a real mount boundary.
+
+const forceExdev = (t, predicate) => {
+  const realLink = fs.linkSync
+  const realRename = fs.renameSync
+  t.mock.method(fs, 'linkSync', (from, to) => {
+    if (predicate(from, to)) throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' })
+    return realLink(from, to)
+  })
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (predicate(from, to)) throw Object.assign(new Error('cross-device rename'), { code: 'EXDEV' })
+    return realRename(from, to)
+  })
+}
+
+test('F2: the cross-device move fallback preserves mode and mtime', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'payload.bin')
+    const destination = path.join(f.root, 'moved.bin')
+    writeFileSync(source, 'payload')
+    fs.chmodSync(source, 0o640)
+    const mtime = new Date('2021-03-04T05:06:07.000Z')
+    fs.utimesSync(source, mtime, mtime)
+    const before = fs.lstatSync(source)
+
+    forceExdev(t, (from) => from === source)
+    const moved = await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+
+    assert.equal(moved.to, destination)
+    assert.equal(fs.existsSync(source), false)
+    const after = fs.lstatSync(destination)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'payload')
+    assert.equal(after.mode & 0o777, before.mode & 0o777)
+    assert.equal(Math.floor(after.mtimeMs), Math.floor(before.mtimeMs))
+    assert.equal(after.uid, before.uid)
+    assert.equal(after.gid, before.gid)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F3: a concurrent append during the cross-device copy aborts instead of losing bytes', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'growing.log')
+    const destination = path.join(f.root, 'moved.log')
+    writeFileSync(source, 'a'.repeat(128 * 1024))
+    forceExdev(t, (from) => from === source)
+
+    const realRead = fs.readSync
+    let appended = false
+    t.mock.method(fs, 'readSync', (fd, buffer, offset, length, position) => {
+      const read = realRead(fd, buffer, offset, length, position)
+      if (!appended) {
+        appended = true
+        fs.appendFileSync(source, 'LATE-APPEND')
+      }
+      return read
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'source-changed',
+    )
+    assert.equal(appended, true)
+    // Nothing lost: the source keeps every byte and no partial copy survives.
+    assert.ok(fs.readFileSync(source, 'utf8').endsWith('LATE-APPEND'))
+    assert.equal(fs.existsSync(destination), false)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure reports success rather than a lying error', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'committed.txt')
+    const destination = path.join(f.root, 'committed-moved.txt')
+    writeFileSync(source, 'committed')
+
+    const realFsync = fs.fsyncSync
+    const realUnlink = fs.unlinkSync
+    let sourceUnlinked = false
+    t.mock.method(fs, 'unlinkSync', (target) => {
+      const result = realUnlink(target)
+      if (target === source) sourceUnlinked = true
+      return result
+    })
+    // Only the durability barrier AFTER the move is committed fails.
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (sourceUnlinked) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    const moved = await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+    assert.deepEqual(moved, { from: source, to: destination })
+    assert.equal(fs.existsSync(source), false)
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'committed')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure does not un-commit a trashed file', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const doomed = path.join(f.root, 'doomed.txt')
+    writeFileSync(doomed, 'doomed')
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    let renamed = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      const result = realRename(from, to)
+      if (from === doomed) renamed = true
+      return result
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (renamed) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    const trashed = await trashGuarded(doomed, { writeRoots: f.writeRoots })
+    assert.equal(trashed.already_missing, false)
+    assert.equal(fs.existsSync(doomed), false)
+    assert.equal(fs.readFileSync(trashed.trashed, 'utf8'), 'doomed')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a post-commit fsync failure does not un-commit an atomic write', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'note.txt')
+    const realFsync = fs.fsyncSync
+    const realRename = fs.renameSync
+    let renamed = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      const result = realRename(from, to)
+      if (to.endsWith('note.txt')) renamed = true
+      return result
+    })
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (renamed) throw Object.assign(new Error('device gone'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    assert.equal(await writeFileAtomic(target, Buffer.from('body'), { writeRoots: f.writeRoots }), target)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'body')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('denialToStatus maps every Phase-2 write reason without falling back to 502', () => {
+  const expected = {
+    sensitive: 403, 'outside-scope': 403, 'trash-protected': 403,
+    'dest-exists': 409, 'dir-not-empty': 409, 'overwrite-conflict': 409,
+    'cross-device-dir': 409, 'confirm-required': 409, 'source-changed': 409,
+    'idem-key-conflict': 409,
+    'too-large': 413,
+    'trash-write-failed': 507, 'audit-fail-closed': 507,
+    'not-a-file': 404, 'not-a-dir': 404, unreadable: 404, symlink: 404,
+    'relative-path': 404, 'bad-workdir': 404,
+  }
+  for (const [reason, status] of Object.entries(expected)) {
+    assert.equal(denialToStatus(reason), status, reason)
+  }
+  assert.equal(denialToStatus('something-unmapped'), 502)
+})
+
+test('writeFileAtomic refuses to replace an existing file without an explicit overwrite', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'existing.txt')
+    const directory = path.join(f.root, 'a-directory')
+    writeFileSync(target, 'original')
+    mkdirSync(directory)
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots })),
+      'overwrite-conflict',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'original')
+    assert.equal(fs.existsSync(path.join(f.root, '.matron-trash')), false)
+    // A directory is never a write target, with or without the flag.
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(directory, Buffer.from('x'), { writeRoots: f.writeRoots, overwrite: true })),
+      'dest-exists',
+    )
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('writeFileAtomic rejects a create-only write whose target appears mid-stream', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'raced.txt')
+    let raced = false
+    async function* slowStream() {
+      yield Buffer.from('new-')
+      if (!raced) { raced = true; writeFileSync(target, 'sneaked-in') }
+      yield Buffer.from('content')
+    }
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, slowStream(), { writeRoots: f.writeRoots })),
+      'overwrite-conflict',
+    )
+    assert.equal(raced, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'sneaked-in')
+  } finally {
+    f.cleanup()
+  }
+})
+
+// --- Codex round-1 findings F2/F4/F5 ----------------------------------------
+
+test('F2: server-owned state inside a write-root is refused by every write primitive', async () => {
+  const f = makeWriteFixture()
+  try {
+    const dbPath = path.join(f.root, 'matron.db')
+    const auditPath = path.join(f.root, 'file-audit.jsonl')
+    const mediaDir = path.join(f.root, 'media')
+    writeFileSync(dbPath, 'sqlite')
+    writeFileSync(auditPath, '{}\n')
+    mkdirSync(mediaDir)
+    writeFileSync(path.join(mediaDir, 'blob.bin'), 'blob')
+    const guarded = withProtectedPaths(f.writeRoots, [dbPath, auditPath, mediaDir])
+
+    for (const target of [dbPath, auditPath, mediaDir, path.join(mediaDir, 'blob.bin')]) {
+      assert.equal(
+        await writeDenied(() => writeFileAtomic(target, Buffer.from('x'), { writeRoots: guarded, overwrite: true })),
+        'protected-path', `write ${target}`,
+      )
+      assert.equal(
+        await writeDenied(() => trashGuarded(target, { writeRoots: guarded, recursive: true })),
+        'protected-path', `delete ${target}`,
+      )
+      assert.equal(
+        await writeDenied(() => moveGuarded(target, path.join(f.root, 'stolen'), { writeRoots: guarded })),
+        'protected-path', `move ${target}`,
+      )
+    }
+    // An ancestor cannot be deleted either — that would take the state with it.
+    assert.equal(
+      await writeDenied(() => mkdirGuarded(path.join(mediaDir, 'sub'), { writeRoots: guarded })),
+      'protected-path',
+    )
+    assert.equal(fs.readFileSync(dbPath, 'utf8'), 'sqlite')
+    assert.equal(fs.readFileSync(auditPath, 'utf8'), '{}\n')
+
+    // Without the protection the same paths are ordinary files — proving the
+    // refusal comes from the pinned set and not from their names.
+    assert.equal(await writeFileAtomic(dbPath, Buffer.from('x'), { writeRoots: f.writeRoots, overwrite: true }), dbPath)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F4: a create-only write installs no-replace and never clobbers a race winner', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'raced.txt')
+    // The racer wins AFTER the create-only existence check, so only an atomic
+    // no-replace install can save its file.
+    const realLink = fs.linkSync
+    let raced = false
+    t.mock.method(fs, 'linkSync', (from, to) => {
+      if (!raced && to.endsWith('raced.txt')) {
+        raced = true
+        writeFileSync(target, 'racer-wrote-this')
+      }
+      return realLink(from, to)
+    })
+
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('mine'), { writeRoots: f.writeRoots })),
+      'overwrite-conflict',
+    )
+    assert.equal(raced, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'racer-wrote-this', 'the racer is never clobbered')
+    // No temp file is left behind.
+    assert.deepEqual(fs.readdirSync(f.root), ['raced.txt'])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F5: an overwrite backup preserves the original inode rather than a copy of it', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'doc.txt')
+    writeFileSync(target, 'original')
+    const before = fs.lstatSync(target)
+
+    await writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })
+    const trashDir = path.join(f.root, '.matron-trash')
+    const [backup] = fs.readdirSync(trashDir)
+    const backupStat = fs.lstatSync(path.join(trashDir, backup))
+
+    assert.equal(fs.readFileSync(target, 'utf8'), 'replacement')
+    assert.equal(fs.readFileSync(path.join(trashDir, backup), 'utf8'), 'original')
+    assert.equal(backupStat.ino, before.ino, 'the backup IS the original file, not a snapshot')
+    assert.equal(backupStat.dev, before.dev)
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F5/R3-F6: an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'doc.txt')
+    writeFileSync(target, 'original')
+    // A byte copy would be a snapshot with a race window between it and the
+    // replacement; refusing keeps the guarantee that an overwrite is always
+    // recoverable from the exact bytes that were replaced.
+    const realLink = fs.linkSync
+    for (const code of ['EXDEV', 'EPERM', 'EMLINK']) {
+      t.mock.restoreAll()
+      t.mock.method(fs, 'linkSync', (from, to) => {
+        if (from === target) throw Object.assign(new Error(code), { code })
+        return realLink(from, to)
+      })
+      assert.equal(
+        await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })),
+        'trash-write-failed', code,
+      )
+      assert.equal(fs.readFileSync(target, 'utf8'), 'original', code)
+      const trashDir = path.join(f.root, '.matron-trash')
+      assert.equal(fs.existsSync(trashDir), false, `${code}: no trash directory is left behind`)
+      assert.deepEqual(fs.readdirSync(f.root), ['doc.txt'], `${code}: no temp file is left behind`)
+    }
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('F5: a cross-device move re-checks the source immediately before destroying it', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const source = path.join(f.root, 'payload.txt')
+    const destination = path.join(f.root, 'moved.txt')
+    writeFileSync(source, 'payload')
+
+    const realLink = fs.linkSync
+    const realRename = fs.renameSync
+    const realFsync = fs.fsyncSync
+    let installed = false
+    let mutated = false
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      if (from === source) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      return realRename(from, to)
+    })
+    t.mock.method(fs, 'linkSync', (from, to) => {
+      if (from === source) throw Object.assign(new Error('cross-device'), { code: 'EXDEV' })
+      const result = realLink(from, to)
+      if (to === destination) installed = true
+      return result
+    })
+    // The destination is installed and the copy's own post-read check has
+    // already passed; a writer touching the source NOW would lose bytes if the
+    // unlink went ahead on the strength of that stale check.
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (installed && !mutated) { mutated = true; fs.appendFileSync(source, 'LATE') }
+      return realFsync(fd)
+    })
+
+    assert.equal(
+      await writeDenied(() => moveGuarded(source, destination, { writeRoots: f.writeRoots })),
+      'source-changed',
+    )
+    assert.equal(mutated, true)
+    assert.ok(fs.readFileSync(source, 'utf8').endsWith('LATE'), 'the source survives with its new bytes')
+    assert.equal(fs.existsSync(destination), false, 'the installed destination is rolled back')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('R4: modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
+  const previousUmask = process.umask(0o077)   // the deployed service's UMask
+  const f = makeWriteFixture()
+  try {
+    const overwritten = path.join(f.root, 'shared.txt')
+    writeFileSync(overwritten, 'v1')
+    fs.chmodSync(overwritten, 0o644)
+    const ownedBefore = fs.lstatSync(overwritten)
+    await writeFileAtomic(overwritten, Buffer.from('v2'), { writeRoots: f.writeRoots, overwrite: true })
+    const ownedAfter = fs.lstatSync(overwritten)
+    assert.equal(ownedAfter.mode & 0o777, 0o644, 'an overwrite must not narrow the file')
+    assert.equal(ownedAfter.uid, ownedBefore.uid, 'an overwrite must not re-home the file')
+    assert.equal(ownedAfter.gid, ownedBefore.gid)
+
+    const source = path.join(f.root, 'moved-me.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'payload')
+    fs.chmodSync(source, 0o664)
+    forceExdev(t, (from) => from === source)
+    await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+    assert.equal(fs.lstatSync(destination).mode & 0o777, 0o664, 'a cross-device move must not narrow the file')
+  } finally {
+    f.cleanup()
+    process.umask(previousUmask)
+  }
+})
+
+test('R4: a failed overwrite leaves no orphan backup link in the trash', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'doc.txt')
+    writeFileSync(target, 'original')
+    const realFsync = fs.fsyncSync
+    let linked = false
+    const realLink = fs.linkSync
+    t.mock.method(fs, 'linkSync', (from, to) => {
+      const result = realLink(from, to)
+      if (from === target) linked = true
+      return result
+    })
+    // The backup link is installed, then its durability barrier fails — so the
+    // overwrite never happens and the trash must not keep a "previous version".
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (linked) throw Object.assign(new Error('io'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    await assert.rejects(writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true }))
+    assert.equal(linked, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'original')
+    const trashDir = path.join(f.root, '.matron-trash')
+    assert.deepEqual(fs.existsSync(trashDir) ? fs.readdirSync(trashDir) : [], [])
+    assert.equal(fs.lstatSync(target).nlink, 1, 'no link is left pointing at the original inode')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('R4: a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const realFsync = fs.fsyncSync
+    const realOpen = fs.openSync
+    const dirOfFd = new Map()
+    t.mock.method(fs, 'openSync', (target, flags, mode) => {
+      const fd = realOpen(target, flags, mode)
+      if (typeof target === 'string') dirOfFd.set(fd, target)
+      return fd
+    })
+    const synced = []
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      synced.push(dirOfFd.get(fd))
+      return realFsync(fd)
+    })
+
+    const target = path.join(f.root, 'a', 'b', 'c')
+    assert.equal(await mkdirGuarded(target, { writeRoots: f.writeRoots }), target)
+    assert.ok(fs.statSync(target).isDirectory())
+    // Each new component's PARENT is made durable after the child lands.
+    for (const parent of [f.root, path.join(f.root, 'a'), path.join(f.root, 'a', 'b')]) {
+      assert.ok(synced.includes(parent), `expected an fsync of ${parent}: ${synced}`)
+    }
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('R5: an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'foreign.txt')
+    writeFileSync(target, 'owned-by-someone-else')
+    t.mock.method(fs, 'fchownSync', () => { throw Object.assign(new Error('not permitted'), { code: 'EPERM' }) })
+
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true })),
+      'metadata-preserve-failed',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'owned-by-someone-else')
+    const trashDir = path.join(f.root, '.matron-trash')
+    assert.deepEqual(fs.existsSync(trashDir) ? fs.readdirSync(trashDir) : [], [], 'no backup is left for a write that did not happen')
+    assert.deepEqual(fs.readdirSync(f.root), ['foreign.txt'], 'no temp file is left behind')
   } finally {
     f.cleanup()
   }
