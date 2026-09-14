@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
@@ -18,6 +19,10 @@ import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { FileLinkDenied, denialBody, denialToStatus } from '../src/file-guard.js'
 import { makeDurableIdemStore, safeToReRun, ORPHAN_RETENTION_MS } from '../src/file-idem.js'
 
+const dirs = []
+process.on('exit', () => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })))
+const t_after = (d) => dirs.push(d)
+const tick = () => new Promise((resolve) => setImmediate(resolve))
 const tmp = (prefix) => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
 
 const DEV = 7
@@ -349,7 +354,7 @@ test('a release that the database refuses does not reject into a dangling promis
     /the write failed/,
   )
   // Let any stray rejection reach the handler before asserting it did not.
-  await new Promise((resolve) => setImmediate(resolve))
+  await tick()
   assert.equal(unhandled, undefined, 'the bookkeeping chain was terminated')
 
   db.prepare = real
@@ -464,6 +469,100 @@ test('an unknown outcome is distinguishable on the wire from a denial that chang
   assert.deepEqual(denialBody('outside-scope'), { error: 'denied' })
   assert.deepEqual(denialBody('audit-fail-closed'), { error: 'denied' })
   assert.notDeepEqual(denialBody('idem-indeterminate'), denialBody('audit-fail-closed'))
+})
+
+test('openDb repairs a pre-release file_idem table instead of wedging on its missing column', () => {
+  const dir = tmp('matron-idem-legacy-')
+  t_after(dir)
+  const dbPath = path.join(dir, 'journal.db')
+  // The exact state an earlier commit of this branch left behind: the table,
+  // without device_id. The repair has to run BEFORE the schema exec, because
+  // the schema builds an index on that column — so getting this wrong does not
+  // skip the repair, it throws out of openDb and locks every opener out of the
+  // database, server and admin CLI alike.
+  const legacy = new Database(dbPath)
+  legacy.exec(`
+    CREATE TABLE file_idem(
+      key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, boot_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','done')), intent TEXT,
+      status INTEGER, body TEXT, content_hash TEXT,
+      created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+    );
+    INSERT INTO file_idem(key,fingerprint,boot_id,state,created_at,expires_at)
+      VALUES('7:stale','fp','old-boot','pending',0,0);
+  `)
+  legacy.close()
+
+  const db = openDb(dbPath)
+  try {
+    const cols = db.prepare('PRAGMA table_info(file_idem)').all().map((c) => c.name)
+    assert.ok(cols.includes('device_id'))
+    assert.ok(cols.includes('gen'))
+    const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+    assert.equal(fk?.table, 'devices')
+    assert.equal(fk?.on_delete, 'CASCADE')
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n, 0,
+      'the pre-release row went with the table it belonged to')
+  } finally {
+    db.close()
+  }
+})
+
+test('a revoked device’s in-flight completion cannot settle its replacement’s reservation', async (t) => {
+  const db = makeDb(t)
+  const s = store(db)
+
+  // In flight when the revoke lands: the cascade takes the row, but the
+  // promise is still running and will try to record an outcome afterwards.
+  let finishOld
+  const stale = s.reserveAs('7:k', 'fp', () => new Promise((resolve) => { finishOld = resolve }),
+    { op: 'mkdir', path: '/w/old' })
+  await tick()   // the factory runs on a microtask, so let it take its resolver
+  db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
+  assert.equal(s.size(), 0)
+
+  // Same reusable id, same client-chosen key — a legitimately different
+  // reservation that merely happens to be named the same thing.
+  addDevice(db, DEV, 'reissued')
+  let finishNew
+  const fresh = s.reserveAs('7:k', 'fp', () => new Promise((resolve) => { finishNew = resolve }),
+    { op: 'mkdir', path: '/w/new' })
+
+  finishOld(ok({ path: '/w/old' }))
+  await stale.promise
+  await tick()
+
+  const row = db.prepare('SELECT state, intent FROM file_idem WHERE key=?').get('7:k')
+  assert.equal(row.state, 'pending', "the replacement's reservation was not settled by the old execution")
+  assert.match(row.intent, /\/w\/new/)
+  // And the replacement's own in-flight entry survived, so a retry still joins
+  // it rather than starting a second mutation.
+  assert.equal(s.reserveAs('7:k', 'fp', async () => ok({ path: '/w/new' }), { op: 'mkdir', path: '/w/new' }).replay,
+    true)
+
+  finishNew(ok({ path: '/w/new' }))
+  await fresh.promise
+  assert.equal(db.prepare('SELECT state FROM file_idem WHERE key=?').get('7:k').state, 'done')
+})
+
+test('a revoked device’s failed in-flight attempt cannot delete its replacement’s reservation', async (t) => {
+  const db = makeDb(t)
+  const s = store(db)
+  let failOld
+  const stale = s.reserveAs('7:k', 'fp', () => new Promise((_, reject) => { failOld = reject }),
+    { op: 'mkdir', path: '/w/old' })
+  await tick()
+  db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
+  addDevice(db, DEV, 'reissued')
+  s.reserveAs('7:k', 'fp', () => new Promise(() => {}), { op: 'mkdir', path: '/w/new' })
+  await tick()
+
+  failOld(new Error('the old attempt failed'))
+  await assert.rejects(stale.promise, /the old attempt failed/)
+  await tick()
+
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem WHERE key=?').get('7:k').n, 1,
+    'the replacement still holds its reservation, so a retry cannot execute a second time')
 })
 
 // ── end to end: a real server, stopped and replaced ──────────────────────────

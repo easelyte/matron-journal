@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS file_idem(
   -- write. The cascade is the fix, and it is the same one agent_idem carries.
   -- It also scopes the capacity quota, so one device cannot spend another's.
   device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  -- Identifies THIS reservation, not just its key. The key is chosen by the
+  -- client and the device id it embeds is reusable, so after a revoke the same
+  -- key can legitimately belong to a different reservation. Bookkeeping that
+  -- addressed rows by key alone could then let an in-flight operation from the
+  -- revoked incarnation settle, or delete, the replacement's row.
+  gen TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
   -- Which server process reserved this row. A 'pending' row whose boot_id is
   -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
@@ -296,6 +302,21 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
+  // BEFORE the schema exec, and it has to be: SCHEMA builds
+  // idx_file_idem_device, and creating that index over a table that predates
+  // the column raises `no such column: device_id` — which does not just skip
+  // the repair below, it throws out of openDb and wedges every opener, server
+  // and admin CLI alike, against exactly the database this is meant to fix.
+  //
+  // A drop is the whole migration: file_idem is introduced by the same
+  // unreleased change that added device_id, so there are no production rows to
+  // preserve. A column-less table can only exist in a dev checkout that ran an
+  // earlier commit of this branch, and SCHEMA recreates it on the next line.
+  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
+  if (fileIdemCols.length && !fileIdemCols.some((c) => c.name === 'device_id')) {
+    db.exec('DROP TABLE file_idem')
+    console.log('file_idem: dropped a pre-release dev table with no device_id column; recreating')
+  }
   db.exec(SCHEMA)
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
@@ -339,18 +360,6 @@ export function openDb(path) {
   // if its numeric id was already reused before this migration. Rows for
   // revoked/replacement devices are intentionally discarded because the new
   // cascade would have removed them.
-  // file_idem gained device_id before it ever shipped: the table is introduced
-  // by the same unreleased change, so there are no production rows to preserve
-  // and no migration to write — a pre-column table can only exist in a dev
-  // checkout that ran an earlier commit of this branch. Recreate it rather than
-  // carrying migration code for a state that never reached a release.
-  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
-  if (fileIdemCols.length && !fileIdemCols.some((c) => c.name === 'device_id')) {
-    db.exec('DROP TABLE file_idem')
-    db.exec(SCHEMA.slice(SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS file_idem('),
-      SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS user_seq(')))
-    console.log('file_idem: recreated with device_id (pre-release dev schema)')
-  }
   const agentIdemCols = db.prepare('PRAGMA table_info(agent_idem)').all()
   const agentIdemFks = db.prepare('PRAGMA foreign_key_list(agent_idem)').all()
   const agentIdemHasDevice = agentIdemCols.some((c) => c.name === 'device_id')

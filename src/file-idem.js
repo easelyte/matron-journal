@@ -114,10 +114,12 @@ export function makeDurableIdemStore({
   // passes it: there is exactly one boot id per process, by construction.
   bootId = BOOT_ID,
 } = {}) {
-  // Live promises for work running in THIS process. The database row says a
+  // Live promises for work running in THIS process, each tagged with the
+  // generation of the reservation it belongs to. The database row says a
   // reservation exists; this map is the only thing that can say it is still
   // being executed here, which is what separates "share the flight" from
-  // "recover an orphan".
+  // "recover an orphan". The generation is what keeps that answer about the
+  // RIGHT reservation when a key outlives the one that created it.
   const inflight = new Map()
 
   const sweep = () => {
@@ -147,11 +149,15 @@ export function makeDurableIdemStore({
       + orphans.map((row) => row.intent || row.key).join(', '))
   }
 
-  const settle = (key, outcome) => {
+  const settle = (key, gen, outcome) => {
     try {
-      db.prepare('UPDATE file_idem SET state=?, status=?, body=?, content_hash=?, expires_at=? WHERE key=?')
+      // Addressed by generation as well as key: a revoke cascades this row
+      // away mid-flight, and a replacement device handed the same reusable id
+      // can hold the same key by the time this runs. Without the generation,
+      // one incarnation's completion would answer for another's request.
+      db.prepare('UPDATE file_idem SET state=?, status=?, body=?, content_hash=?, expires_at=? WHERE key=? AND gen=?')
         .run('done', Number(outcome?.status), JSON.stringify(outcome?.body ?? null),
-          outcome?.contentHash ?? null, now() + ttlMs, key)
+          outcome?.contentHash ?? null, now() + ttlMs, key, gen)
     } catch (err) {
       // Recording the outcome is the one step that must not throw into a
       // dangling .then — an unhandled rejection here would take the process
@@ -169,14 +175,19 @@ export function makeDurableIdemStore({
   // unhandled rejection and take the process down mid-write. If the DELETE
   // fails the row stays PENDING, which reads as "outcome unknown" — the
   // conservative direction, since a retry is then refused rather than repeated.
-  const forget = (key) => {
+  const forget = (key, gen) => {
     try {
-      db.prepare('DELETE FROM file_idem WHERE key=?').run(key)
+      db.prepare('DELETE FROM file_idem WHERE key=? AND gen=?').run(key, gen)
     } catch (err) {
       log.error?.(`file writes: could not release reservation ${key} after a failed attempt; `
         + 'it stays pending, so a retry will be refused rather than re-run', err)
     }
   }
+
+  // Clearing the map entry is conditional for the same reason the SQL is: a
+  // later reservation may already own this key, and dropping its entry would
+  // let a concurrent retry start a second execution alongside it.
+  const release = (key, gen) => { if (inflight.get(key)?.gen === gen) inflight.delete(key) }
 
   const decode = (row) => ({
     status: row.status,
@@ -210,30 +221,32 @@ export function makeDurableIdemStore({
         + 'over its own quota; keyed writes are being refused for everyone until it drains')
       throw new FileLinkDenied('idem-store-full')
     }
+    const gen = crypto.randomUUID()
     try {
-      db.prepare(`INSERT INTO file_idem(key, device_id, fingerprint, boot_id, state, intent, created_at, expires_at)
-                  VALUES(?,?,?,?,'pending',?,?,?)`)
-        .run(key, deviceId, fingerprint, bootId, intent ? JSON.stringify(intent) : null, now(), now() + ttlMs)
+      db.prepare(`INSERT INTO file_idem(key, device_id, gen, fingerprint, boot_id, state, intent, created_at, expires_at)
+                  VALUES(?,?,?,?,?,'pending',?,?,?)`)
+        .run(key, deviceId, gen, fingerprint, bootId, intent ? JSON.stringify(intent) : null,
+          now(), now() + ttlMs)
     } catch (err) {
       // Two processes can both find no row and both insert; the primary key
       // lets exactly one through. Losing that race is not an error — the
       // winner's row is the answer — so report it as a claim that did not
       // happen and let the caller re-read rather than surfacing a 500.
-      if (String(err?.code || '').startsWith('SQLITE_CONSTRAINT')) return false
+      if (String(err?.code || '').startsWith('SQLITE_CONSTRAINT')) return null
       throw err
     }
-    return true
+    return gen
   }
 
-  const start = (key, factory) => {
+  const start = (key, gen, factory) => {
     const promise = Promise.resolve().then(factory)
-    inflight.set(key, promise)
+    inflight.set(key, { promise, gen })
     // `.catch` terminates the bookkeeping chain. settle/forget are already
     // non-throwing; this is the backstop that stops a surprise in either from
     // becoming an unhandled rejection on a promise nobody awaits.
     promise.then(
-      (outcome) => { inflight.delete(key); settle(key, outcome) },
-      () => { inflight.delete(key); forget(key) },
+      (outcome) => { release(key, gen); settle(key, gen, outcome) },
+      () => { release(key, gen); forget(key, gen) },
     ).catch(() => {})
     return promise
   }
@@ -243,6 +256,7 @@ export function makeDurableIdemStore({
   // registered in `inflight` before the first await, so two retries arriving
   // together after a restart cannot both recover the same row.
   const recover = (key, row, factory) => {
+    const gen = row.gen
     const promise = (async () => {
       const intent = row.intent ? JSON.parse(row.intent) : null
       if (!safeToReRun(intent)) {
@@ -269,20 +283,21 @@ export function makeDurableIdemStore({
       // a duplicated mkdir converges; everything destructive refuses above,
       // before reaching here. If that narrowing is ever widened, the lease has
       // to land in the same change.
-      const taken = db.prepare('UPDATE file_idem SET boot_id=?, created_at=?, expires_at=? WHERE key=? AND boot_id=?')
-        .run(bootId, now(), now() + ttlMs, key, row.boot_id)
+      const taken = db.prepare(
+        'UPDATE file_idem SET boot_id=?, created_at=?, expires_at=? WHERE key=? AND boot_id=? AND gen=?',
+      ).run(bootId, now(), now() + ttlMs, key, row.boot_id, gen)
       if (taken.changes !== 1) throw new FileLinkDenied('idem-indeterminate')
       return factory()
     })()
-    inflight.set(key, promise)
+    inflight.set(key, { promise, gen })
     promise.then(
-      (outcome) => { inflight.delete(key); settle(key, outcome) },
+      (outcome) => { release(key, gen); settle(key, gen, outcome) },
       // A refusal must NOT clear the row: the outcome is still unknown, and a
       // cleared row would let the very next retry execute as if nothing had
       // ever been reserved.
       (err) => {
-        inflight.delete(key)
-        if (!(err instanceof FileLinkDenied && err.reason === 'idem-indeterminate')) forget(key)
+        release(key, gen)
+        if (!(err instanceof FileLinkDenied && err.reason === 'idem-indeterminate')) forget(key, gen)
       },
     ).catch(() => {})
     return promise
@@ -304,7 +319,9 @@ export function makeDurableIdemStore({
         if (row.fingerprint !== fingerprint) throw new FileLinkDenied('idem-key-conflict')
         if (row.state === 'done') return { promise: Promise.resolve(decode(row)), replay: true }
         const live = inflight.get(key)
-        if (live) return { promise: live, replay: true }
+        // Only if it is THIS row's execution. A live entry left by a different
+        // generation belongs to a reservation this key no longer names.
+        if (live && live.gen === row.gen) return { promise: live.promise, replay: true }
         // NOT a replay. Recovery either re-runs the work with THIS caller's
         // request (an upload streams its own body into it) or refuses — there
         // is no recorded outcome to hand back. Claiming `replay` here would
@@ -312,7 +329,8 @@ export function makeDurableIdemStore({
         // result that does not exist, starving the re-execution of its bytes.
         return { promise: recover(key, row, factory), replay: false }
       }
-      if (!claim(key, fingerprint, intent, deviceId)) {
+      const gen = claim(key, fingerprint, intent, deviceId)
+      if (!gen) {
         // Another process inserted this key between our read and our insert.
         // Re-enter ONCE to pick up its row; a second miss would mean the row
         // vanished again, which only a concurrent sweep of an expired row can
@@ -320,7 +338,7 @@ export function makeDurableIdemStore({
         if (reread) throw new FileLinkDenied('idem-indeterminate')
         return this.reserve(key, fingerprint, factory, intent, deviceId, true)
       }
-      return { promise: start(key, factory), replay: false }
+      return { promise: start(key, gen, factory), replay: false }
     },
 
     run(key, fingerprint, factory, intent, deviceId) {
