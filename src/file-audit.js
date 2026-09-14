@@ -30,8 +30,19 @@
 //     takes an interprocess lock, so a second writer is not a thing to be
 //     careful about — it is unsupported. Adding one means putting
 //     fstat -> tail -> write/rollback -> fsync under a real file lock first
-//     (Codex R7-F2). Log ROTATION from another process is supported and is
-//     handled by the identity check after fsync, below.
+//     (Codex R7-F2). Log ROTATION from another process is supported, subject
+//     to contract 4.
+//
+//  4. Rotation is rename/create, never copytruncate. Renaming the log away and
+//     letting the next append create a fresh one is what the reachability
+//     check below is built for. `copytruncate` — copy the file, then truncate
+//     the SAME inode in place — can copy the archive before this record is
+//     appended and empty the original after it is fsynced, so the record
+//     survives in neither. The identity check cannot see that (the inode never
+//     changed), so there is an explicit post-write size check as well. It
+//     makes copytruncate FAIL CLOSED rather than silently tolerated: a write
+//     racing that rotation gets a 507 and no mutation, not an unlogged change
+//     (Codex R7-R2-F1). Configure rotation accordingly.
 //
 // Failure posture: throw. The caller maps a throw to 507 and performs NO
 // mutation (fail-closed). Silently continuing would be the one outcome this
@@ -102,7 +113,7 @@ function assertIntactTail(fd, target, size) {
 // misses happened AFTER the intent was durably recorded on the log that was
 // live at the time, so no destructive op is ever authorized by a record the
 // live log never received.
-function assertRecordIsReachable(fd, target, opened) {
+function assertRecordIsReachable(fd, target, opened, minSize) {
   let live
   try {
     live = fs.lstatSync(target)
@@ -111,6 +122,14 @@ function assertRecordIsReachable(fd, target, opened) {
   }
   if (live.dev !== opened.dev || live.ino !== opened.ino) {
     throw new FileAuditFailed(`${target} was replaced while this record was being written; the record is durable only in the rotated-away file, so the operation is refused`)
+  }
+  // Identity survives a copytruncate rotation — the bytes do not. The log is
+  // append-only, so its size can only ever GROW while this process holds the
+  // descriptor; anything shorter than our own line's end offset means the
+  // content was cut out from under it (contract 4).
+  const now = fs.fstatSync(fd)
+  if (now.size < minSize) {
+    throw new FileAuditFailed(`${target} was truncated while this record was being written (${now.size} bytes, expected at least ${minSize}); the live log no longer holds the write-ahead entry, so the operation is refused`)
   }
 }
 
@@ -259,7 +278,7 @@ export function appendAudit(dir, entry) {
     }
     fs.fsyncSync(fd)
     // Durable — but durable somewhere the live log can still be read from?
-    assertRecordIsReachable(fd, target, opened)
+    assertRecordIsReachable(fd, target, opened, sizeBefore + line.length)
     // fsync on the FILE does not make a brand-new directory ENTRY durable. On
     // the very first write after a deploy (or after the log is rotated away) a
     // power loss could otherwise keep the committed mutation and lose the

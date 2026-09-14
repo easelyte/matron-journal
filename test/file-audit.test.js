@@ -374,3 +374,31 @@ test('R7-F1: an audit log unlinked mid-append refuses the operation', (t) => {
   t.mock.restoreAll()
   assert.ok(removed)
 })
+
+test('R7-R2-F1: a copytruncate rotation of the same inode refuses the operation', (t) => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
+
+  // copytruncate empties the log IN PLACE, so dev/ino are untouched and the
+  // identity check has nothing to see — but the record we just fsynced is gone
+  // from both the live log and the archive copied before we appended.
+  const realFsync = fs.fsyncSync
+  let truncated = false
+  t.mock.method(fs, 'fsyncSync', (fd) => {
+    const out = realFsync(fd)
+    if (!truncated) { truncated = true; fs.truncateSync(target, 0) }
+    return out
+  })
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /was truncated while this record was being written/,
+  )
+  t.mock.restoreAll()
+  assert.ok(truncated, 'the log really was truncated in place mid-call')
+  assert.equal(fs.readFileSync(target, 'utf8'), '', 'the live log holds no intent for the refused op')
+  // Not sticky: the next append writes into the freshly emptied log.
+  appendAudit(dir, { ts: 3, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' })
+  assert.deepEqual(lines(dir).map((r) => r.ts), [3])
+})
