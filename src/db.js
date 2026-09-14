@@ -334,20 +334,29 @@ export function openDb(path) {
   // which quietly restores the bug that revision removed: a revoke would
   // delete a PENDING reservation whose work is still running, and a reused
   // device id with the same key would then execute it a second time.
-  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
-  const fileIdemFk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
-  const deviceCol = fileIdemCols.find((c) => c.name === 'device_id')
-  const fileIdemStale = fileIdemCols.length && !(
-    deviceCol && deviceCol.notnull === 0
-    && fileIdemCols.some((c) => c.name === 'gen')
-    && fileIdemFk && fileIdemFk.table === 'devices'
-    && String(fileIdemFk.on_delete).toUpperCase() === 'SET NULL'
-  )
-  if (fileIdemStale) {
-    db.exec('DROP TABLE file_idem')
-    console.log('file_idem: dropped a pre-release dev table whose shape predates this revision; recreating')
-  }
-  db.exec(SCHEMA)
+  //
+  // Inspect, drop and create in ONE immediate transaction. Both the server and
+  // the admin CLI open this database, and split across three statements two
+  // concurrent openers can each see the stale table — the second then either
+  // fails on a table that is no longer there or drops the correct one the
+  // first just built. The write lock serialises them, and the loser re-reads
+  // under it and finds nothing to do.
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(file_idem)').all()
+    const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+    const deviceCol = cols.find((c) => c.name === 'device_id')
+    const stale = cols.length && !(
+      deviceCol && deviceCol.notnull === 0
+      && cols.some((c) => c.name === 'gen')
+      && fk && fk.table === 'devices'
+      && String(fk.on_delete).toUpperCase() === 'SET NULL'
+    )
+    if (stale) {
+      db.exec('DROP TABLE file_idem')
+      console.log('file_idem: dropped a pre-release dev table whose shape predates this revision; recreating')
+    }
+    db.exec(SCHEMA)
+  }).immediate()
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.

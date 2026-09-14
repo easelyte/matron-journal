@@ -681,6 +681,41 @@ test('a reservation whose intent cannot be read refuses, and keeps its evidence'
   )
 })
 
+test('a stored intent that disagrees with the request cannot authorize it', async (t) => {
+  const db = makeDb(t)
+  // Corruption or version skew that stays VALID JSON: a pending `delete`
+  // whose stored intent now reads as a `mkdir`. Deciding replay safety from
+  // the stored side alone would pass it — and then run the delete factory,
+  // because that is what the CURRENT request carries.
+  const real = { op: 'delete', path: '/w/x' }
+  store(db, { bootId: 'boot-1' }).reserveAs('7:k', 'fp', () => new Promise(() => {}), real)
+  await tick()
+  db.prepare('UPDATE file_idem SET intent=? WHERE key=?').run(JSON.stringify({ op: 'mkdir', path: '/w/x' }), '7:k')
+
+  const after = store(db, { bootId: 'boot-2' })
+  await assert.rejects(
+    after.runAs('7:k', 'fp', async () => { throw new Error('a delete authorized by a mkdir') }, real),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+  await tick()
+  assert.equal(after.size(), 1, 'and the evidence stands')
+})
+
+test('recovery still runs when both descriptions of the work agree', async (t) => {
+  const db = makeDb(t)
+  // The positive control for the check above: same op, same path, so the
+  // stored reservation really does describe the factory about to run.
+  const intent = { op: 'mkdir', path: '/w/a' }
+  store(db, { bootId: 'boot-1' }).reserveAs('7:k', 'fp', () => new Promise(() => {}), intent)
+  await tick()
+
+  let ran = 0
+  const outcome = await store(db, { bootId: 'boot-2' })
+    .runAs('7:k', 'fp', async () => { ran += 1; return ok({ path: '/w/a' }) }, { op: 'mkdir', path: '/w/a' })
+  assert.equal(ran, 1)
+  assert.equal(outcome.status, 200)
+})
+
 // ── end to end: a real server, stopped and replaced ──────────────────────────
 test('a move retried across a real server restart executes exactly once', async (t) => {
   const root = tmp('matron-idem-e2e-')

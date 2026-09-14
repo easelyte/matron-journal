@@ -268,7 +268,14 @@ export function makeDurableIdemStore({
   // only if the filesystem proves it never took effect. The recovery itself is
   // registered in `inflight` before the first await, so two retries arriving
   // together after a restart cannot both recover the same row.
-  const recover = (key, row, factory) => {
+  // Two descriptions of the same work: `row.intent` is what was RESERVED, and
+  // `intent` is what THIS request will actually run. They agree in normal
+  // operation, because one code path writes both — so requiring them to agree
+  // costs nothing, and deciding from one while executing the other is how a
+  // corrupted or version-skewed row authorises a factory it never described.
+  const sameIntent = (a, b) => !!a && !!b && a.op === b.op && a.path === b.path && a.to === b.to
+
+  const recover = (key, row, factory, intent) => {
     const gen = row.gen
     const promise = (async () => {
       // A row we cannot READ is a row whose outcome we cannot reason about, so
@@ -276,15 +283,19 @@ export function makeDurableIdemStore({
       // reach the rejection handler below as an ordinary failure and DELETE the
       // reservation — destroying the evidence, and handing the next retry a
       // clean slate for a mutation that may well have happened.
-      let intent = null
+      let stored = null
       try {
-        intent = row.intent ? JSON.parse(row.intent) : null
+        stored = row.intent ? JSON.parse(row.intent) : null
       } catch {
         log.error?.(`file writes: reservation ${key} has an unreadable intent, so its outcome cannot be `
           + 'reasoned about; refusing and keeping the row')
         throw new FileLinkDenied('idem-indeterminate')
       }
-      if (!safeToReRun(intent)) {
+      // Both must be safe, and they must be the SAME work. Checking only the
+      // stored side leaves the syntactically-valid corruption: a pending
+      // `delete` row whose intent reads `{"op":"mkdir"}` would pass, and the
+      // delete factory would run.
+      if (!safeToReRun(stored) || !safeToReRun(intent) || !sameIntent(stored, intent)) {
         log.error?.('file writes: refusing a retry whose original outcome is unknown '
           + `(reservation ${key} outlived its server process): ${row.intent || 'no recorded intent'}`)
         throw new FileLinkDenied('idem-indeterminate')
@@ -359,7 +370,7 @@ export function makeDurableIdemStore({
         // is no recorded outcome to hand back. Claiming `replay` here would
         // make settleUpload drain the body for a hash comparison against a
         // result that does not exist, starving the re-execution of its bytes.
-        return { promise: recover(key, row, factory), replay: false }
+        return { promise: recover(key, row, factory, intent), replay: false }
       }
       const gen = claim(key, fingerprint, intent, deviceId)
       if (!gen) {
