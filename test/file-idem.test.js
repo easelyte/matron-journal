@@ -383,7 +383,7 @@ test('dropping an unresolved reservation at the retention bound is reported, nev
   assert.match(dropped[0], /\/w\/x/)
 })
 
-test('revoking a device takes its reservations with it, settled and pending alike', async (t) => {
+test('revoking a device discards what it was told, and keeps what it started', async (t) => {
   const db = makeDb(t)
   addDevice(db, 8)
   const s = store(db)
@@ -391,25 +391,35 @@ test('revoking a device takes its reservations with it, settled and pending alik
   await s.runAs('7:done-key', 'fp', async () => ok({ path: '/w/a' }), { op: 'mkdir', path: '/w/a' })
   s.reserveAs('7:pending-key', 'fp', () => new Promise(() => {}), { op: 'delete', path: '/w/x' })
   await s.runAs('8:other', 'fp', async () => ok({ path: '/w/b' }), { op: 'mkdir', path: '/w/b' }, 8)
+  await tick()
   assert.equal(s.size(), 3)
 
-  // devices.id is a reusable rowid. If these rows outlived the revocation, the
-  // replacement handed id 7 would inherit them: served the old incarnation's
-  // cached response, or refused outright by an orphan it never created.
   db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
-  assert.equal(s.size(), 1, 'both of the revoked device rows went with it')
+
+  // The settled row was a cached RESPONSE. devices.id is a reusable rowid, so
+  // leaving it would answer a replacement with the previous incarnation's
+  // result — it goes with the device.
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM file_idem WHERE key='7:done-key'").get().n, 0)
+  // The pending row was a live EXCLUSION record, and its work may still be
+  // running. It is detached instead, and still refuses its key.
+  const tombstone = db.prepare("SELECT device_id, state FROM file_idem WHERE key='7:pending-key'").get()
+  assert.equal(tombstone.device_id, null, 'unowned, so it is charged to no quota')
+  assert.equal(tombstone.state, 'pending')
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem WHERE device_id=8').get().n, 1,
     "the other device's reservation is untouched")
 
-  // The replacement really does start clean, including on the key that was
-  // mid-flight when its predecessor was revoked.
   addDevice(db, DEV, 'reissued')
-  let ran = 0
-  await s.runAs('7:pending-key', 'fp', async () => { ran += 1; return ok({ path: '/w/x' }) },
-    { op: 'mkdir', path: '/w/x' })
-  assert.equal(ran, 1)
+  // The replacement is refused on the tombstoned key rather than starting a
+  // second execution of work that may still be in flight.
+  assert.throws(
+    () => s.runAs('7:pending-key', 'fp', async () => { throw new Error('executed against a live reservation') },
+      { op: 'delete', path: '/w/x' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+  // Its own keys are unaffected — the refusal is scoped to the collision.
+  assert.equal((await s.runAs('7:fresh', 'fp', async () => ok({ path: '/w/f' }),
+    { op: 'mkdir', path: '/w/f' })).status, 200)
 })
-
 test('one device cannot spend another device’s reservation budget', async (t) => {
   const db = makeDb(t)
   addDevice(db, 8)
@@ -500,7 +510,9 @@ test('openDb repairs a pre-release file_idem table instead of wedging on its mis
     assert.ok(cols.includes('gen'))
     const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
     assert.equal(fk?.table, 'devices')
-    assert.equal(fk?.on_delete, 'CASCADE')
+    assert.equal(fk?.on_delete, 'SET NULL')
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name=?")
+      .get('file_idem_drop_settled_on_revoke'), 'settled rows are dropped by the revoke trigger')
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n, 0,
       'the pre-release row went with the table it belonged to')
   } finally {
@@ -508,44 +520,35 @@ test('openDb repairs a pre-release file_idem table instead of wedging on its mis
   }
 })
 
-test('a revoked device’s in-flight completion cannot settle its replacement’s reservation', async (t) => {
+test('a revoked device’s in-flight work keeps its key reserved, and settles only its own row', async (t) => {
   const db = makeDb(t)
   const s = store(db)
 
-  // In flight when the revoke lands: the cascade takes the row, but the
-  // promise is still running and will try to record an outcome afterwards.
   let finishOld
   const stale = s.reserveAs('7:k', 'fp', () => new Promise((resolve) => { finishOld = resolve }),
-    { op: 'mkdir', path: '/w/old' })
+    { op: 'move', path: '/w/old', to: '/w/dest' })
   await tick()   // the factory runs on a microtask, so let it take its resolver
   db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
-  assert.equal(s.size(), 0)
-
-  // Same reusable id, same client-chosen key — a legitimately different
-  // reservation that merely happens to be named the same thing.
   addDevice(db, DEV, 'reissued')
-  let finishNew
-  const fresh = s.reserveAs('7:k', 'fp', () => new Promise((resolve) => { finishNew = resolve }),
-    { op: 'mkdir', path: '/w/new' })
 
-  finishOld(ok({ path: '/w/old' }))
+  // The mutation is STILL RUNNING. Handing the replacement a clean slate here
+  // is what executes a move twice; it is refused instead.
+  assert.throws(
+    () => s.runAs('7:k', 'fp', async () => { throw new Error('a second execution of live work') },
+      { op: 'move', path: '/w/old', to: '/w/dest' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+
+  finishOld(ok({ path: '/w/dest' }))
   await stale.promise
   await tick()
 
-  const row = db.prepare('SELECT state, intent FROM file_idem WHERE key=?').get('7:k')
-  assert.equal(row.state, 'pending', "the replacement's reservation was not settled by the old execution")
-  assert.match(row.intent, /\/w\/new/)
-  // And the replacement's own in-flight entry survived, so a retry still joins
-  // it rather than starting a second mutation.
-  assert.equal(s.reserveAs('7:k', 'fp', async () => ok({ path: '/w/new' }), { op: 'mkdir', path: '/w/new' }).replay,
-    true)
-
-  finishNew(ok({ path: '/w/new' }))
-  await fresh.promise
-  assert.equal(db.prepare('SELECT state FROM file_idem WHERE key=?').get('7:k').state, 'done')
+  // It settled its OWN row — the detached one — and created nothing new.
+  const rows = db.prepare('SELECT device_id, state FROM file_idem WHERE key=?').all('7:k')
+  assert.equal(rows.length, 1)
+  assert.deepEqual(rows[0], { device_id: null, state: 'done' })
 })
-
-test('a revoked device’s failed in-flight attempt cannot delete its replacement’s reservation', async (t) => {
+test('a revoked device’s FAILED attempt releases its key, because nothing is in flight to protect', async (t) => {
   const db = makeDb(t)
   const s = store(db)
   let failOld
@@ -554,15 +557,65 @@ test('a revoked device’s failed in-flight attempt cannot delete its replacemen
   await tick()
   db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
   addDevice(db, DEV, 'reissued')
-  s.reserveAs('7:k', 'fp', () => new Promise(() => {}), { op: 'mkdir', path: '/w/new' })
-  await tick()
 
   failOld(new Error('the old attempt failed'))
   await assert.rejects(stale.promise, /the old attempt failed/)
   await tick()
 
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem WHERE key=?').get('7:k').n, 1,
-    'the replacement still holds its reservation, so a retry cannot execute a second time')
+  // A rejected attempt means the mutation did NOT happen, so the tombstone has
+  // nothing left to guard and the key is genuinely free again.
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM file_idem WHERE key=?').get('7:k').n, 0)
+  let ran = 0
+  assert.equal((await s.runAs('7:k', 'fp', async () => { ran += 1; return ok({ path: '/w/new' }) },
+    { op: 'mkdir', path: '/w/new' })).status, 200)
+  assert.equal(ran, 1)
+})
+test('a pre-release table missing only the later column is repaired too', () => {
+  const dir = tmp('matron-idem-legacy2-')
+  t_after(dir)
+  const dbPath = path.join(dir, 'journal.db')
+  // This branch grew device_id in one round and gen in the next, so a dev
+  // database can hold either half-built shape. Checking one column would let
+  // this one through: startup would succeed and the first keyed write would
+  // fail on the missing column as a bare 500.
+  const legacy = new Database(dbPath)
+  legacy.exec(`
+    CREATE TABLE file_idem(
+      key TEXT PRIMARY KEY, device_id INTEGER, fingerprint TEXT NOT NULL, boot_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','done')), intent TEXT,
+      status INTEGER, body TEXT, content_hash TEXT,
+      created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+    );
+  `)
+  legacy.close()
+
+  const db = openDb(dbPath)
+  try {
+    assert.ok(db.prepare('PRAGMA table_info(file_idem)').all().map((c) => c.name).includes('gen'))
+  } finally {
+    db.close()
+  }
+})
+
+test('a device revoked between authenticating and reserving is refused, not told the outcome is unknown', async (t) => {
+  const db = makeDb(t)
+  const s = store(db)
+  // The token was valid when it was presented; the device is gone by the time
+  // the reservation is written. The insert fails on the foreign key — which is
+  // a DEFINITE refusal, since the work has not started. Reporting it as the
+  // insert RACE would end in `idem-indeterminate`: telling a caller its
+  // outcome is unknown when nothing whatsoever happened.
+  db.prepare('DELETE FROM devices WHERE id=?').run(DEV)
+
+  let ran = 0
+  assert.throws(
+    () => s.runAs('7:k', 'fp', async () => { ran += 1; return ok({ path: '/w/a' }) }, { op: 'mkdir', path: '/w/a' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'device-revoked',
+  )
+  assert.equal(ran, 0, 'nothing ran')
+  assert.equal(denialToStatus('device-revoked'), 403)
+  assert.deepEqual(denialBody('device-revoked'), { error: 'denied' },
+    'and it reads as an ordinary denial, because the filesystem really is unchanged')
 })
 
 // ── end to end: a real server, stopped and replaced ──────────────────────────

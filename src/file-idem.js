@@ -199,6 +199,10 @@ export function makeDurableIdemStore({
   // is durable BEFORE the first irreversible filesystem call, so a crash
   // between the two leaves evidence rather than a clean slate.
   const claim = (key, fingerprint, intent, deviceId) => {
+    // The column is nullable only so revocation can DETACH a row; a new
+    // reservation always has an owner, and an unowned one would be a tombstone
+    // nothing could ever settle.
+    if (typeof deviceId !== 'number') throw new FileLinkDenied('device-revoked')
     sweep()
     // Nothing is evicted to make room. `sweep()` has already dropped every
     // EXPIRED settled row, so whatever is left is a live guarantee: a `done`
@@ -232,7 +236,16 @@ export function makeDurableIdemStore({
       // lets exactly one through. Losing that race is not an error — the
       // winner's row is the answer — so report it as a claim that did not
       // happen and let the caller re-read rather than surfacing a 500.
-      if (String(err?.code || '').startsWith('SQLITE_CONSTRAINT')) return null
+      // Only a key collision is the race. The other constraint that can fire
+      // here is the foreign key — the device was revoked between authenticating
+      // and reserving — and that is a DEFINITE refusal: the factory has not
+      // run and the filesystem has not changed. Reporting it as a race would
+      // end in `idem-indeterminate`, telling the caller its outcome is unknown
+      // when we know exactly what it was, which is the one lie this module is
+      // built to avoid.
+      const code = String(err?.code || '')
+      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') return null
+      if (code === 'SQLITE_CONSTRAINT_FOREIGNKEY') throw new FileLinkDenied('device-revoked')
       throw err
     }
     return gen
@@ -314,6 +327,13 @@ export function makeDurableIdemStore({
       sweep()
       const row = db.prepare('SELECT * FROM file_idem WHERE key=?').get(key)
       if (row) {
+        // Whose row is this? `device_id` is NULL on a reservation detached by
+        // revocation, and a different number if the id was reused — either way
+        // the row belongs to an incarnation that is not this caller. Its
+        // outcome is not ours to serve, its flight is not ours to join, and it
+        // is emphatically not a clean slate: the work it reserved may still be
+        // running, so its key stays refused until the tombstone is swept.
+        if (row.device_id !== deviceId) throw new FileLinkDenied('idem-indeterminate')
         // A reused key carrying a different request is served a conflict, never
         // someone else's result.
         if (row.fingerprint !== fingerprint) throw new FileLinkDenied('idem-key-conflict')

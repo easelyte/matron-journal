@@ -162,6 +162,10 @@ export function denialToStatus(reason) {
       || reason === 'metadata-preserve-failed') return 507;
   // Every idempotency reservation is occupied by work that is still running.
   // Transient and retryable — 503, not a conflict and not a bug.
+  // The device was revoked between authenticating and reserving. Nothing ran,
+  // so it is an ordinary refusal — and a 403 rather than a 401, because the
+  // token was valid when it was presented.
+  if (reason === 'device-revoked') return 403;
   if (reason === 'idem-store-full') return 503;
   // The reservation outlived the process executing it, and the filesystem
   // cannot prove the work never happened. Grouped with the 507s because it is

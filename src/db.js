@@ -63,12 +63,21 @@ CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
 CREATE TABLE IF NOT EXISTS file_idem(
   key TEXT PRIMARY KEY,
   -- The device INCARNATION that reserved this row, not just the id encoded in
-  -- the key. devices.id is a reusable rowid, so a revoked device's rows would
-  -- otherwise be inherited by whichever replacement is handed the same number
-  -- — serving it the old incarnation's cached response or refusing its first
-  -- write. The cascade is the fix, and it is the same one agent_idem carries.
-  -- It also scopes the capacity quota, so one device cannot spend another's.
-  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  -- the key. devices.id is a reusable rowid, so without this a revoked device's
+  -- rows are inherited by whichever replacement is handed the same number.
+  --
+  -- Revocation splits by state, because the two states fail in opposite
+  -- directions. A SETTLED row is a cached response: inherited, it answers a
+  -- replacement with the previous incarnation's result, so the trigger below
+  -- deletes it. A PENDING row is a live exclusion record, and its work may
+  -- still be running — cascading it away would let a retry execute a second
+  -- time, which for an upload or a move destroys data. So it is detached
+  -- (device_id → NULL) and kept as a tombstone: unowned, charged to no one's
+  -- quota, swept at the orphan retention bound, and refusing its key until
+  -- then. A replacement colliding on that key is refused rather than served or
+  -- joined — the safe direction, and the collision needs both id reuse and the
+  -- same client-chosen key.
+  device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
   -- Identifies THIS reservation, not just its key. The key is chosen by the
   -- client and the device id it embeds is reusable, so after a revoke the same
   -- key can legitimately belong to a different reservation. Bookkeeping that
@@ -91,6 +100,11 @@ CREATE TABLE IF NOT EXISTS file_idem(
 );
 CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
 CREATE INDEX IF NOT EXISTS idx_file_idem_device ON file_idem(device_id);
+-- Fires before the FK's SET NULL detaches the rest, so only reservations that
+-- have already answered are discarded with the device.
+CREATE TRIGGER IF NOT EXISTS file_idem_drop_settled_on_revoke BEFORE DELETE ON devices BEGIN
+  DELETE FROM file_idem WHERE device_id=OLD.id AND state='done';
+END;
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL
@@ -312,10 +326,17 @@ export function openDb(path) {
   // unreleased change that added device_id, so there are no production rows to
   // preserve. A column-less table can only exist in a dev checkout that ran an
   // earlier commit of this branch, and SCHEMA recreates it on the next line.
-  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
-  if (fileIdemCols.length && !fileIdemCols.some((c) => c.name === 'device_id')) {
+  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all().map((c) => c.name)
+  // Every column this branch added, checked as a set rather than one at a
+  // time: the branch grew `device_id` in one round and `gen` in the next, so a
+  // dev database can hold either shape. Testing only the first would let the
+  // second through, startup would succeed, and the first keyed write would
+  // fail on the missing column as a bare 500.
+  const fileIdemRequired = ['device_id', 'gen']
+  if (fileIdemCols.length && !fileIdemRequired.every((c) => fileIdemCols.includes(c))) {
     db.exec('DROP TABLE file_idem')
-    console.log('file_idem: dropped a pre-release dev table with no device_id column; recreating')
+    console.log('file_idem: dropped an incomplete pre-release dev table '
+      + `(missing ${fileIdemRequired.filter((c) => !fileIdemCols.includes(c)).join(', ')}); recreating`)
   }
   db.exec(SCHEMA)
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
