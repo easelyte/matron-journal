@@ -19,9 +19,11 @@
 //              in-memory store did: two concurrent retries, one mutation.
 //   pending, a PREVIOUS process
 //            — we reserved it, then died. Whether the filesystem changed is
-//              genuinely unknown. We do not guess, and we do not re-run: we
-//              ask the filesystem for the one answer it can give soundly
-//              ("this provably did NOT happen"), and refuse otherwise.
+//              genuinely unknown, and nothing we can observe NOW settles it:
+//              a present post-state is not evidence about the past, because
+//              any other actor could have produced it in between. So we re-run
+//              only what is safe to re-run REGARDLESS of whether it already
+//              ran, and refuse everything else with `idem-indeterminate`.
 //
 // ORDERING, which is what makes the record trustworthy: the `done` row is
 // written by a `.then` registered at reservation time, so it lands BEFORE the
@@ -42,7 +44,6 @@
 // the guard, not by this module, and inventing them would answer a caller with
 // a body that no execution ever produced.
 import crypto from 'node:crypto'
-import fsp from 'node:fs/promises'
 import { FileLinkDenied } from './file-guard.js'
 // One TTL, not two: the window a key is replayable for is a property of the
 // write API, and a second copy here would drift from the route module's.
@@ -65,42 +66,34 @@ export const FILE_IDEM_MAX_ROWS = 4096
 // week-old request, so the eventual sweep costs nothing real.
 export const ORPHAN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 
-const stat = async (p) => { try { return await fsp.lstat(p) } catch { return null } }
-
-// Can we prove, from the filesystem alone, that the interrupted operation did
-// NOT take effect? Only then is re-running it safe. Every other shape —
-// including "it looks like it DID happen" — returns false, because a
-// post-state that matches the intent can equally be another actor's work, and
-// acting on that guess is how a replayed delete removes a replacement.
+// Is it safe to re-run this operation, given we cannot know whether the
+// original attempt took effect?
 //
-// Note the asymmetry is deliberate: proving absence of an effect is sound
-// (nothing to undo), proving presence is not (we cannot tell our effect from
-// someone else's identical one).
-export async function provablyNotCommitted(intent) {
-  if (!intent || typeof intent !== 'object') return false
-  switch (intent.op) {
-    // mkdir -p is idempotent in effect — the route itself answers 200 for an
-    // existing directory — so re-running it cannot destroy anything.
-    case 'mkdir':
-      return true
-    // The target does not exist, so no earlier attempt landed it. (If it DOES
-    // exist we stop: it may be ours, it may be someone else's, and for an
-    // overwrite the difference is a file.)
-    case 'write':
-    case 'upload':
-      return (await stat(intent.path)) === null
-    // The source is still where it was and the destination is still empty:
-    // the rename did not happen.
-    case 'move':
-      return (await stat(intent.path)) !== null && (await stat(intent.to)) === null
-    // Deliberately absent: `delete`. A present target could be the original
-    // (not deleted) or a replacement created after ours was trashed, and those
-    // two demand opposite actions. The web client sends no Idempotency-Key on
-    // DELETE at all and resolves an unknown outcome by making the operator
-    // look at the listing — which is the right answer here too.
-    default:
-      return false
-  }
+// The first cut of this module asked the filesystem instead — "is the target
+// still absent?" — and read absence as proof that nothing had been committed.
+// That inference is unsound, and adversarial review was right to call it a
+// blocker. A post-state observed NOW is not evidence about the past: our
+// upload may have committed and then been deleted, our move may have been
+// moved back. Re-running on that reading resurrects content someone
+// deliberately removed, or moves a replacement belonging to later work. The
+// asymmetry the old comment claimed — absence provable, presence not — does
+// not hold once a third actor can touch the tree, and the write root is the
+// operator's live workspace, where one always can.
+//
+// Nor is there cheap immutable evidence to put in its place. Recording a
+// pre-state fingerprint (dev/ino, mtime) at reservation time makes the guess
+// stronger but still not sound: rename preserves the inode, so an inverse move
+// is indistinguishable from no move at all. Likelihood is not proof.
+//
+// So the question is no longer "did it happen?" — which we cannot answer — but
+// "does it matter whether it happened?", which only an operation that
+// converges on re-execution can answer yes to.
+export function safeToReRun(intent) {
+  // `mkdir -p` is the only one: the route itself answers 200 for a directory
+  // that already exists, and creating one destroys nothing. write, upload,
+  // move and delete can each destroy or duplicate, so an unknown outcome is
+  // refused (507) and left for the operator, who can see the tree.
+  return !!intent && typeof intent === 'object' && intent.op === 'mkdir'
 }
 
 // `db` is required — durability is the entire point, and a store that silently
@@ -123,7 +116,17 @@ export function makeDurableIdemStore({
     db.prepare('DELETE FROM file_idem WHERE state=? AND expires_at<=?').run('done', now())
     // Orphans outlive the replay TTL by design (see ORPHAN_RETENTION_MS); this
     // is the far outer bound that keeps a crash storm from wedging the table.
-    db.prepare("DELETE FROM file_idem WHERE state='pending' AND created_at<=?").run(now() - ORPHAN_RETENTION_MS)
+    // Dropping one destroys the evidence that made its key refusable, so it is
+    // never done quietly: past this bound we accept that nothing is still
+    // retrying a week-old request, and we say exactly what we let go of.
+    const cutoff = now() - ORPHAN_RETENTION_MS
+    const dropping = db.prepare("SELECT key, intent FROM file_idem WHERE state='pending' AND created_at<=?").all(cutoff)
+    if (!dropping.length) return
+    log.error?.(`file writes: dropping ${dropping.length} unresolved idempotency reservation(s) past the `
+      + `${Math.round(ORPHAN_RETENTION_MS / 86_400_000)}-day retention bound; their outcome was never `
+      + 'determined, and a retry carrying the same key will now execute as if nothing had been reserved: '
+      + dropping.map((row) => row.intent || row.key).join(', '))
+    db.prepare("DELETE FROM file_idem WHERE state='pending' AND created_at<=?").run(cutoff)
   }
 
   // Orphans are not swept at startup: a row that outlived its process is
@@ -152,8 +155,20 @@ export function makeDurableIdemStore({
     }
   }
   // A failed attempt is not a result worth replaying — drop the reservation so
-  // the caller can genuinely retry. Unchanged from the in-memory store.
-  const forget = (key) => db.prepare('DELETE FROM file_idem WHERE key=?').run(key)
+  // the caller can genuinely retry. Non-throwing for exactly the reason
+  // `settle` is: this runs inside a `.then` whose promise nobody awaits, so a
+  // SQLITE_BUSY / SQLITE_FULL / I/O error raised here would surface as an
+  // unhandled rejection and take the process down mid-write. If the DELETE
+  // fails the row stays PENDING, which reads as "outcome unknown" — the
+  // conservative direction, since a retry is then refused rather than repeated.
+  const forget = (key) => {
+    try {
+      db.prepare('DELETE FROM file_idem WHERE key=?').run(key)
+    } catch (err) {
+      log.error?.(`file writes: could not release reservation ${key} after a failed attempt; `
+        + 'it stays pending, so a retry will be refused rather than re-run', err)
+    }
+  }
 
   const decode = (row) => ({
     status: row.status,
@@ -166,17 +181,19 @@ export function makeDurableIdemStore({
   // between the two leaves evidence rather than a clean slate.
   const claim = (key, fingerprint, intent) => {
     sweep()
-    const count = () => db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n
-    if (count() >= max) {
-      // Settled rows are a replay cache and may be reclaimed early; a PENDING
-      // row is either live work or the evidence of an unknown outcome, and
-      // dropping either would let a retry start a second mutation. So: evict
-      // the oldest settled rows, and refuse rather than touch the rest. Same
-      // rule the in-memory store enforced, now with a durable table under it.
-      db.prepare(`DELETE FROM file_idem WHERE key IN (
-                    SELECT key FROM file_idem WHERE state='done'
-                    ORDER BY expires_at ASC LIMIT ?)`).run(count() - max + 1)
-      if (count() >= max) throw new FileLinkDenied('idem-store-full')
+    // Nothing is evicted to make room. `sweep()` has already dropped every
+    // EXPIRED settled row, so whatever is left is a live guarantee: a `done`
+    // row inside its replay window IS the promise that a retry of that key
+    // will not execute twice, and a `pending` row is either work in flight or
+    // the evidence of an unknown outcome. The previous cut reclaimed the
+    // oldest settled rows under pressure — which hands a retry a clean slate
+    // and lets a move or delete run a second time, and since the table is
+    // global, one client could force that against another client's keys.
+    // Refusing is the safe failure: 503 is raised BEFORE any filesystem call,
+    // so the caller can retry the same key once the window drains and nothing
+    // has happened in between.
+    if (db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n >= max) {
+      throw new FileLinkDenied('idem-store-full')
     }
     db.prepare(`INSERT INTO file_idem(key, fingerprint, boot_id, state, intent, created_at, expires_at)
                 VALUES(?,?,?,'pending',?,?,?)`)
@@ -186,10 +203,13 @@ export function makeDurableIdemStore({
   const start = (key, factory) => {
     const promise = Promise.resolve().then(factory)
     inflight.set(key, promise)
+    // `.catch` terminates the bookkeeping chain. settle/forget are already
+    // non-throwing; this is the backstop that stops a surprise in either from
+    // becoming an unhandled rejection on a promise nobody awaits.
     promise.then(
       (outcome) => { inflight.delete(key); settle(key, outcome) },
       () => { inflight.delete(key); forget(key) },
-    )
+    ).catch(() => {})
     return promise
   }
 
@@ -200,15 +220,33 @@ export function makeDurableIdemStore({
   const recover = (key, row, factory) => {
     const promise = (async () => {
       const intent = row.intent ? JSON.parse(row.intent) : null
-      if (!(await provablyNotCommitted(intent))) {
+      if (!safeToReRun(intent)) {
         log.error?.('file writes: refusing a retry whose original outcome is unknown '
           + `(reservation ${key} outlived its server process): ${row.intent || 'no recorded intent'}`)
         throw new FileLinkDenied('idem-indeterminate')
       }
-      // Re-claim under OUR boot id, so a second crash is recorded against this
-      // process rather than silently inheriting the old row's evidence.
-      db.prepare('UPDATE file_idem SET boot_id=?, created_at=?, expires_at=? WHERE key=?')
-        .run(bootId, now(), now() + ttlMs, key)
+      // Re-claim under OUR boot id, by compare-and-swap against the boot id we
+      // READ — not unconditionally. Two things to be honest about here.
+      //
+      // What the CAS buys: if two recoveries race on the same row, only one
+      // swap can match, so the loser refuses instead of running a second copy.
+      // That is the reachable race — two retries of one key arriving together
+      // after a restart — and within a single process `inflight` already
+      // covers it, so this is the cross-process half.
+      //
+      // What it does NOT buy, and no ordering of these statements could: proof
+      // that the row's owner is dead. `inflight` is process-local, so a live
+      // second process sharing this database looks exactly like a crashed one,
+      // and once it has taken ownership a third reader would CAS against the
+      // new value and win. Closing that needs a lease with a heartbeat — an
+      // owner liveness record, not an owner name. It is not built because the
+      // only operation this path can re-run is `mkdir` (see safeToReRun), and
+      // a duplicated mkdir converges; everything destructive refuses above,
+      // before reaching here. If that narrowing is ever widened, the lease has
+      // to land in the same change.
+      const taken = db.prepare('UPDATE file_idem SET boot_id=?, created_at=?, expires_at=? WHERE key=? AND boot_id=?')
+        .run(bootId, now(), now() + ttlMs, key, row.boot_id)
+      if (taken.changes !== 1) throw new FileLinkDenied('idem-indeterminate')
       return factory()
     })()
     inflight.set(key, promise)
@@ -221,7 +259,7 @@ export function makeDurableIdemStore({
         inflight.delete(key)
         if (!(err instanceof FileLinkDenied && err.reason === 'idem-indeterminate')) forget(key)
       },
-    )
+    ).catch(() => {})
     return promise
   }
 

@@ -16,7 +16,7 @@ import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { FileLinkDenied, denialToStatus } from '../src/file-guard.js'
-import { makeDurableIdemStore, provablyNotCommitted, ORPHAN_RETENTION_MS } from '../src/file-idem.js'
+import { makeDurableIdemStore, safeToReRun, ORPHAN_RETENTION_MS } from '../src/file-idem.js'
 
 const tmp = (prefix) => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
 
@@ -107,20 +107,64 @@ test('the reservation is durable BEFORE the work runs, so a crash leaves evidenc
   assert.deepEqual(JSON.parse(seen.intent), { op: 'mkdir', path: '/w/a' })
 })
 
-test('an orphaned reservation re-runs only when the filesystem proves it never happened', async (t) => {
+test('an orphaned write is refused even though its target is absent', async (t) => {
   const db = makeDb(t)
   const dir = tmp('matron-idem-fs-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  // An absent target used to be read as proof that nothing had been committed.
+  // It is not: the write could have landed and then been deleted, and re-running
+  // would resurrect content someone removed on purpose.
   const target = path.join(dir, 'never-written.txt')
+  const intent = { op: 'write', path: target }
 
-  // A row left behind by a process that died mid-write.
-  store(db, { bootId: 'boot-1' }).reserve('dev:k', 'fp', () => new Promise(() => {}), { op: 'write', path: target })
+  store(db, { bootId: 'boot-1' }).reserve('dev:k', 'fp', () => new Promise(() => {}), intent)
+
+  await assert.rejects(
+    store(db, { bootId: 'boot-2' })
+      .run('dev:k', 'fp', async () => { throw new Error('re-executed an unknown outcome') }, intent),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+})
+
+test('an orphaned mkdir re-runs, because re-running it converges whether or not it landed', async (t) => {
+  const db = makeDb(t)
+  const intent = { op: 'mkdir', path: '/w/a' }
+  store(db, { bootId: 'boot-1' }).reserve('dev:k', 'fp', () => new Promise(() => {}), intent)
 
   let runs = 0
   const outcome = await store(db, { bootId: 'boot-2' })
-    .run('dev:k', 'fp', async () => { runs += 1; return ok({ path: target, bytes: 2 }) }, { op: 'write', path: target })
-  assert.equal(runs, 1, 'the target does not exist, so nothing was committed and re-running is safe')
+    .run('dev:k', 'fp', async () => { runs += 1; return ok({ path: '/w/a' }) }, intent)
+  assert.equal(runs, 1)
   assert.equal(outcome.status, 200)
+})
+
+test('a recovery whose row was taken between the read and the swap refuses, rather than running a second copy', async (t) => {
+  const db = makeDb(t)
+  const intent = { op: 'mkdir', path: '/w/a' }
+  store(db, { bootId: 'boot-1' }).reserve('dev:k', 'fp', () => new Promise(() => {}), intent)
+
+  // The reachable race: two recoveries of one key, both having read the same
+  // orphaned row. Single-threaded, the read and the swap cannot actually
+  // interleave, so the other recovery is injected into the gap — ownership
+  // moves after this store read the row and before its own swap runs.
+  const loser = store(db, { bootId: 'boot-2' })
+  const real = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    if (sql.startsWith('UPDATE file_idem SET boot_id=')) {
+      db.prepare = real
+      real('UPDATE file_idem SET boot_id=? WHERE key=?').run('boot-3', 'dev:k')
+    }
+    return real(sql)
+  }
+  t.after(() => { db.prepare = real })
+
+  await assert.rejects(
+    loser.run('dev:k', 'fp', async () => { throw new Error('ran despite losing the swap') }, intent),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+  // Losing is not a clean slate either: the row stands, so the key stays
+  // governed by whoever did win it.
+  assert.equal(db.prepare('SELECT boot_id FROM file_idem WHERE key=?').get('dev:k').boot_id, 'boot-3')
 })
 
 test('an orphaned reservation whose outcome cannot be proven is refused, and stays refused', async (t) => {
@@ -154,31 +198,20 @@ test('an indeterminate outcome answers 507, never a 409 that invites a retry', (
   assert.equal(denialToStatus('idem-indeterminate'), 507)
 })
 
-test('provablyNotCommitted proves absence only, and never guesses about delete', async (t) => {
-  const dir = tmp('matron-idem-fs-')
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  const present = path.join(dir, 'present.txt')
-  const absent = path.join(dir, 'absent.txt')
-  fs.writeFileSync(present, 'x')
-
-  // mkdir -p converges, so re-running is always safe.
-  assert.equal(await provablyNotCommitted({ op: 'mkdir', path: present }), true)
-  assert.equal(await provablyNotCommitted({ op: 'write', path: absent }), true)
-  assert.equal(await provablyNotCommitted({ op: 'write', path: present }), false)
-  assert.equal(await provablyNotCommitted({ op: 'upload', path: absent }), true)
-  assert.equal(await provablyNotCommitted({ op: 'upload', path: present }), false)
-  // move: source intact AND destination empty is the only provable shape.
-  assert.equal(await provablyNotCommitted({ op: 'move', path: present, to: absent }), true)
-  assert.equal(await provablyNotCommitted({ op: 'move', path: absent, to: present }), false)
-  assert.equal(await provablyNotCommitted({ op: 'move', path: present, to: present }), false)
-  // delete is never provable: an existing target may be the original or a
-  // replacement, and the two demand opposite actions.
-  assert.equal(await provablyNotCommitted({ op: 'delete', path: present }), false)
-  assert.equal(await provablyNotCommitted({ op: 'delete', path: absent }), false)
-  assert.equal(await provablyNotCommitted(null), false)
+test('safeToReRun answers for the operation alone, never from filesystem state', () => {
+  // The decision must not depend on what the tree looks like now — that is the
+  // unsound inference this replaced. Same verdict whether the path is there or
+  // not, so no fixture is needed and none is consulted.
+  assert.equal(safeToReRun({ op: 'mkdir', path: '/w/a' }), true)
+  for (const op of ['write', 'upload', 'move', 'delete']) {
+    assert.equal(safeToReRun({ op, path: '/w/a', to: '/w/b' }), false, `${op} is never re-run on a guess`)
+  }
+  assert.equal(safeToReRun({ op: 'unknown-future-op', path: '/w/a' }), false, 'a new op defaults to refusing')
+  assert.equal(safeToReRun(null), false)
+  assert.equal(safeToReRun('mkdir'), false)
 })
 
-test('the table is bounded: settled rows are evicted under pressure, live work never is', async (t) => {
+test('the table is bounded by refusing, never by discarding an unexpired guarantee', async (t) => {
   const db = makeDb(t)
   let clock = 1_000_000
   const s = store(db, { ttlMs: 100, max: 2, now: () => clock })
@@ -187,12 +220,26 @@ test('the table is bounded: settled rows are evicted under pressure, live work n
   await s.run('dev:b', 'fp', async () => ok({ path: '/w/b' }), { op: 'mkdir', path: '/w/b' })
   assert.equal(s.size(), 2)
 
-  // Settled rows are a replay cache: reclaimable early to make room.
+  // An unexpired settled row is not a cache line to reclaim — it IS the
+  // guarantee that a retry of that key will not execute twice. Under pressure
+  // the store refuses the NEW key (503, raised before any filesystem call)
+  // rather than dropping a promise it already made about an old one.
+  assert.throws(
+    () => s.reserve('dev:c', 'fp', async () => ok({ path: '/w/c' }), { op: 'mkdir', path: '/w/c' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-store-full',
+  )
+  assert.equal(
+    s.reserve('dev:a', 'fp', async () => ok({ path: '/w/a' }), { op: 'mkdir', path: '/w/a' }).replay,
+    true, 'the guarantee that would have been evicted is still honoured',
+  )
+
+  // Once the window drains the room is genuinely free, and the same call works.
+  clock += 10_000
   await s.run('dev:c', 'fp', async () => ok({ path: '/w/c' }), { op: 'mkdir', path: '/w/c' })
   assert.ok(s.size() <= 2, 'the store stays bounded')
 
-  // Live work is NOT reclaimable — evicting it would let a retry start a
-  // second concurrent mutation of the same target.
+  // Live work is never reclaimable either — evicting it would let a retry
+  // start a second concurrent mutation of the same target.
   let release
   const held = s.reserve('dev:live', 'fp', () => new Promise((resolve) => { release = resolve }),
     { op: 'mkdir', path: '/w/live' })
@@ -212,7 +259,7 @@ test('the table is bounded: settled rows are evicted under pressure, live work n
 
   release(ok({ path: '/w/live' }))
   await held.promise
-  // Settled entries ARE reclaimable again, and the TTL runs from settlement.
+  // Settled entries expire, and the TTL runs from settlement.
   clock += 10_000
   assert.equal(
     s.reserve('dev:live', 'fp', async () => ok({ path: '/w/live' }), { op: 'mkdir', path: '/w/live' }).replay,
@@ -263,6 +310,55 @@ test('an orphaned reservation survives a settle that could not be recorded', asy
   db.prepare = real
   const row = db.prepare('SELECT state FROM file_idem WHERE key=?').get('dev:k')
   assert.equal(row.state, 'pending', 'the row stays pending, so the outcome reads as unknown')
+})
+
+test('a release that the database refuses does not reject into a dangling promise', async (t) => {
+  const db = makeDb(t)
+  const s = store(db)
+  // The failed-attempt path runs inside a `.then` nobody awaits, so a throw
+  // there is an unhandled rejection — which, under this runtime, ends the
+  // process mid-write. A DELETE that fails must be absorbed, not raised.
+  const real = db.prepare.bind(db)
+  db.prepare = (sql) => (sql.startsWith('DELETE FROM file_idem WHERE key=')
+    ? { run: () => { throw new Error('SQLITE_BUSY') } } : real(sql))
+
+  let unhandled
+  const onUnhandled = (err) => { unhandled = err }
+  process.on('unhandledRejection', onUnhandled)
+  t.after(() => { process.off('unhandledRejection', onUnhandled); db.prepare = real })
+
+  await assert.rejects(
+    s.run('dev:k', 'fp', async () => { throw new Error('the write failed') }, { op: 'mkdir', path: '/w/a' }),
+    /the write failed/,
+  )
+  // Let any stray rejection reach the handler before asserting it did not.
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(unhandled, undefined, 'the bookkeeping chain was terminated')
+
+  db.prepare = real
+  const row = db.prepare('SELECT state FROM file_idem WHERE key=?').get('dev:k')
+  assert.equal(row.state, 'pending', 'the reservation it could not release reads as unknown, not as a clean slate')
+})
+
+test('dropping an unresolved reservation at the retention bound is reported, never silent', async (t) => {
+  const db = makeDb(t)
+  let clock = 1_000_000
+  const errors = []
+  const noisy = { warn: () => {}, error: (msg) => errors.push(msg) }
+  const intent = { op: 'delete', path: '/w/x' }
+  makeDurableIdemStore({ db, log: quiet, bootId: 'boot-1', ttlMs: 100, now: () => clock })
+    .reserve('dev:orphan', 'fp', () => new Promise(() => {}), intent)
+
+  clock += ORPHAN_RETENTION_MS + 1
+  const after = makeDurableIdemStore({ db, log: noisy, bootId: 'boot-2', ttlMs: 100, now: () => clock })
+  await after.run('dev:other', 'fp', async () => ok({ path: '/w/o' }), { op: 'mkdir', path: '/w/o' })
+
+  // Past this bound the key becomes executable again, so the evidence being
+  // discarded has to reach the operator rather than vanishing into a sweep.
+  const dropped = errors.filter((m) => typeof m === 'string' && m.includes('retention bound'))
+  assert.equal(dropped.length, 1)
+  assert.match(dropped[0], /"op":"delete"/)
+  assert.match(dropped[0], /\/w\/x/)
 })
 
 // ── end to end: a real server, stopped and replaced ──────────────────────────
