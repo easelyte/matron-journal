@@ -103,8 +103,9 @@ export async function provablyNotCommitted(intent) {
   }
 }
 
-// `db` makes it durable; without one this is an in-memory store with the same
-// semantics (what the unit tests and any embedding without a database use).
+// `db` is required — durability is the entire point, and a store that silently
+// degraded to a Map when it was missing would reintroduce the bug it exists to
+// fix, invisibly.
 export function makeDurableIdemStore({
   db, ttlMs = IDEM_TTL_MS, max = FILE_IDEM_MAX_ROWS, now = Date.now, log = console,
   // Injectable so a test can be a genuine SECOND process rather than a
@@ -136,9 +137,19 @@ export function makeDurableIdemStore({
   }
 
   const settle = (key, outcome) => {
-    db.prepare('UPDATE file_idem SET state=?, status=?, body=?, content_hash=?, expires_at=? WHERE key=?')
-      .run('done', outcome.status, JSON.stringify(outcome.body ?? null),
-        outcome.contentHash ?? null, now() + ttlMs, key)
+    try {
+      db.prepare('UPDATE file_idem SET state=?, status=?, body=?, content_hash=?, expires_at=? WHERE key=?')
+        .run('done', Number(outcome?.status), JSON.stringify(outcome?.body ?? null),
+          outcome?.contentHash ?? null, now() + ttlMs, key)
+    } catch (err) {
+      // Recording the outcome is the one step that must not throw into a
+      // dangling .then — an unhandled rejection here would take the process
+      // down mid-write. Leave the row PENDING rather than deleting it: the
+      // mutation did happen, so the honest state is "outcome unknown", and the
+      // next retry is refused instead of silently repeating it.
+      log.error?.(`file writes: could not record the outcome of reservation ${key}; `
+        + 'it stays pending, so a retry will be refused rather than re-run', err)
+    }
   }
   // A failed attempt is not a result worth replaying — drop the reservation so
   // the caller can genuinely retry. Unchanged from the in-memory store.
@@ -155,8 +166,18 @@ export function makeDurableIdemStore({
   // between the two leaves evidence rather than a clean slate.
   const claim = (key, fingerprint, intent) => {
     sweep()
-    const total = db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n
-    if (total >= max) throw new FileLinkDenied('idem-store-full')
+    const count = () => db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n
+    if (count() >= max) {
+      // Settled rows are a replay cache and may be reclaimed early; a PENDING
+      // row is either live work or the evidence of an unknown outcome, and
+      // dropping either would let a retry start a second mutation. So: evict
+      // the oldest settled rows, and refuse rather than touch the rest. Same
+      // rule the in-memory store enforced, now with a durable table under it.
+      db.prepare(`DELETE FROM file_idem WHERE key IN (
+                    SELECT key FROM file_idem WHERE state='done'
+                    ORDER BY expires_at ASC LIMIT ?)`).run(count() - max + 1)
+      if (count() >= max) throw new FileLinkDenied('idem-store-full')
+    }
     db.prepare(`INSERT INTO file_idem(key, fingerprint, boot_id, state, intent, created_at, expires_at)
                 VALUES(?,?,?,'pending',?,?,?)`)
       .run(key, fingerprint, bootId, intent ? JSON.stringify(intent) : null, now(), now() + ttlMs)

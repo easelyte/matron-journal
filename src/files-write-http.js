@@ -19,7 +19,9 @@
 //   * idempotency — a single-flight reservation keyed by the caller's key AND
 //     a fingerprint of the request, so two concurrent retries perform one
 //     mutation and a reused key carrying a DIFFERENT request is rejected
-//     instead of being served someone else's result;
+//     instead of being served someone else's result. The reservation itself
+//     lives in src/file-idem.js, durably: it has to outlive this process, or a
+//     retry crossing a restart re-executes its move/delete/upload;
 //   * one denial mapping — every rejection is a FileLinkDenied reason run
 //     through denialToStatus, so no endpoint invents its own status.
 import crypto from 'node:crypto'
@@ -45,7 +47,6 @@ export const TRASH_DIR_NAME = '.matron-trash'
 // a key is reusable for a deliberate repeat soon after. Matches the
 // peer-message idempotency window (AGENT_IDEM_TTL_MS).
 export const IDEM_TTL_MS = 120_000
-export const IDEM_MAX_ENTRIES = 512
 
 const badRequest = (res) => { json(res, 400, { error: 'bad_request' }); return true }
 // A path the server will consider at all: a string, absolute, and bounded.
@@ -74,59 +75,6 @@ export function listingIsWritable(ctx, realDir) {
   if (!ctx.fileEnableWrites || ctx.fileWritesDryRun || !ctx.fileWriteRoots) return false
   if (realDir.split(path.sep).filter(Boolean).includes(TRASH_DIR_NAME)) return false
   return ctx.fileWriteRoots.roots.some((root) => contains(root.realPath, realDir))
-}
-
-// In-memory, bounded, TTL'd. NOT what the server runs: http.js wires the
-// durable store in src/file-idem.js, which survives the restart this map does
-// not. Kept because it is the reference semantics the durable store implements
-// (single-flight, fingerprinted, settled-entry eviction) and the shape the unit
-// tests pin — a database is not needed to state what a reservation means.
-export function makeIdemStore({ ttlMs = IDEM_TTL_MS, max = IDEM_MAX_ENTRIES, now = Date.now } = {}) {
-  const entries = new Map()
-  const sweep = () => {
-    const t = now()
-    for (const [key, entry] of entries) if (!entry.pending && entry.expiresAt <= t) entries.delete(key)
-  }
-  return {
-    size: () => entries.size,
-    // Reserves `key`, or reports that it is already reserved. The RESERVATION is
-    // the promise itself, not the finished result — two concurrent retries share
-    // one execution instead of racing two mutations. `replay` tells the caller
-    // it is looking at someone else's execution, which is the hook uploads need
-    // to verify that the bytes really are the same bytes.
-    reserve(key, fingerprint, factory) {
-      sweep()
-      const existing = entries.get(key)
-      if (existing) {
-        if (existing.fingerprint !== fingerprint) throw new FileLinkDenied('idem-key-conflict')
-        return { promise: existing.promise, replay: true }
-      }
-      // An entry whose work is still RUNNING is not a cache line to be reclaimed
-      // — dropping it would let a retry start a second concurrent mutation of
-      // the same target. Evict settled entries only, and refuse a new key rather
-      // than evict live work.
-      while (entries.size >= max) {
-        const evictable = [...entries].find(([, entry]) => !entry.pending)
-        if (!evictable) throw new FileLinkDenied('idem-store-full')
-        entries.delete(evictable[0])
-      }
-      const entry = { fingerprint, pending: true, expiresAt: Infinity }
-      entry.promise = Promise.resolve().then(factory)
-      entries.set(key, entry)
-      entry.promise.then(
-        // The TTL starts when the work SETTLES, not when it started: a slow
-        // upload must not have its own reservation swept out from under it.
-        () => { entry.pending = false; entry.expiresAt = now() + ttlMs },
-        // A failed attempt is not a result worth replaying: drop the key so the
-        // caller can genuinely retry rather than be handed the same failure.
-        () => { entry.pending = false; if (entries.get(key) === entry) entries.delete(key) },
-      )
-      return { promise: entry.promise, replay: false }
-    },
-    run(key, fingerprint, factory) {
-      return this.reserve(key, fingerprint, factory).promise
-    },
-  }
 }
 
 function fingerprintOf(req, url, payload) {

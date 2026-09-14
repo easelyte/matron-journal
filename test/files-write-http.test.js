@@ -12,7 +12,7 @@ import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
-import { makeIdemStore, sanitizeBasename } from '../src/files-write-http.js'
+import { sanitizeBasename } from '../src/files-write-http.js'
 import { FileLinkDenied } from '../src/file-guard.js'
 
 const TRASH = '.matron-trash'
@@ -277,32 +277,6 @@ test('T-2.0: an Idempotency-Key reused for a DIFFERENT request is rejected, not 
   })
   assert.equal(bad.status, 400)
   assert.equal(fs.existsSync(path.join(f.writeRoot, 'c.txt')), false)
-})
-
-test('T-2.0: the idempotency store is single-flight, fingerprinted, TTL-bounded and capped', async () => {
-  let clock = 1000
-  const store = makeIdemStore({ ttlMs: 100, max: 2, now: () => clock })
-  let runs = 0
-  const slow = () => new Promise((resolve) => setTimeout(() => { runs += 1; resolve('done') }, 10))
-
-  const [a, b] = await Promise.all([store.run('k', 'fp', slow), store.run('k', 'fp', slow)])
-  assert.equal(runs, 1)
-  assert.equal(a, 'done')
-  assert.equal(b, 'done')
-  assert.throws(() => store.run('k', 'other-fp', slow), (e) => e instanceof FileLinkDenied && e.reason === 'idem-key-conflict')
-
-  // A failed attempt is forgettable — the caller can genuinely retry.
-  await assert.rejects(store.run('fails', 'fp', async () => { throw new Error('boom') }))
-  let retried = false
-  await store.run('fails', 'fp', async () => { retried = true })
-  assert.equal(retried, true)
-
-  clock += 1000                                  // everything expires
-  await store.run('k', 'different-fp-now', slow) // the key is reusable again
-  assert.equal(runs, 2)
-
-  for (const key of ['c1', 'c2', 'c3', 'c4']) await store.run(key, 'fp', async () => key)
-  assert.ok(store.size() <= 2, 'the store stays bounded')
 })
 
 // --- T-2.1: upload ---------------------------------------------------------
@@ -708,35 +682,6 @@ test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not 
   assert.deepEqual(await retry.json(), { path: target, bytes: 8 })
   assert.deepEqual(trashEntries(f.writeRoot), [], 'the replay did not re-write the file')
   assert.equal(auditLines(f).filter((a) => a.op === 'upload' && a.result === 'attempt').length, 1)
-})
-
-test('F6: an in-flight reservation is never swept or evicted out from under itself', async () => {
-  let clock = 0
-  const store = makeIdemStore({ ttlMs: 10, max: 2, now: () => clock })
-  let release
-  const slow = () => new Promise((resolve) => { release = resolve })
-
-  const pending = store.reserve('slow', 'fp', slow)
-  assert.equal(pending.replay, false)
-  await new Promise((resolve) => setTimeout(resolve, 0))   // let the factory start
-  clock += 10_000                                  // far past the TTL
-
-  // The reservation is still live, so a retry joins it rather than starting a
-  // second concurrent mutation.
-  assert.equal(store.reserve('slow', 'fp', slow).replay, true)
-
-  // Capacity pressure must not reclaim it either.
-  store.reserve('other', 'fp', async () => 'done')
-  assert.throws(
-    () => store.reserve('third', 'fp', async () => 'nope'),
-    (e) => e instanceof FileLinkDenied && e.reason === 'idem-store-full',
-  )
-
-  release('done')
-  await pending.promise
-  // Settled entries ARE reclaimable, and the TTL runs from settlement.
-  clock += 10_000
-  assert.equal(store.reserve('slow', 'fp', async () => 'fresh').replay, false)
 })
 
 // --- Codex round-2 findings ------------------------------------------------

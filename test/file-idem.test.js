@@ -16,9 +16,7 @@ import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { FileLinkDenied, denialToStatus } from '../src/file-guard.js'
-import {
-  makeDurableIdemStore, provablyNotCommitted, ORPHAN_RETENTION_MS,
-} from '../src/file-idem.js'
+import { makeDurableIdemStore, provablyNotCommitted, ORPHAN_RETENTION_MS } from '../src/file-idem.js'
 
 const tmp = (prefix) => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
 
@@ -180,7 +178,7 @@ test('provablyNotCommitted proves absence only, and never guesses about delete',
   assert.equal(await provablyNotCommitted(null), false)
 })
 
-test('the table is bounded: settled rows expire, orphans are kept far longer, and the cap refuses', async (t) => {
+test('the table is bounded: settled rows are evicted under pressure, live work never is', async (t) => {
   const db = makeDb(t)
   let clock = 1_000_000
   const s = store(db, { ttlMs: 100, max: 2, now: () => clock })
@@ -188,33 +186,83 @@ test('the table is bounded: settled rows expire, orphans are kept far longer, an
   await s.run('dev:a', 'fp', async () => ok({ path: '/w/a' }), { op: 'mkdir', path: '/w/a' })
   await s.run('dev:b', 'fp', async () => ok({ path: '/w/b' }), { op: 'mkdir', path: '/w/b' })
   assert.equal(s.size(), 2)
-  assert.throws(
-    () => s.run('dev:c', 'fp', async () => ok({ path: '/w/c' }), { op: 'mkdir', path: '/w/c' }),
-    (e) => e instanceof FileLinkDenied && e.reason === 'idem-store-full',
-  )
 
-  clock += 1000                                     // past the replay TTL
+  // Settled rows are a replay cache: reclaimable early to make room.
   await s.run('dev:c', 'fp', async () => ok({ path: '/w/c' }), { op: 'mkdir', path: '/w/c' })
-  assert.equal(s.size(), 1, 'settled rows are reclaimed once they expire')
+  assert.ok(s.size() <= 2, 'the store stays bounded')
 
-  // An orphan survives the replay TTL — it is evidence, not a cache line —
-  // and is only swept at the far outer retention bound.
-  store(db, { bootId: 'boot-1', now: () => clock })
-    .reserve('dev:orphan', 'fp', () => new Promise(() => {}), { op: 'delete', path: '/w/x' })
+  // Live work is NOT reclaimable — evicting it would let a retry start a
+  // second concurrent mutation of the same target.
+  let release
+  const held = s.reserve('dev:live', 'fp', () => new Promise((resolve) => { release = resolve }),
+    { op: 'mkdir', path: '/w/live' })
+  assert.equal(held.replay, false)
+  await new Promise((resolve) => setTimeout(resolve, 0))   // let the factory start
+  clock += 10_000                                   // far past the replay TTL
+  assert.equal(
+    s.reserve('dev:live', 'fp', async () => ok({ path: '/w/live' }), { op: 'mkdir', path: '/w/live' }).replay,
+    true, 'a retry joins the live reservation rather than starting a second mutation',
+  )
+  s.reserve('dev:filler', 'fp', () => new Promise(() => {}), { op: 'mkdir', path: '/w/f' })
+  assert.throws(
+    () => s.reserve('dev:refused', 'fp', async () => ok({ path: '/w/r' }), { op: 'mkdir', path: '/w/r' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-store-full',
+    'with every row live, the store refuses rather than evicting work in flight',
+  )
+
+  release(ok({ path: '/w/live' }))
+  await held.promise
+  // Settled entries ARE reclaimable again, and the TTL runs from settlement.
   clock += 10_000
+  assert.equal(
+    s.reserve('dev:live', 'fp', async () => ok({ path: '/w/live' }), { op: 'mkdir', path: '/w/live' }).replay,
+    false,
+  )
+})
+
+test('an orphan outlives the replay TTL and is only swept at the far retention bound', async (t) => {
+  const db = makeDb(t)
+  let clock = 1_000_000
+  const intent = { op: 'delete', path: '/w/x' }
+  store(db, { bootId: 'boot-1', ttlMs: 100, now: () => clock })
+    .reserve('dev:orphan', 'fp', () => new Promise(() => {}), intent)
+
+  clock += 10_000                                   // far past the replay TTL
   const after = store(db, { bootId: 'boot-2', ttlMs: 100, now: () => clock })
-  // A sweep runs on every reservation; the orphan must survive all of them.
-  await after.run('dev:d', 'fp', async () => ok({ path: '/w/d' }), { op: 'mkdir', path: '/w/d' })
-  assert.equal(
-    db.prepare("SELECT COUNT(*) AS n FROM file_idem WHERE key='dev:orphan'").get().n, 1,
-    'the orphan outlives the replay TTL',
-  )
+  // A sweep runs on every reservation; the orphan must survive all of them,
+  // because while it stands its key can never execute.
+  await after.run('dev:other', 'fp', async () => ok({ path: '/w/o' }), { op: 'mkdir', path: '/w/o' })
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM file_idem WHERE key='dev:orphan'").get().n, 1)
+
+  // Bounded at the far end only, so a crash storm cannot wedge the table.
   clock += ORPHAN_RETENTION_MS + 1
-  after.run('dev:sweep', 'fp', async () => ok({ path: '/w/s' }), { op: 'mkdir', path: '/w/s' })
-  assert.equal(
-    db.prepare("SELECT COUNT(*) AS n FROM file_idem WHERE key='dev:orphan'").get().n, 0,
-    'and is eventually swept so a crash storm cannot wedge the table',
-  )
+  await after.run('dev:sweep', 'fp', async () => ok({ path: '/w/s' }), { op: 'mkdir', path: '/w/s' })
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM file_idem WHERE key='dev:orphan'").get().n, 0)
+})
+
+test('an expired key is reusable for a deliberately different request', async (t) => {
+  const db = makeDb(t)
+  let clock = 1_000_000
+  const s = store(db, { ttlMs: 100, now: () => clock })
+  await s.run('dev:k', 'fp-one', async () => ok({ path: '/w/a' }), { op: 'mkdir', path: '/w/a' })
+  clock += 1000
+  // Past the window the key was replayable for, it is an ordinary fresh key —
+  // not a permanent conflict.
+  const outcome = await s.run('dev:k', 'fp-two', async () => ok({ path: '/w/b' }), { op: 'mkdir', path: '/w/b' })
+  assert.deepEqual(outcome.body, { path: '/w/b' })
+})
+
+test('an orphaned reservation survives a settle that could not be recorded', async (t) => {
+  const db = makeDb(t)
+  const s = store(db)
+  // A database that refuses the UPDATE stands in for any failure to record the
+  // outcome after the mutation already happened.
+  const real = db.prepare.bind(db)
+  db.prepare = (sql) => (sql.startsWith('UPDATE file_idem SET state=') ? { run: () => { throw new Error('disk full') } } : real(sql))
+  await s.run('dev:k', 'fp', async () => ok({ path: '/w/a' }), { op: 'mkdir', path: '/w/a' })
+  db.prepare = real
+  const row = db.prepare('SELECT state FROM file_idem WHERE key=?').get('dev:k')
+  assert.equal(row.state, 'pending', 'the row stays pending, so the outcome reads as unknown')
 })
 
 // ── end to end: a real server, stopped and replaced ──────────────────────────
