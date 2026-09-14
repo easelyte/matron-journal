@@ -27,7 +27,7 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
 import {
-  FileLinkDenied, contains, denialToStatus,
+  FileLinkDenied, contains, denialBody, denialToStatus,
   writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
 } from './file-guard.js'
 import { json, readBody } from './http-body.js'
@@ -135,7 +135,7 @@ async function audited(ctx, who, intent, run) {
     ctx.audit({ ...base, result: 'attempt' })
   } catch (err) {
     console.error('file writes: refusing — the audit intent line could not be written', err)
-    return { status: denialToStatus('audit-fail-closed'), body: { error: 'denied' } }
+    return { status: denialToStatus('audit-fail-closed'), body: denialBody('audit-fail-closed') }
   }
 
   // The outcome line is best-effort BY DESIGN: the intent line is already
@@ -161,7 +161,7 @@ async function audited(ctx, who, intent, run) {
   } catch (err) {
     if (err instanceof FileLinkDenied) {
       record('denied', { reason: err.reason })
-      return { status: denialToStatus(err.reason), body: { error: 'denied' } }
+      return { status: denialToStatus(err.reason), body: denialBody(err.reason) }
     }
     record('error', { reason: String(err?.code || 'error').slice(0, 64) })
     throw err
@@ -182,7 +182,7 @@ function withIdempotency(ctx, req, who, url, payload, work, intent) {
   if (key === undefined) return null
   if (key === null) return work()
   try {
-    return ctx.idem.run(key, fingerprintOf(req, url, payload), work, intent)
+    return ctx.idem.run(key, fingerprintOf(req, url, payload), work, intent, who.deviceId)
   } catch (err) {
     return Promise.reject(err)
   }
@@ -198,7 +198,7 @@ async function settle(req, res, pending, opts) {
     outcome = await pending
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    outcome = { status: denialToStatus(err.reason), body: { error: 'denied' } }
+    outcome = { status: denialToStatus(err.reason), body: denialBody(err.reason) }
   }
   return answer(req, res, outcome, opts)
 }
@@ -219,10 +219,10 @@ async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, op
 
   let reservation
   try {
-    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run, intent)
+    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run, intent, who.deviceId)
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    return answer(req, res, { status: denialToStatus(err.reason), body: { error: 'denied' } }, opts)
+    return answer(req, res, { status: denialToStatus(err.reason), body: denialBody(err.reason) }, opts)
   }
   if (!reservation.replay) return settle(req, res, reservation.promise, opts)
 
@@ -232,17 +232,17 @@ async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, op
     first = await reservation.promise
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    first = { status: denialToStatus(err.reason), body: { error: 'denied' } }
+    first = { status: denialToStatus(err.reason), body: denialBody(err.reason) }
   }
   // `contentHash` is absent when the first attempt never consumed a body (it
   // was denied during validation), and such a result does not depend on the
   // bytes — so it replays as-is.
   if (first.contentHash !== undefined) {
     if (!replay.complete) {
-      return answer(req, res, { status: denialToStatus('too-large'), body: { error: 'denied' }, close: true }, opts)
+      return answer(req, res, { status: denialToStatus('too-large'), body: denialBody('too-large'), close: true }, opts)
     }
     if (first.contentHash !== replay.hash) {
-      return answer(req, res, { status: denialToStatus('idem-key-conflict'), body: { error: 'denied' } }, opts)
+      return answer(req, res, { status: denialToStatus('idem-key-conflict'), body: denialBody('idem-key-conflict') }, opts)
     }
   }
   return answer(req, res, first, opts)

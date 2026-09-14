@@ -62,6 +62,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
 -- revocation cascade, is what bounds this table.
 CREATE TABLE IF NOT EXISTS file_idem(
   key TEXT PRIMARY KEY,
+  -- The device INCARNATION that reserved this row, not just the id encoded in
+  -- the key. devices.id is a reusable rowid, so a revoked device's rows would
+  -- otherwise be inherited by whichever replacement is handed the same number
+  -- — serving it the old incarnation's cached response or refusing its first
+  -- write. The cascade is the fix, and it is the same one agent_idem carries.
+  -- It also scopes the capacity quota, so one device cannot spend another's.
+  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   fingerprint TEXT NOT NULL,
   -- Which server process reserved this row. A 'pending' row whose boot_id is
   -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
@@ -77,6 +84,7 @@ CREATE TABLE IF NOT EXISTS file_idem(
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
+CREATE INDEX IF NOT EXISTS idx_file_idem_device ON file_idem(device_id);
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL
@@ -331,6 +339,18 @@ export function openDb(path) {
   // if its numeric id was already reused before this migration. Rows for
   // revoked/replacement devices are intentionally discarded because the new
   // cascade would have removed them.
+  // file_idem gained device_id before it ever shipped: the table is introduced
+  // by the same unreleased change, so there are no production rows to preserve
+  // and no migration to write — a pre-column table can only exist in a dev
+  // checkout that ran an earlier commit of this branch. Recreate it rather than
+  // carrying migration code for a state that never reached a release.
+  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
+  if (fileIdemCols.length && !fileIdemCols.some((c) => c.name === 'device_id')) {
+    db.exec('DROP TABLE file_idem')
+    db.exec(SCHEMA.slice(SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS file_idem('),
+      SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS user_seq(')))
+    console.log('file_idem: recreated with device_id (pre-release dev schema)')
+  }
   const agentIdemCols = db.prepare('PRAGMA table_info(agent_idem)').all()
   const agentIdemFks = db.prepare('PRAGMA foreign_key_list(agent_idem)').all()
   const agentIdemHasDevice = agentIdemCols.some((c) => c.name === 'device_id')

@@ -109,9 +109,6 @@ export class FileLinkDenied extends Error {
   }
 }
 
-// Uniform denial->status so the denial reason never leaks which check tripped.
-// Mirrors the bridge's lib/show-file.js:denialToStatus, plus 'not-a-dir'
-// (listing a non-directory) which lands with the other 404 reasons.
 // NAME_MAX on every filesystem we run on. A single component longer than this
 // is ENAMETOOLONG at mkdir/open time — which, on a recursive mkdir, can happen
 // AFTER earlier components were already created. Rejecting it up front keeps
@@ -119,6 +116,23 @@ export class FileLinkDenied extends Error {
 // leaving half a directory tree behind (Codex R3-F2).
 export const MAX_NAME_BYTES = 255;
 
+// The wire body for a denial. Every reason answers `denied` — except the one
+// where the mutation may ALREADY have happened, which a client must not treat
+// like the others.
+//
+// This exists because the dangerous client behaviour is the reasonable-looking
+// one: read an error as "nothing happened", mint a fresh Idempotency-Key and
+// retry. For every other denial that is correct — the guard refused before
+// touching anything. For `idem-indeterminate` it is how a delete runs twice.
+// A distinct machine-readable shape is the only thing standing between those
+// two readings, since both arrive as a 5xx with an `error` field.
+export const denialBody = (reason) => (reason === 'idem-indeterminate'
+  ? { error: 'indeterminate', outcome: 'unknown', retryable: false }
+  : { error: 'denied' })
+
+// Uniform denial->status so the denial reason never leaks which check tripped.
+// Mirrors the bridge's lib/show-file.js:denialToStatus, plus 'not-a-dir'
+// (listing a non-directory) which lands with the other 404 reasons.
 export function denialToStatus(reason) {
   if (reason === 'sensitive'
       || reason === 'outside-scope'

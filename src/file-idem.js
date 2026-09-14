@@ -54,9 +54,16 @@ import { IDEM_TTL_MS } from './files-write-http.js'
 // no persisted value to go stale.
 export const BOOT_ID = crypto.randomUUID()
 
-// Generous compared with the 512-entry in-memory cap it replaces: rows are
-// small, the TTL sweep does the real bounding, and the cap exists only so a
-// pathological client cannot grow the table without limit.
+// The real bound is PER DEVICE. A single global ceiling made the store a
+// shared resource one client could spend on everyone's behalf: guard denials
+// settle as ordinary recorded outcomes, so a client aimed at a path it is not
+// allowed to touch could fill the table with 403s — no filesystem writes at
+// all — and every other client's next keyed write would be refused. Capacity
+// is therefore charged to the device that reserved it.
+export const FILE_IDEM_MAX_ROWS_PER_DEVICE = 512
+// An absolute backstop on table growth, not a per-request budget: reaching it
+// needs several devices at full quota at once, which is not normal operation,
+// so it is reported when it bites.
 export const FILE_IDEM_MAX_ROWS = 4096
 
 // How long an ORPHANED reservation (pending, executor gone) is kept. Far
@@ -100,7 +107,8 @@ export function safeToReRun(intent) {
 // degraded to a Map when it was missing would reintroduce the bug it exists to
 // fix, invisibly.
 export function makeDurableIdemStore({
-  db, ttlMs = IDEM_TTL_MS, max = FILE_IDEM_MAX_ROWS, now = Date.now, log = console,
+  db, ttlMs = IDEM_TTL_MS, max = FILE_IDEM_MAX_ROWS, maxPerDevice = FILE_IDEM_MAX_ROWS_PER_DEVICE,
+  now = Date.now, log = console,
   // Injectable so a test can be a genuine SECOND process rather than a
   // reconstructed store that shares this one's identity. The server never
   // passes it: there is exactly one boot id per process, by construction.
@@ -179,7 +187,7 @@ export function makeDurableIdemStore({
   // Write-ahead, in the same spirit as the audit intent line: the reservation
   // is durable BEFORE the first irreversible filesystem call, so a crash
   // between the two leaves evidence rather than a clean slate.
-  const claim = (key, fingerprint, intent) => {
+  const claim = (key, fingerprint, intent, deviceId) => {
     sweep()
     // Nothing is evicted to make room. `sweep()` has already dropped every
     // EXPIRED settled row, so whatever is left is a live guarantee: a `done`
@@ -192,12 +200,29 @@ export function makeDurableIdemStore({
     // Refusing is the safe failure: 503 is raised BEFORE any filesystem call,
     // so the caller can retry the same key once the window drains and nothing
     // has happened in between.
-    if (db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n >= max) {
+    // Charged to the reserving device first, so exhausting the budget denies
+    // only the device that spent it.
+    if (db.prepare('SELECT COUNT(*) AS n FROM file_idem WHERE device_id=?').get(deviceId).n >= maxPerDevice) {
       throw new FileLinkDenied('idem-store-full')
     }
-    db.prepare(`INSERT INTO file_idem(key, fingerprint, boot_id, state, intent, created_at, expires_at)
-                VALUES(?,?,?,'pending',?,?,?)`)
-      .run(key, fingerprint, bootId, intent ? JSON.stringify(intent) : null, now(), now() + ttlMs)
+    if (db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n >= max) {
+      log.error?.(`file writes: the idempotency table is at its absolute bound (${max} rows) with no device `
+        + 'over its own quota; keyed writes are being refused for everyone until it drains')
+      throw new FileLinkDenied('idem-store-full')
+    }
+    try {
+      db.prepare(`INSERT INTO file_idem(key, device_id, fingerprint, boot_id, state, intent, created_at, expires_at)
+                  VALUES(?,?,?,?,'pending',?,?,?)`)
+        .run(key, deviceId, fingerprint, bootId, intent ? JSON.stringify(intent) : null, now(), now() + ttlMs)
+    } catch (err) {
+      // Two processes can both find no row and both insert; the primary key
+      // lets exactly one through. Losing that race is not an error — the
+      // winner's row is the answer — so report it as a claim that did not
+      // happen and let the caller re-read rather than surfacing a 500.
+      if (String(err?.code || '').startsWith('SQLITE_CONSTRAINT')) return false
+      throw err
+    }
+    return true
   }
 
   const start = (key, factory) => {
@@ -270,7 +295,7 @@ export function makeDurableIdemStore({
     // report that it is already reserved. `replay` tells the caller it is
     // looking at someone else's execution — the hook uploads use to verify the
     // bytes really are the same bytes.
-    reserve(key, fingerprint, factory, intent) {
+    reserve(key, fingerprint, factory, intent, deviceId, reread = false) {
       sweep()
       const row = db.prepare('SELECT * FROM file_idem WHERE key=?').get(key)
       if (row) {
@@ -287,12 +312,19 @@ export function makeDurableIdemStore({
         // result that does not exist, starving the re-execution of its bytes.
         return { promise: recover(key, row, factory), replay: false }
       }
-      claim(key, fingerprint, intent)
+      if (!claim(key, fingerprint, intent, deviceId)) {
+        // Another process inserted this key between our read and our insert.
+        // Re-enter ONCE to pick up its row; a second miss would mean the row
+        // vanished again, which only a concurrent sweep of an expired row can
+        // do, and that is a genuinely fresh request rather than a race.
+        if (reread) throw new FileLinkDenied('idem-indeterminate')
+        return this.reserve(key, fingerprint, factory, intent, deviceId, true)
+      }
       return { promise: start(key, factory), replay: false }
     },
 
-    run(key, fingerprint, factory, intent) {
-      return this.reserve(key, fingerprint, factory, intent).promise
+    run(key, fingerprint, factory, intent, deviceId) {
+      return this.reserve(key, fingerprint, factory, intent, deviceId).promise
     },
   }
 }
