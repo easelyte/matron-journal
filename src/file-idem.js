@@ -271,7 +271,19 @@ export function makeDurableIdemStore({
   const recover = (key, row, factory) => {
     const gen = row.gen
     const promise = (async () => {
-      const intent = row.intent ? JSON.parse(row.intent) : null
+      // A row we cannot READ is a row whose outcome we cannot reason about, so
+      // it has to refuse like any other unknown. Letting the parse throw would
+      // reach the rejection handler below as an ordinary failure and DELETE the
+      // reservation — destroying the evidence, and handing the next retry a
+      // clean slate for a mutation that may well have happened.
+      let intent = null
+      try {
+        intent = row.intent ? JSON.parse(row.intent) : null
+      } catch {
+        log.error?.(`file writes: reservation ${key} has an unreadable intent, so its outcome cannot be `
+          + 'reasoned about; refusing and keeping the row')
+        throw new FileLinkDenied('idem-indeterminate')
+      }
       if (!safeToReRun(intent)) {
         log.error?.('file writes: refusing a retry whose original outcome is unknown '
           + `(reservation ${key} outlived its server process): ${row.intent || 'no recorded intent'}`)

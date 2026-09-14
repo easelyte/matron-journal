@@ -618,6 +618,69 @@ test('a device revoked between authenticating and reserving is refused, not told
     'and it reads as an ordinary denial, because the filesystem really is unchanged')
 })
 
+test('a pre-release table with the right columns but the old cascade is rebuilt', () => {
+  const dir = tmp('matron-idem-legacy3-')
+  t_after(dir)
+  const dbPath = path.join(dir, 'journal.db')
+  // The nastiest of the intermediate shapes: every column present, so a
+  // name-only check accepts it, but the foreign key still CASCADEs. Left
+  // standing, a revoke deletes a PENDING reservation whose work is running and
+  // a reused device id re-executes it.
+  const legacy = new Database(dbPath)
+  legacy.exec(`
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE devices(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+      kind TEXT NOT NULL CHECK(kind IN ('client','agent')), name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0,
+      apns_token TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER
+    );
+    CREATE TABLE file_idem(
+      key TEXT PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      gen TEXT NOT NULL, fingerprint TEXT NOT NULL, boot_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','done')), intent TEXT,
+      status INTEGER, body TEXT, content_hash TEXT,
+      created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+    );
+  `)
+  legacy.close()
+
+  const db = openDb(dbPath)
+  try {
+    const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+    assert.equal(fk?.on_delete, 'SET NULL', 'the obsolete cascade was not preserved')
+    assert.equal(db.prepare('PRAGMA table_info(file_idem)').all()
+      .find((c) => c.name === 'device_id').notnull, 0, 'and the column can be detached')
+  } finally {
+    db.close()
+  }
+})
+
+test('a reservation whose intent cannot be read refuses, and keeps its evidence', async (t) => {
+  const db = makeDb(t)
+  // Version skew or corruption: the row is there, but nothing can be concluded
+  // from it. Deleting it would hand the next retry a clean slate for a
+  // mutation that may already have happened.
+  store(db, { bootId: 'boot-1' }).reserveAs('7:k', 'fp', () => new Promise(() => {}),
+    { op: 'delete', path: '/w/x' })
+  await tick()
+  db.prepare('UPDATE file_idem SET intent=? WHERE key=?').run('{not json', '7:k')
+
+  const after = store(db, { bootId: 'boot-2' })
+  const mustNotRun = async () => { throw new Error('re-executed an unreadable reservation') }
+  await assert.rejects(
+    after.runAs('7:k', 'fp', mustNotRun, { op: 'delete', path: '/w/x' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+  await tick()
+  assert.equal(after.size(), 1, 'the row stands, so the next retry is refused too')
+  await assert.rejects(
+    after.runAs('7:k', 'fp', mustNotRun, { op: 'delete', path: '/w/x' }),
+    (e) => e instanceof FileLinkDenied && e.reason === 'idem-indeterminate',
+  )
+})
+
 // ── end to end: a real server, stopped and replaced ──────────────────────────
 test('a move retried across a real server restart executes exactly once', async (t) => {
   const root = tmp('matron-idem-e2e-')

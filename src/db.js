@@ -326,17 +326,26 @@ export function openDb(path) {
   // unreleased change that added device_id, so there are no production rows to
   // preserve. A column-less table can only exist in a dev checkout that ran an
   // earlier commit of this branch, and SCHEMA recreates it on the next line.
-  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all().map((c) => c.name)
-  // Every column this branch added, checked as a set rather than one at a
-  // time: the branch grew `device_id` in one round and `gen` in the next, so a
-  // dev database can hold either shape. Testing only the first would let the
-  // second through, startup would succeed, and the first keyed write would
-  // fail on the missing column as a bare 500.
-  const fileIdemRequired = ['device_id', 'gen']
-  if (fileIdemCols.length && !fileIdemRequired.every((c) => fileIdemCols.includes(c))) {
+  // The SHAPE of the table, not just its column names. This branch revised
+  // file_idem three times — device_id, then gen, then the cascade becoming a
+  // detach — so a dev database can hold any of those intermediate forms, and
+  // `CREATE TABLE IF NOT EXISTS` repairs none of them. Checking column names
+  // alone would accept the revision whose foreign key still says CASCADE,
+  // which quietly restores the bug that revision removed: a revoke would
+  // delete a PENDING reservation whose work is still running, and a reused
+  // device id with the same key would then execute it a second time.
+  const fileIdemCols = db.prepare('PRAGMA table_info(file_idem)').all()
+  const fileIdemFk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+  const deviceCol = fileIdemCols.find((c) => c.name === 'device_id')
+  const fileIdemStale = fileIdemCols.length && !(
+    deviceCol && deviceCol.notnull === 0
+    && fileIdemCols.some((c) => c.name === 'gen')
+    && fileIdemFk && fileIdemFk.table === 'devices'
+    && String(fileIdemFk.on_delete).toUpperCase() === 'SET NULL'
+  )
+  if (fileIdemStale) {
     db.exec('DROP TABLE file_idem')
-    console.log('file_idem: dropped an incomplete pre-release dev table '
-      + `(missing ${fileIdemRequired.filter((c) => !fileIdemCols.includes(c)).join(', ')}); recreating`)
+    console.log('file_idem: dropped a pre-release dev table whose shape predates this revision; recreating')
   }
   db.exec(SCHEMA)
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
