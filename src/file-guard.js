@@ -143,7 +143,9 @@ export function denialToStatus(reason) {
   // Storage-side refusals: the request was well-formed and authorized, but the
   // server could not complete it SAFELY (no recoverable copy in the trash, no
   // durable audit record). 507 keeps them distinct from a 5xx bug.
-  if (reason === 'trash-write-failed' || reason === 'audit-fail-closed') return 507;
+  if (reason === 'trash-write-failed'
+      || reason === 'audit-fail-closed'
+      || reason === 'metadata-preserve-failed') return 507;
   // Every idempotency reservation is occupied by work that is still running.
   // Transient and retryable — 503, not a conflict and not a bug.
   if (reason === 'idem-store-full') return 503;
@@ -581,11 +583,16 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     }
     const tmpName = path.basename(randomSibling(prepared.target));
     tmpPath = childPathThroughParentFd(prepared, tmpName);
+    const intendedMode = prepared.targetStat ? prepared.targetStat.mode & 0o777 : 0o600;
     tmpFd = fs.openSync(
       tmpPath,
       fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-      prepared.targetStat ? prepared.targetStat.mode & 0o777 : 0o600,
+      intendedMode,
     );
+    // open(2)'s mode is masked by the process umask — the service runs with
+    // UMask=0077, so a 0644 file replaced through here would come back 0600 and
+    // silently cut off every other reader. fchmod is not masked (Codex R4).
+    fs.fchmodSync(tmpFd, intendedMode);
     let size = 0;
     if (bytes) {
       writeAllSync(tmpFd, bytes);
@@ -670,8 +677,34 @@ export async function mkdirGuarded(targetPath, { writeRoots, dryRun = false } = 
     }
     reverifyPrepared(prepared);
     if (dryRun) return prepared.target;
-    fs.mkdirSync(prepared.target, { recursive: true });
-    postCommitFsync(prepared.parentFd, 'a mkdir');
+    // mkdir -p, one component at a time, fsyncing each parent after its child
+    // lands. A single fsync of the deepest PRE-EXISTING ancestor would leave
+    // the intermediate entries undurable, so a crash could lose part of a tree
+    // the API (and the audit log) already called created (Codex R4).
+    const opened = [];
+    try {
+      let parentFd = prepared.parentFd;
+      let cursor = prepared.pinnedAncestor;
+      for (const segment of path.relative(prepared.pinnedAncestor, prepared.target).split(path.sep)) {
+        const child = path.join(cursor, segment);
+        try {
+          fs.mkdirSync(child);
+        } catch (err) {
+          if (err?.code !== 'EEXIST') throw err;
+        }
+        postCommitFsync(parentFd, 'a mkdir');
+        // O_NOFOLLOW: a racer that swapped the component we just made for a
+        // symlink does not get to be the directory we descend through.
+        parentFd = fs.openSync(
+          child,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+        );
+        opened.push(parentFd);
+        cursor = child;
+      }
+    } finally {
+      for (const fd of opened) { try { fs.closeSync(fd); } catch {} }
+    }
     return prepared.target;
   } finally {
     closePrepared(prepared);
@@ -789,6 +822,8 @@ function copyRegularFileForMove(
       fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
       sourcePrepared.targetStat.mode & 0o777,
     );
+    // Not umask-masked, unlike the mode passed to open(2) above.
+    fs.fchmodSync(tmpFd, sourceStat.mode & 0o777);
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (position < sourceStat.size) {
@@ -815,9 +850,13 @@ function copyRegularFileForMove(
     // is best-effort; mode came from the open above and mtime/atime are set
     // last, after the final write that would otherwise bump them.
     try {
-      if (sourceStat.uid !== undefined) fs.fchownSync(tmpFd, sourceStat.uid, sourceStat.gid);
+      fs.fchownSync(tmpFd, sourceStat.uid, sourceStat.gid);
     } catch (err) {
-      if (err?.code !== 'EPERM' && err?.code !== 'EINVAL' && err?.code !== 'ENOSYS') throw err;
+      // A move must not quietly re-home a file it cannot re-own: the source is
+      // about to be unlinked, so losing the owner here is permanent. Refuse.
+      // (Re-owning to the SAME uid/gid always succeeds, so this only fires for
+      // a foreign-owned file the server has no right to reassign.)
+      throw new FileLinkDenied('metadata-preserve-failed');
     }
     fs.futimesSync(tmpFd, sourceStat.atime, sourceStat.mtime);
     fs.fsyncSync(tmpFd);
@@ -1065,6 +1104,8 @@ function preserveFileForOverwrite(prepared) {
   const trash = ensureTrashDirectory(prepared);
   let trashFd;
   let linked = false;
+  let backupPath;
+  let installedStat;
   try {
     trashFd = fs.openSync(
       trash.trashDir,
@@ -1073,18 +1114,38 @@ function preserveFileForOverwrite(prepared) {
     const trashStat = fs.fstatSync(trashFd);
     assertTrashDirectoryIdentity(prepared.root, trash.trashDir, trashFd, trashStat);
     assertTargetIdentity(prepared, prepared.targetStat);
-    const backupPath = path.join(trash.trashDir, trashName(prepared.target));
+    backupPath = path.join(trash.trashDir, trashName(prepared.target));
     let installed;
     try {
       installed = linkNoReplace(prepared.target, backupPath, prepared.targetStat);
     } catch (err) {
+      backupPath = undefined;
       if (err instanceof FileLinkDenied) throw err;
       throw new FileLinkDenied('trash-write-failed');
     }
+    installedStat = installed;
     fs.fsyncSync(trashFd);
     linked = true;
     return { path: backupPath, dev: installed.dev, ino: installed.ino, trash };
   } finally {
+    // The link exists the moment linkNoReplace returns. If anything after it
+    // fails, the overwrite does NOT happen — so the trash must not keep a
+    // "previous version" of a replacement that never occurred, and retries must
+    // not pile up links (Codex R4).
+    if (!linked && backupPath && installedStat) {
+      try {
+        const current = lstatIfPresent(backupPath);
+        if (current
+            && !current.isSymbolicLink()
+            && current.dev === installedStat.dev
+            && current.ino === installedStat.ino) {
+          fs.unlinkSync(backupPath);
+          if (trashFd !== undefined) fs.fsyncSync(trashFd);
+        }
+      } catch (err) {
+        console.error(`file-guard: could not remove the orphaned overwrite backup ${backupPath}`, err);
+      }
+    }
     if (trashFd !== undefined) try { fs.closeSync(trashFd); } catch {}
     if (!linked && removeCreatedTrashDirectory(trash)) {
       try { fsyncDirectoryPathSync(prepared.root.realPath); } catch {}

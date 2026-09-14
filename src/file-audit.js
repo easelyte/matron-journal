@@ -146,7 +146,16 @@ export function appendAudit(dir, entry) {
       created = true
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err
-      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND, 0o600)
+      // O_NOFOLLOW: `file-audit.jsonl` left as a symlink by a bad rotation or
+      // restore would otherwise make the first authenticated write append this
+      // server's JSON into whatever the link points at — and fsync it —  while
+      // the audit gate reported success (Codex R4).
+      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600)
+      const opened = fs.fstatSync(fd)
+      if (!opened.isFile()) {
+        poisoned.add(target)
+        throw new FileAuditFailed(`${target} is not a regular file; refusing to append`)
+      }
     }
     // The offset this append must roll back to if it only partly lands.
     sizeBefore = fs.fstatSync(fd).size

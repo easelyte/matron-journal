@@ -237,3 +237,24 @@ test('R3-F5: a log left with a partial tail by a dead process is refused, not ap
   appendAudit(clean, { ts: 2, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
   assert.equal(lines(clean).length, 2)
 })
+
+test('R4: the audit sink refuses a symlinked or non-regular log', () => {
+  const dir = tmpDir()
+  const elsewhere = tmpDir()
+  const victim = path.join(elsewhere, 'some-other-state.json')
+  fs.writeFileSync(victim, '{"important":true}\n')
+  fs.symlinkSync(victim, path.join(dir, FILE_AUDIT_BASENAME))
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 1, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    FileAuditFailed,
+  )
+  assert.equal(fs.readFileSync(victim, 'utf8'), '{"important":true}\n', 'the link target is untouched')
+
+  const asDir = tmpDir()
+  fs.mkdirSync(path.join(asDir, FILE_AUDIT_BASENAME))
+  assert.throws(
+    () => appendAudit(asDir, { ts: 1, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    FileAuditFailed,
+  )
+})

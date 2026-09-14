@@ -1603,3 +1603,86 @@ test('F5: a cross-device move re-checks the source immediately before destroying
     f.cleanup()
   }
 })
+
+test('R4: modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
+  const previousUmask = process.umask(0o077)   // the deployed service's UMask
+  const f = makeWriteFixture()
+  try {
+    const overwritten = path.join(f.root, 'shared.txt')
+    writeFileSync(overwritten, 'v1')
+    fs.chmodSync(overwritten, 0o644)
+    await writeFileAtomic(overwritten, Buffer.from('v2'), { writeRoots: f.writeRoots, overwrite: true })
+    assert.equal(fs.lstatSync(overwritten).mode & 0o777, 0o644, 'an overwrite must not narrow the file')
+
+    const source = path.join(f.root, 'moved-me.txt')
+    const destination = path.join(f.root, 'destination.txt')
+    writeFileSync(source, 'payload')
+    fs.chmodSync(source, 0o664)
+    forceExdev(t, (from) => from === source)
+    await moveGuarded(source, destination, { writeRoots: f.writeRoots })
+    assert.equal(fs.lstatSync(destination).mode & 0o777, 0o664, 'a cross-device move must not narrow the file')
+  } finally {
+    f.cleanup()
+    process.umask(previousUmask)
+  }
+})
+
+test('R4: a failed overwrite leaves no orphan backup link in the trash', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'doc.txt')
+    writeFileSync(target, 'original')
+    const realFsync = fs.fsyncSync
+    let linked = false
+    const realLink = fs.linkSync
+    t.mock.method(fs, 'linkSync', (from, to) => {
+      const result = realLink(from, to)
+      if (from === target) linked = true
+      return result
+    })
+    // The backup link is installed, then its durability barrier fails — so the
+    // overwrite never happens and the trash must not keep a "previous version".
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      if (linked) throw Object.assign(new Error('io'), { code: 'EIO' })
+      return realFsync(fd)
+    })
+
+    await assert.rejects(writeFileAtomic(target, Buffer.from('replacement'), { writeRoots: f.writeRoots, overwrite: true }))
+    assert.equal(linked, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'original')
+    const trashDir = path.join(f.root, '.matron-trash')
+    assert.deepEqual(fs.existsSync(trashDir) ? fs.readdirSync(trashDir) : [], [])
+    assert.equal(fs.lstatSync(target).nlink, 1, 'no link is left pointing at the original inode')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('R4: a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
+  const f = makeWriteFixture()
+  try {
+    const realFsync = fs.fsyncSync
+    const realOpen = fs.openSync
+    const dirOfFd = new Map()
+    t.mock.method(fs, 'openSync', (target, flags, mode) => {
+      const fd = realOpen(target, flags, mode)
+      if (typeof target === 'string') dirOfFd.set(fd, target)
+      return fd
+    })
+    const synced = []
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      synced.push(dirOfFd.get(fd))
+      return realFsync(fd)
+    })
+
+    const target = path.join(f.root, 'a', 'b', 'c')
+    assert.equal(await mkdirGuarded(target, { writeRoots: f.writeRoots }), target)
+    assert.ok(fs.statSync(target).isDirectory())
+    // Each new component's PARENT is made durable after the child lands.
+    for (const parent of [f.root, path.join(f.root, 'a'), path.join(f.root, 'a', 'b')]) {
+      assert.ok(synced.includes(parent), `expected an fsync of ${parent}: ${synced}`)
+    }
+  } finally {
+    f.cleanup()
+  }
+})
