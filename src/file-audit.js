@@ -18,6 +18,21 @@
 //     both. So the line is assembled into one Buffer and written once, and a
 //     short write is a hard failure rather than a half-record on disk.
 //
+//  3. ONE WRITER owns this sink. The server is a single `node src/server.js`
+//     (deploy/matron-journal.service, Type=simple, one ExecStart), so every
+//     append is serialized by Node's one thread and the read-check-write
+//     sequence below is atomic by construction. That is a CONTRACT, not an
+//     accident: a second appending process would race the tail check against
+//     another writer's in-flight short write — A validates an intact tail, B
+//     leaves a fragment, A's atomic append lands after it and reports success
+//     on an intent that is now unparsable, and B's rollback guard correctly
+//     refuses to truncate A's bytes but cannot revoke A's gate. Nothing here
+//     takes an interprocess lock, so a second writer is not a thing to be
+//     careful about — it is unsupported. Adding one means putting
+//     fstat -> tail -> write/rollback -> fsync under a real file lock first
+//     (Codex R7-F2). Log ROTATION from another process is supported and is
+//     handled by the identity check after fsync, below.
+//
 // Failure posture: throw. The caller maps a throw to 507 and performs NO
 // mutation (fail-closed). Silently continuing would be the one outcome this
 // module exists to prevent.
@@ -65,6 +80,37 @@ function assertIntactTail(fd, target, size) {
   if (read !== 1 || last[0] !== 0x0a) {
     poisoned.add(target)
     throw new FileAuditFailed(`${target} ends in a partial line (a previous process died mid-append); repair or rotate it and restart`)
+  }
+}
+
+// O_APPEND + O_NOFOLLOW pin this append to ONE inode, which is what makes the
+// tail check above trustworthy — but the pathname is not pinned to it. A
+// rotation or restore landing after our open leaves the record durable in an
+// inode nothing can reach any more (close() releases the last link), while the
+// LIVE log holds no write-ahead entry for the mutation the caller is about to
+// make. Durability in an orphan is not evidence, so the name is re-resolved
+// after fsync and a mismatch REFUSES the append (Codex R7-F1).
+//
+// Not poison: rotation is a legitimate operator action, and the next call opens
+// the new file and succeeds normally. This attempt simply does not get to
+// authorize a mutation it cannot evidence. lstat, not stat, so a replacement
+// that is a symlink is a mismatch rather than something to follow.
+//
+// The check follows the write deliberately. It cannot close the window (a
+// rotation one instruction later is always possible without an interprocess
+// lock) — what it guarantees is the direction that matters: any rotation this
+// misses happened AFTER the intent was durably recorded on the log that was
+// live at the time, so no destructive op is ever authorized by a record the
+// live log never received.
+function assertRecordIsReachable(fd, target, opened) {
+  let live
+  try {
+    live = fs.lstatSync(target)
+  } catch (err) {
+    throw new FileAuditFailed(`${target} was replaced or removed while this record was being written; the live log holds no write-ahead entry, so the operation is refused`, err)
+  }
+  if (live.dev !== opened.dev || live.ino !== opened.ino) {
+    throw new FileAuditFailed(`${target} was replaced while this record was being written; the record is durable only in the rotated-away file, so the operation is refused`)
   }
 }
 
@@ -212,6 +258,8 @@ export function appendAudit(dir, entry) {
       badRecord(`short write (${written}/${line.length} bytes)${repaired ? ', partial line rolled back' : '; THE LOG TAIL COULD NOT BE REPAIRED — auditing is now refused'}`)
     }
     fs.fsyncSync(fd)
+    // Durable — but durable somewhere the live log can still be read from?
+    assertRecordIsReachable(fd, target, opened)
     // fsync on the FILE does not make a brand-new directory ENTRY durable. On
     // the very first write after a deploy (or after the log is rotated away) a
     // power loss could otherwise keep the committed mutation and lose the

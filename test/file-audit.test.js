@@ -314,3 +314,63 @@ test('R7: the tail check reads the very inode the line lands on, not the pathnam
   // And nothing was welded onto either inode.
   assert.equal(fs.readFileSync(target, 'utf8'), `${'x'.repeat(fragment.length - 1)}\n`)
 })
+
+test('R7-F1: a record that lands in a rotated-away inode refuses the operation', (t) => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  // Unlike R7 above, the original log is WELL FORMED — the tail check passes,
+  // the line is written and fsynced. The defect is where it ends up.
+  fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
+  const rotatedIn = path.join(dir, 'rotated-in.jsonl')
+  fs.writeFileSync(rotatedIn, '')
+
+  // Rotation lands after the descriptor exists: the append goes to an inode the
+  // name no longer resolves to, and close() releases its last link.
+  const realOpen = fs.openSync
+  let swapped = false
+  t.mock.method(fs, 'openSync', (p, ...rest) => {
+    const fd = realOpen(p, ...rest)
+    if (!swapped && p === target) {
+      swapped = true
+      fs.renameSync(rotatedIn, target)
+    }
+    return fd
+  })
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /was replaced while this record was being written/,
+    'a write-ahead record the live log never received must not authorize the mutation',
+  )
+  t.mock.restoreAll()
+  assert.ok(swapped, 'the pathname really was rotated mid-call')
+  // The live log holds no intent for the refused operation.
+  assert.equal(fs.readFileSync(target, 'utf8'), '')
+  // And the refusal is NOT sticky: the next append lands on the new file.
+  appendAudit(dir, { ts: 3, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' })
+  assert.deepEqual(lines(dir).map((r) => r.ts), [3])
+})
+
+test('R7-F1: an audit log unlinked mid-append refuses the operation', (t) => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
+
+  const realOpen = fs.openSync
+  let removed = false
+  t.mock.method(fs, 'openSync', (p, ...rest) => {
+    const fd = realOpen(p, ...rest)
+    if (!removed && p === target) {
+      removed = true
+      fs.unlinkSync(target)
+    }
+    return fd
+  })
+
+  assert.throws(
+    () => appendAudit(dir, { ts: 2, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    /was replaced or removed while this record was being written/,
+  )
+  t.mock.restoreAll()
+  assert.ok(removed)
+})
