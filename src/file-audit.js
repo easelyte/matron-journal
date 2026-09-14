@@ -35,14 +35,20 @@
 //
 //  4. Rotation is rename/create, never copytruncate. Renaming the log away and
 //     letting the next append create a fresh one is what the reachability
-//     check below is built for. `copytruncate` — copy the file, then truncate
-//     the SAME inode in place — can copy the archive before this record is
-//     appended and empty the original after it is fsynced, so the record
-//     survives in neither. The identity check cannot see that (the inode never
-//     changed), so there is an explicit post-write size check as well. It
-//     makes copytruncate FAIL CLOSED rather than silently tolerated: a write
-//     racing that rotation gets a 507 and no mutation, not an unlogged change
-//     (Codex R7-R2-F1). Configure rotation accordingly.
+//     check below is built for, and it is the only rotation method this module
+//     supports. `copytruncate` — copy the file, then truncate the SAME inode in
+//     place — can copy the archive before this record is appended and empty the
+//     original after it is fsynced, so the record survives in neither, and the
+//     identity check cannot see it because the inode never changed.
+//
+//     The post-write size check catches that, but only for a truncate that has
+//     already landed when it looks. It is a NARROWING, not a guarantee: a
+//     truncate between the check and the caller's mutation still leaves an
+//     authorized write with its intent in neither file. Closing that needs a
+//     lock held across the append AND the mutation, shared with the rotator —
+//     which contract 3 deliberately does not take (Codex R7-R2-F1, R7-R3-F1).
+//     So: configure rename/create rotation. Under copytruncate this sink is
+//     best-effort, and no amount of checking here makes it otherwise.
 //
 // Failure posture: throw. The caller maps a throw to 507 and performs NO
 // mutation (fail-closed). Silently continuing would be the one outcome this
