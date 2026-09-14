@@ -148,9 +148,18 @@ export function appendAudit(dir, entry) {
       if (err?.code !== 'EEXIST') throw err
       // O_NOFOLLOW: `file-audit.jsonl` left as a symlink by a bad rotation or
       // restore would otherwise make the first authenticated write append this
-      // server's JSON into whatever the link points at — and fsync it —  while
+      // server's JSON into whatever the link points at — and fsync it — while
       // the audit gate reported success (Codex R4).
-      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600)
+      //
+      // O_NONBLOCK: the type check below cannot run until open() returns, and
+      // opening a FIFO for writing BLOCKS until a reader appears. On Node's
+      // single thread that is not a failed write, it is a wedged server — so
+      // refuse to block at all. A no-op on a regular file (Codex R6).
+      fd = fs.openSync(
+        target,
+        fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        0o600,
+      )
       const opened = fs.fstatSync(fd)
       if (!opened.isFile()) {
         poisoned.add(target)
@@ -161,7 +170,7 @@ export function appendAudit(dir, entry) {
     sizeBefore = fs.fstatSync(fd).size
     if (!created && !tailChecked.has(target)) {
       // O_WRONLY cannot read, so inspect the tail through a separate handle.
-      const readFd = fs.openSync(target, fs.constants.O_RDONLY)
+      const readFd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
       try { assertIntactTail(readFd, target, sizeBefore) } finally { fs.closeSync(readFd) }
     }
     tailChecked.add(target)

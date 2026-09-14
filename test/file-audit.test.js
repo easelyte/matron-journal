@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { spawnSync } from 'node:child_process'
 import {
   FILE_AUDIT_BASENAME, FileAuditFailed, appendAudit, auditPathFor, makeFileAudit,
 } from '../src/file-audit.js'
@@ -257,4 +258,21 @@ test('R4: the audit sink refuses a symlinked or non-regular log', () => {
     () => appendAudit(asDir, { ts: 1, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
     FileAuditFailed,
   )
+})
+
+test('R6: a FIFO audit target fails closed instead of blocking the process', () => {
+  const dir = tmpDir()
+  const target = path.join(dir, FILE_AUDIT_BASENAME)
+  const made = spawnSync('mkfifo', [target])
+  if (made.error || made.status !== 0) return    // no mkfifo on this host
+
+  // Opening a reader-less FIFO for writing blocks forever without O_NONBLOCK,
+  // and this runs on Node's only thread — so the whole server would wedge
+  // rather than answer 507. It must refuse, and refuse promptly.
+  const started = Date.now()
+  assert.throws(
+    () => appendAudit(dir, { ts: 1, deviceId: 1, op: 'delete', path: '/w/a', result: 'attempt' }),
+    FileAuditFailed,
+  )
+  assert.ok(Date.now() - started < 2000, 'the refusal is immediate, not a block')
 })
