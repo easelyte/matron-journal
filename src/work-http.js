@@ -1,9 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { realpathSync, statSync } from 'node:fs'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { json } from './http-body.js'
+import { compileJsonSchema } from './json-schema.js'
 
 const DEFAULT_BUILDER_TIMEOUT_MS = 5000
+const DEFAULT_BUILDER_MAX_OUTPUT_BYTES = 1024 * 1024
+const DEFAULT_MAX_CONCURRENT_BUILDERS = 2
 const STARTUP_PROBE_TIMEOUT_MS = 10000
 const GROUP_BY_VALUES = new Set(['repo', 'domain'])
 const SESSION_LIVENESS = new Map([
@@ -16,6 +19,11 @@ const BUILDER_ERROR_MESSAGES = {
   builder_failed: 'The Work-view builder failed.',
   builder_timeout: 'The Work-view builder timed out.',
 }
+const WORK_VIEW_SCHEMA = JSON.parse(readFileSync(new URL('./contracts/work-view.schema.json', import.meta.url), 'utf8'))
+export const WORK_VIEW_REQUIRED_ENV = Object.freeze([
+  'WORK_VIEW_OWNER_USER_ID',
+  'WORK_VIEW_PRODUCER_ROOT',
+])
 
 function childEnv(env) {
   // The builder needs an executable search path and locale, not the journal's
@@ -80,21 +88,19 @@ function builderError(groupBy, code) {
   }
 }
 
-function parseBuilderOutput(stdout, groupBy) {
-  const payload = JSON.parse(stdout)
-  if (
-    payload === null || typeof payload !== 'object' || Array.isArray(payload) ||
-    payload.schema_version !== 1 || payload.group_by !== groupBy ||
-    !['ok', 'empty', 'error'].includes(payload.status) || !Array.isArray(payload.groups)
-  ) {
-    throw new Error('invalid Work-view envelope')
-  }
-  return payload
+function parseBuilderOutput(stdout) {
+  return JSON.parse(stdout)
 }
 
-export function resolveClaimLiveness(db, convoId) {
+export function compileWorkViewValidator() {
+  return compileJsonSchema(WORK_VIEW_SCHEMA)
+}
+
+export function resolveClaimLiveness(db, convoId, ownerUserId) {
   try {
-    const row = db.prepare('SELECT session_state FROM conversations WHERE id=?').get(convoId)
+    const row = db.prepare(
+      'SELECT session_state FROM conversations WHERE id=? AND owner_user_id=?'
+    ).get(convoId, ownerUserId)
     if (!row) return 'stale'
     return SESSION_LIVENESS.get(row.session_state) ?? 'unknown'
   } catch {
@@ -102,26 +108,69 @@ export function resolveClaimLiveness(db, convoId) {
   }
 }
 
-function resolvePayloadLiveness(db, payload) {
+function resolvePayloadLiveness(db, payload, ownerUserId) {
+  if (!Array.isArray(payload?.groups)) return payload
   for (const group of payload.groups) {
-    if (group === null || typeof group !== 'object' || !Array.isArray(group.loops)) {
-      throw new Error('invalid Work-view group')
-    }
+    if (!Array.isArray(group?.loops)) continue
     for (const item of group.loops) {
-      if (item === null || typeof item !== 'object' || Array.isArray(item)) {
-        throw new Error('invalid Work-view loop')
+      if (item?.claim !== null && typeof item?.claim === 'object' && !Array.isArray(item.claim)) {
+        item.claim.liveness = resolveClaimLiveness(db, item.claim.convo_id, ownerUserId)
       }
-      if (item.claim === null) continue
-      if (item.claim === undefined || typeof item.claim !== 'object' || Array.isArray(item.claim)) {
-        throw new Error('invalid Work-view claim')
-      }
-      item.claim.liveness = resolveClaimLiveness(db, item.claim.convo_id)
     }
   }
   return payload
 }
 
-function runBuilder(view, groupBy) {
+function makeBuilderSemaphore(limit) {
+  let active = 0
+  const queued = []
+
+  const release = () => {
+    active -= 1
+    while (queued.length > 0) {
+      const waiter = queued.shift()
+      waiter.signal?.removeEventListener('abort', waiter.abort)
+      if (waiter.signal?.aborted) continue
+      active += 1
+      waiter.resolve(release)
+      return
+    }
+  }
+
+  return (signal) => {
+    if (signal?.aborted) return Promise.resolve(null)
+    if (active < limit) {
+      active += 1
+      return Promise.resolve(release)
+    }
+    return new Promise((resolve) => {
+      const waiter = { resolve, signal, abort: null }
+      waiter.abort = () => {
+        const index = queued.indexOf(waiter)
+        if (index === -1) return
+        queued.splice(index, 1)
+        signal.removeEventListener('abort', waiter.abort)
+        resolve(null)
+      }
+      signal?.addEventListener('abort', waiter.abort, { once: true })
+      queued.push(waiter)
+    })
+  }
+}
+
+function killBuilder(child) {
+  if (process.platform !== 'win32' && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch (err) {
+      if (err?.code !== 'ESRCH') throw err
+    }
+  }
+  try { child.kill('SIGKILL') } catch { /* close/error handlers finish the request */ }
+}
+
+function spawnBuilder(view, groupBy, signal) {
   const args = ['-m', 'scripts.work_view_cli', '--group-by', groupBy]
   if (view.storePath) args.push('--store', view.storePath)
 
@@ -132,6 +181,7 @@ function runBuilder(view, groupBy) {
         cwd: view.producerRoot,
         env: childEnv(view.env),
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
       })
     } catch {
       view.logger.error('work view: builder could not be spawned')
@@ -140,51 +190,106 @@ function runBuilder(view, groupBy) {
     }
 
     let stdout = ''
-    let settled = false
-    const settle = (payload) => {
-      if (settled) return
-      settled = true
+    let stdoutBytes = 0
+    let forced = false
+    let forcedPayload = null
+    const terminate = (payload, message) => {
+      if (forced) return
+      forced = true
+      forcedPayload = payload
       clearTimeout(timer)
-      resolve(payload)
+      child.stdout.removeListener('data', onStdout)
+      child.stdout.resume()
+      stdout = ''
+      if (message) view.logger.error(message)
+      try { killBuilder(child) } catch {
+        view.logger.error('work view: builder process group could not be killed')
+      }
     }
     const timer = setTimeout(() => {
-      if (settled) return
-      child.kill('SIGKILL')
-      view.logger.error('work view: builder exceeded its deadline and was killed')
-      settle(builderError(groupBy, 'builder_timeout'))
+      terminate(
+        builderError(groupBy, 'builder_timeout'),
+        'work view: builder exceeded its deadline and was killed'
+      )
     }, view.timeoutMs)
 
     child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (chunk) => { stdout += chunk })
+    const onStdout = (chunk) => {
+      stdoutBytes += Buffer.byteLength(chunk, 'utf8')
+      if (stdoutBytes > view.maxOutputBytes) {
+        terminate(
+          builderError(groupBy, 'builder_failed'),
+          'work view: builder exceeded its output limit and was killed'
+        )
+        return
+      }
+      stdout += chunk
+    }
+    child.stdout.on('data', onStdout)
     // Always drain stderr so a noisy failed builder cannot block on a full pipe.
     // Its content is deliberately not logged: producer errors may contain paths
     // or data that do not belong in the journal log.
     child.stderr.resume()
     child.on('error', () => {
-      view.logger.error('work view: builder process failed')
-      settle(builderError(groupBy, 'builder_failed'))
+      if (!forced) {
+        forced = true
+        forcedPayload = builderError(groupBy, 'builder_failed')
+        clearTimeout(timer)
+        view.logger.error('work view: builder process failed')
+      }
     })
     child.on('close', (code) => {
-      if (settled) return
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      if (forced) {
+        resolve(forcedPayload)
+        return
+      }
       if (code !== 0) {
         view.logger.error(`work view: builder exited non-zero (${code})`)
-        settle(builderError(groupBy, 'builder_failed'))
+        resolve(builderError(groupBy, 'builder_failed'))
         return
       }
       try {
-        settle(resolvePayloadLiveness(view.db, parseBuilderOutput(stdout, groupBy)))
+        const payload = resolvePayloadLiveness(
+          view.db,
+          parseBuilderOutput(stdout),
+          view.ownerUserId
+        )
+        if (payload.group_by !== groupBy || !view.validatePayload(payload)) {
+          throw new Error('invalid Work-view envelope')
+        }
+        resolve(payload)
       } catch {
         view.logger.error('work view: builder emitted an invalid envelope')
-        settle(builderError(groupBy, 'builder_failed'))
+        resolve(builderError(groupBy, 'builder_failed'))
       }
     })
+    const onAbort = () => terminate(null, 'work view: client disconnected; builder was killed')
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
   })
+}
+
+async function runBuilder(view, groupBy, signal) {
+  const release = await view.acquireBuilder(signal)
+  if (release === null) return null
+  try {
+    if (signal?.aborted) return null
+    return await spawnBuilder(view, groupBy, signal)
+  } finally {
+    // spawnBuilder resolves only from the child's close event, so capacity is
+    // not released while a killed process (or one of its open pipes) remains.
+    release()
+  }
 }
 
 export function createWorkView({
   db,
   env = process.env,
   timeoutMs = DEFAULT_BUILDER_TIMEOUT_MS,
+  maxOutputBytes = DEFAULT_BUILDER_MAX_OUTPUT_BYTES,
+  maxConcurrentBuilders = DEFAULT_MAX_CONCURRENT_BUILDERS,
   logger = console,
   spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
@@ -192,16 +297,28 @@ export function createWorkView({
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
     throw new Error('Work-view builder timeout must be a positive integer')
   }
-  const ownerUserId = parseOwnerUserId(env.WORK_VIEW_OWNER_USER_ID)
-  const producerRoot = resolveProducerRoot(env.WORK_VIEW_PRODUCER_ROOT, env, spawnSyncImpl)
+  if (!Number.isInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new Error('Work-view builder output limit must be a positive integer')
+  }
+  if (!Number.isInteger(maxConcurrentBuilders) || maxConcurrentBuilders <= 0) {
+    throw new Error('Work-view builder concurrency limit must be a positive integer')
+  }
+  const ownerUserId = parseOwnerUserId(env[WORK_VIEW_REQUIRED_ENV[0]])
+  const producerRoot = resolveProducerRoot(env[WORK_VIEW_REQUIRED_ENV[1]], env, spawnSyncImpl)
   const storePath = typeof env.WORK_VIEW_STORE_PATH === 'string' && env.WORK_VIEW_STORE_PATH
     ? env.WORK_VIEW_STORE_PATH
     : null
-  return { db, env, timeoutMs, logger, spawnImpl, ownerUserId, producerRoot, storePath }
+  return {
+    db, env, timeoutMs, maxOutputBytes, logger, spawnImpl, ownerUserId, producerRoot, storePath,
+    validatePayload: compileWorkViewValidator(),
+    acquireBuilder: makeBuilderSemaphore(maxConcurrentBuilders),
+  }
 }
 
 export async function handleWorkRoute(view, req, res, url, who) {
-  if (req.method !== 'GET' || url.pathname !== '/work') return false
+  if (url.pathname !== '/work') return false
+  res.setHeader('Cache-Control', 'private, no-store')
+  if (req.method !== 'GET') return false
   if (!who) { json(res, 401, { error: 'unauthenticated' }); return true }
 
   if (view.ownerUserId === null) {
@@ -226,6 +343,17 @@ export async function handleWorkRoute(view, req, res, url, who) {
     return true
   }
 
-  json(res, 200, await runBuilder(view, groupBy))
+  const abortController = new AbortController()
+  const abort = () => abortController.abort()
+  req.once('aborted', abort)
+  res.once('close', abort)
+  if (req.aborted || res.destroyed) abort()
+  try {
+    const payload = await runBuilder(view, groupBy, abortController.signal)
+    if (payload !== null) json(res, 200, payload)
+  } finally {
+    req.removeListener('aborted', abort)
+    res.removeListener('close', abort)
+  }
   return true
 }

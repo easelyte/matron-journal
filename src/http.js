@@ -86,6 +86,13 @@ function preapproveKeyMatches(expected, given) {
 // request's parse, same concern as readBody's existing 413 handling below.
 const rejectEarly = (req, res, status, obj) => {
   res.on('finish', () => req.destroy())
+  // Never cacheable. Both callers are transient states -- 401 (no/!valid
+  // credential) and 429 (throttled) -- so a cached copy would be served back
+  // to a caller whose credential or throttle window has since changed. It also
+  // keeps the guarantee uniform for routes that promise no-store on every
+  // response (see /work), whose own handler never runs when the shared auth
+  // gate rejects first.
+  res.setHeader('Cache-Control', 'private, no-store')
   return json(res, status, obj)
 }
 
