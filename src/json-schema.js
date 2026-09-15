@@ -40,7 +40,7 @@ export function compileJsonSchema(rootSchema) {
   // Draft-07 date-time is RFC 3339. Date.parse alone normalizes impossible
   // dates, so compare the parsed UTC components back to the source as well.
   const isDateTime = (value) => {
-    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value)
+    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/i.exec(value)
     if (!match) return false
     const timestamp = Date.parse(value)
     if (!Number.isFinite(timestamp)) return false
@@ -53,7 +53,7 @@ export function compileJsonSchema(rootSchema) {
     if (local.getUTCFullYear() !== y || local.getUTCMonth() + 1 !== mo ||
         local.getUTCDate() !== d || local.getUTCHours() !== h ||
         local.getUTCMinutes() !== mi || local.getUTCSeconds() !== s) return false
-    if (match[8] !== 'Z') {
+    if (match[8].toUpperCase() !== 'Z') {
       const [offsetHour, offsetMinute] = match[8].slice(1).split(':').map(Number)
       if (offsetHour > 23 || offsetMinute > 59) return false
     }

@@ -96,6 +96,15 @@ journal user allowed to use the route. `WORK_VIEW_STORE_PATH` is optional when
 the producer's own default store location is correct. Restarting or reloading
 the service remains an operator-controlled deployment step.
 
+Under a hardened systemd unit, filesystem permissions alone are not enough:
+`ProtectHome=yes` can hide paths under `/home`, `/root`, and `/run/user`, while
+`ProtectSystem=strict` can make other locations inaccessible to the service.
+Site the producer root outside protected homes, or add only the narrowly scoped
+mount/read exception needed for that root in the service drop-in. A path that
+exists and is readable from an operator shell can still be invisible inside the
+service sandbox; in that case the journal logs the startup error and disables
+only `GET /work`.
+
 ## How it fits together
 
 ```

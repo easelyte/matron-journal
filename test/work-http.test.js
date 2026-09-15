@@ -13,6 +13,7 @@ import { startServer } from '../src/server.js'
 import {
   compileWorkViewValidator,
   createWorkView,
+  handleWorkRoute,
   resolveClaimLiveness,
   WORK_VIEW_REQUIRED_ENV,
 } from '../src/work-http.js'
@@ -81,6 +82,14 @@ if mode == "oversized":
     time.sleep(10)
 if mode == "abort":
     Path(fixture["pid_path"]).write_text(str(os.getpid()))
+    time.sleep(10)
+if mode == "hold_pipes":
+    import subprocess
+    descendant = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        start_new_session=True,
+    )
+    Path(fixture["pid_path"]).write_text(str(descendant.pid))
     time.sleep(10)
 if mode == "count":
     import fcntl
@@ -220,6 +229,17 @@ test('vendored Work schema carries the canonical endpoint contract', () => {
   ])
 })
 
+test('Work schema date-time accepts RFC 3339 case and offsets but rejects malformed dates', () => {
+  const withClaimedAt = (claimedAt) => envelope('repo', [{
+    ...loop(1, 'date-time-convo'),
+    claim: { ...claim('date-time-convo'), claimed_at: claimedAt },
+  }])
+
+  assert.equal(VALIDATE_WORK_ENVELOPE(withClaimedAt('2026-09-15t12:34:56z')), true)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withClaimedAt('2026-09-15T18:04:56+05:30')), true)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withClaimedAt('2026-02-30t12:34:56z')), false)
+})
+
 test('Work-view activation docs name the exact required environment variables read by startup', () => {
   assert.deepEqual(WORK_VIEW_REQUIRED_ENV, [
     'WORK_VIEW_OWNER_USER_ID',
@@ -297,17 +317,31 @@ test('GET /work fails closed and logs when WORK_VIEW_PRODUCER_ROOT is absent', a
   assert.match(String(errors[0][0]), /WORK_VIEW_PRODUCER_ROOT/)
 })
 
-test('Work route startup rejects an unresolvable WORK_VIEW_PRODUCER_ROOT', () => {
-  assert.throws(
-    () => createWorkView({
-      db: {},
-      env: {
-        WORK_VIEW_OWNER_USER_ID: '1',
-        WORK_VIEW_PRODUCER_ROOT: '/definitely/missing/work-view-producer',
-      },
-    }),
-    /WORK_VIEW_PRODUCER_ROOT/
-  )
+test('an unresolvable producer root disables only /work and logs an actionable startup error', async (t) => {
+  const errors = []
+  const configuredRoot = '/definitely/missing/work-view-producer'
+  const s = startWorkServer(t, {
+    env: {
+      WORK_VIEW_OWNER_USER_ID: '1',
+      WORK_VIEW_PRODUCER_ROOT: configuredRoot,
+    },
+    logger: { error: (message) => errors.push(String(message)) },
+  })
+  const owner = addUser(s.db, 'invalid-root-owner')
+
+  const snapshot = await s.http('/snapshot', { token: owner.token })
+  assert.equal(snapshot.status, 200)
+  assert.ok(Array.isArray(snapshot.json.conversations))
+
+  const work = await s.http('/work', { token: owner.token })
+  assert.equal(work.status, 500)
+  assert.deepEqual(work.json, { error: 'internal' })
+
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /WORK_VIEW_PRODUCER_ROOT/)
+  assert.match(errors[0], new RegExp(configuredRoot.replaceAll('/', '\\/')))
+  assert.match(errors[0], /ProtectHome=yes/)
+  assert.match(errors[0], /ProtectSystem=strict/)
 })
 
 test('GET /work resolves all real journal session states, switches grouping, and never serves stale cache', async (t) => {
@@ -495,6 +529,59 @@ test('GET /work kills a builder whose stdout exceeds the byte cap', async (t) =>
   assert.ok(errors.some((message) => /output limit/.test(message)))
 })
 
+test('a killed builder with a separate-session descendant settles and releases its slot', async (t) => {
+  const producerRoot = makeFakeProducer(t)
+  const storePath = path.join(producerRoot, 'fixture.json')
+  const descendantPidPath = path.join(producerRoot, 'descendant.pid')
+  writeFileSync(storePath, JSON.stringify({ mode: 'hold_pipes', pid_path: descendantPidPath }))
+  let descendantPid = null
+  t.after(() => {
+    if (descendantPid === null) return
+    try { process.kill(descendantPid, 'SIGKILL') } catch { /* already exited */ }
+  })
+  const s = startWorkServer(t, {
+    env: workEnv(producerRoot, storePath),
+    // The FIRST request must time out and the SECOND must succeed, but both
+    // share one server and therefore one builder timeout. The first times out
+    // on any budget under the producer's 10s sleep, so the budget only has to
+    // be generous enough for the second (a fast fixture read) to finish on a
+    // machine running the whole suite in parallel. At 100ms the second request
+    // raced its own timeout and intermittently came back `builder_timeout`,
+    // failing this test for a reason unrelated to settlement.
+    timeoutMs: 2000,
+    // Small on purpose -- this IS the behaviour under test.
+    builderSettlementTimeoutMs: 100,
+    maxConcurrentBuilders: 1,
+    logger: { error: () => {} },
+  })
+  const owner = addUser(s.db, 'settlement-owner')
+
+  const startedAt = Date.now()
+  const first = s.http('/work', { token: owner.token })
+  await waitFor(() => {
+    try { return readFileSync(descendantPidPath, 'utf8').length > 0 } catch { return false }
+  }, 'builder never recorded its separate-session descendant')
+  descendantPid = Number(readFileSync(descendantPidPath, 'utf8'))
+  writeFixture(storePath, envelope('repo', [loop(1)]))
+  const second = s.http('/work', { token: owner.token })
+
+  const [timedOut, afterTimeout] = await Promise.all([first, second])
+  assert.equal(timedOut.status, 200)
+  assert.equal(timedOut.json.error.code, 'builder_timeout')
+  assert.equal(afterTimeout.status, 200)
+  assert.equal(afterTimeout.json.status, 'ok')
+  // The discriminator is the DESCENDANT'S 10s lifetime, not a performance
+  // target: if the settlement deadline never fires, the second request cannot
+  // be served until that descendant exits and closes the inherited pipes, so
+  // this elapses at ~10s. A 5s budget proves the deadline fired while leaving
+  // 25x headroom over the ~200ms logic path, so a loaded machine running the
+  // full suite in parallel cannot turn a correct implementation red. (A 1000ms
+  // budget did exactly that -- it was measuring load, not behaviour.)
+  const elapsed = Date.now() - startedAt
+  assert.ok(elapsed < 8000, `builder slot remained held past the settlement deadline (${elapsed}ms; a correct run is ~2400ms and a descendant-bound wait would be >=10000ms)`)
+  assert.doesNotThrow(() => process.kill(descendantPid, 0), 'descendant did not outlive the killed builder')
+})
+
 test('aborting a real /work response terminates its builder process', async (t) => {
   const producerRoot = makeFakeProducer(t)
   const storePath = path.join(producerRoot, 'fixture.json')
@@ -550,4 +637,81 @@ test('concurrent /work requests never exceed the configured builder process limi
   assert.equal(counts.started, 7)
   assert.equal(counts.active, 0)
   assert.ok(counts.max <= 2, `observed ${counts.max} concurrent builder processes`)
+})
+
+test('GET /work caps and expires its builder wait queue with explicit overload responses', async (t) => {
+  const producerRoot = makeFakeProducer(t)
+  const storePath = path.join(producerRoot, 'fixture.json')
+  const counterPath = path.join(producerRoot, 'counter.json')
+  writeFixture(
+    storePath,
+    envelope('repo', [loop(1)]),
+    null,
+    { mode: 'count', counter_path: counterPath }
+  )
+  const s = startWorkServer(t, {
+    env: workEnv(producerRoot, storePath),
+    maxConcurrentBuilders: 1,
+    maxQueuedBuilders: 2,
+    builderQueueTimeoutMs: 50,
+  })
+  const owner = addUser(s.db, 'overload-owner')
+
+  const results = await Promise.all(Array.from({ length: 12 }, () =>
+    s.http('/work', { token: owner.token })))
+  const successes = results.filter((result) => result.status === 200)
+  const overloaded = results.filter((result) => result.status === 503)
+  assert.equal(successes.length, 1)
+  assert.equal(overloaded.length, 11)
+  assert.ok(overloaded.every((result) => result.json?.error === 'overloaded'))
+  const counts = JSON.parse(readFileSync(counterPath, 'utf8'))
+  assert.equal(counts.started, 1)
+  assert.equal(counts.active, 0)
+})
+
+test('a disconnected builder waiter is removed from the bounded queue', async (t) => {
+  const producerRoot = makeFakeProducer(t)
+  const storePath = path.join(producerRoot, 'fixture.json')
+  const counterPath = path.join(producerRoot, 'counter.json')
+  writeFixture(
+    storePath,
+    envelope('repo', [loop(1)]),
+    null,
+    { mode: 'count', counter_path: counterPath }
+  )
+  const db = openDb(':memory:')
+  t.after(() => { if (db.open) db.close() })
+  const view = createWorkView({
+    db,
+    env: workEnv(producerRoot, storePath),
+    maxConcurrentBuilders: 1,
+    maxQueuedBuilders: 1,
+    builderQueueTimeoutMs: 1000,
+  })
+  const beginRequest = () => {
+    const req = new EventEmitter()
+    req.method = 'GET'
+    req.aborted = false
+    const res = new MockResponse()
+    const pending = handleWorkRoute(view, req, res, new URL('http://x/work'), { userId: 1 })
+    return { req, res, pending }
+  }
+
+  const active = beginRequest()
+  await waitFor(() => {
+    try { return JSON.parse(readFileSync(counterPath, 'utf8')).active === 1 } catch { return false }
+  }, 'first builder never occupied its slot')
+  const disconnected = beginRequest()
+  disconnected.req.aborted = true
+  disconnected.req.emit('aborted')
+  await disconnected.pending
+  assert.equal(disconnected.res.writableEnded, false)
+
+  const replacement = beginRequest()
+  await Promise.all([active.pending, replacement.pending])
+  assert.equal(active.res.statusCode, 200)
+  assert.equal(replacement.res.statusCode, 200)
+  const counts = JSON.parse(readFileSync(counterPath, 'utf8'))
+  assert.equal(counts.started, 2)
+  assert.equal(counts.active, 0)
 })

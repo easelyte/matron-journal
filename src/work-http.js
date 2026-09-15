@@ -7,6 +7,8 @@ import { compileJsonSchema } from './json-schema.js'
 const DEFAULT_BUILDER_TIMEOUT_MS = 5000
 const DEFAULT_BUILDER_MAX_OUTPUT_BYTES = 1024 * 1024
 const DEFAULT_MAX_CONCURRENT_BUILDERS = 2
+const DEFAULT_MAX_QUEUED_BUILDERS = 16
+const DEFAULT_BUILDER_SETTLEMENT_TIMEOUT_MS = 1000
 const STARTUP_PROBE_TIMEOUT_MS = 10000
 const GROUP_BY_VALUES = new Set(['repo', 'domain'])
 const SESSION_LIVENESS = new Map([
@@ -19,6 +21,7 @@ const BUILDER_ERROR_MESSAGES = {
   builder_failed: 'The Work-view builder failed.',
   builder_timeout: 'The Work-view builder timed out.',
 }
+const BUILDER_QUEUE_OVERLOADED = Symbol('builder_queue_overloaded')
 const WORK_VIEW_SCHEMA = JSON.parse(readFileSync(new URL('./contracts/work-view.schema.json', import.meta.url), 'utf8'))
 export const WORK_VIEW_REQUIRED_ENV = Object.freeze([
   'WORK_VIEW_OWNER_USER_ID',
@@ -42,11 +45,19 @@ function parseOwnerUserId(raw) {
   return Number.isSafeInteger(value) ? value : null
 }
 
-function resolveProducerRoot(raw, env, spawnSyncImpl) {
+function resolveProducerRoot(raw, env, spawnSyncImpl, logger) {
   if (typeof raw !== 'string' || raw.trim() === '') return null
   const configured = raw.trim()
+  const disable = (reason) => {
+    logger.error(
+      `work view: /work disabled because WORK_VIEW_PRODUCER_ROOT=${JSON.stringify(configured)} ${reason}. ` +
+      'Under systemd, ProtectHome=yes or ProtectSystem=strict can hide a path that exists and is readable on disk; ' +
+      'site the producer outside protected homes or add a narrowly scoped mount/read exception.'
+    )
+    return null
+  }
   if (!path.isAbsolute(configured)) {
-    throw new Error('WORK_VIEW_PRODUCER_ROOT must be an absolute directory containing scripts.work_view_cli')
+    return disable('is not an absolute directory containing scripts.work_view_cli')
   }
 
   let producerRoot
@@ -59,21 +70,26 @@ function resolveProducerRoot(raw, env, spawnSyncImpl) {
       throw new Error('CLI resolves outside producer root')
     }
   } catch {
-    throw new Error(`WORK_VIEW_PRODUCER_ROOT does not contain scripts.work_view_cli: ${configured}`)
+    return disable('is not a visible directory containing scripts.work_view_cli')
   }
 
-  const probe = spawnSyncImpl(
-    'python3',
-    ['-m', 'scripts.work_view_cli', '--help'],
-    {
-      cwd: producerRoot,
-      env: childEnv(env),
-      stdio: 'ignore',
-      timeout: STARTUP_PROBE_TIMEOUT_MS,
-    }
-  )
+  let probe
+  try {
+    probe = spawnSyncImpl(
+      'python3',
+      ['-m', 'scripts.work_view_cli', '--help'],
+      {
+        cwd: producerRoot,
+        env: childEnv(env),
+        stdio: 'ignore',
+        timeout: STARTUP_PROBE_TIMEOUT_MS,
+      }
+    )
+  } catch {
+    return disable('could not be probed for scripts.work_view_cli')
+  }
   if (probe.error || probe.status !== 0) {
-    throw new Error(`WORK_VIEW_PRODUCER_ROOT does not resolve scripts.work_view_cli: ${configured}`)
+    return disable('does not resolve scripts.work_view_cli')
   }
   return producerRoot
 }
@@ -121,16 +137,29 @@ function resolvePayloadLiveness(db, payload, ownerUserId) {
   return payload
 }
 
-function makeBuilderSemaphore(limit) {
+function makeBuilderSemaphore(limit, maxQueued, queueTimeoutMs) {
   let active = 0
   const queued = []
+
+  const remove = (waiter, result) => {
+    const index = queued.indexOf(waiter)
+    if (index === -1) return
+    queued.splice(index, 1)
+    clearTimeout(waiter.timer)
+    waiter.signal?.removeEventListener('abort', waiter.abort)
+    waiter.resolve(result)
+  }
 
   const release = () => {
     active -= 1
     while (queued.length > 0) {
       const waiter = queued.shift()
+      clearTimeout(waiter.timer)
       waiter.signal?.removeEventListener('abort', waiter.abort)
-      if (waiter.signal?.aborted) continue
+      if (waiter.signal?.aborted) {
+        waiter.resolve(null)
+        continue
+      }
       active += 1
       waiter.resolve(release)
       return
@@ -143,17 +172,13 @@ function makeBuilderSemaphore(limit) {
       active += 1
       return Promise.resolve(release)
     }
+    if (queued.length >= maxQueued) return Promise.resolve(BUILDER_QUEUE_OVERLOADED)
     return new Promise((resolve) => {
-      const waiter = { resolve, signal, abort: null }
-      waiter.abort = () => {
-        const index = queued.indexOf(waiter)
-        if (index === -1) return
-        queued.splice(index, 1)
-        signal.removeEventListener('abort', waiter.abort)
-        resolve(null)
-      }
+      const waiter = { resolve, signal, abort: null, timer: null }
+      waiter.abort = () => remove(waiter, null)
       signal?.addEventListener('abort', waiter.abort, { once: true })
       queued.push(waiter)
+      waiter.timer = setTimeout(() => remove(waiter, BUILDER_QUEUE_OVERLOADED), queueTimeoutMs)
     })
   }
 }
@@ -193,15 +218,34 @@ function spawnBuilder(view, groupBy, signal) {
     let stdoutBytes = 0
     let forced = false
     let forcedPayload = null
+    let settled = false
+    let settlementTimer = null
+    let onAbort = null
+    const settle = (payload) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearTimeout(settlementTimer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(payload)
+    }
     const terminate = (payload, message) => {
       if (forced) return
       forced = true
       forcedPayload = payload
       clearTimeout(timer)
       child.stdout.removeListener('data', onStdout)
-      child.stdout.resume()
       stdout = ''
       if (message) view.logger.error(message)
+      settlementTimer = setTimeout(() => {
+        view.logger.error('work view: killed builder did not settle before the post-kill deadline')
+        settle(forcedPayload)
+      }, view.builderSettlementTimeoutMs)
+      // A descendant in another process group can inherit these descriptors
+      // and keep ChildProcess's close event pending after the builder dies.
+      // Close our pipe ends now; the settlement timer remains the final guard.
+      child.stdout.destroy()
+      child.stderr.destroy()
       try { killBuilder(child) } catch {
         view.logger.error('work view: builder process group could not be killed')
       }
@@ -230,24 +274,18 @@ function spawnBuilder(view, groupBy, signal) {
     // Its content is deliberately not logged: producer errors may contain paths
     // or data that do not belong in the journal log.
     child.stderr.resume()
-    child.on('error', () => {
-      if (!forced) {
-        forced = true
-        forcedPayload = builderError(groupBy, 'builder_failed')
-        clearTimeout(timer)
-        view.logger.error('work view: builder process failed')
-      }
-    })
+    child.on('error', () => terminate(
+      builderError(groupBy, 'builder_failed'),
+      'work view: builder process failed'
+    ))
     child.on('close', (code) => {
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
       if (forced) {
-        resolve(forcedPayload)
+        settle(forcedPayload)
         return
       }
       if (code !== 0) {
         view.logger.error(`work view: builder exited non-zero (${code})`)
-        resolve(builderError(groupBy, 'builder_failed'))
+        settle(builderError(groupBy, 'builder_failed'))
         return
       }
       try {
@@ -259,13 +297,13 @@ function spawnBuilder(view, groupBy, signal) {
         if (payload.group_by !== groupBy || !view.validatePayload(payload)) {
           throw new Error('invalid Work-view envelope')
         }
-        resolve(payload)
+        settle(payload)
       } catch {
         view.logger.error('work view: builder emitted an invalid envelope')
-        resolve(builderError(groupBy, 'builder_failed'))
+        settle(builderError(groupBy, 'builder_failed'))
       }
     })
-    const onAbort = () => terminate(null, 'work view: client disconnected; builder was killed')
+    onAbort = () => terminate(null, 'work view: client disconnected; builder was killed')
     signal?.addEventListener('abort', onAbort, { once: true })
     if (signal?.aborted) onAbort()
   })
@@ -274,12 +312,13 @@ function spawnBuilder(view, groupBy, signal) {
 async function runBuilder(view, groupBy, signal) {
   const release = await view.acquireBuilder(signal)
   if (release === null) return null
+  if (release === BUILDER_QUEUE_OVERLOADED) return BUILDER_QUEUE_OVERLOADED
   try {
     if (signal?.aborted) return null
     return await spawnBuilder(view, groupBy, signal)
   } finally {
-    // spawnBuilder resolves only from the child's close event, so capacity is
-    // not released while a killed process (or one of its open pipes) remains.
+    // spawnBuilder has a post-kill settlement deadline, so capacity cannot be
+    // retained forever by a descendant that inherited the builder's pipes.
     release()
   }
 }
@@ -290,6 +329,9 @@ export function createWorkView({
   timeoutMs = DEFAULT_BUILDER_TIMEOUT_MS,
   maxOutputBytes = DEFAULT_BUILDER_MAX_OUTPUT_BYTES,
   maxConcurrentBuilders = DEFAULT_MAX_CONCURRENT_BUILDERS,
+  maxQueuedBuilders = DEFAULT_MAX_QUEUED_BUILDERS,
+  builderQueueTimeoutMs = timeoutMs,
+  builderSettlementTimeoutMs = DEFAULT_BUILDER_SETTLEMENT_TIMEOUT_MS,
   logger = console,
   spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
@@ -303,15 +345,27 @@ export function createWorkView({
   if (!Number.isInteger(maxConcurrentBuilders) || maxConcurrentBuilders <= 0) {
     throw new Error('Work-view builder concurrency limit must be a positive integer')
   }
+  if (!Number.isInteger(maxQueuedBuilders) || maxQueuedBuilders < 0) {
+    throw new Error('Work-view builder queue limit must be a non-negative integer')
+  }
+  if (!Number.isInteger(builderQueueTimeoutMs) || builderQueueTimeoutMs <= 0) {
+    throw new Error('Work-view builder queue timeout must be a positive integer')
+  }
+  if (!Number.isInteger(builderSettlementTimeoutMs) || builderSettlementTimeoutMs <= 0) {
+    throw new Error('Work-view builder settlement timeout must be a positive integer')
+  }
   const ownerUserId = parseOwnerUserId(env[WORK_VIEW_REQUIRED_ENV[0]])
-  const producerRoot = resolveProducerRoot(env[WORK_VIEW_REQUIRED_ENV[1]], env, spawnSyncImpl)
+  const producerRootConfigured = typeof env[WORK_VIEW_REQUIRED_ENV[1]] === 'string' &&
+    env[WORK_VIEW_REQUIRED_ENV[1]].trim() !== ''
+  const producerRoot = resolveProducerRoot(env[WORK_VIEW_REQUIRED_ENV[1]], env, spawnSyncImpl, logger)
   const storePath = typeof env.WORK_VIEW_STORE_PATH === 'string' && env.WORK_VIEW_STORE_PATH
     ? env.WORK_VIEW_STORE_PATH
     : null
   return {
-    db, env, timeoutMs, maxOutputBytes, logger, spawnImpl, ownerUserId, producerRoot, storePath,
+    db, env, timeoutMs, maxOutputBytes, builderSettlementTimeoutMs, logger, spawnImpl,
+    ownerUserId, producerRoot, producerRootConfigured, storePath,
     validatePayload: compileWorkViewValidator(),
-    acquireBuilder: makeBuilderSemaphore(maxConcurrentBuilders),
+    acquireBuilder: makeBuilderSemaphore(maxConcurrentBuilders, maxQueuedBuilders, builderQueueTimeoutMs),
   }
 }
 
@@ -331,7 +385,9 @@ export async function handleWorkRoute(view, req, res, url, who) {
     return true
   }
   if (view.producerRoot === null) {
-    view.logger.error('work view: WORK_VIEW_PRODUCER_ROOT is absent')
+    if (!view.producerRootConfigured) {
+      view.logger.error('work view: WORK_VIEW_PRODUCER_ROOT is absent')
+    }
     json(res, 500, { error: 'internal' })
     return true
   }
@@ -350,7 +406,8 @@ export async function handleWorkRoute(view, req, res, url, who) {
   if (req.aborted || res.destroyed) abort()
   try {
     const payload = await runBuilder(view, groupBy, abortController.signal)
-    if (payload !== null) json(res, 200, payload)
+    if (payload === BUILDER_QUEUE_OVERLOADED) json(res, 503, { error: 'overloaded' })
+    else if (payload !== null) json(res, 200, payload)
   } finally {
     req.removeListener('aborted', abort)
     res.removeListener('close', abort)
