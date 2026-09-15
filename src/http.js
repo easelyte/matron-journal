@@ -13,7 +13,8 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
-import { handleFilesWriteRoute, listingIsWritable, makeIdemStore } from './files-write-http.js'
+import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
+import { makeDurableIdemStore } from './file-idem.js'
 import { makeFileAudit } from './file-audit.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
@@ -106,7 +107,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
   const fileWriteCtx = {
     fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
     audit: makeFileAudit(fileAuditDir),
-    idem: makeIdemStore(),
+    // Durable, not a Map: a reservation has to outlive the process that made
+    // it, or a retry crossing a restart re-executes its move/delete/upload
+    // (loop #644). Built here for the same reason the audit is — at the
+    // trusted boundary, once, bound to the server's own database.
+    idem: makeDurableIdemStore({ db }),
   }
   return async (req, res) => {
     try {

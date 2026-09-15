@@ -19,13 +19,15 @@
 //   * idempotency — a single-flight reservation keyed by the caller's key AND
 //     a fingerprint of the request, so two concurrent retries perform one
 //     mutation and a reused key carrying a DIFFERENT request is rejected
-//     instead of being served someone else's result;
+//     instead of being served someone else's result. The reservation itself
+//     lives in src/file-idem.js, durably: it has to outlive this process, or a
+//     retry crossing a restart re-executes its move/delete/upload;
 //   * one denial mapping — every rejection is a FileLinkDenied reason run
 //     through denialToStatus, so no endpoint invents its own status.
 import crypto from 'node:crypto'
 import path from 'node:path'
 import {
-  FileLinkDenied, contains, denialToStatus,
+  FileLinkDenied, contains, denialBody, denialToStatus,
   writeFileAtomic, mkdirGuarded, moveGuarded, trashGuarded,
 } from './file-guard.js'
 import { json, readBody } from './http-body.js'
@@ -45,7 +47,6 @@ export const TRASH_DIR_NAME = '.matron-trash'
 // a key is reusable for a deliberate repeat soon after. Matches the
 // peer-message idempotency window (AGENT_IDEM_TTL_MS).
 export const IDEM_TTL_MS = 120_000
-export const IDEM_MAX_ENTRIES = 512
 
 const badRequest = (res) => { json(res, 400, { error: 'bad_request' }); return true }
 // A path the server will consider at all: a string, absolute, and bounded.
@@ -74,58 +75,6 @@ export function listingIsWritable(ctx, realDir) {
   if (!ctx.fileEnableWrites || ctx.fileWritesDryRun || !ctx.fileWriteRoots) return false
   if (realDir.split(path.sep).filter(Boolean).includes(TRASH_DIR_NAME)) return false
   return ctx.fileWriteRoots.roots.some((root) => contains(root.realPath, realDir))
-}
-
-// In-memory, bounded, TTL'd. DOCUMENTED RESIDUAL (plan deferred-(e)): a restart
-// drops the map, so a retry that crosses one can re-execute its write. That is
-// acceptable while Idempotency-Key is optional and the rollout is dormant-first;
-// a durable store is the follow-up if a double-write ever bites.
-export function makeIdemStore({ ttlMs = IDEM_TTL_MS, max = IDEM_MAX_ENTRIES, now = Date.now } = {}) {
-  const entries = new Map()
-  const sweep = () => {
-    const t = now()
-    for (const [key, entry] of entries) if (!entry.pending && entry.expiresAt <= t) entries.delete(key)
-  }
-  return {
-    size: () => entries.size,
-    // Reserves `key`, or reports that it is already reserved. The RESERVATION is
-    // the promise itself, not the finished result — two concurrent retries share
-    // one execution instead of racing two mutations. `replay` tells the caller
-    // it is looking at someone else's execution, which is the hook uploads need
-    // to verify that the bytes really are the same bytes.
-    reserve(key, fingerprint, factory) {
-      sweep()
-      const existing = entries.get(key)
-      if (existing) {
-        if (existing.fingerprint !== fingerprint) throw new FileLinkDenied('idem-key-conflict')
-        return { promise: existing.promise, replay: true }
-      }
-      // An entry whose work is still RUNNING is not a cache line to be reclaimed
-      // — dropping it would let a retry start a second concurrent mutation of
-      // the same target. Evict settled entries only, and refuse a new key rather
-      // than evict live work.
-      while (entries.size >= max) {
-        const evictable = [...entries].find(([, entry]) => !entry.pending)
-        if (!evictable) throw new FileLinkDenied('idem-store-full')
-        entries.delete(evictable[0])
-      }
-      const entry = { fingerprint, pending: true, expiresAt: Infinity }
-      entry.promise = Promise.resolve().then(factory)
-      entries.set(key, entry)
-      entry.promise.then(
-        // The TTL starts when the work SETTLES, not when it started: a slow
-        // upload must not have its own reservation swept out from under it.
-        () => { entry.pending = false; entry.expiresAt = now() + ttlMs },
-        // A failed attempt is not a result worth replaying: drop the key so the
-        // caller can genuinely retry rather than be handed the same failure.
-        () => { entry.pending = false; if (entries.get(key) === entry) entries.delete(key) },
-      )
-      return { promise: entry.promise, replay: false }
-    },
-    run(key, fingerprint, factory) {
-      return this.reserve(key, fingerprint, factory).promise
-    },
-  }
 }
 
 function fingerprintOf(req, url, payload) {
@@ -186,7 +135,7 @@ async function audited(ctx, who, intent, run) {
     ctx.audit({ ...base, result: 'attempt' })
   } catch (err) {
     console.error('file writes: refusing — the audit intent line could not be written', err)
-    return { status: denialToStatus('audit-fail-closed'), body: { error: 'denied' } }
+    return { status: denialToStatus('audit-fail-closed'), body: denialBody('audit-fail-closed') }
   }
 
   // The outcome line is best-effort BY DESIGN: the intent line is already
@@ -212,7 +161,7 @@ async function audited(ctx, who, intent, run) {
   } catch (err) {
     if (err instanceof FileLinkDenied) {
       record('denied', { reason: err.reason })
-      return { status: denialToStatus(err.reason), body: { error: 'denied' } }
+      return { status: denialToStatus(err.reason), body: denialBody(err.reason) }
     }
     record('error', { reason: String(err?.code || 'error').slice(0, 64) })
     throw err
@@ -223,12 +172,17 @@ async function audited(ctx, who, intent, run) {
 // Without a key there is nothing to deduplicate and the work runs directly.
 // Returns null when the header is present but unusable (the caller answers 400):
 // silently ignoring it would leave a client believing a retry was deduped.
-function withIdempotency(ctx, req, who, url, payload, work) {
+//
+// `intent` is recorded WITH the reservation, and exists for exactly one case:
+// a reservation that outlives the process executing it. The filesystem is then
+// the only witness to whether the work happened, and it can only be questioned
+// by something that knows what was attempted (see file-idem.js).
+function withIdempotency(ctx, req, who, url, payload, work, intent) {
   const key = idemKeyOf(req, who)
   if (key === undefined) return null
   if (key === null) return work()
   try {
-    return ctx.idem.run(key, fingerprintOf(req, url, payload), work)
+    return ctx.idem.run(key, fingerprintOf(req, url, payload), work, intent, who.deviceId)
   } catch (err) {
     return Promise.reject(err)
   }
@@ -244,7 +198,7 @@ async function settle(req, res, pending, opts) {
     outcome = await pending
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    outcome = { status: denialToStatus(err.reason), body: { error: 'denied' } }
+    outcome = { status: denialToStatus(err.reason), body: denialBody(err.reason) }
   }
   return answer(req, res, outcome, opts)
 }
@@ -258,17 +212,17 @@ async function settle(req, res, pending, opts) {
 // So a REPLAY reads and hashes its own body and compares it with what the first
 // execution actually wrote; a mismatch is the same conflict a mismatched
 // fingerprint would have been.
-async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, opts) {
+async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, opts, intent) {
   const key = idemKeyOf(req, who)
   if (key === undefined) return badRequest(res)
   if (key === null) return settle(req, res, run(), opts)
 
   let reservation
   try {
-    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run)
+    reservation = ctx.idem.reserve(key, fingerprintOf(req, url, payload), run, intent, who.deviceId)
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    return answer(req, res, { status: denialToStatus(err.reason), body: { error: 'denied' } }, opts)
+    return answer(req, res, { status: denialToStatus(err.reason), body: denialBody(err.reason) }, opts)
   }
   if (!reservation.replay) return settle(req, res, reservation.promise, opts)
 
@@ -278,17 +232,17 @@ async function settleUpload(ctx, req, res, who, url, payload, run, uploadMax, op
     first = await reservation.promise
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) throw err
-    first = { status: denialToStatus(err.reason), body: { error: 'denied' } }
+    first = { status: denialToStatus(err.reason), body: denialBody(err.reason) }
   }
   // `contentHash` is absent when the first attempt never consumed a body (it
   // was denied during validation), and such a result does not depend on the
   // bytes — so it replays as-is.
   if (first.contentHash !== undefined) {
     if (!replay.complete) {
-      return answer(req, res, { status: denialToStatus('too-large'), body: { error: 'denied' }, close: true }, opts)
+      return answer(req, res, { status: denialToStatus('too-large'), body: denialBody('too-large'), close: true }, opts)
     }
     if (first.contentHash !== replay.hash) {
-      return answer(req, res, { status: denialToStatus('idem-key-conflict'), body: { error: 'denied' } }, opts)
+      return answer(req, res, { status: denialToStatus('idem-key-conflict'), body: denialBody('idem-key-conflict') }, opts)
     }
   }
   return answer(req, res, first, opts)
@@ -348,7 +302,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       }
     })
 
-    return settleUpload(ctx, req, res, who, url, { target, overwrite }, run, uploadMax, opts)
+    return settleUpload(ctx, req, res, who, url, { target, overwrite }, run, uploadMax, opts,
+      { op: 'upload', path: target })
   }
 
   // --- T-2.2: POST /files/mkdir {path} -------------------------------------
@@ -365,7 +320,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       return { status: 200, body: { path: canonical }, audit: { path: canonical } }
     })
 
-    return settle(req, res, withIdempotency(ctx, req, who, url, { target }, run), opts)
+    return settle(req, res, withIdempotency(ctx, req, who, url, { target }, run,
+      { op: 'mkdir', path: target }), opts)
   }
 
   // --- T-2.3: POST /files/move {from,to} -----------------------------------
@@ -380,7 +336,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       return { status: 200, body: moved, audit: { path: moved.from, to: moved.to } }
     })
 
-    return settle(req, res, withIdempotency(ctx, req, who, url, { from, to }, run), opts)
+    return settle(req, res, withIdempotency(ctx, req, who, url, { from, to }, run,
+      { op: 'move', path: from, to }), opts)
   }
 
   // --- T-2.4: POST /files/write {path, content, overwrite?} ----------------
@@ -408,7 +365,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
 
     return settle(req, res, withIdempotency(ctx, req, who, url, {
       target, overwrite, contentHash: crypto.createHash('sha256').update(content).digest('hex'),
-    }, run), opts)
+    }, run, { op: 'write', path: target }), opts)
   }
 
   // --- T-2.5: DELETE /files?path=&recursive=0|1&confirm=1 ------------------
@@ -434,5 +391,6 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     }
   })
 
-  return settle(req, res, withIdempotency(ctx, req, who, url, { requested, recursive, confirmed }, run), opts)
+  return settle(req, res, withIdempotency(ctx, req, who, url, { requested, recursive, confirmed }, run,
+    { op: 'delete', path: requested }), opts)
 }

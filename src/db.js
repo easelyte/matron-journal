@@ -52,6 +52,59 @@ CREATE TABLE IF NOT EXISTS agent_idem(
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
+-- Durable idempotency for the file WRITE API (loop #644). Separate from
+-- agent_idem because the unit of replay is an HTTP OUTCOME (status + body),
+-- not an appended event seq, and because a row has to survive the process that
+-- created it: the in-memory store this replaces lost every reservation on
+-- restart, so a client retry crossing one re-executed its move/delete/upload.
+-- The key column already carries the calling device (idemKeyOf prefixes it
+-- with the device id), so there is no device column here: the 120s TTL, not a
+-- revocation cascade, is what bounds this table.
+CREATE TABLE IF NOT EXISTS file_idem(
+  key TEXT PRIMARY KEY,
+  -- The device INCARNATION that reserved this row, not just the id encoded in
+  -- the key. devices.id is a reusable rowid, so without this a revoked device's
+  -- rows are inherited by whichever replacement is handed the same number.
+  --
+  -- Revocation splits by state, because the two states fail in opposite
+  -- directions. A SETTLED row is a cached response: inherited, it answers a
+  -- replacement with the previous incarnation's result, so the trigger below
+  -- deletes it. A PENDING row is a live exclusion record, and its work may
+  -- still be running — cascading it away would let a retry execute a second
+  -- time, which for an upload or a move destroys data. So it is detached
+  -- (device_id → NULL) and kept as a tombstone: unowned, charged to no one's
+  -- quota, swept at the orphan retention bound, and refusing its key until
+  -- then. A replacement colliding on that key is refused rather than served or
+  -- joined — the safe direction, and the collision needs both id reuse and the
+  -- same client-chosen key.
+  device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+  -- Identifies THIS reservation, not just its key. The key is chosen by the
+  -- client and the device id it embeds is reusable, so after a revoke the same
+  -- key can legitimately belong to a different reservation. Bookkeeping that
+  -- addressed rows by key alone could then let an in-flight operation from the
+  -- revoked incarnation settle, or delete, the replacement's row.
+  gen TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  -- Which server process reserved this row. A 'pending' row whose boot_id is
+  -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
+  boot_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','done')),
+  -- JSON {op, path, to?, contentHash?}: what the row was reserved to do, so a
+  -- crossed-restart retry can ask the filesystem whether it happened.
+  intent TEXT,
+  status INTEGER,
+  body TEXT,
+  content_hash TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
+CREATE INDEX IF NOT EXISTS idx_file_idem_device ON file_idem(device_id);
+-- Fires before the FK's SET NULL detaches the rest, so only reservations that
+-- have already answered are discarded with the device.
+CREATE TRIGGER IF NOT EXISTS file_idem_drop_settled_on_revoke BEFORE DELETE ON devices BEGIN
+  DELETE FROM file_idem WHERE device_id=OLD.id AND state='done';
+END;
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL
@@ -263,7 +316,47 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
-  db.exec(SCHEMA)
+  // BEFORE the schema exec, and it has to be: SCHEMA builds
+  // idx_file_idem_device, and creating that index over a table that predates
+  // the column raises `no such column: device_id` — which does not just skip
+  // the repair below, it throws out of openDb and wedges every opener, server
+  // and admin CLI alike, against exactly the database this is meant to fix.
+  //
+  // A drop is the whole migration: file_idem is introduced by the same
+  // unreleased change that added device_id, so there are no production rows to
+  // preserve. A column-less table can only exist in a dev checkout that ran an
+  // earlier commit of this branch, and SCHEMA recreates it on the next line.
+  // The SHAPE of the table, not just its column names. This branch revised
+  // file_idem three times — device_id, then gen, then the cascade becoming a
+  // detach — so a dev database can hold any of those intermediate forms, and
+  // `CREATE TABLE IF NOT EXISTS` repairs none of them. Checking column names
+  // alone would accept the revision whose foreign key still says CASCADE,
+  // which quietly restores the bug that revision removed: a revoke would
+  // delete a PENDING reservation whose work is still running, and a reused
+  // device id with the same key would then execute it a second time.
+  //
+  // Inspect, drop and create in ONE immediate transaction. Both the server and
+  // the admin CLI open this database, and split across three statements two
+  // concurrent openers can each see the stale table — the second then either
+  // fails on a table that is no longer there or drops the correct one the
+  // first just built. The write lock serialises them, and the loser re-reads
+  // under it and finds nothing to do.
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(file_idem)').all()
+    const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+    const deviceCol = cols.find((c) => c.name === 'device_id')
+    const stale = cols.length && !(
+      deviceCol && deviceCol.notnull === 0
+      && cols.some((c) => c.name === 'gen')
+      && fk && fk.table === 'devices'
+      && String(fk.on_delete).toUpperCase() === 'SET NULL'
+    )
+    if (stale) {
+      db.exec('DROP TABLE file_idem')
+      console.log('file_idem: dropped a pre-release dev table whose shape predates this revision; recreating')
+    }
+    db.exec(SCHEMA)
+  }).immediate()
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.
