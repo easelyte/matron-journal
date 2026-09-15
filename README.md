@@ -73,6 +73,37 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
+| `WORK_VIEW_OWNER_USER_ID` | unset | Numeric journal user ID authorized to access `GET /work`; required to activate the Work view |
+| `WORK_VIEW_PRODUCER_ROOT` | unset | Absolute directory containing `scripts/work_view_cli.py`; required to activate the Work view |
+| `WORK_VIEW_STORE_PATH` | producer default | Optional canonical loop-store path passed to the Work-view producer |
+
+To activate `GET /work` for the reference systemd service, put the
+deployment-specific values in a root-owned environment file, for example
+`/etc/matron-journal/work-view.env`:
+
+    WORK_VIEW_OWNER_USER_ID=REPLACE_WITH_NUMERIC_USER_ID
+    WORK_VIEW_PRODUCER_ROOT=/absolute/path/to/work-view-producer
+    WORK_VIEW_STORE_PATH=/absolute/path/to/canonical-loop-store.json
+
+Then add a systemd drop-in with `systemctl edit matron-journal`:
+
+    [Service]
+    EnvironmentFile=/etc/matron-journal/work-view.env
+
+The producer root must be readable and traversable by the service's `matron`
+user and must contain `scripts/work_view_cli.py`. The owner ID is the sole
+journal user allowed to use the route. `WORK_VIEW_STORE_PATH` is optional when
+the producer's own default store location is correct. Restarting or reloading
+the service remains an operator-controlled deployment step.
+
+Under a hardened systemd unit, filesystem permissions alone are not enough:
+`ProtectHome=yes` can hide paths under `/home`, `/root`, and `/run/user`, while
+`ProtectSystem=strict` can make other locations inaccessible to the service.
+Site the producer root outside protected homes, or add only the narrowly scoped
+mount/read exception needed for that root in the service drop-in. A path that
+exists and is readable from an operator shell can still be invisible inside the
+service sandbox; in that case the journal logs the startup error and disables
+only `GET /work`.
 
 ## How it fits together
 

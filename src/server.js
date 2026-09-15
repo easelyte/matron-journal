@@ -342,7 +342,8 @@ export function startServer({
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, httpHandlerFactory = makeHttpHandler,
+  fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, workViewOptions,
+  httpHandlerFactory = makeHttpHandler,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -509,6 +510,7 @@ export function startServer({
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
+    workViewOptions,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
