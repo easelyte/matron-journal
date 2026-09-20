@@ -530,6 +530,54 @@ test('T-2.5: delete moves into the trash, demands confirm, and guards non-empty 
   assert.equal(fs.readFileSync(path.join((await recursive.json()).trashed ?? '', 'nested.txt'), 'utf8'), 'nested\n')
 })
 
+test('T-2.5: an Idempotency-Key deduplicates DELETE — one trash, replayed body, and a reused key on a different target is a conflict', async (t) => {
+  const f = makeFixture()
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s)
+  const doomed = path.join(f.writeRoot, 'existing.txt')
+  const key = crypto.randomUUID()
+  const send = () => call(s, `/files?path=${encodeURIComponent(doomed)}&confirm=1`, {
+    method: 'DELETE', token, headers: { 'idempotency-key': key },
+  })
+
+  // Two concurrent retries of one key are single-flighted into ONE delete: the
+  // shared reservation is what stops the second from trashing a replacement
+  // that landed at the same name after the first delete (the move/delete case
+  // durable idempotency exists for — file-idem.js).
+  const [a, b] = await Promise.all([send(), send()])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  const aBody = await a.json()
+  assert.deepEqual(aBody, await b.json(), 'both retries answer with the same recorded outcome')
+  assert.equal(fs.existsSync(doomed), false)
+  assert.equal(trashEntries(f.writeRoot).length, 1, 'one delete, one trashed copy — not two')
+  assert.equal(auditLines(f).filter((r) => r.op === 'delete' && r.result === 'attempt').length, 1)
+
+  // A replay after completion returns the SAME body without re-running: it does
+  // not re-observe an already-gone target as a fresh `already_missing:true`.
+  const replay = await send()
+  assert.equal(replay.status, 200)
+  assert.deepEqual(await replay.json(), aBody)
+  assert.equal(trashEntries(f.writeRoot).length, 1)
+
+  // The same key aimed at a DIFFERENT target is a conflict, never served the
+  // first delete's result (fingerprint covers path + recursive + confirm).
+  const other = path.join(f.writeRoot, 'sub', 'nested.txt')
+  const reused = await call(s, `/files?path=${encodeURIComponent(other)}&confirm=1`, {
+    method: 'DELETE', token, headers: { 'idempotency-key': key },
+  })
+  assert.equal(reused.status, 409)
+  assert.ok(fs.existsSync(other), 'the mismatched-key delete did not run')
+
+  // An unusable Idempotency-Key header is a 400, never silently ignored.
+  const bad = await call(s, `/files?path=${encodeURIComponent(other)}&confirm=1`, {
+    method: 'DELETE', token, headers: { 'idempotency-key': 'x'.repeat(200) },
+  })
+  assert.equal(bad.status, 400)
+  assert.ok(fs.existsSync(other), 'a rejected header performs no mutation')
+})
+
 test('T-2.5: the trash itself is not deletable, and it stays out of ordinary listings', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
