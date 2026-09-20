@@ -279,7 +279,15 @@ const DECORATE = `
   -- title lets a viewer render "from «that convo»" without a second fetch.
   -- May be '' (conversations.title defaults to '') or NULL if the origin
   -- conversation row is gone; clients treat both as "no title".
-  (SELECT title FROM conversations cv WHERE cv.id = i.origin_convo_id) AS origin_convo_title
+  --   owner_user_id = i.user_id: a conversation id is a global PK, so an
+  -- orphaned origin_convo_id that a DIFFERENT user later reuses must NOT
+  -- disclose that user's title — scope the lookup to the item's own owner
+  -- (P2 canonical source: provenance resolves through the item user's convo).
+  --   substr(...,1,200): the title is repeated on every row of a page (up to
+  -- 500) and copied into durable markers; bound the projection so one
+  -- oversized title can't amplify a response or event into hundreds of MiB.
+  (SELECT substr(cv.title, 1, 200) FROM conversations cv
+     WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS origin_convo_title
 `
 
 export function getItem(db, userId, idOrNum) {

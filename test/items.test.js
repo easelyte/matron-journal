@@ -186,6 +186,24 @@ test('item read shape exposes origin_convo_id + origin_convo_title for provenanc
   assert.equal(getItem(db, dan.id, a.id).origin_convo_title, null)
 })
 
+test('origin_convo_title never leaks a title from a conversation owned by another user', async () => {
+  const { db, dan, pat, agent } = await seed()
+  // A conversation id is a global PK. If dan holds an item whose origin_convo_id was later reused
+  // by pat, the title lookup must resolve through DAN's ownership, not pat's row.
+  upsertConversation(db, { id: 'shared-id', ownerUserId: pat.id, title: "pat's private title", agentDeviceId: agent.deviceId })
+  const danItem = createItem(db, base({ userId: dan.id, originConvoId: 'shared-id' })).item
+  const seen = getItem(db, dan.id, danItem.id)
+  assert.equal(seen.origin_convo_id, 'shared-id')
+  assert.equal(seen.origin_convo_title, null) // owner mismatch -> no title, not pat's
+})
+
+test('origin_convo_title is bounded so one oversized title cannot amplify a response', async () => {
+  const { db, dan } = await seed()
+  db.prepare('UPDATE conversations SET title=? WHERE id=?').run('x'.repeat(5000), 'c1')
+  const it = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
+  assert.equal(getItem(db, dan.id, it.id).origin_convo_title.length, 200)
+})
+
 test('listItems filters, sorts, pages, and decorates', async () => {
   const { db, dan } = await seed()
   createItem(db, base({ userId: dan.id, now: 1 }))
