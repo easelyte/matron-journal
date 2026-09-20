@@ -273,7 +273,13 @@ const DECORATE = `
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   (SELECT COALESCE(attachments,'[]') FROM item_comments c WHERE c.item_id = i.id AND c.kind='status' AND c.meta LIKE '%"role":"body"%' LIMIT 1) AS attachments,
   EXISTS(SELECT 1 FROM item_comments c WHERE c.item_id = i.id AND c.attachments LIKE '%"mime":"image/%') AS has_image,
-  (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num
+  (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num,
+  -- Origin conversation title for client-side provenance labelling (this
+  -- session / another session). origin_convo_id already rides on i.*; the
+  -- title lets a viewer render "from «that convo»" without a second fetch.
+  -- May be '' (conversations.title defaults to '') or NULL if the origin
+  -- conversation row is gone; clients treat both as "no title".
+  (SELECT title FROM conversations cv WHERE cv.id = i.origin_convo_id) AS origin_convo_title
 `
 
 export function getItem(db, userId, idOrNum) {

@@ -168,6 +168,24 @@ test('getItem accepts id, #num, num; other user 404s', async () => {
   assert.deepEqual(getItem(db, dan.id, a.id).labels, [])
 })
 
+test('item read shape exposes origin_convo_id + origin_convo_title for provenance labelling', async () => {
+  const { db, dan } = await seed() // seed() creates c1 (title 'C1') and c2 (title 'C2')
+  const a = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
+  const b = createItem(db, base({ userId: dan.id, originConvoId: 'c2' })).item
+  // getItem
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_title, 'C1')
+  assert.equal(getItem(db, dan.id, b.id).origin_convo_title, 'C2')
+  // listItems decorates identically
+  const byId = Object.fromEntries(listItems(db, dan.id, {}).items.map((it) => [it.id, it]))
+  assert.equal(byId[a.id].origin_convo_title, 'C1')
+  assert.equal(byId[b.id].origin_convo_title, 'C2')
+  // A gone origin conversation degrades to null title, never throws.
+  db.prepare('DELETE FROM conversations WHERE id=?').run('c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_title, null)
+})
+
 test('listItems filters, sorts, pages, and decorates', async () => {
   const { db, dan } = await seed()
   createItem(db, base({ userId: dan.id, now: 1 }))
