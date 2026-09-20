@@ -20,6 +20,13 @@ export function itemMarkerPayload({ item, action, by, comment = null }) {
     by,
     awaiting: item.awaiting ?? null,
     resolution: item.resolution ?? null,
+    // Origin conversation, so a client rendering the marker can label the
+    // item's provenance relative to the session receiving it (this session /
+    // another session). origin_convo_id is a base column; origin_convo_title
+    // rides on the decorated item shape (getItem/DECORATE) — null when the
+    // origin conversation row is gone or the item was passed undecorated.
+    origin_convo_id: item.origin_convo_id ?? null,
+    origin_convo_title: item.origin_convo_title ?? null,
   }
   if (comment && (comment.body || (comment.attachments && comment.attachments.length))) {
     payload.comment = {

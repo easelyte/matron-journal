@@ -491,10 +491,13 @@ test('itemMarkerPayload carries the spec fields and trims the comment', async ()
     attachments: [{ blob_ref: 'b', mime: 'audio/mp4', name: 'v.m4a', size: 1 }] })
   const p = itemMarkerPayload({ item: r.item, action: 'commented', by: 'user', comment: r.comment })
   assert.equal(ITEM_EVENT_TYPE, 'item')
-  assert.deepEqual(Object.keys(p).sort(), ['action', 'awaiting', 'by', 'comment', 'item_id', 'kind', 'num', 'resolution', 'title'])
+  assert.deepEqual(Object.keys(p).sort(), ['action', 'awaiting', 'by', 'comment', 'item_id', 'kind', 'num', 'origin_convo_id', 'origin_convo_title', 'resolution', 'title'])
   assert.equal(p.comment.body, 'use A'); assert.equal(p.comment.attachments[0].transcript, null)
+  // Origin conversation rides on the marker for client-side provenance labelling.
+  assert.equal(p.origin_convo_id, 'c1'); assert.equal(p.origin_convo_title, 'C1')
   const created = itemMarkerPayload({ item: q, action: 'created', by: 'agent' })
   assert.equal(created.comment, undefined); assert.equal(created.awaiting, 'user')
+  assert.equal(created.origin_convo_id, 'c1'); assert.equal(created.origin_convo_title, 'C1')
 })
 
 test('snippetOf renders item markers', () => {
