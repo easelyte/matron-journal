@@ -530,6 +530,89 @@ test('T-2.5: delete moves into the trash, demands confirm, and guards non-empty 
   assert.equal(fs.readFileSync(path.join((await recursive.json()).trashed ?? '', 'nested.txt'), 'utf8'), 'nested\n')
 })
 
+test('T-2.5: an Idempotency-Key deduplicates DELETE — replayed body, and every fingerprinted field (path/recursive/confirm) conflicts on reuse', async (t) => {
+  const f = makeFixture()
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s)
+  const del = (target, key, { recursive = false, confirm = true } = {}) => call(
+    s,
+    `/files?path=${encodeURIComponent(target)}${recursive ? '&recursive=1' : ''}${confirm ? '&confirm=1' : ''}`,
+    { method: 'DELETE', token, ...(key ? { headers: { 'idempotency-key': key } } : {}) },
+  )
+
+  // A completed delete replays its EXACT recorded body under the same key,
+  // without re-observing the now-gone target as a fresh already_missing:true and
+  // without trashing a second time. The genuinely-in-flight single-flight JOIN
+  // (two retries sharing one live execution) is covered deterministically at the
+  // store layer, in file-idem.test.js ("concurrent retries inside one process
+  // still share a single execution"): DELETE's mutation completes synchronously,
+  // so an HTTP-level Promise.all cannot reliably force that branch. What this
+  // asserts is the end-to-end guarantee a client relies on — a retried delete
+  // never double-mutates and always answers identically.
+  const doomed = path.join(f.writeRoot, 'existing.txt')
+  const key = crypto.randomUUID()
+  const first = await del(doomed, key)
+  assert.equal(first.status, 200)
+  const firstBody = await first.json()
+  assert.ok(firstBody.trashed && firstBody.already_missing === false)
+  assert.equal(fs.existsSync(doomed), false)
+
+  const replay = await del(doomed, key)
+  assert.equal(replay.status, 200)
+  assert.deepEqual(await replay.json(), firstBody, 'the same body, not a fresh already_missing:true')
+  assert.equal(trashEntries(f.writeRoot).length, 1, 'one delete, one trashed copy')
+  // Exactly one write-ahead attempt for this target: the replay returns the
+  // stored outcome without re-entering the audited funnel.
+  assert.equal(auditLines(f).filter((r) => r.op === 'delete' && r.path === doomed && r.result === 'attempt').length, 1)
+
+  // Concurrent retries of one key never double-mutate, whichever branch each
+  // lands in: identical bodies, and exactly one execution (one attempt line).
+  const doomed2 = path.join(f.writeRoot, 'concurrent.txt')
+  fs.writeFileSync(doomed2, 'x\n')
+  const key2 = crypto.randomUUID()
+  const [a, b] = await Promise.all([del(doomed2, key2), del(doomed2, key2)])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.deepEqual(await a.json(), await b.json())
+  assert.equal(auditLines(f).filter((r) => r.op === 'delete' && r.path === doomed2 && r.result === 'attempt').length, 1)
+
+  // The reservation fingerprint covers path + recursive + confirm: reusing a key
+  // with ANY of the three changed is a 409 conflict, never a replay of the first
+  // outcome. Each case would otherwise silently replay a success for DIFFERENT
+  // deletion semantics if that field were dropped from the reservation payload.
+
+  // (a) different PATH — reuse the first key on a still-present target.
+  const other = path.join(f.writeRoot, 'sub', 'nested.txt')
+  const byPath = await del(other, key)
+  assert.equal(byPath.status, 409)
+  assert.ok(fs.existsSync(other), 'the mismatched-key delete did not run')
+
+  // (b) different RECURSIVE — a recursive delete succeeds, then the same key
+  // WITHOUT recursive must conflict rather than replay the 200. The 409 is a
+  // pre-execution fingerprint mismatch, so the now-gone dir is irrelevant.
+  const dir = path.join(f.writeRoot, 'emptydir')
+  fs.mkdirSync(dir)
+  const key3 = crypto.randomUUID()
+  assert.equal((await del(dir, key3, { recursive: true })).status, 200)
+  assert.equal((await del(dir, key3, { recursive: false })).status, 409, 'recursive is fingerprinted')
+
+  // (c) different CONFIRM — a confirmed delete succeeds, then the same key
+  // without confirm must conflict rather than replay the success.
+  const doomed3 = path.join(f.writeRoot, 'confirmed.txt')
+  fs.writeFileSync(doomed3, 'y\n')
+  const key4 = crypto.randomUUID()
+  assert.equal((await del(doomed3, key4, { confirm: true })).status, 200)
+  assert.equal((await del(doomed3, key4, { confirm: false })).status, 409, 'confirm is fingerprinted, not replayed as a success')
+
+  // An unusable Idempotency-Key header is a 400 that performs no mutation.
+  const survivor = path.join(f.writeRoot, 'survivor.txt')
+  fs.writeFileSync(survivor, 'z\n')
+  const bad = await del(survivor, 'x'.repeat(200))
+  assert.equal(bad.status, 400)
+  assert.ok(fs.existsSync(survivor), 'a rejected header performs no mutation')
+})
+
 test('T-2.5: the trash itself is not deletable, and it stays out of ordinary listings', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
