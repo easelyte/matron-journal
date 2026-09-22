@@ -531,23 +531,36 @@ export function openDb(path) {
         //      a row that also carries an integer *_device_id, already covered
         //      by (1); a detached file_idem key (device_id NULL) is left to
         //      file_idem's own colliding-key refusal + 120s TTL (A1-retained).
+        // Quote an identifier from the schema by doubling embedded quotes — the
+        // names come from sqlite_master/PRAGMA, not user input, but a table or
+        // column legally containing a `"` would otherwise generate invalid SQL
+        // and wedge the migration on every restart.
+        const qid = (id) => `"${String(id).replace(/"/g, '""')}"`
         let highWater = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM devices').get().m
         for (const t of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
-          for (const c of db.prepare(`PRAGMA table_info("${t.name}")`).all()) {
+          for (const c of db.prepare(`PRAGMA table_info(${qid(t.name)})`).all()) {
             if (c.name === 'device_id' || /_device_id$/.test(c.name)) {
-              const v = db.prepare(`SELECT MAX("${c.name}") AS m FROM "${t.name}"`).get().m
+              const v = db.prepare(`SELECT MAX(${qid(c.name)}) AS m FROM ${qid(t.name)}`).get().m
               if (v != null && v > highWater) highWater = v
             }
           }
         }
         const eventsExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
         if (eventsExists) {
-          // 2nd colon segment of `<scheme>:<id>:<rest>`, non-numeric/malformed → 0.
+          // 2nd colon segment of `<scheme>:<id>:<rest>`. Only a canonical, in-
+          // range decimal counts: SQLite's CAST accepts a numeric PREFIX, so
+          // `client:<huge>junk:x` would otherwise cast to a giant value and seed
+          // the sequence to it (SQLITE_FULL on the next insert). The GLOB filter
+          // requires all-digits and length ≤ 18 (< 10^18, safely inside int64),
+          // so any suffix, sign, whitespace, scientific notation or overflow
+          // width is excluded rather than truncated to a huge integer.
           const ev = db.prepare(`
-            SELECT COALESCE(MAX(CAST(substr(rest, 1, instr(rest || ':', ':') - 1) AS INTEGER)), 0) AS m
-              FROM (SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest
-                      FROM events
-                     WHERE idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%')
+            SELECT COALESCE(MAX(CAST(seg AS INTEGER)), 0) AS m
+              FROM (SELECT substr(rest, 1, instr(rest || ':', ':') - 1) AS seg
+                      FROM (SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest
+                              FROM events
+                             WHERE idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%'))
+             WHERE length(seg) BETWEEN 1 AND 18 AND seg NOT GLOB '*[^0-9]*'
           `).get().m
           if (ev > highWater) highWater = ev
         }

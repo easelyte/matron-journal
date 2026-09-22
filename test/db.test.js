@@ -889,3 +889,67 @@ test('devices rebuild seeds above a dangling id found only in events.idem_key', 
   assert.equal(next, 51, 'the events.idem_key scan must reach the 2nd colon segment')
   db.close()
 })
+
+// F1/F2 round-3 hardening (loop #755): defensive against data our own code
+// never writes but externally-repaired/legacy DBs might.
+test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID exhaustion)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-malformed-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  // A numeric-prefix-with-junk key (CAST would yield a giant int) and a real one.
+  raw.exec(`INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key)
+            VALUES(1,1,'room',0,'user:dan','text','{}','client:9223372036854775807junk:x'),
+                  (1,2,'room',0,'user:dan','text','{}','client:7:ok')`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  // The malformed key is excluded; the real id 7 wins → next is 8, NOT a giant.
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'client','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 8, 'malformed prefixes must not inflate the sequence')
+  db.close()
+})
+
+test('devices rebuild scans a table whose name contains a double-quote', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-quote-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // A table with a literal double-quote in its name, holding a dangling id 60.
+  raw.exec('CREATE TABLE "weird""tbl" (x_device_id INTEGER); INSERT INTO "weird""tbl" VALUES(60);')
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 61, 'the quoted-identifier scan must reach the oddly-named table without throwing')
+  db.close()
+})
