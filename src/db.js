@@ -9,7 +9,17 @@ CREATE TABLE IF NOT EXISTS users(
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices(
-  id INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT, not a plain rowid (loop #755): a plain INTEGER PRIMARY KEY
+  -- hands a deleted device's number straight to the next insert, so a
+  -- replacement inherits the revoked device's identity — and with it the
+  -- revoked device's idempotency namespace, since idemKeyOf embeds who.deviceId
+  -- (\`<deviceId>:<key>\`). AUTOINCREMENT makes the id monotonic and never
+  -- reused, closing that at the source. The downstream workarounds that were
+  -- built while this id was reusable (file_idem's revoke trigger + gen + SET
+  -- NULL detach, agent_idem's incarnation-binding migration, the convo_agents
+  -- cascade) are LEFT in place here as belt-and-braces and removed in a
+  -- follow-up — this change only re-bases the invariant they defend.
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id),
   kind TEXT NOT NULL CHECK(kind IN ('client','agent')),
   name TEXT NOT NULL,
@@ -441,6 +451,148 @@ export function openDb(path) {
   // local defaults, which is exactly why it never followed the user.
   if (!deviceCols.some((c) => c.name === 'tag_char')) {
     db.exec('ALTER TABLE devices ADD COLUMN tag_char TEXT')
+  }
+  // Retrofit AUTOINCREMENT onto a devices table that predates it (loop #755).
+  // SQLite has no ALTER to add AUTOINCREMENT, so the table is rebuilt — and
+  // devices is a PARENT (agent_idem, file_idem and convo_agents all reference
+  // devices(id)), so unlike the child-table rebuilds above this one must run
+  // with foreign_keys OFF: with it ON, DROP TABLE devices would fire every
+  // child's ON DELETE action and wipe/detach their rows. Placed AFTER every
+  // devices ADD COLUMN so the rebuilt shape is the full, stable column set, and
+  // BEFORE the apns dedupe + unique index below so that index lands on the new
+  // table for free. The BEFORE DELETE trigger is dropped with the old table and
+  // recreated by re-running SCHEMA (IF NOT EXISTS makes every other object a
+  // no-op) — sourcing it from the canonical text rather than a hand-copy that
+  // could drift.
+  //
+  // The explicit-id copy alone seeds sqlite_sequence only to MAX(live device
+  // id) — which is NOT enough. A device deleted before the migration can still
+  // be REFERENCED by a durable, non-cascading integer column, above all
+  // `conversations.agent_device_id`, which authorizeAgentWrite treats as
+  // conversation ownership (it is deliberately not a foreign key, so a revoke
+  // leaves it dangling). If such a dangling id is the highest ever issued, the
+  // live-max seed would hand it straight back to the next device, which would
+  // then inherit write access to the revoked agent's conversation. The retained
+  // idempotency/convo_agents workarounds do not cover that column. So the
+  // sequence is seeded to the high-water mark across EVERY durable device-id
+  // reference, guaranteeing no id that was ever issued — live or dangling — is
+  // reissued from here on.
+  const devicesSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get()
+  if (devicesSql && !/AUTOINCREMENT/i.test(devicesSql.sql)) {
+    db.pragma('foreign_keys = OFF')
+    try {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE devices_ai(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL CHECK(kind IN ('client','agent')),
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            cursor INTEGER NOT NULL DEFAULT 0,
+            apns_token TEXT,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER,
+            apns_env TEXT,
+            push_prefs TEXT,
+            private INTEGER NOT NULL DEFAULT 0,
+            private_pinned INTEGER NOT NULL DEFAULT 0,
+            tag_char TEXT
+          );
+          INSERT INTO devices_ai(id, user_id, kind, name, token_hash, cursor, apns_token,
+                                 created_at, last_seen_at, apns_env, push_prefs, private, private_pinned, tag_char)
+            SELECT id, user_id, kind, name, token_hash, cursor, apns_token,
+                   created_at, last_seen_at, apns_env, push_prefs, private, private_pinned, tag_char
+              FROM devices;
+          DROP TABLE devices;
+          ALTER TABLE devices_ai RENAME TO devices;
+        `)
+        // Recreate the trigger dropped with the old table, from the canonical
+        // SCHEMA (every other CREATE ... IF NOT EXISTS is a no-op here).
+        db.exec(SCHEMA)
+        // Lift the sequence above every surviving device-id reference, not just
+        // the live device rows, so a revoked-but-still-referenced id (e.g. a
+        // dangling conversation owner, an item's origin_device_id, or a
+        // milestone's device_id) is never reissued and cannot inherit that
+        // reference's meaning (ownership, idempotency replay, attribution).
+        //
+        // The reference set is DISCOVERED from the schema, not hand-listed — a
+        // hand-list silently diverges as columns are added (P2 canonical
+        // source). Two kinds of reference:
+        //   1. Integer columns: devices.id plus every column named `device_id`
+        //      or `*_device_id` in any table. This auto-covers items, missions,
+        //      milestones, item_comments, conversations, convo_agents,
+        //      agent_spawn_requests, file_idem and agent_idem — and any future
+        //      column that follows the same naming convention.
+        //   2. `events.idem_key`, the ONLY persistent namespace that encodes a
+        //      device id with no sibling integer column (`client:<id>:<local>`
+        //      / `agent:<id>:<key>`, id as the 2nd colon segment). Every other
+        //      idem_key column (items/missions/milestones/item_comments) sits in
+        //      a row that also carries an integer *_device_id, already covered
+        //      by (1); a detached file_idem key (device_id NULL) is left to
+        //      file_idem's own colliding-key refusal + 120s TTL (A1-retained).
+        // Quote an identifier from the schema by doubling embedded quotes — the
+        // names come from sqlite_master/PRAGMA, not user input, but a table or
+        // column legally containing a `"` would otherwise generate invalid SQL
+        // and wedge the migration on every restart.
+        const qid = (id) => `"${String(id).replace(/"/g, '""')}"`
+        let highWater = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM devices').get().m
+        for (const t of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+          for (const c of db.prepare(`PRAGMA table_info(${qid(t.name)})`).all()) {
+            if (c.name === 'device_id' || /_device_id$/.test(c.name)) {
+              const v = db.prepare(`SELECT MAX(${qid(c.name)}) AS m FROM ${qid(t.name)}`).get().m
+              if (v != null && v > highWater) highWater = v
+            }
+          }
+        }
+        const eventsExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
+        if (eventsExists) {
+          // 2nd colon segment of `<scheme>:<id>:<rest>`. Only a canonical, in-
+          // range decimal counts: SQLite's CAST accepts a numeric PREFIX, so
+          // `client:<huge>junk:x` would otherwise cast to a giant value and seed
+          // the sequence to it (SQLITE_FULL on the next insert). The GLOB filter
+          // requires all-digits and length ≤ 18 (< 10^18, safely inside int64),
+          // so any suffix, sign, whitespace, scientific notation or overflow
+          // width is excluded rather than truncated to a huge integer.
+          const ev = db.prepare(`
+            SELECT COALESCE(MAX(CAST(seg AS INTEGER)), 0) AS m
+              FROM (SELECT substr(rest, 1, instr(rest || ':', ':') - 1) AS seg
+                      FROM (SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest
+                              FROM events
+                             WHERE idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%'))
+             WHERE length(seg) BETWEEN 1 AND 18 AND seg NOT GLOB '*[^0-9]*'
+          `).get().m
+          if (ev > highWater) highWater = ev
+        }
+        const seqRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name='devices'").get()
+        if (seqRow) {
+          if (highWater > seqRow.seq) {
+            db.prepare("UPDATE sqlite_sequence SET seq=? WHERE name='devices'").run(highWater)
+          }
+        } else if (highWater > 0) {
+          db.prepare("INSERT INTO sqlite_sequence(name, seq) VALUES('devices', ?)").run(highWater)
+        }
+        // Validate BEFORE commit, scoped to children that reference devices
+        // (parent==='devices'): those are the only violations THIS rebuild could
+        // introduce (a device row the copy dropped while a child still points at
+        // it). Throwing here rolls the whole rebuild back, so a failed audit
+        // cannot be silently "completed" by the AUTOINCREMENT DDL landing and the
+        // guard above skipping the migration on the next restart. Scoped rather
+        // than whole-DB so a pre-existing unrelated orphan (e.g. a device whose
+        // user_id no longer resolves) does not wedge every opener against a
+        // condition this migration neither caused nor fixes.
+        const violations = db.pragma('foreign_key_check').filter((v) => v.parent === 'devices')
+        if (violations.length) {
+          throw new Error(`devices AUTOINCREMENT migration orphaned a child reference: ${JSON.stringify(violations)}`)
+        }
+      })()
+      console.log('devices: rebuilt with AUTOINCREMENT so revoked ids are never reused (loop #755)')
+    } finally {
+      // Always restore enforcement, even if the transaction rolled back — a
+      // failed migration must not leave this connection running with foreign
+      // keys off for the rest of the process.
+      db.pragma('foreign_keys = ON')
+    }
   }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration

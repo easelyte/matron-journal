@@ -768,7 +768,7 @@ test('a forged device name reaches /agent-chat/pending sanitised, never as forge
 // created lands on exactly its id. Anything keyed on a device id therefore
 // has to die with the device. "Retire an agent, register its replacement" is
 // the ordinary sequence that hits this.
-test('revoking a device clears its room membership, so a reused id inherits nothing', async (t) => {
+test('revoking a device clears its room membership, and a fresh-id replacement inherits nothing', async (t) => {
   const { s, dan, agA, clientToken } = await roomFleet(t)
   const doomed = createAgent(s.db, dan.id, 'dev-doomed')
   parkInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, initiatorDeviceId: agA.deviceId })
@@ -779,10 +779,11 @@ test('revoking a device clears its room membership, so a reused id inherits noth
 
   assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
 
-  // The reused id is the real test: the replacement agent lands on the
-  // revoked device's id and must start from nothing.
+  // devices.id is AUTOINCREMENT (#755): the replacement gets a fresh id, never
+  // the revoked one — and the cascade above already cleared the membership, so
+  // it starts from nothing under either its own or the old id.
   const fresh = createAgent(s.db, dan.id, 'dev-replacement')
-  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.notEqual(fresh.deviceId, doomed.deviceId, 'the revoked id is not reused')
   assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
 })
 
