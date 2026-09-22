@@ -821,3 +821,71 @@ test('a devices-parent FK violation rolls the rebuild back and re-fails on resta
   // Restart re-attempts and re-fails rather than silently accepting the state.
   assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'restart does not skip the never-completed migration')
 })
+
+// F1 round-2 (loop #755): the high-water scan must be schema-complete, not a
+// hand-list. A revoked id surviving ONLY in items.origin_device_id (an integer
+// column reached by the dynamic *_device_id scan) or ONLY in events.idem_key
+// (the one persistent integer-less namespace, `client:<id>:` / `agent:<id>:`)
+// must still lift the sequence past it — otherwise a reissued id inherits the
+// old item's idempotency key (replay) or the old device's message dedup.
+test('devices rebuild seeds above a dangling id found only in items.origin_device_id', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-item-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // Revoked device 40 persists only as an item's author.
+  raw.exec(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
+            VALUES('it1',1,1,'task','open',1.0,'t','room',40,'agent','40:ckey',0,0)`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 41, 'the dynamic *_device_id scan must reach items.origin_device_id')
+  db.close()
+})
+
+test('devices rebuild seeds above a dangling id found only in events.idem_key', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-events-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // Revoked client 50 persists only as a message idempotency key; agent 30 too.
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  raw.exec(`INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key)
+            VALUES(1,1,'room',0,'user:dan','text','{}','client:50:local-1'),
+                  (1,2,'room',0,'agent:a','text','{}','agent:30:some-key')`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'client','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 51, 'the events.idem_key scan must reach the 2nd colon segment')
+  db.close()
+})

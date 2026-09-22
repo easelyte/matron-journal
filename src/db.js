@@ -512,24 +512,45 @@ export function openDb(path) {
         db.exec(SCHEMA)
         // Lift the sequence above every surviving device-id reference, not just
         // the live device rows, so a revoked-but-still-referenced id (e.g. a
-        // dangling conversation owner) is never reissued. Each subselect guards
-        // its table with a name check so a schema that predates one of these
-        // columns/tables is skipped rather than throwing.
-        const has = (t) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t)
-        const sources = [
-          ['devices', 'id'],
-          ['conversations', 'agent_device_id'],
-          ['convo_agents', 'agent_device_id'],
-          ['convo_agents', 'initiator_device_id'],
-          ['agent_spawn_requests', 'target_device_id'],
-          ['agent_spawn_requests', 'from_device_id'],
-          ['file_idem', 'device_id'],
-          ['agent_idem', 'device_id'],
-        ].filter(([t, c]) => has(t) && db.prepare(`PRAGMA table_info(${t})`).all().some((x) => x.name === c))
-        const highWater = sources.reduce((max, [t, c]) => {
-          const v = db.prepare(`SELECT MAX(${c}) AS m FROM ${t}`).get().m
-          return v != null && v > max ? v : max
-        }, 0)
+        // dangling conversation owner, an item's origin_device_id, or a
+        // milestone's device_id) is never reissued and cannot inherit that
+        // reference's meaning (ownership, idempotency replay, attribution).
+        //
+        // The reference set is DISCOVERED from the schema, not hand-listed — a
+        // hand-list silently diverges as columns are added (P2 canonical
+        // source). Two kinds of reference:
+        //   1. Integer columns: devices.id plus every column named `device_id`
+        //      or `*_device_id` in any table. This auto-covers items, missions,
+        //      milestones, item_comments, conversations, convo_agents,
+        //      agent_spawn_requests, file_idem and agent_idem — and any future
+        //      column that follows the same naming convention.
+        //   2. `events.idem_key`, the ONLY persistent namespace that encodes a
+        //      device id with no sibling integer column (`client:<id>:<local>`
+        //      / `agent:<id>:<key>`, id as the 2nd colon segment). Every other
+        //      idem_key column (items/missions/milestones/item_comments) sits in
+        //      a row that also carries an integer *_device_id, already covered
+        //      by (1); a detached file_idem key (device_id NULL) is left to
+        //      file_idem's own colliding-key refusal + 120s TTL (A1-retained).
+        let highWater = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM devices').get().m
+        for (const t of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+          for (const c of db.prepare(`PRAGMA table_info("${t.name}")`).all()) {
+            if (c.name === 'device_id' || /_device_id$/.test(c.name)) {
+              const v = db.prepare(`SELECT MAX("${c.name}") AS m FROM "${t.name}"`).get().m
+              if (v != null && v > highWater) highWater = v
+            }
+          }
+        }
+        const eventsExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
+        if (eventsExists) {
+          // 2nd colon segment of `<scheme>:<id>:<rest>`, non-numeric/malformed → 0.
+          const ev = db.prepare(`
+            SELECT COALESCE(MAX(CAST(substr(rest, 1, instr(rest || ':', ':') - 1) AS INTEGER)), 0) AS m
+              FROM (SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest
+                      FROM events
+                     WHERE idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%')
+          `).get().m
+          if (ev > highWater) highWater = ev
+        }
         const seqRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name='devices'").get()
         if (seqRow) {
           if (highWater > seqRow.seq) {
