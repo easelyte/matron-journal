@@ -5,8 +5,8 @@ import path from 'node:path'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
-import { runOffload, runExpireLogs, runReapMedia } from '../src/retention.js'
-import { resolveReapPcts } from '../src/server.js'
+import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs } from '../src/retention.js'
+import { resolveReapPcts, resolveOrphanBlobGraceHours } from '../src/server.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
 import { createItem, addComment } from '../src/items.js'
 import { makeTmpDir } from './tmp-dir.js'
@@ -779,4 +779,164 @@ test('reap pass runs at boot when a user is over quota', async (t) => {
   assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs WHERE id=?').get(fresh.blob.id).n, 1)
   const row = s.db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, old.seq)
   assert.equal(JSON.parse(row.payload).expired, true)
+})
+
+// --- Orphan-blob reaper (loop #780) ---------------------------------------
+// runReapMedia joins through events, so a blob nothing references (an upload
+// whose send never happened, an item attachment abandoned mid-compose) was
+// never a candidate for anything and lived forever. runReapOrphanBlobs is the
+// age-gated sweep for exactly those.
+
+const HOUR = 3600000
+
+function seedAgedBlob(db, mediaDir, { userId, bytes = 100, hoursAgo = 0, contentType = 'image/png' }) {
+  const b = writeBlobSync(mediaDir, Buffer.alloc(bytes, 7))
+  insertBlob(db, { id: b.id, ownerUserId: userId, contentType, size: b.size, sha256: b.sha256, diskPath: b.diskPath })
+  db.prepare('UPDATE blobs SET created_at=? WHERE id=?').run(Date.now() - hoursAgo * HOUR, b.id)
+  return b
+}
+
+test('runReapOrphanBlobs: a fresh orphan survives the grace window, an old one is reaped (row + file)', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const fresh = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 100, hoursAgo: 1 })
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 300, hoursAgo: 48 })
+
+  const r = runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 300 })
+  assert.equal(getBlob(db, old.id), undefined)
+  assert.equal(fs.existsSync(old.diskPath), false)
+  assert.ok(getBlob(db, fresh.id), 'an upload inside the grace window may still be attached')
+  assert.ok(fs.existsSync(fresh.diskPath))
+
+  // Idempotent: nothing left to reap.
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+})
+
+test('runReapOrphanBlobs never reaps an old blob referenced by an item body or an item comment', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const bodyBlob = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72 })
+  const commentBlob = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72, contentType: 'audio/webm' })
+  const orphan = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72 })
+  const it = createItem(db, {
+    userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'user',
+    attachments: [{ blob_ref: bodyBlob.id, mime: 'image/png', name: 'shot', size: bodyBlob.size }],
+  }).item
+  addComment(db, {
+    userId: dan.id, itemId: it.id, author: 'user', deviceId: 1, body: '',
+    attachments: [{ blob_ref: commentBlob.id, mime: 'audio/webm', name: 'note', size: commentBlob.size }],
+  })
+
+  const r = runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: orphan.size }, 'the unreferenced one proves the pass ran')
+  assert.equal(getBlob(db, orphan.id), undefined)
+  assert.ok(getBlob(db, bodyBlob.id), 'item-body attachment must survive')
+  assert.ok(getBlob(db, commentBlob.id), 'item-comment attachment must survive')
+  assert.ok(fs.existsSync(bodyBlob.diskPath) && fs.existsSync(commentBlob.diskPath))
+})
+
+test('runReapOrphanBlobs never reaps tool_output or attachment blobs referenced by events.blob_ref', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // A retention-offloaded tool_output payload: its blob is referenced by the column.
+  const r0 = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 's', output: 'x'.repeat(2000) } })
+  backdate(db, r0.seq, dan.id, 40)
+  assert.equal(runOffload(db, { days: 30, mediaDir }).offloaded, 1)
+  const toolRef = db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r0.seq).blob_ref
+  db.prepare('UPDATE blobs SET created_at=? WHERE id=?').run(Date.now() - 72 * HOUR, toolRef)
+  // An ordinary image send (blob_ref on the frame → the column).
+  const img = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72 })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'image', payload: { blob_ref: img.id, name: 'a.png' }, blobRef: img.id })
+
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, toolRef), 'tool_output blob must survive')
+  assert.ok(getBlob(db, img.id), 'attached image blob must survive')
+})
+
+test('runReapOrphanBlobs honours a blob_ref carried only inside an event payload (column NULL)', async () => {
+  // Agent publishes that put blob_ref in the payload but not on the frame
+  // land with events.blob_ref NULL — the live DB holds such file/image rows,
+  // and item markers mirror comment attachments the same way. A column-only
+  // reference check would delete blobs the timeline still renders.
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const published = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72 })
+  const nested = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 72 })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:bridge', type: 'file', payload: { blob_ref: published.id, name: 'r.pdf' } })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'system', type: 'text', payload: { comment: { attachments: [{ blob_ref: nested.id }] } } })
+
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, published.id))
+  assert.ok(getBlob(db, nested.id))
+})
+
+test('runReapOrphanBlobs tolerates a blob file already missing on disk (ENOENT)', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 50, hoursAgo: 48 })
+  fs.unlinkSync(old.diskPath)
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 1, bytesFreed: 50 })
+  assert.equal(getBlob(db, old.id), undefined)
+})
+
+test('runReapOrphanBlobs never unlinks a disk_path outside mediaDir, and leaves that row alone', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => warn.mock.restore())
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const elsewhere = tmpMediaDir()
+  const stray = seedAgedBlob(db, elsewhere, { userId: dan.id, hoursAgo: 48 })
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, stray.id))
+  assert.ok(fs.existsSync(stray.diskPath))
+  assert.ok(warn.mock.calls.length >= 1)
+})
+
+test('runReapOrphanBlobs is a loud no-op on a nonsense grace or a missing mediaDir', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => warn.mock.restore())
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, hoursAgo: 48 })
+  for (const bad of [0, -1, NaN, undefined, 'soon', Infinity]) {
+    assert.deepEqual(runReapOrphanBlobs(db, { graceMs: bad, mediaDir }), { reaped: 0, bytesFreed: 0 }, `graceMs=${bad}`)
+  }
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: HOUR }), { reaped: 0, bytesFreed: 0 }, 'no mediaDir')
+  assert.ok(getBlob(db, old.id))
+})
+
+test('resolveOrphanBlobGraceHours: 24h default, override beats env, 0/garbage disable', (t) => {
+  const mute = t.mock.method(console, 'warn', () => {})
+  t.after(() => mute.mock.restore())
+  delete process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS
+  assert.equal(resolveOrphanBlobGraceHours(undefined), 24)
+  assert.equal(resolveOrphanBlobGraceHours(6), 6)
+  assert.equal(resolveOrphanBlobGraceHours(0), null)
+  assert.equal(resolveOrphanBlobGraceHours('nope'), null)
+  assert.equal(resolveOrphanBlobGraceHours(-3), null)
+  process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS = '72'
+  assert.equal(resolveOrphanBlobGraceHours(undefined), 72)
+  assert.equal(resolveOrphanBlobGraceHours(12), 12, 'override beats env')
+  process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS = ''
+  assert.equal(resolveOrphanBlobGraceHours(undefined), null, "empty env (Number('') === 0) disables")
+  delete process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS
+})
+
+test('orphan-blob pass runs at boot from the retention scheduler', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-orphan-boot-'))
+  const dbPath = path.join(dir, 'test.db')
+  const mediaDir = resolveMediaDir(dbPath)
+  const preDb = openDb(dbPath)
+  const dan = await createUser(preDb, 'dan', 'pw')
+  const old = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 48 })
+  const fresh = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 1 })
+  preDb.close()
+
+  const s = await startTestServer({ dbPath })
+  t.after(() => s.close())
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs WHERE id=?').get(old.id).n, 0, 'boot pass must reap the old orphan')
+  assert.equal(fs.existsSync(old.diskPath), false)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs WHERE id=?').get(fresh.id).n, 1)
 })

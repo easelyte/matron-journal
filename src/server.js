@@ -18,7 +18,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
-import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { makeWaker } from './wake.js'
@@ -164,6 +164,32 @@ function resolveToolLogTtlHours(override) {
   return n
 }
 
+export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 24
+
+// Grace window for the orphan-blob reaper (runReapOrphanBlobs, loop #780):
+// how old an unreferenced blob must be before it is deleted. `override` is
+// startServer's `orphanBlobGraceHours` opt and beats MATRON_ORPHAN_BLOB_GRACE_HOURS,
+// mirroring the other retention resolvers: unset means ENABLED at 24h; `0`
+// disables; anything that is not a non-negative integer disables with one
+// warn line (this pass deletes data — fail closed means off). Returns hours
+// or null.
+export function resolveOrphanBlobGraceHours(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS : override
+  if (raw === undefined) return DEFAULT_ORPHAN_BLOB_GRACE_HOURS
+  const name = fromEnv ? 'MATRON_ORPHAN_BLOB_GRACE_HOURS' : 'orphanBlobGraceHours'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — orphan-blob reaper disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — orphan-blob reaper disabled`)
+    return null
+  }
+  return n
+}
+
 export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
 export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
 
@@ -220,13 +246,16 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // tick or being scheduled for the next. The quota-pressure media reaper runs
 // LAST: the offload pass just before it converts inline payloads into new
 // blobs, so reaping after offload sees the user's honest post-offload
-// footprint instead of triggering one tick late. Returns the interval handle
+// footprint instead of triggering one tick late. The orphan-blob reaper
+// (runReapOrphanBlobs) runs after it, on its own knob
+// (MATRON_ORPHAN_BLOB_GRACE_HOURS). Returns the interval handle
 // (for close()) or null only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
-  if (days === null && ttlHours === null && reapPcts === null) return null
+  const orphanGraceHours = resolveOrphanBlobGraceHours(orphanBlobGraceHours)
+  if (days === null && ttlHours === null && reapPcts === null && orphanGraceHours === null) return null
   const run = () => {
     if (ttlHours !== null) {
       try {
@@ -250,6 +279,14 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
         if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
       } catch (err) {
         console.error('retention: media reap run failed', err)
+      }
+    }
+    if (orphanGraceHours !== null) {
+      try {
+        const r = runReapOrphanBlobs(db, { graceMs: orphanGraceHours * 3600000, mediaDir })
+        if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} orphan blob(s), ${r.bytesFreed} bytes, unreferenced for over ${orphanGraceHours}h`)
+      } catch (err) {
+        console.error('retention: orphan-blob reap run failed', err)
       }
     }
   }
@@ -351,7 +388,7 @@ export function startServer({
   // wake is actually under way, so a journal without MATRON_WAKE_CMD never
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
+  mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
   fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, workViewOptions,
   httpHandlerFactory = makeHttpHandler,
 } = {}) {
@@ -555,6 +592,7 @@ export function startServer({
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+        orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is

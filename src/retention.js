@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import path from 'node:path'
 import { writeBlobSync } from './media.js'
 import { insertBlob, getBlob } from './db.js'
 import { snippetOf, MESSAGE_TYPES } from './journal.js'
@@ -166,10 +167,11 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
 //     blob_ref on a text event pin a blob out of the reaper forever;
 //   - orphan blobs with no referencing event — an upload sits orphaned
 //     between POST /media and the ws send that attaches it, so reaping
-//     orphans would corrupt an in-flight attachment (structurally excluded
-//     by the events-join);
-//   - anything, when the un-reapable floor (tool_output blobs + orphans,
-//     which nothing ever deletes) alone keeps the user at or above the
+//     orphans here would corrupt an in-flight attachment (structurally
+//     excluded by the events-join). Orphans past a grace window are the
+//     orphan-blob reaper's job (runReapOrphanBlobs, below), not this pass's;
+//   - anything, when the un-reapable floor (tool_output blobs + orphans
+//     still inside that grace window) alone keeps the user at or above the
 //     low-water target: reaping can then never reach the target, so the
 //     pass must refuse and warn rather than grind through every attachment
 //     the user owns — including brand-new ones — tick after tick.
@@ -264,6 +266,96 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
       bytesFreed += cand.size
       reaped += 1
     }
+  }
+  return { reaped, bytesFreed }
+}
+
+// Orphan-blob reaper (fourth retention pass, loop #780). runReapMedia joins
+// through events, so a blob NOTHING references was never a candidate for any
+// pass and lived forever: an upload whose ws send never happened, an item
+// attachment abandoned mid-compose, the blob half of a crashed offload. Blob
+// ids are random (media.js), not content-addressed, so an unreferenced blob
+// can never be re-attached by content — only by an id a client or agent
+// already holds, which is what the grace window is for: an upload sits
+// orphaned between POST /media and the send / item POST that attaches it, so
+// only blobs older than `graceMs` are candidates.
+//
+// "Referenced" is deliberately broad — a false "orphan" deletes user data:
+//   - events.blob_ref (attachments, offloaded / live-log tool_output);
+//   - any `blob_ref` string anywhere inside an event payload, even with the
+//     column NULL: agent publishes that carry blob_ref only in the payload
+//     land that way (the live DB holds such file/image rows), and item
+//     markers mirror comment attachments under payload.comment.attachments;
+//   - item_comments.attachments (item bodies ride on a synthetic body
+//     comment, so this covers both).
+// References are matched across users on purpose: any reference anywhere
+// keeps the blob.
+//
+// Each reaped blob: row delete in its own transaction (re-checking the
+// column reference inside it), then unlink after commit tolerating ENOENT —
+// the runExpireLogs stance. The whole pass is synchronous, so no ws handler
+// can attach a candidate between the reference scan and the delete. A
+// disk_path outside `mediaDir` is never unlinked and its row is left alone.
+export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } = {}) {
+  if (!Number.isFinite(graceMs) || graceMs <= 0) {
+    console.warn(`retention: orphan-blob graceMs=${JSON.stringify(graceMs)} is invalid — orphan-blob reap skipped`)
+    return { reaped: 0, bytesFreed: 0 }
+  }
+  if (typeof mediaDir !== 'string' || !mediaDir) {
+    console.warn('retention: orphan-blob reap has no mediaDir — skipped')
+    return { reaped: 0, bytesFreed: 0 }
+  }
+  const candidates = db.prepare(
+    `SELECT b.id, b.size, b.disk_path FROM blobs b
+     WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)`
+  ).all(now - graceMs)
+  if (candidates.length === 0) return { reaped: 0, bytesFreed: 0 }
+
+  const referenced = new Set()
+  const collect = (v) => {
+    if (Array.isArray(v)) { for (const x of v) collect(x); return }
+    if (!v || typeof v !== 'object') return
+    for (const [k, x] of Object.entries(v)) {
+      if (k === 'blob_ref' && typeof x === 'string') referenced.add(x)
+      else collect(x)
+    }
+  }
+  const collectJson = (text) => {
+    try { collect(JSON.parse(text)) } catch {
+      // Unparseable text can still name a blob: keep whatever string follows
+      // a blob_ref key rather than risk deleting a referenced blob.
+      for (const m of String(text).matchAll(/"blob_ref"\s*:\s*"([^"]+)"/g)) referenced.add(m[1])
+    }
+  }
+  for (const row of db.prepare(`SELECT payload FROM events WHERE instr(payload, '"blob_ref"') > 0`).iterate()) collectJson(row.payload)
+  for (const row of db.prepare(`SELECT attachments FROM item_comments WHERE instr(attachments, '"blob_ref"') > 0`).iterate()) collectJson(row.attachments)
+
+  const root = path.resolve(mediaDir) + path.sep
+  const stillOrphan = db.prepare('SELECT NOT EXISTS (SELECT 1 FROM events WHERE blob_ref = ?) AS orphan')
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+  let reaped = 0
+  let bytesFreed = 0
+  for (const cand of candidates) {
+    if (referenced.has(cand.id)) continue
+    if (!path.resolve(cand.disk_path).startsWith(root)) {
+      console.warn(`retention: orphan blob ${cand.id} lives outside the media dir (${cand.disk_path}) — left alone`)
+      continue
+    }
+    const deleted = db.transaction(() => {
+      if (!stillOrphan.get(cand.id).orphan) return false
+      return deleteBlobRow.run(cand.id).changes === 1
+    })()
+    if (!deleted) continue
+    try {
+      fs.unlinkSync(cand.disk_path)
+    } catch (err) {
+      // ENOENT is the steady state after a crash between commit and unlink
+      // (or a file already gone); anything else leaves bytes on disk the DB
+      // no longer tracks — say so loudly.
+      if (err.code !== 'ENOENT') console.error(`retention: failed to unlink orphan blob ${cand.id} at ${cand.disk_path}`, err)
+    }
+    reaped += 1
+    bytesFreed += cand.size
   }
   return { reaped, bytesFreed }
 }
