@@ -28,8 +28,11 @@ function removeAll() {
 
 beforeEach((t) => {
   // Subtests inherit root hooks; only a new top-level test means the previous
-  // one is done with its directories.
-  if (!t.fullName.includes(' > ')) removeAll()
+  // one is done with its directories. TestContext.fullName needs Node 20.16 /
+  // 22.3; on older runtimes every test is treated as top-level, which is
+  // correct for the current callers (none create directories across subtests).
+  const nested = typeof t.fullName === 'string' && t.fullName.includes(' > ')
+  if (!nested) removeAll()
 })
 after(removeAll)
 process.once('exit', removeAll)
