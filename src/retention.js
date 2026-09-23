@@ -291,8 +291,9 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
 // References are matched across users on purpose: any reference anywhere
 // keeps the blob.
 //
-// Each reaped blob: re-check the column reference, unlink (ENOENT is fine),
-// then delete the row in its own transaction, logging one evidence line. The
+// Each reaped blob: re-check the column reference, stage the file aside,
+// delete the row in its own transaction (restoring the file if that fails),
+// unlink the staged file, and log one evidence line. The
 // whole pass is synchronous, so no ws handler can attach a candidate between
 // the reference scan and the delete. A disk_path outside `mediaDir` is never
 // unlinked and its row is left alone.
@@ -347,21 +348,43 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
       continue
     }
     if (!stillOrphan.get(cand.id).orphan) continue
-    // File first, row second — the reverse of runExpireLogs, and deliberately:
-    // the row is what makes a failed unlink retryable. A non-ENOENT failure
-    // keeps the row for the next pass and counts nothing; a crash between
-    // unlink and delete leaves an unreferenced row with no file, which the
-    // next pass finishes (ENOENT is fine). Nothing references an orphan, so a
-    // row briefly outliving its file is invisible to every reader.
+    // Stage, delete, then unlink. The file is renamed aside (same directory,
+    // atomic) before the row delete so a failed delete can put it back — the
+    // id then still serves exactly as before and the next pass retries. A
+    // non-ENOENT rename failure keeps row and file for retry and counts
+    // nothing. After commit the staged file is unlinked; a crash or unlink
+    // failure there strands only a `.reaping` file no row points at (same
+    // stance as runExpireLogs' unlink-after-commit), logged by name.
+    const staged = `${cand.disk_path}.reaping`
+    let hasStaged = true
     try {
-      fs.unlinkSync(cand.disk_path)
+      fs.renameSync(cand.disk_path, staged)
     } catch (err) {
       if (err.code !== 'ENOENT') {
-        console.error(`retention: failed to unlink orphan blob ${cand.id} at ${cand.disk_path} — row kept for retry`, err)
+        console.error(`retention: failed to stage orphan blob ${cand.id} at ${cand.disk_path} — kept for retry`, err)
         continue
       }
+      // Already gone — or staged by a pass that crashed before its delete.
+      hasStaged = fs.existsSync(staged)
     }
-    db.transaction(() => { deleteBlobRow.run(cand.id) })()
+    try {
+      db.transaction(() => { deleteBlobRow.run(cand.id) })()
+    } catch (err) {
+      if (hasStaged) {
+        try { fs.renameSync(staged, cand.disk_path) } catch (e) {
+          console.error(`retention: orphan blob ${cand.id} row delete failed AND restoring ${staged} failed`, e)
+        }
+      }
+      console.error(`retention: failed to delete orphan blob row ${cand.id} — file restored, kept for retry`, err)
+      continue
+    }
+    if (hasStaged) {
+      try {
+        fs.unlinkSync(staged)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: orphan blob ${cand.id} row deleted but ${staged} could not be unlinked`, err)
+      }
+    }
     // Decision evidence: which blob went, how big, how old.
     console.log(`retention: reaped orphan blob ${cand.id} (${cand.content_type}, ${cand.size} bytes, ${Math.round((now - cand.created_at) / 3600000)}h old)`)
     reaped += 1

@@ -880,23 +880,51 @@ test('runReapOrphanBlobs tolerates a blob file already missing on disk (ENOENT)'
   assert.equal(getBlob(db, old.id), undefined)
 })
 
-test('runReapOrphanBlobs keeps the row (and counts nothing) when unlink fails with a non-ENOENT error', async (t) => {
+test('runReapOrphanBlobs keeps row and file (and counts nothing) when staging fails with a non-ENOENT error', async (t) => {
   const err = t.mock.method(console, 'error', () => {})
   t.after(() => err.mock.restore())
   const { db, dan } = await setup()
   const mediaDir = tmpMediaDir()
   const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 40, hoursAgo: 48 })
-  // Swap the file for a non-empty directory: unlinkSync fails EISDIR/EPERM.
-  fs.unlinkSync(old.diskPath)
-  fs.mkdirSync(old.diskPath)
-  fs.writeFileSync(path.join(old.diskPath, 'x'), 'x')
+  // Occupy the staging path with a non-empty directory: the rename fails
+  // EISDIR (works as root too, unlike a chmod).
+  const blocker = `${old.diskPath}.reaping`
+  fs.mkdirSync(blocker)
+  fs.writeFileSync(path.join(blocker, 'x'), 'x')
   assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
   assert.ok(getBlob(db, old.id), 'row kept so the next pass can retry')
   assert.ok(err.mock.calls.length >= 1)
+  assert.ok(fs.existsSync(old.diskPath), 'file untouched')
   // Once the obstruction clears, the next pass finishes the job.
-  fs.rmSync(old.diskPath, { recursive: true })
+  fs.rmSync(blocker, { recursive: true })
   assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 1, bytesFreed: 40 })
   assert.equal(getBlob(db, old.id), undefined)
+})
+
+test('runReapOrphanBlobs restores the file when the row delete fails, so the id keeps serving', async (t) => {
+  const err = t.mock.method(console, 'error', () => {})
+  t.after(() => err.mock.restore())
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 30, hoursAgo: 48 })
+  db.exec("CREATE TRIGGER no_blob_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT, 'nope'); END")
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, old.id), 'row kept')
+  assert.ok(fs.existsSync(old.diskPath), 'file restored to its original path')
+  assert.equal(fs.existsSync(`${old.diskPath}.reaping`), false)
+  db.exec('DROP TRIGGER no_blob_delete')
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 1, bytesFreed: 30 })
+  assert.equal(fs.existsSync(old.diskPath), false)
+})
+
+test('runReapOrphanBlobs finishes a blob a crashed pass left staged', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 20, hoursAgo: 48 })
+  fs.renameSync(old.diskPath, `${old.diskPath}.reaping`) // crash between stage and delete
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 1, bytesFreed: 20 })
+  assert.equal(getBlob(db, old.id), undefined)
+  assert.equal(fs.existsSync(`${old.diskPath}.reaping`), false)
 })
 
 test('runReapOrphanBlobs never unlinks a disk_path outside mediaDir, and leaves that row alone', async (t) => {
