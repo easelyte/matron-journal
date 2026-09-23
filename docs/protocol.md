@@ -117,7 +117,9 @@ the machine-checkable version of this page.
   An **orphan** blob — one nothing references (no `events.blob_ref`, no
   `blob_ref` anywhere inside an event payload, no item or item-comment
   attachment) — is deleted by the same scheduler once it is older than
-  `MATRON_ORPHAN_BLOB_GRACE_HOURS` (default 24; `0`/invalid disables). Upload
+  `MATRON_ORPHAN_BLOB_GRACE_HOURS` (default 168 = 7 days, long enough for a
+  client outbox to resend a pending attachment after a long offline spell;
+  `0`/invalid disables). Upload
   and attach within that window: a blob id held longer than the grace
   without being sent or attached may 404.
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A

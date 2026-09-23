@@ -164,12 +164,13 @@ function resolveToolLogTtlHours(override) {
   return n
 }
 
-export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 24
+export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 168
 
 // Grace window for the orphan-blob reaper (runReapOrphanBlobs, loop #780):
 // how old an unreferenced blob must be before it is deleted. `override` is
 // startServer's `orphanBlobGraceHours` opt and beats MATRON_ORPHAN_BLOB_GRACE_HOURS,
-// mirroring the other retention resolvers: unset means ENABLED at 24h; `0`
+// mirroring the other retention resolvers: unset means ENABLED at 7 days
+// (168h — see runReapOrphanBlobs for why not 24h); `0`
 // disables; anything that is not a non-negative integer disables with one
 // warn line (this pass deletes data — fail closed means off). Returns hours
 // or null.

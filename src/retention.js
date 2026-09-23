@@ -291,11 +291,16 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
 // References are matched across users on purpose: any reference anywhere
 // keeps the blob.
 //
-// Each reaped blob: row delete in its own transaction (re-checking the
-// column reference inside it), then unlink after commit tolerating ENOENT —
-// the runExpireLogs stance. The whole pass is synchronous, so no ws handler
-// can attach a candidate between the reference scan and the delete. A
-// disk_path outside `mediaDir` is never unlinked and its row is left alone.
+// Each reaped blob: re-check the column reference, unlink (ENOENT is fine),
+// then delete the row in its own transaction, logging one evidence line. The
+// whole pass is synchronous, so no ws handler can attach a candidate between
+// the reference scan and the delete. A disk_path outside `mediaDir` is never
+// unlinked and its row is left alone.
+//
+// Grace default is 7 days (MATRON_ORPHAN_BLOB_GRACE_HOURS, server.js), not
+// 24h: the web client's outbox keeps a pending attachment's blob_ref in
+// IndexedDB and resends it on reconnect, so an upload whose send failed can
+// legitimately be attached days later (a tab closed over a weekend).
 export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } = {}) {
   if (!Number.isFinite(graceMs) || graceMs <= 0) {
     console.warn(`retention: orphan-blob graceMs=${JSON.stringify(graceMs)} is invalid — orphan-blob reap skipped`)
@@ -306,7 +311,7 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
     return { reaped: 0, bytesFreed: 0 }
   }
   const candidates = db.prepare(
-    `SELECT b.id, b.size, b.disk_path FROM blobs b
+    `SELECT b.id, b.size, b.disk_path, b.content_type, b.created_at FROM blobs b
      WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)`
   ).all(now - graceMs)
   if (candidates.length === 0) return { reaped: 0, bytesFreed: 0 }
@@ -341,19 +346,24 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
       console.warn(`retention: orphan blob ${cand.id} lives outside the media dir (${cand.disk_path}) — left alone`)
       continue
     }
-    const deleted = db.transaction(() => {
-      if (!stillOrphan.get(cand.id).orphan) return false
-      return deleteBlobRow.run(cand.id).changes === 1
-    })()
-    if (!deleted) continue
+    if (!stillOrphan.get(cand.id).orphan) continue
+    // File first, row second — the reverse of runExpireLogs, and deliberately:
+    // the row is what makes a failed unlink retryable. A non-ENOENT failure
+    // keeps the row for the next pass and counts nothing; a crash between
+    // unlink and delete leaves an unreferenced row with no file, which the
+    // next pass finishes (ENOENT is fine). Nothing references an orphan, so a
+    // row briefly outliving its file is invisible to every reader.
     try {
       fs.unlinkSync(cand.disk_path)
     } catch (err) {
-      // ENOENT is the steady state after a crash between commit and unlink
-      // (or a file already gone); anything else leaves bytes on disk the DB
-      // no longer tracks — say so loudly.
-      if (err.code !== 'ENOENT') console.error(`retention: failed to unlink orphan blob ${cand.id} at ${cand.disk_path}`, err)
+      if (err.code !== 'ENOENT') {
+        console.error(`retention: failed to unlink orphan blob ${cand.id} at ${cand.disk_path} — row kept for retry`, err)
+        continue
+      }
     }
+    db.transaction(() => { deleteBlobRow.run(cand.id) })()
+    // Decision evidence: which blob went, how big, how old.
+    console.log(`retention: reaped orphan blob ${cand.id} (${cand.content_type}, ${cand.size} bytes, ${Math.round((now - cand.created_at) / 3600000)}h old)`)
     reaped += 1
     bytesFreed += cand.size
   }

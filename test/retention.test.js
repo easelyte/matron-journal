@@ -880,6 +880,25 @@ test('runReapOrphanBlobs tolerates a blob file already missing on disk (ENOENT)'
   assert.equal(getBlob(db, old.id), undefined)
 })
 
+test('runReapOrphanBlobs keeps the row (and counts nothing) when unlink fails with a non-ENOENT error', async (t) => {
+  const err = t.mock.method(console, 'error', () => {})
+  t.after(() => err.mock.restore())
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 40, hoursAgo: 48 })
+  // Swap the file for a non-empty directory: unlinkSync fails EISDIR/EPERM.
+  fs.unlinkSync(old.diskPath)
+  fs.mkdirSync(old.diskPath)
+  fs.writeFileSync(path.join(old.diskPath, 'x'), 'x')
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, old.id), 'row kept so the next pass can retry')
+  assert.ok(err.mock.calls.length >= 1)
+  // Once the obstruction clears, the next pass finishes the job.
+  fs.rmSync(old.diskPath, { recursive: true })
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 1, bytesFreed: 40 })
+  assert.equal(getBlob(db, old.id), undefined)
+})
+
 test('runReapOrphanBlobs never unlinks a disk_path outside mediaDir, and leaves that row alone', async (t) => {
   const warn = t.mock.method(console, 'warn', () => {})
   t.after(() => warn.mock.restore())
@@ -906,11 +925,11 @@ test('runReapOrphanBlobs is a loud no-op on a nonsense grace or a missing mediaD
   assert.ok(getBlob(db, old.id))
 })
 
-test('resolveOrphanBlobGraceHours: 24h default, override beats env, 0/garbage disable', (t) => {
+test('resolveOrphanBlobGraceHours: 7-day default, override beats env, 0/garbage disable', (t) => {
   const mute = t.mock.method(console, 'warn', () => {})
   t.after(() => mute.mock.restore())
   delete process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS
-  assert.equal(resolveOrphanBlobGraceHours(undefined), 24)
+  assert.equal(resolveOrphanBlobGraceHours(undefined), 168, '7-day default (client outbox can resend days later)')
   assert.equal(resolveOrphanBlobGraceHours(6), 6)
   assert.equal(resolveOrphanBlobGraceHours(0), null)
   assert.equal(resolveOrphanBlobGraceHours('nope'), null)
@@ -930,8 +949,8 @@ test('orphan-blob pass runs at boot from the retention scheduler', async (t) => 
   const mediaDir = resolveMediaDir(dbPath)
   const preDb = openDb(dbPath)
   const dan = await createUser(preDb, 'dan', 'pw')
-  const old = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 48 })
-  const fresh = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 1 })
+  const old = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 200 })
+  const fresh = seedAgedBlob(preDb, mediaDir, { userId: dan.id, hoursAgo: 72 }) // inside the 7-day default
   preDb.close()
 
   const s = await startTestServer({ dbPath })
