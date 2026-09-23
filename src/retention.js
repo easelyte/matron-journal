@@ -311,6 +311,7 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
     console.warn('retention: orphan-blob reap has no mediaDir — skipped')
     return { reaped: 0, bytesFreed: 0 }
   }
+  recoverStagedOrphans(db, mediaDir)
   const candidates = db.prepare(
     `SELECT b.id, b.size, b.disk_path, b.content_type, b.created_at FROM blobs b
      WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)`
@@ -352,9 +353,9 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
     // atomic) before the row delete so a failed delete can put it back — the
     // id then still serves exactly as before and the next pass retries. A
     // non-ENOENT rename failure keeps row and file for retry and counts
-    // nothing. After commit the staged file is unlinked; a crash or unlink
-    // failure there strands only a `.reaping` file no row points at (same
-    // stance as runExpireLogs' unlink-after-commit), logged by name.
+    // nothing. A crash (or unlink failure) anywhere after staging leaves a
+    // `.reaping` file that recoverStagedOrphans resolves at the top of the
+    // next pass, by whether the row survived.
     const staged = `${cand.disk_path}.reaping`
     let hasStaged = true
     try {
@@ -391,4 +392,38 @@ export function runReapOrphanBlobs(db, { graceMs, mediaDir, now = Date.now() } =
     bytesFreed += cand.size
   }
   return { reaped, bytesFreed }
+}
+
+// Crash recovery for runReapOrphanBlobs' staging step. A `<id>.reaping` file
+// in a shard directory is a pass interrupted between stage and unlink:
+//   - its blobs row still exists → the delete never committed: put the file
+//     back so the id serves again (a still-orphaned blob is simply re-staged
+//     by the pass that follows);
+//   - no row → the delete committed: finish the unlink.
+// One readdir per shard (at most 256 two-hex directories), so it is cheap to
+// run at the top of every pass rather than only at boot.
+function recoverStagedOrphans(db, mediaDir) {
+  let shards
+  try { shards = fs.readdirSync(mediaDir, { withFileTypes: true }) } catch (err) {
+    if (err.code !== 'ENOENT') console.error(`retention: cannot list media dir ${mediaDir} for staged orphans`, err)
+    return
+  }
+  const rowOf = db.prepare('SELECT disk_path FROM blobs WHERE id=?')
+  for (const shard of shards) {
+    if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
+    const dir = path.join(mediaDir, shard.name)
+    let names
+    try { names = fs.readdirSync(dir) } catch { continue }
+    for (const name of names) {
+      if (!name.endsWith('.reaping')) continue
+      const staged = path.join(dir, name)
+      const row = rowOf.get(name.slice(0, -'.reaping'.length))
+      try {
+        if (row) fs.renameSync(staged, row.disk_path)
+        else fs.unlinkSync(staged)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: could not recover staged orphan ${staged}`, err)
+      }
+    }
+  }
 }

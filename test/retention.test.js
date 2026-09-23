@@ -917,6 +917,29 @@ test('runReapOrphanBlobs restores the file when the row delete fails, so the id 
   assert.equal(fs.existsSync(old.diskPath), false)
 })
 
+test('a pass that crashed after the row delete committed: the next pass unlinks the stranded staged file', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const gone = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 20, hoursAgo: 48 })
+  fs.renameSync(gone.diskPath, `${gone.diskPath}.reaping`)
+  db.prepare('DELETE FROM blobs WHERE id=?').run(gone.id) // committed, then crash before unlink
+  runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir })
+  assert.equal(fs.existsSync(`${gone.diskPath}.reaping`), false, 'stranded bytes reclaimed')
+})
+
+test('a staged file whose row survived is restored even when the blob is no longer a candidate', async () => {
+  // Crash after staging, then the id got attached before the next pass: the
+  // file must come back to its path so GET /media serves it again.
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const b = seedAgedBlob(db, mediaDir, { userId: dan.id, bytes: 20, hoursAgo: 48 })
+  fs.renameSync(b.diskPath, `${b.diskPath}.reaping`)
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'image', payload: { blob_ref: b.id }, blobRef: b.id })
+  assert.deepEqual(runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir }), { reaped: 0, bytesFreed: 0 })
+  assert.ok(fs.existsSync(b.diskPath), 'restored')
+  assert.equal(fs.existsSync(`${b.diskPath}.reaping`), false)
+})
+
 test('runReapOrphanBlobs finishes a blob a crashed pass left staged', async () => {
   const { db, dan } = await setup()
   const mediaDir = tmpMediaDir()
