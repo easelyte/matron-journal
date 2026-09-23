@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { indexableBody, backfillSearchIndex } from '../src/search.js'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 test('indexableBody: text events index their body', () => {
   assert.equal(indexableBody('text', { body: 'why did we drop SQLCipher' }), 'why did we drop SQLCipher')
@@ -64,7 +65,6 @@ import { append, upsertConversation } from '../src/journal.js'
 import { runExpireLogs, runOffload } from '../src/retention.js'
 import { createAgent } from '../src/auth.js'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 
 function seedUserAndConvo(db, { userId = 1, convoId = 'c1' } = {}) {
@@ -123,7 +123,7 @@ test('append: a failing search insert rolls back the whole append (same transact
 test('retention rewriting tool_output leaves the index untouched', () => {
   const db = openDb(':memory:')
   const { userId, convoId } = seedUserAndConvo(db)
-  const mediaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-retention-'))
+  const mediaDir = makeTmpDir('search-retention-')
   append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'the only indexed row' } })
   append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'out', live_log: true } })
   append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'old out' } })

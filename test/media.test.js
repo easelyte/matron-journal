@@ -2,14 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import crypto from 'node:crypto'
 import net from 'node:net'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 function tmpDbPath() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-media-'))
+  const dir = makeTmpDir('matron-media-')
   return path.join(dir, 'test.db')
 }
 
@@ -231,7 +231,7 @@ test('POST /media with an empty body -> 400 empty, nothing persisted', async (t)
 test('a write-stream error during the final flush rejects instead of hanging (fails closed)', async () => {
   const { receiveBlob } = await import('../src/media.js')
   const { PassThrough, Writable } = await import('node:stream')
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-media-flush-'))
+  const root = makeTmpDir('matron-media-flush-')
 
   // A sink that accepts every chunk but fails at end()-time flush — the shape
   // of ENOSPC/EIO surfacing only when buffered data is forced out on close.

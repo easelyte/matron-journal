@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
@@ -10,6 +9,7 @@ import { makeHub } from '../src/hub.js'
 import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
 import { recordJoined } from '../src/participants.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 // Wake-on-message (src/wake.js): traffic addressed to an agent device with no
 // live socket fires the operator-configured wake command for that device's
@@ -43,7 +43,7 @@ test('waker is disabled without a command and refuses bad box names', () => {
 })
 
 test('waker appends the box name to the argv and debounces per box', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'wake-'))
+  const dir = makeTmpDir('wake-')
   const out = path.join(dir, 'calls')
   const script = path.join(dir, 'capture.js')
   writeFileSync(out, '')

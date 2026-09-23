@@ -2,13 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 function tmpDbPath() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-metrics-'))
+  const dir = makeTmpDir('matron-metrics-')
   return path.join(dir, 'test.db')
 }
 

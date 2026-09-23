@@ -9,7 +9,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
@@ -18,12 +17,13 @@ import { createUser } from '../src/auth.js'
 import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { FileLinkDenied, denialBody, denialToStatus } from '../src/file-guard.js'
 import { makeDurableIdemStore, safeToReRun, ORPHAN_RETENTION_MS } from '../src/file-idem.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 const dirs = []
 process.on('exit', () => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })))
 const t_after = (d) => dirs.push(d)
 const tick = () => new Promise((resolve) => setImmediate(resolve))
-const tmp = (prefix) => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
+const tmp = (prefix) => fs.realpathSync(makeTmpDir(prefix))
 
 const DEV = 7
 

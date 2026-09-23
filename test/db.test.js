@@ -1,12 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs, upsertDeviceStatus, deviceStatuses } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')
@@ -31,7 +31,7 @@ test('events PK is (user_id, seq)', () => {
 })
 
 test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade path)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-migration-'))
+  const dir = makeTmpDir('matron-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -68,7 +68,7 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
 })
 
 test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-parent-migration-'))
+  const dir = makeTmpDir('matron-parent-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -106,7 +106,7 @@ test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations 
 })
 
 test('openDb adds session_outcome to a pre-existing conversations table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-outcome-migration-'))
+  const dir = makeTmpDir('matron-outcome-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -150,7 +150,7 @@ test('openDb adds session_outcome to a pre-existing conversations table in place
 })
 
 test('openDb adds agent_kind to legacy conversations and codex upserts round-trip', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-agent-kind-migration-'))
+  const dir = makeTmpDir('matron-agent-kind-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -198,7 +198,7 @@ test('openDb adds agent_kind to legacy conversations and codex upserts round-tri
 // process down at boot). The live journal DB is the second case on every
 // restart after the first, so re-runnability is not academic.
 test('openDb adds summary_updated_at to legacy conversations, is re-runnable, and cold-starts fresh', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-summary-stamp-migration-'))
+  const dir = makeTmpDir('matron-summary-stamp-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -264,7 +264,7 @@ test('openDb adds summary_updated_at to legacy conversations, is re-runnable, an
 // long one-shot runs. Asserted on a file-backed DB because :memory:
 // databases silently ignore WAL mode.
 test('openDb bounds the WAL file but keeps the stock auto-checkpoint', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walpragma-'))
+  const dir = makeTmpDir('matron-walpragma-')
   const db = openDb(path.join(dir, 'm.db'))
   try {
     assert.equal(db.pragma('journal_mode', { simple: true }), 'wal')
@@ -355,7 +355,7 @@ test('convo_agents accepts the consent states and columns', () => {
 })
 
 test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-migration-'))
+  const dir = makeTmpDir('matron-convo-agents-migration-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -411,7 +411,7 @@ test('convo_agents: an unknown agent_device_id is rejected outright', () => {
 })
 
 test('convo_agents migration adds the cascade and drops rows the old revoke path stranded', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-fk-'))
+  const dir = makeTmpDir('matron-convo-agents-fk-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-fk.db')
 
@@ -454,7 +454,7 @@ test('openDb: agent_chat_allowances is gone from a fresh database', () => {
 })
 
 test('openDb: an existing agent_chat_allowances table is dropped on migrate', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-allow-'))
+  const dir = makeTmpDir('matron-allow-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'm.db')
   const raw = new Database(dbPath)
@@ -558,7 +558,7 @@ test('unregistering clears only the calling device row', async () => {
 // The live dev-2 DB already carries 18 rows sharing one token; the fix above
 // only stops NEW duplicates, so openDb collapses the existing ones on start.
 test('openDb collapses duplicate APNs tokens, keeping the newest device row', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-apns-dedupe-'))
+  const dir = makeTmpDir('matron-apns-dedupe-')
   const dbPath = path.join(dir, 'dupes.db')
 
   // Seeded through a raw handle, because openDb is exactly what refuses to
@@ -627,7 +627,7 @@ test('fresh DB: devices.id is AUTOINCREMENT and a revoked id is never reused', a
 })
 
 test('openDb rebuilds a pre-AUTOINCREMENT devices table in place, preserving rows and ids', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-'))
+  const dir = makeTmpDir('matron-devices-ai-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -694,7 +694,7 @@ test('openDb rebuilds a pre-AUTOINCREMENT devices table in place, preserving row
 })
 
 test('devices rebuild preserves inbound FK children and the file_idem revoke trigger', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-fk-'))
+  const dir = makeTmpDir('matron-devices-ai-fk-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -749,7 +749,7 @@ test('devices rebuild preserves inbound FK children and the file_idem revoke tri
 // so if the highest id ever issued was revoked but still owns a conversation,
 // reissuing it would hand the replacement that conversation's write access.
 test('devices rebuild seeds the sequence above a dangling conversation owner, not just live rows', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-hw-'))
+  const dir = makeTmpDir('matron-devices-ai-hw-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -789,7 +789,7 @@ test('devices rebuild seeds the sequence above a dangling conversation owner, no
 // rather than skipping the (never-completed) migration and booting with the
 // broken FK state silently accepted.
 test('a devices-parent FK violation rolls the rebuild back and re-fails on restart', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-fkfail-'))
+  const dir = makeTmpDir('matron-devices-ai-fkfail-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -829,7 +829,7 @@ test('a devices-parent FK violation rolls the rebuild back and re-fails on resta
 // must still lift the sequence past it — otherwise a reissued id inherits the
 // old item's idempotency key (replay) or the old device's message dedup.
 test('devices rebuild seeds above a dangling id found only in items.origin_device_id', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-item-'))
+  const dir = makeTmpDir('matron-devices-ai-item-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -859,7 +859,7 @@ test('devices rebuild seeds above a dangling id found only in items.origin_devic
 })
 
 test('devices rebuild seeds above a dangling id found only in events.idem_key', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-events-'))
+  const dir = makeTmpDir('matron-devices-ai-events-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -893,7 +893,7 @@ test('devices rebuild seeds above a dangling id found only in events.idem_key', 
 // F1/F2 round-3 hardening (loop #755): defensive against data our own code
 // never writes but externally-repaired/legacy DBs might.
 test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID exhaustion)', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-malformed-'))
+  const dir = makeTmpDir('matron-devices-ai-malformed-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -926,7 +926,7 @@ test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID 
 })
 
 test('devices rebuild scans a table whose name contains a double-quote', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-devices-ai-quote-'))
+  const dir = makeTmpDir('matron-devices-ai-quote-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
 
@@ -958,7 +958,7 @@ test('devices rebuild scans a table whose name contains a double-quote', (t) => 
 // always-linked contract, so the column's DEFAULT keeps them linked; only
 // rows written by the new code carry an explicit 0.
 test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing rows', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-spawn-link-migration-'))
+  const dir = makeTmpDir('matron-spawn-link-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
   const raw = new Database(dbPath)
   raw.exec(`
@@ -998,7 +998,7 @@ test('device_status: the row goes with its device on revoke, and a reused id sta
 })
 
 test('old-schema device_status (no cascade) is rebuilt in place: live rows kept, orphans dropped', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-status-migration-'))
+  const dir = makeTmpDir('matron-device-status-migration-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 

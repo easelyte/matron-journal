@@ -6,13 +6,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import { spawnSync } from 'node:child_process'
 import {
   FILE_AUDIT_BASENAME, FileAuditFailed, appendAudit, auditPathFor, makeFileAudit,
 } from '../src/file-audit.js'
+import { makeTmpDir } from './tmp-dir.js'
 
-const tmpDir = () => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-audit-')))
+const tmpDir = () => fs.realpathSync(makeTmpDir('matron-audit-'))
 const lines = (dir) => fs.readFileSync(path.join(dir, FILE_AUDIT_BASENAME), 'utf8')
   .split('\n').filter(Boolean).map((l) => JSON.parse(l))
 
