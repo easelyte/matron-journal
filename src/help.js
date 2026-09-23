@@ -74,8 +74,11 @@ transcribing is the origin bridge's job); those 404 on refusal.
   \`{item, comment}\`. A USER comment always flips \`awaiting\` to \`agent\`
   and reopens a closed item; yours as an agent never flips it.
 - \`PATCH /items/:id/comments/:cid\` \`{blob_ref, transcript}\` — agent-only
-  write-back after transcribing a voice-note attachment. This is the ONLY way
-  a transcript is stored; one sent on a create/comment is dropped.
+  write-back after transcribing a voice-note attachment; one sent on a
+  create/comment is dropped. When the journal transcribes itself, a user's
+  audio attachment arrives \`transcript_status:'pending'\`: hold the turn —
+  a quiet \`updated\` marker with \`transcription:'done'|'failed'\` and the
+  comment (transcripts filled in) follows when it settles.
 - \`POST /items/:id/close\` \`{resolution:'done'|'answered'|'decided'|'reversed'|'cancelled', comment?}\`
   → 200 \`{item, comment}\`; 409 if already closed. Closing clears \`awaiting\`.
 - \`POST /items/:id/reopen\` \`{comment?}\` → 200 \`{item, comment}\`; 409 if

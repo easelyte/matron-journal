@@ -169,6 +169,8 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   task              TEXT NOT NULL,
   topic             TEXT NOT NULL DEFAULT '',
   model             TEXT,
+  link              INTEGER NOT NULL DEFAULT 1,
+  child_short       TEXT,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -310,6 +312,13 @@ CREATE TABLE IF NOT EXISTS search_backfill_state(
   id INTEGER PRIMARY KEY CHECK(id=1),
   last_events_rowid INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS device_status(
+  device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  reported_at INTEGER NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
 `
 
 export function openDb(path) {
@@ -773,6 +782,16 @@ export function openDb(path) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
   }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors a parked chat ask, NULL for rows predating the mirror. After
+  // BOTH convo_agents rebuilds above for the reason target_convo_id is: a
+  // rebuild recreates the table from a fixed definition. A renewed row
+  // (a fresh ask after a deny/expiry) gets a fresh item, overwriting this.
+  const caCols = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN item_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_convo_agents_item ON convo_agents(item_id)')
   // Which Claude model the spawned session should run (spec: agent-spawned
   // sessions). An alias like 'opus' or a full model id — the target bridge's
   // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
@@ -789,6 +808,36 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'model')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
   }
+  // Whether the approved spawn opens a chat room between parent and child
+  // (2026-09-17: rooms are opt-in — a spawn is normally a clean break, and
+  // an automatic room made the child narrate its progress back to a parent
+  // that then relayed it on). DEFAULT 1, not 0: a row parked before the
+  // column existed was asked under the always-linked contract, and the
+  // card the user is about to tap promised a room. New rows always write
+  // the value explicitly (createSpawnRequest), so the default only ever
+  // speaks for those pre-migration rows.
+  if (!spawnCols.some((c) => c.name === 'link')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN link INTEGER NOT NULL DEFAULT 1')
+  }
+  // The child's session short as first learned from its published title —
+  // frozen there so the linked room's title never follows a later child
+  // rename (bridge rooms freeze the peer short at creation the same way).
+  // NULL until the child's bridge publishes a title with a short.
+  if (!spawnCols.some((c) => c.name === 'child_short')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
+  }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors this ask, NULL for rows predating the mirror (they resolve
+  // without one). Not a foreign key — same stance as mission_id.
+  if (!spawnCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN item_id TEXT')
+  }
+  // items.js isConsentMirror / listItems' excludeConsent look items up by
+  // this column on every agent read; keep both point lookups.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_item ON agent_spawn_requests(item_id)')
+  // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
+  // on every titled convo_upsert; keep that a point lookup.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
   // Missions (spec 2026-09-10): a conversation belongs to at most one
   // mission, set once and never changed; an item follows its origin
   // conversation but can be moved (PATCH /items/:id {mission}). Both are
@@ -805,11 +854,52 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN mission_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id, state, awaiting)')
+  // Consent items (spec 2026-09-22 consent-items): 'spawn' | 'chat' on the
+  // tracker mirror of a consent card, NULL on every ordinary item. Carried
+  // on the ITEM, not derived from the spawn/convo_agents row that points at
+  // it: a renewed chat ask reuses its row and re-points item_id, and a
+  // device revoke cascades the row away — either would otherwise turn the
+  // old mirror, justification and all, into an ordinary agent-readable item.
+  const itemConsentCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemConsentCols.some((c) => c.name === 'consent')) {
+    db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security
   // control to the next person who finds it.
   db.exec('DROP TABLE IF EXISTS agent_chat_allowances')
+  // Retrofit the device_status -> devices cascade onto a database that
+  // created the table before it carried one (the constraint cannot be added
+  // in place; same rebuild as convo_agents above). Without it a revoked box
+  // left its last report behind, and since devices.id is a plain rowid the
+  // next box to take that id inherited the old usage, paths and account on
+  // /devices and /roster until it reported. The copy skips rows whose device
+  // is already gone — with foreign_keys=ON the INSERT would refuse them.
+  const dsNow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='device_status'").get()
+  if (dsNow && !dsNow.sql.includes('ON DELETE CASCADE')) {
+    const orphans = db.prepare(
+      'SELECT COUNT(*) n FROM device_status WHERE device_id NOT IN (SELECT id FROM devices)'
+    ).get().n
+    db.exec(`
+      CREATE TABLE device_status_fk(
+        device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        reported_at INTEGER NOT NULL,
+        status TEXT NOT NULL
+      );
+      INSERT INTO device_status_fk
+        SELECT device_id, user_id, reported_at, status FROM device_status
+         WHERE device_id IN (SELECT id FROM devices);
+      DROP TABLE device_status;
+      ALTER TABLE device_status_fk RENAME TO device_status;
+      CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+    `)
+    if (orphans > 0) {
+      console.log(`device_status: dropped ${orphans} report(s) whose device was already revoked`)
+    }
+  }
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
@@ -922,6 +1012,51 @@ export function listDevices(db, userId) {
   return db.prepare(
     'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
+}
+
+// Box status (spec: 2026-09-21 "usage and allowances live in the journal").
+// The last capacity report a bridge sent for its own box — activity,
+// limits, disk, account — persisted so every client sees every box's last
+// known state, including a box that is asleep and one this client has never
+// talked to. One row per device, latest wins; the JSON is already sanitised
+// (sanitizeBoxStatus in spawns.js) before it lands here.
+export function upsertDeviceStatus(db, { userId, deviceId, status, reportedAt = Date.now() }) {
+  db.prepare(
+    `INSERT INTO device_status(device_id, user_id, reported_at, status) VALUES (?,?,?,?)
+     ON CONFLICT(device_id) DO UPDATE SET user_id=excluded.user_id, reported_at=excluded.reported_at, status=excluded.status`
+  ).run(deviceId, userId, reportedAt, JSON.stringify(status))
+}
+
+// The partial-report write: refresh the blocks `status` carries, keep the
+// stored blocks it omits. For a source that never speaks the whole report —
+// a recent_folders reply carries activity/limits/disk at most, never
+// account — so one live fan-out cannot erase what the box's own box_status
+// said. A bridge's box_status stays a full replacement (upsertDeviceStatus):
+// it always sends everything it knows, and omitting a block there means
+// "gone". Read-then-write is atomic here: better-sqlite3 is synchronous and
+// nothing yields between the two statements.
+export function mergeDeviceStatus(db, { userId, deviceId, status, reportedAt = Date.now() }) {
+  const { reported_at: _, ...kept } = getDeviceStatus(db, userId, deviceId) || {}
+  upsertDeviceStatus(db, { userId, deviceId, status: { ...kept, ...status }, reportedAt })
+}
+
+// One device's stored report, {reported_at, ...blocks}, or null when it has
+// never reported (or its JSON no longer parses — treated as never).
+export function getDeviceStatus(db, userId, deviceId) {
+  const row = db.prepare('SELECT reported_at, status FROM device_status WHERE device_id=? AND user_id=?').get(deviceId, userId)
+  if (!row) return null
+  try { return { reported_at: row.reported_at, ...JSON.parse(row.status) } } catch { return null }
+}
+
+// deviceId -> {reported_at, activity?, limits?, disk?, account?} for one
+// user. A row whose JSON no longer parses (never expected) is skipped rather
+// than failing the whole roster.
+export function deviceStatuses(db, userId) {
+  const out = new Map()
+  for (const r of db.prepare('SELECT device_id, reported_at, status FROM device_status WHERE user_id=?').all(userId)) {
+    try { out.set(r.device_id, { reported_at: r.reported_at, ...JSON.parse(r.status) }) } catch { /* skip */ }
+  }
+  return out
 }
 
 // The privacy flag, read side. False for unknown ids: a caller checking a

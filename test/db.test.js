@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs } from '../src/db.js'
+import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs, upsertDeviceStatus, deviceStatuses } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 
@@ -952,4 +952,77 @@ test('devices rebuild scans a table whose name contains a double-quote', (t) => 
   const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','r','h-new',0)").run().lastInsertRowid
   assert.equal(next, 61, 'the quoted-identifier scan must reach the oddly-named table without throwing')
   db.close()
+})
+
+// Rows parked before the `link` column existed were asked under the
+// always-linked contract, so the column's DEFAULT keeps them linked; only
+// rows written by the new code carry an explicit 0.
+test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing rows', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-spawn-link-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE agent_spawn_requests(
+      id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, from_device_id INTEGER NOT NULL,
+      from_convo_id TEXT NOT NULL, target_device_id INTEGER NOT NULL, workdir TEXT NOT NULL,
+      task TEXT NOT NULL, topic TEXT NOT NULL DEFAULT '', model TEXT,
+      state TEXT NOT NULL CHECK(state IN ('awaiting_user','approved','started','denied','expired','failed')),
+      room_id TEXT, child_convo_id TEXT, created_at INTEGER NOT NULL, answered_at INTEGER, resolved_at INTEGER
+    );
+  `)
+  raw.prepare("INSERT INTO agent_spawn_requests(id,user_id,from_device_id,from_convo_id,target_device_id,workdir,task,state,created_at) VALUES('old',1,1,'c',2,'/w','t','awaiting_user',0)").run()
+  raw.close()
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(agent_spawn_requests)').all().map((c) => c.name)
+  assert.ok(cols.includes('link'), 'link column missing after migration')
+  assert.ok(cols.includes('child_short'), 'child_short column missing after migration')
+  assert.equal(db.prepare('SELECT link FROM agent_spawn_requests WHERE id=?').get('old').link, 1)
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
+})
+
+// device_status rides the device row: a revoked box takes its last report
+// with it, so a replacement that happens to reuse the integer id (devices.id
+// is a plain rowid, not AUTOINCREMENT) cannot inherit the old usage, paths
+// and account email on /devices and /roster until it reports.
+test('device_status: the row goes with its device on revoke, and a reused id starts clean', () => {
+  const db = openDb(':memory:')
+  seedDevice(db, 1)
+  upsertDeviceStatus(db, { userId: 1, deviceId: 1, status: { account: { email: 'old@example.com' } }, reportedAt: 5 })
+  assert.equal(deviceStatuses(db, 1).get(1).account.email, 'old@example.com')
+  db.prepare('DELETE FROM devices WHERE id=1').run()
+  assert.equal(deviceStatuses(db, 1).has(1), false)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM device_status').get().n, 0)
+  seedDevice(db, 1)
+  assert.equal(deviceStatuses(db, 1).has(1), false, 'the replacement box has no status until it reports')
+})
+
+test('old-schema device_status (no cascade) is rebuilt in place: live rows kept, orphans dropped', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-status-migration-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  preMigrationDb(dbPath, (raw) => {
+    seedDevice(raw, 2)
+    raw.exec(`DROP TABLE device_status;
+      CREATE TABLE device_status(
+        device_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, reported_at INTEGER NOT NULL, status TEXT NOT NULL);
+      CREATE INDEX idx_device_status_user ON device_status(user_id);
+      INSERT INTO device_status VALUES(2, 1, 111, '{"disk":{"free_bytes":1,"total_bytes":2}}');
+      INSERT INTO device_status VALUES(9, 1, 222, '{"account":{"email":"gone@example.com"}}');`)
+  })
+
+  const db = openDb(dbPath)
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='device_status'").get().sql
+  assert.ok(sql.includes('ON DELETE CASCADE'))
+  assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_device_status_user'").get())
+  const rows = deviceStatuses(db, 1)
+  assert.deepEqual([...rows.keys()], [2])
+  assert.equal(rows.get(2).reported_at, 111)
+  assert.deepEqual(rows.get(2).disk, { free_bytes: 1, total_bytes: 2 })
+  db.prepare('DELETE FROM devices WHERE id=2').run()
+  assert.equal(deviceStatuses(db, 1).size, 0, 'the rebuilt table cascades')
+  db.close()
+
+  assert.doesNotThrow(() => openDb(dbPath).close())
 })

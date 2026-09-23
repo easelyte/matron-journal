@@ -9,6 +9,7 @@ import {
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation, messagesBefore } from '../src/journal.js'
+import { refreshSpawnRoomTitle } from '../src/spawns.js'
 
 async function seed() {
   const db = openDb(':memory:')
@@ -18,10 +19,10 @@ async function seed() {
   return { db, dan, parent, target }
 }
 
-function makeRow(db, dan, parent, target, id = 'spawn-1', now = 1000, model = '') {
+function makeRow(db, dan, parent, target, id = 'spawn-1', now = 1000, model = '', link = true) {
   createSpawnRequest(db, {
     id, userId: dan.id, fromDeviceId: parent.deviceId, fromConvoId: 'parent-convo',
-    targetDeviceId: target.deviceId, workdir: '/home/dan/proj', task: 'do the thing', topic: 'thing', model, now,
+    targetDeviceId: target.deviceId, workdir: '/home/dan/proj', task: 'do the thing', topic: 'thing', model, link, now,
   })
 }
 
@@ -38,6 +39,7 @@ test('createSpawnRequest lands in awaiting_user with every field', async () => {
   assert.equal(row.task, 'do the thing')
   assert.equal(row.topic, 'thing')
   assert.equal(row.model, '') // no model asked for — stored empty, never null-vs-'' ambiguous
+  assert.equal(row.link, 1)
   assert.equal(row.created_at, 1000)
   assert.equal(row.answered_at, null)
   assert.equal(row.resolved_at, null)
@@ -287,4 +289,126 @@ test('sanitizeSpawnDisk rejects malformed blocks whole', () => {
   assert.equal(sanitizeSpawnDisk({ free_bytes: 1.5, total_bytes: 4096 }), null)        // fractional bytes
   assert.equal(sanitizeSpawnDisk({ free_bytes: '1024', total_bytes: 4096 }), null)     // stringly numbers
   assert.equal(sanitizeSpawnDisk({ free_bytes: 2 ** 60, total_bytes: 2 ** 61 }), null) // isInteger-true, isSafeInteger-false
+})
+
+// ---- link flag (spawn rooms are opt-in) ----------------------------------
+
+const okBroker = (params, convoId = 'child-1') => ({
+  issue: async (h, userId, deviceId, method, p) => { params.push(p); return { ok: true, result: { convo_id: convoId } } },
+})
+const quietHub = () => {
+  const frames = []
+  return { hub: { sendToDevice: (u, d, msg) => { frames.push(msg); return true }, broadcastJournal: () => {} }, frames }
+}
+const roomRows = (db) => db.prepare("SELECT id, title FROM conversations WHERE id NOT IN ('parent-convo','child-1')").all()
+
+test('createSpawnRequest defaults link to off and stores it as 0/1', async () => {
+  const { db, dan, parent, target } = await seed()
+  createSpawnRequest(db, {
+    id: 'plain', userId: dan.id, fromDeviceId: parent.deviceId, fromConvoId: 'parent-convo',
+    targetDeviceId: target.deviceId, workdir: '/w', task: 't',
+  })
+  assert.equal(getSpawn(db, 'plain').link, 0)
+  makeRow(db, dan, parent, target, 'linked', 1000, '', true)
+  assert.equal(getSpawn(db, 'linked').link, 1)
+})
+
+test('approveSpawn on a detached row: no room, no room_id on the wire, started outcome without room_id', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub, frames } = quietHub()
+  const params = []
+  makeRow(db, dan, parent, target, 's-detached', 1000, '', false)
+  claimApprove(db, 's-detached')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker(params), startTimeoutMs: 50 }, getSpawn(db, 's-detached')), 'started')
+  assert.ok(!('room_id' in params[0]), 'a detached spawn must not hand the child a room')
+  assert.equal(params[0].prompt, 'do the thing')
+  assert.equal(params[0].from_name, 'dev-6')
+  assert.deepEqual(roomRows(db), [], 'no conversation row was minted')
+  const row = getSpawn(db, 's-detached')
+  assert.equal(row.state, 'started')
+  assert.equal(row.room_id, null)
+  assert.equal(row.child_convo_id, 'child-1')
+  const out = frames.find((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  assert.ok(!('room_id' in out))
+  assert.equal(out.child_convo_id, 'child-1')
+})
+
+test('approveSpawn on a detached row that fails: no epitaph anywhere, the parent still hears failed', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub, frames } = quietHub()
+  makeRow(db, dan, parent, target, 's-detached-fail', 1000, '', false)
+  claimApprove(db, 's-detached-fail')
+  const broker = { issue: async () => ({ ok: false, error: { code: 'agent_unreachable' } }) }
+  assert.equal(await approveSpawn({ db, hub, broker, startTimeoutMs: 50 }, getSpawn(db, 's-detached-fail')), 'failed')
+  assert.deepEqual(roomRows(db), [])
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM events WHERE type='text' AND sender='journal'").get().c, 0)
+  const out = frames.find((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'agent_unreachable')
+})
+
+test('a linked spawn room is titled like a bridge-minted room: parent tag ↔️ target, topic after a dash', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub } = quietHub()
+  const params = []
+  // The parent's own bridge baked a short into its title, exactly as it
+  // does for every earned title; the child has no title yet.
+  upsertConversation(db, { id: 'parent-convo', ownerUserId: dan.id, title: '[ab] parent work', sessionState: 'running', agentDeviceId: parent.deviceId })
+  makeRow(db, dan, parent, target, 's-title', 1000, '', true)
+  claimApprove(db, 's-title')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker(params), startTimeoutMs: 50, roomId: 'room-t' }, getSpawn(db, 's-title')), 'started')
+  assert.equal(params[0].room_id, 'room-t')
+  const room = db.prepare('SELECT title FROM conversations WHERE id=?').get('room-t')
+  assert.equal(room.title, 'D:ab ↔️ eric — thing')
+})
+
+test('the target side gains its tag once the child bridge publishes a title (at start, or later via refreshSpawnRoomTitle)', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub } = quietHub()
+  upsertConversation(db, { id: 'parent-convo', ownerUserId: dan.id, title: '[ab] parent work', sessionState: 'running', agentDeviceId: parent.deviceId })
+  // Child title already published by the time the start reply lands.
+  upsertConversation(db, { id: 'child-1', ownerUserId: dan.id, title: '🐣 [cd] do the thing', sessionState: 'running', agentDeviceId: target.deviceId })
+  makeRow(db, dan, parent, target, 's-early', 1000, '', true)
+  claimApprove(db, 's-early')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker([]), startTimeoutMs: 50, roomId: 'room-early' }, getSpawn(db, 's-early')), 'started')
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-early').title, 'D:ab ↔️ E:cd — thing')
+
+  // Child title arrives AFTER the start reply (the usual case: a bridge
+  // publishes the seed title with its first state-transition upsert).
+  makeRow(db, dan, parent, target, 's-late', 1000, '', true)
+  claimApprove(db, 's-late')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker([], 'child-2'), startTimeoutMs: 50, roomId: 'room-late' }, getSpawn(db, 's-late')), 'started')
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-late').title, 'D:ab ↔️ eric — thing')
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false, 'no child title yet: nothing to refresh')
+  upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: '🐣 [ef] do the thing', sessionState: 'running', agentDeviceId: target.deviceId })
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), true)
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-late').title, 'D:ab ↔️ E:ef — thing')
+  // Frozen: a second refresh writes nothing, and a later child rename with
+  // a DIFFERENT short (or none) never moves the room off the first one.
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  assert.equal(getSpawn(db, 's-late').child_short, 'ef')
+  upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: '🐣 [zz] renamed', sessionState: 'waiting', agentDeviceId: target.deviceId })
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: 'renamed from the app', sessionState: 'waiting', agentDeviceId: target.deviceId })
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-late').title, 'D:ab ↔️ E:ef — thing')
+  // The retitle fanned a convo_meta into the room carrying the new title.
+  const metas = messagesBefore(db, dan.id, 'room-late', {}).filter((m) => m.type === 'convo_meta')
+  assert.ok(metas.some((m) => m.payload.title === 'D:ab ↔️ E:ef — thing'))
+  // A conversation that is nobody's spawn child is a no-op.
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'parent-convo'), false)
+})
+
+test('a room title honours tag_char overrides and derives letters against the whole roster', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub } = quietHub()
+  db.prepare('UPDATE devices SET tag_char=?, name=? WHERE id=?').run('🦊', 'dev-e', target.deviceId)
+  createAgent(db, dan.id, 'dev-7') // every box shares the dev- prefix: dev-6 / dev-e / dev-7 strip to 6 / E / 7
+  upsertConversation(db, { id: 'parent-convo', ownerUserId: dan.id, title: '[ab] parent work', sessionState: 'running', agentDeviceId: parent.deviceId })
+  upsertConversation(db, { id: 'child-1', ownerUserId: dan.id, title: '[cd] child', sessionState: 'running', agentDeviceId: target.deviceId })
+  makeRow(db, dan, parent, target, 's-tags', 1000, '', true)
+  claimApprove(db, 's-tags')
+  await approveSpawn({ db, hub, broker: okBroker([]), startTimeoutMs: 50, roomId: 'room-tags' }, getSpawn(db, 's-tags'))
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-tags').title, '6:ab ↔️ 🦊:cd — thing')
 })

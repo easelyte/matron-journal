@@ -4,7 +4,7 @@ import path from 'node:path'
 import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
@@ -16,6 +16,8 @@ import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } fro
 import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
 import { makeDurableIdemStore } from './file-idem.js'
 import { makeFileAudit } from './file-audit.js'
+import { closeChatConsentItem } from './consent-items.js'
+import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { createWorkView, handleWorkRoute } from './work-http.js'
@@ -107,7 +109,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, workViewOptions }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, workViewOptions }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -481,7 +483,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleWorkRoute(workView, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
@@ -558,8 +560,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // connected = has a live WS right now (hub scan, no persistence) —
         // the roster's "which agents can I start a session on" signal.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // status = the box's last capacity report (box_status op), the
+        // journal-resident answer to "what is this box's usage" for a client
+        // that has never talked to it or while it is asleep. Omitted (never
+        // null) for a device that has not reported.
+        const statuses = deviceStatuses(db, who.userId)
         const devices = listDevices(db, who.userId).map((d) => ({
           ...d, is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
+          ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
         }))
         return json(res, 200, { devices })
       }
@@ -577,10 +585,22 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // agent is invisible, not blinded (one-directional, deliberately) —
         // which also resolves "can two private agents see each other" as yes.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const statuses = deviceStatuses(db, who.userId)
         const agents = db.prepare(
           `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
-        ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        ).all(who.userId).map((d) => ({
+          ...d, connected: live.has(d.device_id),
+          // A disconnected box is asleep, not gone, when this journal has a
+          // wake command AND the box's name is one the command would take
+          // (same rule wakeIfOffline applies): any message, invite or spawn
+          // aimed at it starts it again. Omitted (never false) when
+          // connected or unwakeable, so older readers see the shape they
+          // always did.
+          ...(!live.has(d.device_id) && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+          // Last capacity report (box_status), same shape as GET /devices.
+          ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
+        }))
         // Ordered by last message time then id — same rule and same JS
         // comparator as /snapshot (byLastMessageThenId, see journal.js); sorting
         // in JS avoids re-evaluating the correlated last_ts subquery in a SQL
@@ -638,6 +658,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
         if (decision === 'deny') {
           answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
+          // The tracker mirror (spec: 2026-09-22 consent-items), best-effort.
+          closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'denied', answeredByDeviceId: who.deviceId })
           // Indistinguishable from a peer refusal — reason 'refused', never
           // 'denied' (a requester must never learn the human said no).
           hub.sendToDevice(who.userId, row.initiator_device_id, {
@@ -646,6 +668,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 200, { ok: true })
         }
         answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'approved', answeredByDeviceId: who.deviceId })
         // Join requests self-target (row.initiator_device_id ===
         // target_device_id, the joiner) — the recipient of THIS row's relay
         // (and, below, the directed-pair target) is the room owner, not the
@@ -660,6 +683,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // exact.
         deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
         const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
+        // Undelivered means the recipient has no live socket — most often a
+        // box the host idle-stopped since the ask was parked. Wake it: the
+        // approved row is pumped again the moment its bridge says hello
+        // (deliverPendingInvites on register), so nothing is lost meanwhile.
+        if (!delivered) wakeIfOffline({ db, hub, waker }, who.userId, isJoin ? room.agent_device_id : target_device_id)
         return json(res, 200, { ok: true, delivered })
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
@@ -682,7 +710,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
           // Reported plainly (spec: no peer to hide behind) — 'declined',
           // never a fabricated box-side failure.
-          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined' })
+          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined', answeredByDeviceId: who.deviceId })
           return json(res, 200, { ok: true })
         }
         // The tap CLAIMS the row; a zero row-count means another tap already
@@ -693,7 +721,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // it runs off the request cycle — the app needs its 200 now, the
         // outcome reaches the parent as a turn. Errors are contained: the
         // broker timeout guarantees approveSpawn itself always settles.
-        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs }, getSpawn(db, request_id))
+        // wake-before-spawn: a target that went to sleep between the card and
+        // the tap is woken and waited for (up to spawnWakeWaitMs) before the
+        // start RPC, instead of failing the user's approval on the spot.
+        approveSpawn({
+          db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId,
+          wakeWaitMs: spawnWakeWaitMs,
+          wakeTarget: () => wakeIfOffline({ db, hub, waker }, who.userId, row.target_device_id),
+        }, getSpawn(db, request_id))
           .catch((err) => console.error('agent-spawn approve orchestration failed', err))
         return json(res, 200, { ok: true })
       }

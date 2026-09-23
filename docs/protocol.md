@@ -164,8 +164,13 @@ the machine-checkable version of this page.
   a private agent caller sees every device, unchanged.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
+  cursor, lag, last_seen_at, is_self, connected, push_prefs, status?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
+  `status` (agent devices, omitted until the box has reported) is the box's
+  last capacity report — `{reported_at, activity?, limits?, disk?,
+  account?}`, see "Box status" under the spawn section — so a client sees a
+  box's usage and allowances without ever having talked to it, and while it
+  is asleep; `reported_at` says how old the numbers are.
   `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
   above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
@@ -173,7 +178,13 @@ the machine-checkable version of this page.
   device has a live WebSocket right now — the "can I start a session on
   this agent" signal; `last_seen_at` stays the offline story.
 - `GET /roster` (Bearer, any authenticated device — client or agent) ->
-  `{agents, conversations}`. Targeting surface for agent chat rooms (spec:
+  `{agents, conversations}`. Each agent carries `connected` (live socket
+  now) and, when not connected and the journal has a wake command,
+  `wakeable: true` — asleep, not gone: a message, invite or spawn aimed at
+  it starts the box (see "Wake-before-spawn"; never set for a name the wake
+  command would refuse) — and its last `status` report when it has one (same
+  shape as `GET /devices`'s `status`, see "Box status" under the spawn
+  section). Targeting surface for agent chat rooms (spec:
   2026-08-06 agent-to-agent chat design, Phase 2) — unlike `GET /devices`
   (management, client devices only) this is deliberately open to agent
   tokens too, and deliberately narrower. `agents`:
@@ -791,7 +802,10 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
 
 - **`agent_invite {room_id, target_device_id, target_convo_id?, from_convo_id?, topic?, justification}`** —
   only the room's own owner (`agent_device_id === conn.deviceId`) may send
-  it (`forbidden` — "only the room owner may invite" — otherwise);
+  it (`forbidden` — "only the room owner may invite" — otherwise); a
+  target with no live connection is woken as the ask parks (see
+  "Wake-before-spawn" under the spawn section — same rule for
+  `agent_join`, which wakes the room's owner);
   `target_device_id` must be a different agent device of the same user
   (`not_found` for an unknown id, another user's device, or a client-kind
   device — anti-enumeration, same stance as `agent_request`; `bad_request`
@@ -985,6 +999,8 @@ peer text it renders in its own voice, now applied journal-side because the
 journal is the one publishing this event. Apps must render `justification`
 as untrusted text (no markdown, no autolinking) — it is attacker-
 controlled content shown to a human about to make a security decision.
+
+**Tracker item.** (spec: `docs/superpowers/specs/2026-09-22-consent-items-design.md`; the spawn card's twin is described in full under *Agent-spawned sessions → Tracker item*, and every rule there applies here.) The moment the card is journaled, the journal also files a `question` item on the **room** conversation (`fileChatConsentItem`, `src/consent-items.js`) and the row remembers it (`convo_agents.item_id`; a renewed row — a fresh ask after a deny or expiry — gets a fresh item): awaiting the user, top of the open list, label `consent`, link `matron://consent/chat/<room_id>/<target_device_id>` (the row's key, i.e. the card's own `target_device_id` — the invitee, or the joiner itself), title `<from_name> asks to chat with <to_name> — <topic>` or `<from_name> asks to join <to_name>'s room`, body = both sides with their session titles when the card has them, the topic, the justification **verbatim in a fenced code block**, and how to answer. It is the user's alone (invisible to every agent; its markers carry `consent: 'chat'` and are client-only) and it is closed by whatever takes the row out of `awaiting_user`: `POST /agent-chat/answer` and `matron-admin agent-chat approve|deny` (`approved`/`denied` → `decided`, attributed to the answering client device when there is one), the awaiting-TTL sweep (`expired` → `cancelled`), and an owner's `agent_leave` dissolve (`left` → `cancelled`). Filing and closing are best-effort: a tracker failure never costs the ask or its frames.
 
 **It is a client-only event, load-bearing.** `permission_request` with
 `payload.kind === 'agent_chat'` is excluded from agent delivery — live
@@ -1200,13 +1216,16 @@ A parent agent may ask a target agent to start a new session (child conversation
   "workdir": "string (capped at 1024 chars)",
   "task": "string (the child's seed prompt, capped at 2000 chars)",
   "topic": "string (optional, title fragment for the card, capped at 200 chars)",
-  "model": "string (optional, the Claude model the child should run, capped at 64 chars)"
+  "model": "string (optional, the Claude model the child should run, capped at 64 chars)",
+  "link": "boolean (optional, default false — also open a chat room between the parent and the child)"
 }
 ```
 
-Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only).
+`link` is opt-in because a spawn is normally a clean break: the child gets the task and its provenance in its opening turn, the parent gets the outcome, and an automatic room only made the child narrate progress back to a parent that relayed it on. A parent that later needs a channel opens one with an ordinary `agent_chat_start` against the child (it is on the roster like any session). With `link: true` the approval also mints a room — see "Answering" below.
 
-**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-integer `target_device_id`; targeting **self** (`target_device_id === conn.deviceId`); and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now; checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
+
+**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
 
 **`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
 
@@ -1217,9 +1236,11 @@ Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the
 }
 ```
 
-Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, self?, online, folders: [{path, last_used}], activity?, limits?}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. Self (the requesting device) **is** listed (loop #690, easelyte fork divergence — same-box spawn support; upstream excludes it as "a self-spawn trap"): the self entry carries `self: true` and its `name` is suffixed `" (this box)"` so the picker can label it as a same-box target. Private devices are hidden from non-private agents; the caller's own box always passes that filter.
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, self?, online, wakeable?, folders: [{path, last_used}], activity?, limits?}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Self (the requesting device) **is** listed, flagged `self: true` and its `name` suffixed `" (this box)"` so the picker can label it (easelyte fork divergence, loop #690) — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
 
-Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all.
+Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
+
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
 
 **Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
 
@@ -1240,7 +1261,8 @@ A `permission_request` event with `payload.kind: 'agent_spawn'` is appended to t
   "workdir": "string",
   "task": "string (the child's seed prompt, also the card's text)",
   "topic": "string (optional, title fragment for the card)",
-  "model": "string (optional, the Claude model the child will run — omitted, not empty, when none was asked for)"
+  "model": "string (optional, the Claude model the child will run — omitted, not empty, when none was asked for)",
+  "link": "true (optional — present only when the ask requested a chat room; a detached ask carries no key)"
 }
 ```
 
@@ -1256,12 +1278,36 @@ Like agent-chat cards, this is a **client-only event** excluded from agent deliv
 
 sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
 
+### Tracker item
+
+(spec: `docs/superpowers/specs/2026-09-22-consent-items-design.md`.) The card sits in one conversation's timeline and is easy to lose; the Decisions list is where the user looks for things that need an answer. So the moment a card is journaled, the journal also files a **tracker item** on the parent conversation (`src/consent-items.js`, `fileSpawnConsentItem`) and the row remembers it (`agent_spawn_requests.item_id`):
+
+- `kind: 'question'`, `awaiting: 'user'`, `created_by: 'agent'`, origin = the parent conversation and device (so it inherits the parent's mission like any item filed there), placed at the **top** of the open list.
+- `title`: `Approve spawn on <target_name> — <topic, or the head of the task>`; `labels: ['consent']`; `links: [{url: 'matron://consent/spawn/<request_id>', title}]` — the link is how a client that learns to embed the card in item detail finds the ask; until then the item's origin chip is the way back to the conversation holding the card.
+- `body`: who asks, the box, the workdir, the model and the room flag when present, the task **verbatim**, and how to answer (open the named conversation, tap Approve or Decline on the card, 24 h expiry). Peer strings arrive single-line from the card, but the body is **markdown** — the first place another agent's words meet a renderer — so the task sits in a fenced code block (a fence closes only at the start of a line, which a single-line task cannot reach; the fence is one backtick longer than the task's longest backtick run, so the task itself is never altered), device and conversation names have markup characters stripped, and a backtick in a workdir is stripped rather than let close its code span.
+- Its `created` marker is written under the **asking agent's device** (same sender as the card), carries `consent: 'spawn'` (client-only, see below), and is **quiet**: no push (the card's own `permission_request` push already rang the pocket), no wake, and **no old-client fallback text** (`emitMarker`'s `fallback: false`) — a fallback `text` would overwrite the card's `🤝 Agent spawn request` snippet and count a second unread for one ask. Connected clients still learn of the item live from the marker.
+
+**The item is the user's alone — invisible to every agent, in every state.** Its body carries the very text the card withholds from agents (`isClientOnlyEvent`), so `isConsentMirror` (`src/items.js`: `items.consent` is `'spawn'` or `'chat'`, set at creation and carried on the item itself — never derived from the row pointing at it, which a renewed chat ask re-points and a device revoke cascades away) makes it a 404 for agent callers on `GET /items/:id` and on every mutation route, and absent from `GET /items` (`excludeConsent`), private agents included. Its `created`/`closed` markers carry `consent: 'spawn'` and are therefore client-only too (`isClientOnlyEvent` covers `item` markers with a `consent` key): no agent hears of the item live, on replay, or through message reads. The asking agent, if prompt-injected, can neither rewrite the task the user reads there nor close it out of the open list. A client's hand-close is still the user's own call.
+
+**The item is a mirror, never a second source of truth.** Answering happens on the card (`POST /agent-spawn/answer`); the row's state machine decides what the item says. `emitSpawnOutcome` — the one funnel every terminal transition passes through — closes it (`closeSpawnConsentItem`) between the durable `spawn_outcome` append and the ephemeral frame, so the tracker is settled by the time the parent hears:
+
+| outcome | resolution | closing note (status row) | attributed to |
+|---|---|---|---|
+| `started` | `decided` | `Approved — the session started on <target>.` (+ room sentence for a linked ask) | the user; the answering client device (`answeredByDeviceId`, threaded from the answer route through `approveSpawn`) |
+| `declined` | `decided` | `Declined.` | the user; the answering client device |
+| `expired` | `cancelled` | `Expired — no answer within 24 h.` | the asking agent's device |
+| `failed` | `cancelled` | `Approved, but the session could not be started (<error_code>).` | the asking agent's device |
+
+The `closed` marker is as quiet as the `created` one. Closing the item by hand does **not** answer the ask — the row stays `awaiting_user`, the card still answers, and the 24 h expiry still runs; an item the user already closed by hand is left exactly as they left it (`closeItem` answers null and the outcome proceeds); a row with no `item_id` — one parked before the mirror existed, or one whose filing failed — resolves with no item at all. Filing and closing are **best-effort by contract**: a tracker failure is logged and never costs the ask, the card, or the outcome frame.
+
+Because items are user-wide, the parent's task text is readable through `GET /items` by every non-private agent of the user while the ask is open — the same text the card withholds from agents (`isClientOnlyEvent`). That is the trade the design makes on purpose (the user asked for the task in the item), recorded in the spec; a stricter sieve is a follow-up, not an accident.
+
 ### Answering
 
 **`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
 
 - **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
-- **`approve`** flips the row to `approved`, creates a new `conversations` row owned by the parent, and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id: <new room id>, from_name?: <parent device's sanitised name>, model?: <the requested model>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. `model` follows the same omit-when-absent rule — a row that named no model, including any row written before the column existed, sends no key at all. The parent hears one of: `outcome:'started'` (with `room_id` and `child_convo_id`), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
+- **`approve`** flips the row to `approved` and then, **for a linked row only** (`link` was `true` on the ask), creates a new `conversations` row owned by the parent and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. The room is titled the way a bridge titles its own agent-chat rooms (`D:ab ↔️ E:cd — topic`, see matron-bridge `lib/agent-chat.js` and this repo's `src/room-title.js`): each side is the box letter derived from the parent-visible roster (tag_char honoured) plus the session short the owning bridge baked into that session's title, and a side with no short yet falls back to the device name. At creation the child has no title, so its side is the bare target name; when the child's bridge later publishes a title (`convo_upsert` with `title`), the journal retitles the room with the child's tag and fans a `convo_meta` (`refreshSpawnRoomTitle`, `src/spawns.js`). That short is learned once and frozen on the row (`child_short`), so a later child rename — even one carrying a different short, or none — changes nothing, the same way a bridge room freezes its peer short at creation. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. A **detached row** (the default) mints no room and writes no epitaph on failure: the outcome frame is its whole story. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id?: <new room id, linked rows only>, from_name?: <parent device's sanitised name>, model?: <the requested model>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. `model` follows the same omit-when-absent rule — a row that named no model, including any row written before the column existed, sends no key at all. The parent hears one of: `outcome:'started'` (with `child_convo_id`, plus `room_id` for a linked row), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
 
 ### Outcome frames
 
@@ -1273,7 +1319,7 @@ All settlement notifications to the parent take the form `{kind:'spawn', event:'
   "event": "outcome",
   "request_id": "the spawn row's id",
   "outcome": "started | declined | expired | failed",
-  "room_id": "new room id (started only)",
+  "room_id": "new room id (started only, and only for a linked spawn)",
   "child_convo_id": "child session id reported by the target (started only)",
   "error_code": "code describing the failure (failed only)"
 }
@@ -1285,7 +1331,7 @@ All settlement notifications to the parent take the form `{kind:'spawn', event:'
 {
   "request_id": "the spawn row's id (same value the card carries)",
   "outcome": "started | declined | expired | failed",
-  "room_id": "new room id (started only)",
+  "room_id": "new room id (started only, and only for a linked spawn)",
   "child_convo_id": "child session id (started only)",
   "error_code": "sanitised failure code (failed only)"
 }
@@ -1301,6 +1347,8 @@ The append is **best-effort**: `from_convo_id` may point at a conversation delet
 
 The four outcomes flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, returned a bad start response, or — see "Stranded-`approved` recovery" below — orphaned by a restart or an internal error mid-orchestration). These outcomes are coarser than the six `agent_spawn_requests.state` values: `awaiting_user` and `approved` are transient parking states with no outcome frame of their own, folded into whichever of the four above the row eventually resolves to. **Frame delivery to live sockets is still at-most-once; the journaled event is now the durable record.** Every parked request resolves to exactly one terminal state, and both the outcome frame and the `spawn_outcome` event fire exactly once for it — but the frame itself remains fire-and-forget to the parent's live sockets (like `/agent-chat/answer` frames), so a parent offline at resolution time still misses *the frame*. It no longer misses the outcome (absent an append failure, above): the journaled event lands in `from_convo_id` regardless of whether anyone was listening, and a parent that was offline picks it up on its next hello replay, the same way it would any other event in a conversation it manages. The durable row (`agent_spawn_requests.state`) remains the ultimate source of truth; the journal event is what makes that truth reach the parent agent without depending on socket timing — the recorded follow-up this section used to promise, now implemented.
 
+**Wake-before-spawn.** A target with no live connection is usually a box the host idle-stopped, not a dead one. With a wake command configured (`MATRON_WAKE_CMD`, see `src/wake.js`): `spawn_request` fires the wake and parks the ask as usual instead of refusing it (the ack carries `target_waking: true`); `/agent-spawn/answer` approve fires it again if the box is still down and the orchestration then waits up to `spawnWakeWaitMs` (`MATRON_SPAWN_WAKE_WAIT_MS`, default 240000 — sized for a cold VM boot on the shared hosts) for the box's socket to register before issuing `start`; only then does the ordinary `agent_unreachable` failure apply. The wait is only ever paid when a wake is actually under way (`wakeIfOffline` returned true): a journal without a wake command behaves exactly as before, and its orphan TTL is unchanged. The same wake fires when an `agent_invite`/`agent_join` is parked against an asleep box and when its approval finds the recipient still down — approved invites are already pumped on the recipient's next hello (`deliverPendingInvites`), so the wake is what turns "sits until someone starts the box" into "arrives in a few minutes".
+
 **Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
 
 ### Expiry
@@ -1314,7 +1362,7 @@ A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hou
 Two mechanisms close this, layered the same way `expireSpawns` covers `awaiting_user`:
 
 - The orchestration itself (`approveSpawn`) wraps its body in a try/catch: a throw before `broker.issue` routes to the same failure tail a bad `start` reply gets, with `error_code: 'internal'`.
-- The periodic sweep timer additionally flips any `approved` row whose `answered_at` (the claim timestamp) is older than the orphan TTL — derived as `max(5 minutes, 2 × the configured start timeout)`, so a raised `spawnStartTimeoutMs` can never let the sweep fail a row whose orchestration is still legitimately awaiting the target's reply — to `failed`, and notifies the parent with `error_code: 'orphaned'`. If the orchestration got as far as creating the room before the restart (the room linkage is persisted onto the row *before* the `start` RPC is issued), the sweep also writes the same `❌ spawn failed` epitaph into that room a live failure writes, so the user is never left with an unexplained dead room. This is the backstop for the restart case, where nothing is left to run the try/catch above at all.
+- The periodic sweep timer additionally flips any `approved` row whose `answered_at` (the claim timestamp) is older than the orphan TTL — derived as `max(5 minutes, 2 × (the configured start timeout + the wake wait, below))`, so a raised `spawnStartTimeoutMs` or `spawnWakeWaitMs` can never let the sweep fail a row whose orchestration is still legitimately awaiting the target's reply — to `failed`, and notifies the parent with `error_code: 'orphaned'`. If the orchestration got as far as creating the room before the restart (the room linkage is persisted onto the row *before* the `start` RPC is issued), the sweep also writes the same `❌ spawn failed` epitaph into that room a live failure writes, so the user is never left with an unexplained dead room. This is the backstop for the restart case, where nothing is left to run the try/catch above at all.
 
 Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markFailed` / the sweep's own update) that the rest of the state machine relies on: whichever one wins the race is the only one whose outcome frame is ever sent, so a row a live orchestration successfully resolved (`started` or `failed`) can never also be reported `orphaned` by a sweep tick that happens to land moments later.
 
@@ -1368,15 +1416,21 @@ Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image, mission_id,
-mission_num}`. `mission_id`/`mission_num` are the mission this item belongs
+mission_num, consent}`. `consent` is `'spawn'` or `'chat'` on the journal's
+mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
+`null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
 inherited when the item's origin conversation joins a mission (see *Missions
 & milestones*, whose *Visibility* section covers what an ordinary agent may
-learn from `mission_num`). `attachments`
+learn from `mission_num`). `links[].url` must be `http(s)://` or the apps' own `matron://` (item
+links, consent asks — see *Agent-spawned sessions → Tracker item*); any
+other scheme is 400. **Consent mirrors** — the items the journal files for
+spawn and agent-chat consent cards — are invisible to every agent caller
+(404 on read and mutation, absent from `GET /items`); see that section. `attachments`
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,transcript?}], meta}`.
+created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta}`.
 `meta` is `null` for an ordinary comment and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
 close/reopen writes. `idem_key` is an internal column on both and is never
@@ -1384,11 +1438,50 @@ returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
 strip); a comment omits `user_id` too — the caller is the owner by
 construction.
 
-An attachment's `transcript` is **agent-attested**: it is written only by
+An attachment's `transcript` is **never caller-authored**: it is written only
+by the journal's own transcription job (below) or by the origin bridge's
 `PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
 or a comment is stripped before storage (not a 400 — the blob still lands,
 just without the forged words). It is the text the apps show in place of a
 voice note, so it must never be caller-authored.
+
+**Journal-side transcription.** When the journal host has whisper configured
+(`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional
+`MATRON_WHISPER_CLI`, default `<model dir>/../build/bin/whisper-cli`;
+`MATRON_WHISPER_LANGUAGE`, default `en`; `ffmpeg` on `PATH`), a **user's**
+comment with `audio/*` attachments is transcribed on upload, one job at a
+time:
+
+1. The comment is stored, and the `commented` marker announced, with
+   `transcript_status:'pending'` on each audio attachment (`transcript:null`).
+   Wake and push behave as for any comment, so a sleeping box boots while
+   whisper runs.
+2. Each job writes `transcript` and `transcript_status:'done'`, or
+   `'failed'` (whisper error, empty result, blob missing or not the user's).
+3. When the comment's **last** pending attachment settles, one quiet marker
+   follows: `action:'updated'`, the same `comment` (now with transcripts),
+   plus `transcription:'done'|'failed'` (`failed` if any attachment failed)
+   and `for_action:'commented'`. Sender and `by` are the commenting user's.
+   Quiet = no wake, no push, no fallback text.
+
+A bridge that knows the fields **holds the agent's turn** on a marker with a
+pending attachment and delivers it from the follow-up marker (falling back to
+its own whisper on `failed`, or if no follow-up arrives in time). A bridge
+that predates them sees `transcript:null`, transcribes as it always did and
+PATCHes the words in — which settles the status, so the journal's job skips
+the whisper run — and ignores the `updated` marker like any other. Pending
+jobs left by a restart are re-queued at boot. With whisper unconfigured none
+of this happens: no status field, and the origin bridge does the job.
+
+A voice note on a new item's **body** (`POST /items` `attachments`, user
+callers only) is handled identically: the body's attachments live on a
+synthetic comment, so the `created` marker carries that comment (empty
+`body`, the attachments `pending`) — only in this case — and the follow-up is
+`for_action:'created'`. The item body is still fetched with `GET /items/:id`.
+
+The bridge's PATCH announces itself the same way: one quiet `updated` marker
+with `transcription:'done'` (sender = the agent, so no bridge routes it as
+input), so an open item view refreshes when the words land.
 
 Rules: the `awaiting` default at creation depends on the kind **and on who
 filed it**. An agent-filed item takes the kind default — a `question`

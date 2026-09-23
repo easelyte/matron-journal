@@ -50,9 +50,16 @@ export const CONVO_ID_MAX_CHARS = 128
 // accepted. One predicate, consumed by ws.js fanOut, ws.js hello replay, and
 // http.js message reads — inlining the check at each site is how they drift
 // apart.
+//
+// The tracker mirror of either card (spec 2026-09-22 consent-items) is
+// announced by an `item` marker carrying `consent: 'spawn'|'chat'` — the
+// same rule applies to it: its title names the ask, and the room owner
+// hearing "dev-b asks to join" is exactly what parking exists to prevent.
 export function isClientOnlyEvent(type, payload) {
-  return type === 'permission_request' && !!payload && typeof payload === 'object'
-    && (payload.kind === 'agent_chat' || payload.kind === 'agent_spawn')
+  if (!payload || typeof payload !== 'object') return false
+  if (type === 'permission_request') return payload.kind === 'agent_chat' || payload.kind === 'agent_spawn'
+  if (type === 'item') return typeof payload.consent === 'string' && payload.consent !== ''
+  return false
 }
 
 export function snippetOf(type, payload) {
@@ -60,7 +67,7 @@ export function snippetOf(type, payload) {
   // number — rather than crashing on `payload.body` etc. A malformed
   // payload just yields an empty/placeholder snippet, never a thrown error.
   const p = payload && typeof payload === 'object' ? payload : {}
-  if (isClientOnlyEvent(type, payload)) {
+  if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
     return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'
   }
   if (type === 'text') return String(p.body || '').slice(0, 120)

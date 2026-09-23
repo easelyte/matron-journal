@@ -136,3 +136,36 @@ test('sendToDevice multicasts to every live socket of exactly that device', () =
   hub.sendToDevice(1, 1, { kind: 'invite' })
   assert.deepEqual(sent, [1, 1])
 })
+
+test('waitForDevice: true at once for a live socket, true on registration, false on timeout', async () => {
+  const hub = makeHub()
+  const live = { userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } }
+  hub.register(live)
+  assert.equal(await hub.waitForDevice(1, 7, 1000), true)
+  // Not yet registered: resolves when it lands.
+  const p = hub.waitForDevice(1, 8, 1000)
+  const t0 = Date.now()
+  setTimeout(() => hub.register({ userId: 1, deviceId: 8, kind: 'agent', ws: { readyState: 1 } }), 30)
+  assert.equal(await p, true)
+  assert.ok(Date.now() - t0 < 900, 'released by registration, not by the timer')
+  // Same device id on ANOTHER user never releases the waiter.
+  const other = hub.waitForDevice(2, 9, 120)
+  hub.register({ userId: 3, deviceId: 9, kind: 'agent', ws: { readyState: 1 } })
+  assert.equal(await other, false)
+  // Zero/negative wait never parks.
+  assert.equal(await hub.waitForDevice(1, 10, 0), false)
+})
+
+test('close: every parked waiter is released with false at once, and its timer is gone', async () => {
+  const hub = makeHub()
+  const a = hub.waitForDevice(1, 7, 600000)
+  const b = hub.waitForDevice(2, 8, 600000)
+  const t0 = Date.now()
+  hub.close()
+  assert.deepEqual(await Promise.all([a, b]), [false, false])
+  assert.ok(Date.now() - t0 < 500, 'released by close(), not by the timers')
+  // A registration after close() finds nothing to release, and a fresh
+  // wait no longer parks (the hub is shut).
+  hub.register({ userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } })
+  assert.equal(await hub.waitForDevice(1, 9, 600000), false)
+})

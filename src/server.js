@@ -22,6 +22,9 @@ import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { makeWaker } from './wake.js'
+import { makeTranscriber } from './transcribe.js'
+import { makeItemTranscription } from './items-transcribe.js'
+import { emitTranscriptionMarker } from './items-http.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -341,7 +344,14 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct, waker, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
+  // How long an approved spawn waits for a woken target box to attach
+  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
+  // incus start + bridge start + journal dial is ~3 minutes on the shared
+  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
+  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
+  // pays it.
+  spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
   fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, workViewOptions,
   httpHandlerFactory = makeHttpHandler,
 } = {}) {
@@ -494,6 +504,10 @@ export function startServer({
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
   // MATRON_WAKE_CMD is set (or a waker is injected by tests).
   const resolvedWaker = waker || makeWaker()
+  // A journal that cannot wake anything never waits for a wake — and its
+  // orphan sweep TTL (derived in attachWs from this value) stays what it
+  // always was, rather than growing by a window that can never be used.
+  const effectiveWakeWaitMs = resolvedWaker.enabled ? spawnWakeWaitMs : 0
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -502,11 +516,20 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  // Voice notes on tracker items are transcribed here when whisper is
+  // configured (MATRON_WHISPER_MODEL; src/transcribe.js) — off otherwise, and
+  // then the origin bridge does it as before. `transcriber` is the test seam;
+  // `null` forces it off.
+  const itemTranscription = makeItemTranscription({
+    db,
+    transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
+    onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
+  })
   const server = http.createServer(httpHandlerFactory({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
@@ -522,7 +545,7 @@ export function startServer({
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
-    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, waker: resolvedWaker,
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
@@ -534,6 +557,9 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Whatever a previous process left mid-transcription: a bridge is
+      // holding a turn for each, so finish them (or fail them) now.
+      itemTranscription.recover()
       // Fire-and-forget: search serves partial results until this finishes
       // (self-healing — spec). shouldStop lets close() end the walk cleanly
       // instead of racing a closed DB handle.
@@ -549,17 +575,25 @@ export function startServer({
         broker,
         toolStreams,
         pushPipeline,
+        itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         close: () => new Promise((r) => {
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
+          // of up to spawnWakeWaitMs; release them before the sockets go so
+          // each approveSpawn settles its row while the DB is still open.
+          hub.close()
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
           if (ownsApnsClient) resolvedApnsClient.close()
-          server.close(() => { searchBackfill.then(() => { db.close(); r() }) })
+          // The transcription queue touches the DB between awaits: abort its
+          // child and let it drain before the handle closes.
+          const transcriptionDone = itemTranscription.close()
+          server.close(() => { Promise.all([searchBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
         }),
       })
     })

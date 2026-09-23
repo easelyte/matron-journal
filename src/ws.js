@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { applyBridgePrivate, isPrivateDevice } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
-import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -33,6 +34,11 @@ const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
 ])
+// The subset of agent publishes that are a MESSAGE to the conversation's
+// other agents (an agent_chat_send into a room lands as one of these) and
+// so should start a joined peer whose box is asleep. Status, streams,
+// summaries and prompts are the publishing agent's own bookkeeping.
+const ROOM_WAKE_PUBLISH_TYPES = new Set(['text', 'file', 'image'])
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only
 // states a bridge may broadcast. Anything else is bad_request.
@@ -261,11 +267,12 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, waker = null,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
-  // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment).
-  const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, spawnStartTimeoutMs * 2)
+  // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
+  // since wake-before-spawn, the wake wait that may precede it.
+  const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
   const vitalsCache = makeVitalsCache()
@@ -333,6 +340,9 @@ export function attachWs({
       // decision must be indistinguishable from a deliberate no, or a peer
       // could infer "the user hasn't looked yet" and keep re-asking.
       for (const row of expireAwaiting(db, AWAITING_USER_TTL_MS)) {
+        // The tracker mirror closes as cancelled (spec: 2026-09-22
+        // consent-items); best-effort, before the frame like every close.
+        closeChatConsentItem({ db, hub }, row.convo_id, row.agent_device_id, { outcome: 'expired' })
         const convo = ownerLookup.get(row.convo_id)
         if (!convo) continue
         hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
@@ -752,7 +762,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // Purely additive: every op keeps its existing answer. Shared with the
   // HTTP items routes — see src/wake.js for the full rationale.
   const wakeIfOffline = (agentDeviceId) => wakeIfOfflineShared({ db, hub, waker }, conn.userId, agentDeviceId)
-  const wakeConvoAgent = (convoId) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId)
+  const wakeConvoAgent = (convoId, opts) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId, opts)
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
   // other post-commit notification in the invite lifecycle — by the time
@@ -973,6 +983,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sanitisation the way workdir/task are — a model that sieves down to
         // nothing means "no model named", which is a legal ask, not a bad one.
         if (msg.model != null && (typeof msg.model !== 'string' || msg.model.length > SPAWN_MODEL_MAX_CHARS)) return fail('bad_request', 'bad model')
+        // Optional: whether approval also opens a chat room between parent
+        // and child. Absent means no room (a spawn is a clean break by
+        // default); anything but a boolean is a bad ask, not a coerced one.
+        if (msg.link != null && typeof msg.link !== 'boolean') return fail('bad_request', 'bad link')
+        const link = msg.link === true
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         // Spawning on the caller's own box is allowed: the start rpc lands on
         // the same bridge, which already runs several sessions side by side
@@ -994,16 +1009,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
           || fromConvo.parent_convo_id != null) return fail('not_found')
-        // An unreachable box is refused BEFORE any card is published — never
-        // spend the user's tap on something that cannot work. Same liveness
-        // rule as hub.sendRpcRequest without sending anything.
+        // A box with no live socket is asleep when this journal can wake it
+        // (wake-before-spawn): fire the wake now and park the ask as usual —
+        // the user's tap takes minutes anyway, and approveSpawn waits for the
+        // box to attach before issuing `start`. Only a box that cannot be
+        // woken (no MATRON_WAKE_CMD, or the wake refused) is still refused
+        // BEFORE any card is published, so the user's tap is never spent on
+        // an ask that cannot work. Same liveness rule as hub.sendRpcRequest.
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
-        if (!online) {
-          // Same shape as agent_request above: refuse now, boot the box so
-          // the parent's retry can succeed.
-          wakeIfOffline(msg.target_device_id)
-          return fail('agent_unreachable')
-        }
+        const targetWaking = !online && wakeIfOffline(msg.target_device_id)
+        if (!online && !targetWaking) return fail('agent_unreachable')
         const workdir = sanitizePeerText(msg.workdir, SPAWN_WORKDIR_MAX_CHARS)
         if (!workdir) return fail('bad_request', 'bad workdir')
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
@@ -1018,7 +1033,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model,
+          workdir, task, topic, model, link,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1046,6 +1061,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // topic's): a client renders this as a "will run on <model>" chip,
           // and an empty one would read as a model named "".
           ...(model ? { model } : {}),
+          // Same omit-when-absent stance: a linked ask says so, a detached
+          // one says nothing about a room — the common case stays the
+          // card shape every client already renders.
+          ...(link ? { link: true } : {}),
         }
         let cardAppend
         try {
@@ -1065,7 +1084,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             console.error('spawn_request: card broadcast failed (card is journaled; clients catch up via snapshot)', err)
           }
         }
-        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
+        // The card's mirror in the tracker (spec: 2026-09-22 consent-items):
+        // a question item on the parent conversation, closed by the spawn's
+        // outcome. After the card and before the ack: the card is the
+        // commit point above; the item is best-effort and its own failure
+        // never costs the ask (the row's item_id simply stays NULL).
+        fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
+        // target_waking: the box was asleep and is being started; the parent's
+        // tool copy can tell its user the session begins once the box is up
+        // AND the card is answered. Omitted (never false) when it was online.
+        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId, ...(targetWaking ? { target_waking: true } : {}) }))
         break
       }
       case 'spawn_targets': {
@@ -1099,6 +1127,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // discovery rides it for free"). Offline boxes are listed with no
         // folders and no RPC; a box that fails or times out degrades to []
         // — discovery must never error because one box is sick.
+        // Last reported box status per device (box_status op / earlier
+        // spawn_targets replies): what an OFFLINE box is listed with, so a
+        // sleeping box still shows its last known usage instead of nothing.
+        const stored = deviceStatuses(db, conn.userId)
         try {
           const SELF_TAG = ' (this box)'
           const out = await Promise.all(boxes.map(async (d) => {
@@ -1108,7 +1140,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             let activity = null
             let limits = null
             let disk = null
+            let reportedAt = null
             if (online) {
+              const issuedAt = Date.now()
               const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
               if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
               if (r.ok) {
@@ -1117,7 +1151,37 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 activity = sanitizeSpawnActivity(r.result?.activity)
                 limits = sanitizeSpawnLimits(r.result?.limits)
                 disk = sanitizeSpawnDisk(r.result?.disk)
+                // A live reply is also the freshest status this journal
+                // holds for the box: keep it, so the next reader (or the
+                // next time the box is asleep) sees these numbers. Merged,
+                // not replaced: this reply never carries account and may
+                // omit other blocks, and an omission here is "not in this
+                // RPC", not "gone" — the box's own box_status still owns
+                // the full row.
+                const fresh = sanitizeBoxStatus(r.result)
+                if (fresh) {
+                  // A box_status that landed while this RPC was in flight is
+                  // newer than the reply (the bridge composed it later):
+                  // list that row and leave it alone, rather than merging a
+                  // stale reply over it and stamping the listing reply-time.
+                  const current = getDeviceStatus(db, conn.userId, d.device_id)
+                  if (current && current.reported_at >= issuedAt) {
+                    activity = current.activity ?? null
+                    limits = current.limits ?? null
+                    disk = current.disk ?? null
+                    reportedAt = current.reported_at
+                  } else {
+                    reportedAt = Date.now()
+                    try { mergeDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status merge failed', err) }
+                  }
+                }
               }
+            } else if (stored.has(d.device_id)) {
+              const last = stored.get(d.device_id)
+              activity = last.activity ?? null
+              limits = last.limits ?? null
+              disk = last.disk ?? null
+              reportedAt = last.reported_at
             }
             // Sanitised like every other client-bound device name (roster,
             // consent cards) — the recipient here is an agent, not a client, so
@@ -1128,8 +1192,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // detect the same-box entry without string-matching the tag.
             const baseName = sanitizePeerText(d.name, isSelf ? PEER_NAME_CAP - SELF_TAG.length : PEER_NAME_CAP)
             return {
-              device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
-              ...(d.device_id === conn.deviceId ? { self: true } : {}),
+              device_id: d.device_id, name: isSelf ? `${baseName}${SELF_TAG}` : baseName, online, folders,
+              ...(isSelf ? { self: true } : {}),
+              // Offline + a wake command configured + a name the command
+              // would take (wakeIfOffline's own rule) = asleep, not gone: a
+              // spawn or invite aimed at it starts the box (wake-before-
+              // spawn). Omitted when online or when nothing could wake it.
+              ...(!online && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+              // When the blocks below came from the journal's stored status
+              // rather than a live reply (offline box), say how old they are.
+              ...(reportedAt != null ? { reported_at: reportedAt } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),
@@ -1222,12 +1294,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // An asleep target is started now, while the ask waits for the user:
+        // by the time they approve, the box is usually up to receive it, and
+        // if not, the approved row is pumped on its hello anyway
+        // (deliverPendingInvites). Fire-and-forget like every wake.
+        wakeIfOffline(msg.target_device_id)
         // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
         // own fan-out already excludes every agent device, including the
         // room's recorded owner, so this never reaches an agent socket.
-        appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
-          payload: {
+        const inviteCard = {
             kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
             target_device_id: msg.target_device_id, topic, justification,
@@ -1249,8 +1324,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             to_name: sanitizePeerText(target.name, PEER_NAME_CAP),
             to_convo_id: targetConvoId ?? '',
             to_convo_title: toConvoTitle,
-          },
-        })
+        }
+        appendAndFan({ userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request', payload: inviteCard })
+        // The card's mirror in the tracker (spec: 2026-09-22 consent-items),
+        // best-effort — its failure never costs the ask.
+        fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: msg.target_device_id, card: inviteCard })
         // Same ack as a relayed request: to the bridge, delivered means
         // "accepted into the system" — its tool copy already says pending is
         // normal and the answer arrives as a later turn. A distinct 'parked'
@@ -1287,9 +1365,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
-        appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
-          payload: {
+        // The recipient of a join is the room's owner box; start it if asleep
+        // (same stance as agent_invite above).
+        wakeIfOffline(room.agent_device_id)
+        const joinCard = {
             kind: 'agent_chat', request: 'join', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
             // The row this card asks about is keyed on the JOINER (parkInvite
@@ -1312,8 +1391,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
             to_convo_id: '',
             to_convo_title: '',
-          },
-        })
+        }
+        appendAndFan({ userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request', payload: joinCard })
+        // Mirror in the tracker, keyed on the joiner like the row (spec:
+        // 2026-09-22 consent-items); best-effort.
+        fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: conn.deviceId, card: joinCard })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }
@@ -1417,6 +1499,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // decision — either way it is the one leaving, so no notification
           // is owed (and for the parked case the target never even knew).
           for (const row of pending) {
+            // A parked ask's tracker item closes as cancelled whoever
+            // initiated it (an owner-initiated parked invite has an item
+            // too); an already-answered row's item is closed and untouched.
+            closeChatConsentItem({ db, hub }, msg.room_id, row.agent_device_id, { outcome: 'left' })
             if (row.initiator_device_id === conn.deviceId) continue
             notify(row.initiator_device_id, {
               kind: 'invite', event: 'answer', room_id: msg.room_id,
@@ -1565,6 +1651,19 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           summary: msg.summary ?? null,
           agentKind: msg.agent_kind ?? null,
         })
+        // A spawned child's first published title carries the session short
+        // its spawn room's title has been waiting for (the room is minted
+        // before the child exists). One indexed lookup for every titled
+        // upsert; a retitle only when this convo is a started spawn's child
+        // and the computed title actually changed. Best-effort: the child's
+        // own upsert must land whatever happens to the room.
+        if (msg.title != null) {
+          try {
+            refreshSpawnRoomTitle(db, hub, msg.convo_id)
+          } catch (err) {
+            console.error('convo_upsert: spawn room retitle failed', err)
+          }
+        }
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE
           // this update — an in-memory hint only, so push.js can tell a
@@ -1762,6 +1861,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: msg.blob_ref ?? null,
           idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
         })
+        // After the append (which authorized the write): a message into a
+        // room should also start any joined peer whose box is asleep. The
+        // writer's own box is awake by definition. Additive, like the
+        // client `send` path above — the publish is already answered.
+        if (ROOM_WAKE_PUBLISH_TYPES.has(msg.type)) wakeConvoAgent(msg.convo_id, { exceptDeviceId: conn.deviceId })
         break
       }
       case 'stream': {
@@ -1828,6 +1932,24 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
         })
+        break
+      }
+      case 'box_status': {
+        // A bridge's report about its OWN box (spec: 2026-09-21 "usage and
+        // allowances live in the journal"): activity, usage limits, disk,
+        // account. Persisted per device so every client — including one
+        // that has never talked to this box, and while the box is asleep —
+        // sees its last known state from /devices and /roster; fanned live
+        // to the user's client sockets so an open picker updates. Not a
+        // conversation event: nothing is appended or replayed. Same
+        // sanitisers as the recent_folders capacity blocks, so a bridge
+        // sends the one payload for both.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        const status = sanitizeBoxStatus(msg)
+        if (!status) return fail('bad_request', 'no valid status block')
+        const reportedAt = Date.now()
+        upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
         break
       }
       case 'status': {

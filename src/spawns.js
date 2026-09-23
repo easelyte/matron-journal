@@ -10,18 +10,27 @@ import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
 import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { isPrivateDevice } from './db.js'
+import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
+import { closeSpawnConsentItem } from './consent-items.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
 // that never mentions one writes the same falsy value rows predating the
 // column carry (NULL). approveSpawn's relay is a falsy test, so the two are
 // interchangeable there and nowhere has to distinguish them.
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', now = Date.now() }) {
+//
+// `link` is whether approval also opens a chat room between the parent and
+// the child (spec: 2026-09-17 spawn rooms opt-in). Off by default: a spawn
+// is normally a clean break, and the parent can open a room later with an
+// ordinary agent_chat_start if it turns out to need one. Stored 0/1 (SQLite
+// has no boolean); read back with a truthiness test like model.
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', link = false, now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, model, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, now)
+      workdir, task, topic, model, link, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, link ? 1 : 0, now)
   return { id }
 }
 
@@ -69,7 +78,13 @@ export function markFailed(db, id, now = Date.now()) {
 // purpose (not in isClientOnlyEvent): the parent owns from_convo_id, so
 // replay hands it the outcome durably — the fix for the at-most-once
 // delivery gap protocol.md used to document.
-export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode }) {
+//
+// The consent item (src/consent-items.js) is closed here too — between the
+// durable event and the frame, so the tracker is settled by the time the
+// parent hears — because this is the ONE funnel every terminal transition
+// passes through. `answeredByDeviceId` is the client that tapped, when a
+// tap is what resolved the row; it only names the closing note's device.
+export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode, answeredByDeviceId = null }) {
   const extras = {
     ...(roomId ? { room_id: roomId } : {}),
     ...(childConvoId ? { child_convo_id: childConvoId } : {}),
@@ -83,6 +98,7 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
   } catch (err) {
     console.error('emitSpawnOutcome: durable outcome append failed', err)
   }
+  closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId })
   hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
 }
 
@@ -141,19 +157,98 @@ export function countPendingAsks(db, fromDeviceId) {
   `).get(fromDeviceId, fromDeviceId).c
 }
 
-// Spec step 4/5 — everything after the user's tap. Ordering is load-bearing:
-// room first, then spawn. Spawning first would, on a room-creation failure,
-// leave a live agent on another box with no channel and no provenance. The
-// broker's timeout guarantees the `start` rpc itself settles; the try/catch
-// below guarantees the ORCHESTRATION settles too, even if something throws
-// before broker.issue is ever reached (e.g. upsertConversation/
-// appendAndBroadcast hitting a DB error) — otherwise the row is left
-// 'approved' forever with the caller's own `.catch(console.error)` the only
-// thing that ever sees the failure. The stranded-'approved' sweep
+// The title of a spawn room, in the bridge's own agent-chat room form —
+// `D:ab ↔️ E:cd — topic` (src/room-title.js): the parent's tag, the
+// child's tag, the topic. Each tag is the box letter (derived against the
+// same roster the apps colour from, tag_char override honoured) plus the
+// session short the owning bridge baked into that session's title. A side
+// whose title has not earned a short yet — the child before its bridge
+// publishes one, always the case at creation — falls back to the device
+// name, exactly as chatStart's peer side does. `childShort` is the frozen
+// child_short (see refreshSpawnRoomTitle), '' at creation. The roster the
+// letters are struck against is the one the PARENT can see (private boxes stay
+// invisible to an ordinary agent's room title as they are to its roster),
+// with the pair's own names added should either be missing from it.
+function spawnRoomTitle(db, row, childShort = '') {
+  const excludePrivate = !isPrivateDevice(db, row.from_device_id)
+  const agents = db.prepare(
+    `SELECT id, name, tag_char FROM devices WHERE user_id=? AND kind='agent'${excludePrivate ? ' AND private=0' : ''} ORDER BY id`
+  ).all(row.user_id).map((a) => ({ ...a, name: sanitizePeerText(a.name, PEER_NAME_CAP) }))
+  const agentFor = (deviceId) => agents.find((a) => a.id === deviceId)
+    || (() => { const d = db.prepare('SELECT id, name, tag_char FROM devices WHERE id=?').get(deviceId); return d ? { ...d, name: sanitizePeerText(d.name, PEER_NAME_CAP) } : null })()
+  const parent = agentFor(row.from_device_id)
+  const target = agentFor(row.target_device_id)
+  const names = [...new Set([...agents.map((a) => a.name), parent?.name, target?.name].filter((n) => typeof n === 'string' && n))]
+  const side = (agent, deviceId, short) => sideTag({
+    name: agent?.name || null,
+    short,
+    names,
+    override: agent?.tag_char ?? null,
+    label: agent?.name || `device ${deviceId}`,
+  })
+  const parentShort = sessionShortFromTitle(db.prepare('SELECT title FROM conversations WHERE id=?').get(row.from_convo_id)?.title)
+  return roomTitle(side(parent, row.from_device_id, parentShort), side(target, row.target_device_id, childShort), row.topic || '')
+}
+
+// Bring a started spawn room's title up to date once its child's bridge has
+// published a title — called from ws.js on every titled convo_upsert,
+// because the child's seed title normally lands AFTER the start reply (a
+// bridge publishes it with its first state-transition upsert, not at spawn).
+// The short is learned ONCE and frozen on the row (child_short): bridge
+// rooms freeze the peer short at creation, and a room title that followed
+// every later child rename would flap — to a different short after a
+// resume, or back to the bare device name after an app-side rename that
+// dropped the prefix. So: cheap when the convo is nobody's child (one
+// indexed point lookup), a no-op once the short is known or while the
+// child's title still carries none, and exactly one retitle otherwise.
+// Returns whether a retitle happened. Best-effort by contract: callers log
+// and carry on.
+export function refreshSpawnRoomTitle(db, hub, childConvoId) {
+  const row = db.prepare(
+    "SELECT * FROM agent_spawn_requests WHERE child_convo_id=? AND room_id IS NOT NULL AND state='started'"
+  ).get(childConvoId)
+  if (!row || row.child_short) return false
+  const short = sessionShortFromTitle(db.prepare('SELECT title FROM conversations WHERE id=?').get(childConvoId)?.title)
+  if (!short) return false
+  const room = db.prepare('SELECT owner_user_id, title FROM conversations WHERE id=?').get(row.room_id)
+  if (!room) return false
+  db.prepare('UPDATE agent_spawn_requests SET child_short=? WHERE id=?').run(short, row.id)
+  const title = spawnRoomTitle(db, row, short)
+  if (title === room.title) return false
+  upsertConversation(db, { id: row.room_id, ownerUserId: room.owner_user_id, title })
+  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id) } })
+  return true
+}
+
+// Spec step 4/5 — everything after the user's tap. Ordering is load-bearing
+// for a LINKED row: room first, then spawn. Spawning first would, on a
+// room-creation failure, leave a live agent on another box with no channel
+// and no provenance. A detached row (row.link falsy, the default) mints no
+// room at all: the child gets the task and its provenance in its opening
+// turn, the parent gets the outcome frame, and that is the whole contract.
+// The broker's timeout guarantees the `start` rpc itself settles; the
+// try/catch below guarantees the ORCHESTRATION settles too, even if
+// something throws before broker.issue is ever reached (e.g.
+// upsertConversation/appendAndBroadcast hitting a DB error) — otherwise the
+// row is left 'approved' forever with the caller's own `.catch(console.error)`
+// the only thing that ever sees the failure. The stranded-'approved' sweep
 // (expireApproved) is the remaining backstop for the case even this can't
 // cover: the process dying mid-orchestration, taking this stack frame with
 // it.
-export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = randomUUID() }, row) {
+//
+// `roomId` is a test seam (a caller-chosen id for a linked row); production
+// mints one. It is ignored for a detached row — the flag on the row is the
+// only thing that decides whether a room exists.
+// wakeTarget / wakeWaitMs (wake-before-spawn): a target box with no live
+// socket at approval time is usually asleep, not gone — the host idle-stops
+// dev VMs and a wake command starts them again. When the caller supplies
+// wakeTarget (which fires the wake and reports whether one is under way),
+// the orchestration waits up to wakeWaitMs for the box's socket to register
+// before issuing `start`, instead of failing on the spot. A box that never
+// comes up still fails with agent_unreachable from the broker; the orphan
+// sweep's TTL is derived to outlast wakeWaitMs + startTimeoutMs (ws.js).
+export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: roomIdOverride = null, answeredByDeviceId = null, wakeTarget = null, wakeWaitMs = 0 }, row) {
+  const roomId = row.link ? (roomIdOverride || randomUUID()) : null
   // Exactly-once guard: markFailed is state-scoped (WHERE state='approved'),
   // so its changes-count tells us whether THIS call is the one resolving the
   // row out of 'approved'. A false here means someone else already did
@@ -162,14 +257,6 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
   // may be sent a second time.
   const fail = (code) => {
     if (!markFailed(db, row.id)) return 'failed'
-    // Best-effort epitaph: normally the room already exists (both users can
-    // see it, so it gets the same epitaph a dead chat room gets) — but a
-    // throw from THIS call's own try block can land here before
-    // upsertConversation ever ran, in which case there is no room row to
-    // write into and appendAndBroadcast itself throws (append() requires an
-    // existing, owned conversation). That must never swallow the outcome
-    // frame below — telling the parent is the one thing this tail cannot
-    // skip.
     // `code` here is the target bridge's own error_code (e.g. from a
     // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
     // msg.error.code) — peer-authored, not journal-composed — so it goes
@@ -181,50 +268,64 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // must never cross any of those wires. Same 'unknown' fallback for a
     // missing code.
     const safeCode = sanitizePeerText(code, 64) || 'unknown'
-    try {
-      appendAndBroadcast(db, hub, {
-        userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
-        payload: { body: `❌ spawn failed — ${safeCode}. This room's child session never started.` },
-      })
-    } catch (err) {
-      console.error('approveSpawn: epitaph write failed (room likely never created)', err)
+    // Best-effort epitaph for a linked row: normally the room already
+    // exists (both users can see it, so it gets the same epitaph a dead
+    // chat room gets) — but a throw from THIS call's own try block can land
+    // here before upsertConversation ever ran, in which case there is no
+    // room row to write into and appendAndBroadcast itself throws (append()
+    // requires an existing, owned conversation). That must never swallow
+    // the outcome frame below — telling the parent is the one thing this
+    // tail cannot skip. A detached row has no room and gets no epitaph: the
+    // outcome frame is its whole story.
+    if (roomId) {
+      try {
+        appendAndBroadcast(db, hub, {
+          userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
+          payload: { body: `❌ spawn failed — ${safeCode}. This room's child session never started.` },
+        })
+      } catch (err) {
+        console.error('approveSpawn: epitaph write failed (room likely never created)', err)
+      }
     }
-    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode })
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode, answeredByDeviceId })
     return 'failed'
   }
   try {
-    // Same title convention as bridge-minted agent-chat rooms (🔗 marker +
-    // 2-char room short): a spawn room is a multi-agent room too, and the
-    // chat list should say so the same way.
-    const title = `🔗 [${roomId.slice(0, 2)}] ${row.topic || row.task.slice(0, 80)}`
-    // The parent owns the room (conversations.agent_device_id), the target is
-    // its joined participant — the same shape an accepted chat invite leaves.
-    upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
-    recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
-    // Live clients learn the room exists now, not at their next /snapshot —
-    // the same two frames convo_upsert fans for a fresh conversation.
-    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
-    // participants rides the same meta so the spawn room chips both boxes
-    // (parent owner + spawned target) the moment it appears (spec:
-    // multi-agent room tags). Best-effort: the row's title and membership
-    // are already committed (upsertConversation/recordJoined above) and
-    // /snapshot serves both, so a failed live fan must log and let the
-    // spawn proceed — not trip the outer catch into reporting a failed
-    // outcome for a room that exists with joined membership.
-    try {
-      appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
-    } catch (err) {
-      console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
+    if (roomId) {
+      // Titled the way the bridge titles its own agent-chat rooms, so a
+      // spawn room reads like every other room in the chat list. The child
+      // side is the bare device name for now — its short arrives with the
+      // child's first published title (refreshSpawnRoomTitle, via ws.js).
+      const title = spawnRoomTitle(db, row)
+      // The parent owns the room (conversations.agent_device_id), the target is
+      // its joined participant — the same shape an accepted chat invite leaves.
+      upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
+      recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
+      // Live clients learn the room exists now, not at their next /snapshot —
+      // the same two frames convo_upsert fans for a fresh conversation.
+      appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
+      // participants rides the same meta so the spawn room chips both boxes
+      // (parent owner + spawned target) the moment it appears (spec:
+      // multi-agent room tags). Best-effort: the row's title and membership
+      // are already committed (upsertConversation/recordJoined above) and
+      // /snapshot serves both, so a failed live fan must log and let the
+      // spawn proceed — not trip the outer catch into reporting a failed
+      // outcome for a room that exists with joined membership.
+      try {
+        appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+      } catch (err) {
+        console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
+      }
+      // Persist the room linkage NOW, before the `start` RPC — the row is
+      // still 'approved', so a restart in the RPC gap leaves the sweep
+      // (expireApproved) a room_id to report and write the epitaph into.
+      // Without this, markStarted was the first writer of room_id and a
+      // restart-orphaned row pointed at nothing: the user was left with an
+      // unexplained dead room and the parent with an unlocatable failure.
+      // State-scoped like every other write; markStarted re-setting the same
+      // value later is harmless.
+      db.prepare("UPDATE agent_spawn_requests SET room_id=? WHERE id=? AND state='approved'").run(roomId, row.id)
     }
-    // Persist the room linkage NOW, before the `start` RPC — the row is
-    // still 'approved', so a restart in the RPC gap leaves the sweep
-    // (expireApproved) a room_id to report and write the epitaph into.
-    // Without this, markStarted was the first writer of room_id and a
-    // restart-orphaned row pointed at nothing: the user was left with an
-    // unexplained dead room and the parent with an unlocatable failure.
-    // State-scoped like every other write; markStarted re-setting the same
-    // value later is harmless.
-    db.prepare("UPDATE agent_spawn_requests SET room_id=? WHERE id=? AND state='approved'").run(roomId, row.id)
     // The parent device's name may be gone by approval time (deleted between
     // the ask and the tap) — omitted rather than forced, same as every other
     // optional wire field.
@@ -236,8 +337,18 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // asked) and NULL (a row predating the column) are both falsy, so a
     // target bridge only ever sees the key when the requester named a model.
     // Already sanitised and capped at the ws boundary before it was stored.
+    // `room_id` likewise: absent means detached, and the target's opening
+    // turn says so instead of naming a channel back.
+    // Wake-and-wait before the start RPC. Only when a wake is actually under
+    // way: a target that is offline with no wake possible fails fast below,
+    // exactly as before, rather than holding the row for the whole window.
+    if (wakeTarget && wakeWaitMs > 0) {
+      let waking = false
+      try { waking = wakeTarget() === true } catch (err) { console.error('approveSpawn: wake threw', err) }
+      if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
+    }
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
-      { workdir: row.workdir, prompt: row.task, room_id: roomId, ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}) },
+      { workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}) },
       { timeoutMs: startTimeoutMs })
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
@@ -258,7 +369,13 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
-      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id })
+      // The child's bridge may already have published its title (it does
+      // when it flushes the seed before answering); if so the room can
+      // carry the child's tag from the start. Best-effort like every fan.
+      if (roomId) {
+        try { refreshSpawnRoomTitle(db, hub, r.result.convo_id) } catch (err) { console.error('approveSpawn: room retitle failed', err) }
+      }
+      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId })
       return 'started'
     }
     return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))
@@ -316,6 +433,32 @@ export function sanitizeSpawnDisk(raw) {
   if (!Number.isSafeInteger(raw.total_bytes) || raw.total_bytes <= 0) return null
   if (raw.free_bytes > raw.total_bytes) return null
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
+}
+
+// A bridge's own box-status report (`box_status` op): the same optional
+// capacity blocks a recent_folders reply may carry, plus the account it
+// burns quota against. Each block is all-or-nothing on its own; a report
+// with no valid block at all is rejected (nothing to store).
+const ACCOUNT_EMAIL_CAP = 254
+
+export function sanitizeBoxStatus(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const activity = sanitizeSpawnActivity(raw.activity)
+  const limits = sanitizeSpawnLimits(raw.limits)
+  const disk = sanitizeSpawnDisk(raw.disk)
+  let account = null
+  if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
+    && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
+    const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
+    if (email) account = { email }
+  }
+  if (!activity && !limits && !disk && !account) return null
+  return {
+    ...(activity ? { activity } : {}),
+    ...(limits ? { limits } : {}),
+    ...(disk ? { disk } : {}),
+    ...(account ? { account } : {}),
+  }
 }
 
 export function sanitizeSpawnLimits(raw) {

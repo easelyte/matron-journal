@@ -11,6 +11,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -37,22 +38,30 @@ function answerKnownError(res, err) {
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure.
+// A consent mirror (isConsentMirror, items.js) is invisible to EVERY agent,
+// private ones included — it is the user's card in item form.
 function visibleItem(db, who, idOrNum) {
   const item = getItem(db, who.userId, idOrNum)
   if (!item) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, item.origin_convo_id)) return null
+  if (who.kind === 'agent' && isConsentMirror(db, item.id)) return null
   return item
 }
 
 // The one place an 'item' marker is written. Called AFTER the item's own
 // transaction has committed — never inside it, so a broadcast can never
-// advertise a write that then rolls back.
-function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null }) {
+// advertise a write that then rolls back. Exported for the journal's own
+// item writes (src/consent-items.js), which pass a synthetic `who`.
+// `fallback: false` skips the old-client text below — for a marker that
+// mirrors something the conversation already shows as its own message (a
+// consent card, src/consent-items.js): the text would overwrite the card's
+// snippet and count a second unread for one ask.
+export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null, fallback = true }) {
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
-  const payload = itemMarkerPayload({ item, action, by: author, comment })
+  const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
   const sender = senderOf(db, who)
   let r
   try {
@@ -74,7 +83,7 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   // append/push failures are logged and swallowed exactly like the marker's
   // — this is a degrade path, never a reason to fail the request or the
   // marker that already landed.
-  if (FALLBACK_ACTIONS.has(action)) {
+  if (fallback && FALLBACK_ACTIONS.has(action)) {
     const actor = sender.slice(sender.indexOf(':') + 1)
     const text = itemFallbackText(payload, { actor, body: action === 'created' ? item.body : null })
     if (text != null) {
@@ -95,6 +104,20 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
   if (who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+}
+
+// The journal's transcription job settled every voice note on a comment
+// (src/items-transcribe.js): re-announce the comment on a quiet `updated`
+// marker. Quiet on purpose — no wake (the `commented` marker already woke the
+// box), no push, no fallback text — but it is what an open item view refreshes
+// from, and what a bridge holding the agent's turn is waiting for. The sender
+// is rebuilt as the commenting user (only a user's comment is ever queued):
+// the bridge routes `user:` markers as input, and `by:'user'` keeps it honest.
+export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, deviceId, isItemBody = false }) {
+  emitMarker(ctx, { kind: 'client', userId, deviceId }, {
+    item, action: 'updated', comment, by: 'user',
+    extra: { transcription: failed ? 'failed' : 'done', for_action: isItemBody ? 'created' : 'commented' },
+  })
 }
 
 // null = absent, undefined = present but not in `list` (i.e. reject).
@@ -122,7 +145,7 @@ function handleList(db, res, url, who) {
   if (convoId != null && (!convoId || convoId.length > ID_MAX)) return badRequest(res)
   const r = listItems(db, who.userId, {
     convoId, kind, state, awaiting, label, sort, since,
-    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who),
+    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who), excludeConsent: who.kind === 'agent',
   })
   // An undecodable cursor is a malformed request, not an empty page.
   if (r.badCursor) return badRequest(res)
@@ -168,6 +191,14 @@ async function handleCreate(ctx, req, res, who) {
   if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, body.convo_id)) return notFound(res)
   if (filteredAgent(db, who) && convo.agent_device_id != null && isPrivateDevice(db, convo.agent_device_id)) return notFound(res)
   const createdBy = body.on_behalf_of === 'user' || who.kind !== 'agent' ? 'user' : 'agent'
+  // Voice notes on the item BODY get the same treatment as a comment's (see
+  // the comments route below): a user's are transcribed here, announced
+  // pending, and the `created` turn waits for the words. Keyed off the WRITER,
+  // like the wake: an agent filing on the user's behalf has no audio to send.
+  const bodyAudio = [...new Set((v.value.attachments ?? []).filter(isAudioAttachment).map((a) => a.blob_ref))]
+  const transcribeHere = who.kind !== 'agent' && bodyAudio.length > 0
+    && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, bodyAudio.length)
+  if (transcribeHere) v.value.attachments = markTranscriptsPending(v.value.attachments)
   let out
   try {
     out = createItem(db, {
@@ -183,7 +214,14 @@ async function handleCreate(ctx, req, res, who) {
     throw err
   }
   // A replayed idempotency key must not fan a second marker out.
-  if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'created', by: createdBy })
+  if (!out.duplicate) {
+    // The body's attachments ride on the `created` marker only when there is
+    // a transcript to wait for — it is where a bridge reads `pending` from.
+    emitMarker(ctx, who, { item: out.item, action: 'created', by: createdBy, comment: transcribeHere ? out.bodyComment : null })
+    if (transcribeHere && out.bodyComment) {
+      for (const blobRef of bodyAudio) ctx.itemTranscription.enqueue({ commentId: out.bodyComment.id, userId: who.userId, blobRef })
+    }
+  }
   json(res, out.duplicate ? 200 : 201, { item: out.item })
   return true
 }
@@ -302,7 +340,18 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments }, { partial: true })
     if (!v.ok) return badRequest(res)
     const text = v.value.body ?? ''
-    const attachments = v.value.attachments ?? []
+    // A user's voice note is transcribed here, on upload, when this journal
+    // has whisper (ctx.itemTranscription.enabled): stored and announced as
+    // pending so the origin bridge holds the turn for the words instead of
+    // transcribing the same audio itself. An agent's comment is never a turn,
+    // so nothing waits on it and it is left alone.
+    // admit() bounds the backlog: a comment it refuses is stored as if this
+    // journal had no whisper, and the bridge transcribes it instead.
+    const rawAttachments = v.value.attachments ?? []
+    const audioBlobs = [...new Set(rawAttachments.filter(isAudioAttachment).map((a) => a.blob_ref))]
+    const transcribeHere = who.kind !== 'agent' && audioBlobs.length > 0
+      && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, audioBlobs.length)
+    const attachments = transcribeHere ? markTranscriptsPending(rawAttachments) : rawAttachments
     // A comment with neither words nor blobs is nothing at all — it would
     // still flip `awaiting` and wake the box, so it is a bad request.
     if (!text.trim() && attachments.length === 0) return badRequest(res)
@@ -316,7 +365,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // Only reachable if the item vanished between the read and the write.
     if (!out) return notFound(res)
     // A replayed idempotency key must not fan a second marker out.
-    if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+    if (!out.duplicate) {
+      emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+      // Queued AFTER the marker so the follow-up can never precede it.
+      if (transcribeHere) {
+        // One job per blob: the same audio attached twice is one whisper run.
+        for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
+      }
+    }
     json(res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })
     return true
   }
@@ -336,8 +392,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // Unknown comment and unknown blob_ref answer the same 404.
     const c = setAttachmentTranscript(db, { userId: who.userId, itemId: item.id, commentId: subId, blobRef: body.blob_ref, transcript: body.transcript })
     if (!c) return notFound(res)
-    // No marker and no wake: filling in a transcript is not new traffic,
-    // it is the agent finishing a job the apps already know about.
+    // A QUIET marker, and no wake: filling in a transcript is not new traffic
+    // (no push, no fallback text, nothing a bridge turns into a turn — the
+    // sender is the agent), but without it an open item view never learned
+    // the words had arrived and showed a bare voice note until its next
+    // refetch. Same `updated` + `transcription` shape the journal's own job
+    // announces with (emitTranscriptionMarker) — including `for_action`: the
+    // item body's synthetic comment belongs to the `created` turn.
+    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
     json(res, 200, { comment: c })
     return true
   }

@@ -80,7 +80,9 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     value.links = []
     for (const l of fields.links) {
       if (!isPlainObject(l) || typeof l.url !== 'string' || l.url.length > URL_MAX) return { ok: false }
-      if (!/^https?:\/\//i.test(l.url)) return { ok: false }
+      // matron:// is the apps' own scheme (item links, consent asks — spec
+      // 2026-09-22 consent-items); anything else is refused, javascript: above all.
+      if (!/^(https?|matron):\/\//i.test(l.url)) return { ok: false }
       const link = { url: l.url }
       if (l.title !== undefined) {
         if (typeof l.title !== 'string' || l.title.length > TITLE_MAX) return { ok: false }
@@ -219,7 +221,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 
 export function createItem(db, {
   userId, kind, title, body = '', labels = [], links = [], attachments = [], awaiting, position, after, before,
-  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, now = Date.now(),
+  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, now = Date.now(),
 }) {
   return db.transaction(() => {
     if (idemKey) {
@@ -237,10 +239,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -255,16 +257,22 @@ export function createItem(db, {
       }
       throw err
     }
+    let bodyCommentId = null
     if (attachments.length) {
       // Item-body attachments ride on a synthetic first comment of kind
       // 'status' with meta.role='body' so the thread has one place for
       // blob refs; rowToItem exposes them as item.attachments via listItems'
       // decoration query. Simpler than a fourth table.
+      bodyCommentId = newId('ic')
       db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,created_at)
         VALUES(?,?,?,?,?,'status','',?,?,?)`)
-        .run(newId('ic'), id, userId, createdBy, originDeviceId, JSON.stringify(attachments), JSON.stringify({ role: 'body' }), now)
+        .run(bodyCommentId, id, userId, createdBy, originDeviceId, JSON.stringify(attachments), JSON.stringify({ role: 'body' }), now)
     }
-    return { item: getItem(db, userId, id), duplicate: false }
+    // `bodyComment`: the synthetic row above, so the caller can queue its
+    // voice notes for transcription exactly like a comment's (null without
+    // attachments, and on a duplicate — a replay queues nothing).
+    const bodyComment = bodyCommentId ? rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(bodyCommentId)) : null
+    return { item: getItem(db, userId, id), bodyComment, duplicate: false }
   })()
 }
 
@@ -317,7 +325,7 @@ const decCursor = (s) => { try { const v = JSON.parse(Buffer.from(String(s), 'ba
 
 export function listItems(db, userId, {
   convoId = null, kind = null, state = null, awaiting = null, label = null, sort = 'rank', since = null,
-  limit = 100, cursor = null, excludePrivateOwned = false,
+  limit = 100, cursor = null, excludePrivateOwned = false, excludeConsent = false,
 } = {}) {
   // Default 100, max 500 (spec: listItems). Coerce first — an unclamped
   // string limit went straight into a SQL LIMIT via bind param concatenation
@@ -339,6 +347,7 @@ export function listItems(db, userId, {
     where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
       WHERE cv.id = i.origin_convo_id AND d.private = 1)`)
   }
+  if (excludeConsent) where.push('i.consent IS NULL') // the user's alone (isConsentMirror)
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
   let order
@@ -457,13 +466,90 @@ export function setAttachmentTranscript(db, { userId, itemId, commentId, blobRef
     const c = db.prepare('SELECT * FROM item_comments WHERE id=? AND item_id=? AND user_id=?').get(commentId, itemId, userId)
     if (!c) return null
     const atts = parseJson(c.attachments, [])
-    const target = atts.find((a) => a.blob_ref === blobRef)
-    if (!target) return null
-    target.transcript = transcript
+    // Every attachment naming the blob: the same audio attached twice is the
+    // same words twice, and settling only the first would strand the other
+    // `pending` forever.
+    const targets = atts.filter((a) => a.blob_ref === blobRef)
+    if (!targets.length) return null
+    for (const target of targets) {
+      target.transcript = transcript
+      // The origin bridge beat the journal's own job to it (an older bridge
+      // transcribes without waiting): the words are in, so it is no longer
+      // pending. The job keeps this transcript when it lands (below).
+      if (target.transcript_status) target.transcript_status = 'done'
+    }
     db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
     touch(db, itemId, now)
     return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId))
   })()
+}
+
+// --- Journal-side transcription (src/items-transcribe.js) -------------------
+// `transcript_status` on an audio attachment: 'pending' while the journal's
+// own whisper job owns it, then 'done' or 'failed'. Absent = this journal
+// never took the job (transcription off, or a row from before it existed),
+// which is what tells a bridge to transcribe the note itself.
+export const isAudioAttachment = (a) => typeof a?.mime === 'string' && a.mime.startsWith('audio/')
+
+// Pure. Run on VALIDATED attachments only (validateAttachments drops any
+// client-sent status along with every other unknown key).
+export function markTranscriptsPending(attachments) {
+  return (attachments || []).map((a) => (isAudioAttachment(a) ? { ...a, transcript_status: 'pending' } : a))
+}
+
+// The job's write-back. `transcript` null/blank = the attempt failed. Never
+// overwrites words that are already there. `settled` is true once no
+// attachment on the comment is still pending — the moment the follow-up
+// marker may go out. `changed` is false when the attachment was not pending
+// (a replayed job), so the caller does not emit a second marker.
+export function finishAttachmentTranscript(db, { commentId, blobRef, transcript, now = Date.now() }) {
+  return db.transaction(() => {
+    const c = db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)
+    if (!c) return null
+    const atts = parseJson(c.attachments, [])
+    // All of them, for the same reason as setAttachmentTranscript above.
+    const targets = atts.filter((a) => a.blob_ref === blobRef)
+    if (!targets.length) return null
+    const got = typeof transcript === 'string' && transcript.trim()
+    let changed = false
+    for (const target of targets) {
+      if (target.transcript_status !== 'pending') continue
+      changed = true
+      const have = typeof target.transcript === 'string' && target.transcript.trim()
+      if (!have && got) target.transcript = transcript.trim().slice(0, BODY_MAX)
+      target.transcript_status = have || got ? 'done' : 'failed'
+    }
+    if (changed) {
+      db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
+      touch(db, c.item_id, now)
+    }
+    const settled = !atts.some((a) => a.transcript_status === 'pending')
+    const failed = atts.some((a) => a.transcript_status === 'failed')
+    return {
+      changed, settled, failed, userId: c.user_id, deviceId: c.device_id,
+      // The synthetic body row of createItem: its voice notes belong to the
+      // `created` turn, not to a reply.
+      isItemBody: parseJson(c.meta, null)?.role === 'body',
+      comment: rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)),
+      item: getItem(db, c.user_id, c.item_id),
+    }
+  })()
+}
+
+// Boot recovery: comments a previous process left pending (crash or restart
+// mid-job). The LIKE is a cheap prefilter; the parsed check is the rule.
+export function listPendingTranscripts(db) {
+  const rows = db.prepare(`SELECT * FROM item_comments WHERE attachments LIKE '%"transcript_status":"pending"%' ORDER BY created_at`).all()
+  const out = []
+  for (const row of rows) {
+    const seen = new Set() // one job per blob, however often it is attached
+    for (const a of parseJson(row.attachments, [])) {
+      if (a.transcript_status !== 'pending' || seen.has(a.blob_ref)) continue
+      seen.add(a.blob_ref)
+      out.push({ commentId: row.id, userId: row.user_id, blobRef: a.blob_ref })
+    }
+  }
+  return out
 }
 
 export function rerankItem(db, { userId, itemId, position, after, before, now = Date.now() }) {
@@ -476,3 +562,22 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
   })()
 }
 
+
+// Is this item the tracker mirror of a consent ask — a spawn or agent-chat
+// card (src/consent-items.js, `items.consent` = 'spawn' | 'chat')? Such an
+// item is the USER's alone, in every state: while the ask is pending, what
+// the user reads there must stay what the journal wrote, and it must stay
+// in the open list (the asking agent, prompt-injected, could otherwise
+// rewrite the task or close it out of sight); and its body carries the
+// very text the card withholds from agents — a spawn's unapproved task, a
+// chat ask's justification — which the consent design keeps away from
+// every sibling agent, approved or not. So items-http.js treats it as
+// invisible to agent callers, exactly as the cards are (isClientOnlyEvent):
+// 404 on read and on every mutation, absent from GET /items
+// (excludeConsent). Clients are unaffected. The mark lives on the item
+// itself, never derived from the row that points at it: a renewed chat ask
+// re-points its row's item_id and a device revoke cascades the row away,
+// and neither may turn the old mirror into an ordinary item.
+export function isConsentMirror(db, itemId) {
+  return db.prepare('SELECT consent FROM items WHERE id=?').get(itemId)?.consent != null
+}

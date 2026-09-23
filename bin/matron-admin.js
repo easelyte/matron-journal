@@ -10,6 +10,7 @@ import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
+import { closeChatConsentItem } from '../src/consent-items.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
@@ -401,6 +402,9 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: true })) {
       throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
     }
+    // No hub here: the tracker mirror is closed in the table; live clients
+    // see it at their next /items (spec: 2026-09-22 consent-items).
+    closeChatConsentItem({ db, hub: null }, roomId, deviceId, { outcome: 'approved' })
     return [
       `approved: room ${roomId} device ${deviceId} is now invited (asked by device ${row.initiator_device_id}).`,
       "this CLI cannot reach the running server's hub — the invite is delivered by the journal's sweep-tick pump, within one sweep interval, or sooner if that agent connects/hellos in the meantime.",
@@ -419,6 +423,7 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: false })) {
       throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
     }
+    closeChatConsentItem({ db, hub: null }, roomId, deviceId, { outcome: 'denied' })
     return [
       `denied: room ${roomId} device ${deviceId} is now denied.`,
       `this CLI cannot push an answer frame to device ${row.initiator_device_id} — it has no connection to the running server's hub — so that agent's wait simply times out to pending; its next attempt will read as declined, same as a peer refusal.`,

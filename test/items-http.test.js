@@ -460,7 +460,7 @@ test('rank: position is exclusive of after/before; after+before together is a mi
   assert.equal(closed.status, 409); assert.equal(closed.json.error, 'conflict')
 })
 
-test('transcript: bounded, markerless, silent — and a trailing segment never mutates the item', async (t) => {
+test('transcript: bounded, announced only by a quiet updated marker, silent — and a trailing segment never mutates the item', async (t) => {
   const { s, agent, client, wakeCalls } = await fleet(t)
   const id = (await mkItem(s, agent.token, {})).json.item.id
   const c = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'v', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v', size: 1 }] } })
@@ -471,7 +471,14 @@ test('transcript: bounded, markerless, silent — and a trailing segment never m
   assert.equal((await s.http(`/items/${id}/comments/ic_nope`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b1', transcript: 'hi' } })).status, 404)
   const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n
   assert.equal((await patch({ blob_ref: 'b1', transcript: 'hi' })).status, 200)
-  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, before)
+  // One quiet `updated` marker so an open item view refreshes — and nothing
+  // else: no fallback text, no wake.
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, before + 1)
+  const last = s.db.prepare("SELECT sender, payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get()
+  const lp = JSON.parse(last.payload)
+  assert.equal(last.sender, 'agent:dev-2'); assert.equal(lp.action, 'updated'); assert.equal(lp.transcription, 'done')
+  assert.equal(lp.comment.attachments[0].transcript, 'hi')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='text' AND payload LIKE '%fallback_for%' AND seq > (SELECT MAX(seq) FROM events WHERE type='item') ").get().n, 0)
   assert.equal(wakeCalls.length, 1) // the comment woke the box; the transcript did not
   // The trailing segment belongs to the sub-route, so a junk one is not a close.
   assert.equal((await s.http(`/items/${id}/close/junk`, { method: 'POST', token: agent.token, body: { resolution: 'done' } })).status, 404)

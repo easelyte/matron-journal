@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { joinedAgentIds } from './participants.js'
 
 // Wake-on-message for idle-stopped agent boxes (yearbook shared-2 design,
 // 2026-08-17). The infra host winds down dev VMs idle for 90 minutes; the
@@ -27,6 +28,15 @@ const REFUSED_EXIT_CODE = 2
 // re-validates against live incus state, this is just the cheap local half.
 const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
 
+// The local half of "can this device be woken at all": device names are
+// free text (a client may be called "Dan MacBook"), the wake command only
+// takes an incus instance name. wakeIfOffline and the roster/spawn_targets
+// `wakeable` flag share this so a listing never promises a wake the
+// command would refuse.
+export function isWakeableBoxName(name) {
+  return typeof name === 'string' && BOX_NAME_RE.test(name)
+}
+
 export function makeWaker({
   cmd = process.env.MATRON_WAKE_CMD,
   debounceMs = DEFAULT_DEBOUNCE_MS,
@@ -42,7 +52,7 @@ export function makeWaker({
     // box is already being woken); false when disabled or the name is unusable.
     wake(box) {
       if (!argv.length) return false
-      if (typeof box !== 'string' || !BOX_NAME_RE.test(box)) return false
+      if (!isWakeableBoxName(box)) return false
       const now = Date.now()
       if (now - (lastFired.get(box) || 0) < debounceMs) return true
       lastFired.set(box, now)
@@ -76,21 +86,42 @@ export function makeWaker({
   }
 }
 
-// Shared by ws.js (send / prompt_reply / agent_request / spawn_request) and
+// Shared by ws.js (send / prompt_reply / agent_request / spawn_request /
+// agent_invite / agent_join), http.js (spawn approval, invite approval) and
 // items-http.js (user-authored item markers): traffic for an agent device
 // with no live socket asks the infra layer to start its box. Same-user
 // scoping mirrors the anti-enumeration stance of every call site.
+//
+// Returns true when the box is now being woken (a wake command was fired,
+// or one is already in flight under the waker's debounce) — the signal
+// spawn_request and approveSpawn use to decide whether waiting for the box
+// can ever pay off. False when it is already online, when no waker is
+// configured, or when the device is not a wakeable agent box (not an agent,
+// or a name the wake command would refuse — isWakeableBoxName).
 export function wakeIfOffline({ db, hub, waker }, userId, agentDeviceId) {
-  if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
+  if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return false
   const online = hub.connsOf(userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
-  if (online) return
+  if (online) return false
   const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, userId)
-  if (!dev || dev.kind !== 'agent') return
-  waker.wake(dev.name)
+  if (!dev || dev.kind !== 'agent' || !isWakeableBoxName(dev.name)) return false
+  return waker.wake(dev.name) === true
 }
 
-export function wakeConvoAgent({ db, hub, waker }, userId, convoId) {
+// Every agent device a message into this conversation is FOR: the managing
+// agent, plus — when the conversation is an agent-chat room — each joined
+// participant (state 'joined' is exactly the set with delivery rights, see
+// participants.js). Until 2026-09-21 only the owner was woken, so a room
+// message for a guest whose box had idle-stopped sat unread until something
+// unrelated started that box. `exceptDeviceId` is the writer: an agent
+// posting into a room is awake by definition, and waking it would spend the
+// debounce window on a no-op.
+export function wakeConvoAgent({ db, hub, waker }, userId, convoId, { exceptDeviceId = null } = {}) {
   if (!waker || !waker.enabled) return
   const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
-  if (row && row.agent_device_id != null) wakeIfOffline({ db, hub, waker }, userId, row.agent_device_id)
+  if (!row) return
+  const targets = new Set(joinedAgentIds(db, convoId))
+  if (row.agent_device_id != null) targets.add(row.agent_device_id)
+  for (const id of targets) {
+    if (id !== exceptDeviceId) wakeIfOffline({ db, hub, waker }, userId, id)
+  }
 }

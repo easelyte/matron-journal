@@ -6,6 +6,7 @@ import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
 import { getParticipant, parkInvite, answerParkedInvite } from '../src/participants.js'
 import { deliverPendingInvites } from '../src/invite-delivery.js'
+import { runAdmin } from '../bin/matron-admin.js'
 
 // Harness pattern copied from the top of test/invites.test.js: one user, one
 // client device, one agent device — both connected, both hello_ok'd, and a
@@ -877,3 +878,149 @@ test('join card names the room owner it is asking to be let in by', async (t) =>
   assert.equal(card.payload.to_name, 'dev-a', 'the owner being asked, not the joiner')
 })
 
+
+
+// --- Consent asks mirrored into the tracker (spec: 2026-09-22 consent-items) ---
+
+const isItemMarker = (f) => f.kind === 'journal' && f.type === 'item'
+const chatItemFor = (s, roomId, deviceId) => {
+  const row = s.db.prepare('SELECT item_id FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(roomId, deviceId)
+  assert.ok(row?.item_id, 'the parked row must point at its tracker item')
+  return s.db.prepare('SELECT * FROM items WHERE id=?').get(row.item_id)
+}
+const closingStatus = (s, itemId) => s.db.prepare("SELECT * FROM item_comments WHERE item_id=? AND kind='status' ORDER BY rowid DESC LIMIT 1").get(itemId)
+
+test('agent_invite also files a question item on the room: awaiting the user, consent-labelled, linked to the row — and invisible to every agent', async (t) => {
+  const { s, dan, agA, agB, clientToken, a, b, client } = await roomFleet(t)
+  a.send({ op: 'convo_upsert', convo_id: 'a-session', title: 'A:xy fixing ci', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === 'a-session')
+  client.frames.length = 0
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci logs', justification: 'need the **failing** job output', from_convo_id: 'a-session' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  assert.equal(item.kind, 'question'); assert.equal(item.state, 'open'); assert.equal(item.awaiting, 'user')
+  assert.equal(item.origin_convo_id, 'room'); assert.equal(item.origin_device_id, agA.deviceId)
+  assert.equal(item.created_by, 'agent'); assert.equal(item.user_id, dan.id)
+  assert.equal(item.title, 'dev-a asks to chat with dev-b — ci logs')
+  assert.deepEqual(JSON.parse(item.labels), ['consent'])
+  assert.deepEqual(JSON.parse(item.links), [{ url: `matron://consent/chat/room/${agB.deviceId}`, title: 'Agent chat request' }])
+  assert.ok(item.body.includes('need the **failing** job output') && item.body.includes('A:xy fixing ci') && item.body.includes('dev-b'))
+  assert.ok(/Approve/.test(item.body) && /Decline/.test(item.body))
+  const marker = await client.waitFor((f) => isItemMarker(f) && f.payload.action === 'created' && f.payload.item_id === item.id)
+  assert.equal(marker.convo_id, 'room'); assert.equal(marker.sender, 'agent:dev-a'); assert.equal(marker.payload.consent, 'chat')
+  // Neither the owner (who asked) nor the target hears of it, and neither can read it.
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(a.frames.some(isItemMarker), false)
+  assert.equal(b.frames.some(isItemMarker), false)
+  assert.equal((await s.http(`/items/${item.id}`, { token: agA.token })).status, 404)
+  assert.equal((await s.http(`/items/${item.id}`, { token: agB.token })).status, 404)
+  assert.equal((await s.http('/items', { token: agB.token })).json.items.some((i) => i.id === item.id), false)
+  assert.equal((await s.http(`/items/${item.id}`, { token: clientToken })).status, 200)
+  // The card's push is the only push; the mirror is quiet.
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE type='text' AND convo_id='room'").get().n, 0)
+})
+
+test('agent_join files an item too, titled as a join and keyed on the joiner', async (t) => {
+  const { s, agB, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'I have the fix' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  assert.equal(item.title, "dev-b asks to join dev-a's room")
+  assert.deepEqual(JSON.parse(item.links), [{ url: `matron://consent/chat/room/${agB.deviceId}`, title: 'Agent chat request' }])
+  assert.ok(item.body.includes('I have the fix'))
+})
+
+test('approve closes the chat consent item as decided, attributed to the tapping device; deny closes it as decided too', async (t) => {
+  const { s, agB, clientToken, a, client } = await roomFleet(t)
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  assert.equal((await s.http('/agent-chat/answer', { method: 'POST', token: login.json.token, body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' } })).status, 200)
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
+  const status = closingStatus(s, item.id)
+  assert.equal(status.author, 'user'); assert.equal(status.device_id, login.json.device_id)
+  assert.ok(status.body.includes('Approved'))
+  const marker = await client.waitFor((f) => isItemMarker(f) && f.payload.action === 'closed' && f.payload.item_id === item.id)
+  assert.equal(marker.payload.by, 'user'); assert.equal(marker.payload.consent, 'chat')
+  assert.equal(a.frames.some(isItemMarker), false)
+  // Deny, on a fresh ask (a denied row is renewable).
+  s.db.prepare("UPDATE convo_agents SET state='denied' WHERE convo_id='room' AND agent_device_id=?").run(agB.deviceId)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'again' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && a.frames.filter((g) => g.kind === 'invite' && g.event === 'delivered').length === 2)
+  const item2 = chatItemFor(s, 'room', agB.deviceId)
+  assert.notEqual(item2.id, item.id)
+  assert.equal((await s.http('/agent-chat/answer', { method: 'POST', token: clientToken, body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'deny' } })).status, 200)
+  const after2 = s.db.prepare('SELECT * FROM items WHERE id=?').get(item2.id)
+  assert.equal(after2.state, 'closed'); assert.equal(after2.resolution, 'decided')
+  assert.equal(closingStatus(s, item2.id).body, 'Declined.')
+  assert.equal(s.db.prepare('SELECT state FROM items WHERE id=?').get(item.id).state, 'closed') // the first stays as it was
+})
+
+test('an expired chat ask closes its consent item as cancelled on the sweep', async (t) => {
+  const s = await startTestServer({ revocationSweepMs: 100 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => a.close())
+  a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  s.db.prepare("UPDATE convo_agents SET created_at=? WHERE convo_id='room' AND agent_device_id=?").run(Date.now() - 25 * 3600_000, agB.deviceId)
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'cancelled')
+  assert.ok(closingStatus(s, item.id).body.includes('24 h'))
+})
+
+test('the owner dissolving the room closes a parked join ask\'s item as cancelled', async (t) => {
+  const { s, agB, a, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me in' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  a.send({ op: 'agent_leave', room_id: 'room' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'answer' && f.reason === 'left', 3000)
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'cancelled')
+  assert.ok(/room/i.test(closingStatus(s, item.id).body))
+})
+
+test('matron-admin approve/deny close the chat consent item too (no hub: closed in the table, no live marker)', async (t) => {
+  const { s, agB, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const item = chatItemFor(s, 'room', agB.deviceId)
+  const out = await runAdmin(s.db, ['agent-chat', 'deny', 'dan', 'room', String(agB.deviceId)])
+  assert.match(out, /denied/)
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
+  assert.equal(closingStatus(s, item.id).body, 'Declined.')
+})
+
+test('a renewed chat ask does not expose the previous ask\'s item: consent items stay invisible to agents after the row moves on', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'SECRET-FIRST' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const first = chatItemFor(s, 'room', agB.deviceId)
+  assert.equal((await s.http('/agent-chat/answer', { method: 'POST', token: clientToken, body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'deny' } })).status, 200)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'second' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && a.frames.filter((g) => g.kind === 'invite' && g.event === 'delivered').length === 2)
+  const second = chatItemFor(s, 'room', agB.deviceId)
+  assert.notEqual(second.id, first.id)
+  // The row now points at the second item; the first must still be nobody's but the user's.
+  for (const token of [agB.token, (await import('../src/auth.js')).createAgent(s.db, s.db.prepare("SELECT id FROM users WHERE name='dan'").get().id, 'dev-c').token]) {
+    assert.equal((await s.http(`/items/${first.id}`, { token })).status, 404)
+    assert.equal((await s.http(`/items/${second.id}`, { token })).status, 404)
+    const listed = await s.http('/items?state=closed', { token })
+    assert.equal(listed.json.items.some((i) => i.id === first.id), false)
+  }
+  const mine = await s.http(`/items/${first.id}`, { token: clientToken })
+  assert.equal(mine.status, 200)
+  assert.equal(mine.json.item.consent, 'chat')
+})

@@ -9,6 +9,7 @@ import { makeWaker, wakeConvoAgent } from '../src/wake.js'
 import { makeHub } from '../src/hub.js'
 import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
+import { recordJoined } from '../src/participants.js'
 
 // Wake-on-message (src/wake.js): traffic addressed to an agent device with no
 // live socket fires the operator-configured wake command for that device's
@@ -144,7 +145,7 @@ test('agent_request to an offline agent still fails agent_unreachable but wakes 
   assert.deepEqual(waker.calls, ['henry'])
 })
 
-test('spawn_request to an offline target wakes the box before refusing', async (t) => {
+test('spawn_request to an offline target wakes the box and parks the ask (wake-before-spawn)', async (t) => {
   const { s, dan, agent, client, waker } = await boot(t)
 
   const parent = createAgent(s.db, dan.id, 'eric')
@@ -158,8 +159,8 @@ test('spawn_request to an offline target wakes the box before refusing', async (
     op: 'spawn_request', request_id: 's1', target_device_id: agent.deviceId,
     from_convo_id: 'parent-1', workdir: '/home/danbarker', task: 'do the thing',
   })
-  const err = await p.waitFor((f) => f.kind === 'control' && f.op === 'error')
-  assert.equal(err.code, 'agent_unreachable')
+  const ack = await p.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(ack.target_waking, true)
   await until(() => waker.calls.length === 1)
   assert.deepEqual(waker.calls, ['henry'])
 })
@@ -181,4 +182,65 @@ test('wakeConvoAgent resolves the managing agent and wakes it only when offline'
   wakeConvoAgent({ db, hub, waker: { enabled: false, wake: () => calls.push('x') } }, dan.id, 'c1')
   wakeConvoAgent({ db, hub, waker: null }, dan.id, 'c1')
   assert.deepEqual(calls, ['dev-2'])
+})
+
+// --- rooms: every joined participant is a wake target ------------------------
+//
+// A room is a conversation with joined agent devices besides its owner. Until
+// 2026-09-21 only the OWNER's box was ever woken, so a message into a room
+// whose guest had idle-stopped sat unread until something else started that
+// box (bridge rooms now survive the guest's sleep, which made this visible).
+
+test('wakeConvoAgent wakes the joined participants of a room too, never the sender', async () => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'dev-a')
+  const guest = createAgent(db, dan.id, 'dev-b')
+  const gone = createAgent(db, dan.id, 'dev-c')
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, title: 'T', agentDeviceId: owner.deviceId })
+  recordJoined(db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId })
+  // A participant that LEFT is not a target: only state 'joined' has delivery rights.
+  recordJoined(db, { convoId: 'room', agentDeviceId: gone.deviceId, initiatorDeviceId: owner.deviceId })
+  db.prepare("UPDATE convo_agents SET state='left' WHERE agent_device_id=?").run(gone.deviceId)
+  const calls = []
+  const waker = { enabled: true, wake: (name) => calls.push(name) }
+  wakeConvoAgent({ db, hub, waker }, dan.id, 'room')
+  assert.deepEqual(calls.sort(), ['dev-a', 'dev-b'])
+  calls.length = 0
+  // The writer is awake by definition — an agent posting into the room
+  // must not fire a wake for its own box.
+  wakeConvoAgent({ db, hub, waker }, dan.id, 'room', { exceptDeviceId: owner.deviceId })
+  assert.deepEqual(calls, ['dev-b'])
+  calls.length = 0
+  wakeConvoAgent({ db, hub, waker }, dan.id + 1, 'room') // foreign user: nothing
+  assert.deepEqual(calls, [])
+})
+
+test('an agent publishing text into a room wakes an offline joined peer, and only for message-like types', async (t) => {
+  const { s, dan, agent: owner, client, waker } = await boot(t)
+  const guest = createAgent(s.db, dan.id, 'dev-b')
+  const a = await makeWsClient(s.base, { token: owner.token, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => a.close())
+  a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId })
+
+  // A status-style publish is not a message: no wake.
+  a.send({ op: 'publish', convo_id: 'room', type: 'summary', payload: { toc: 'x', detail: 'y' } })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'summary')
+  assert.deepEqual(waker.calls, [])
+
+  a.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'peer, are you there?' } })
+  await client.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'peer, are you there?')
+  await until(() => waker.calls.length === 1)
+  assert.deepEqual(waker.calls, ['dev-b'])
+
+  // The user typing into the room wakes the offline guest as well (the
+  // owner is online and is not woken).
+  client.send({ op: 'send', convo_id: 'room', payload: { body: 'both of you: status?' } })
+  await client.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'both of you: status?')
+  await until(() => waker.calls.length === 2)
+  assert.deepEqual(waker.calls, ['dev-b', 'dev-b'])
 })

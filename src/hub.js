@@ -33,10 +33,19 @@ export function mergeEphemeral(prev, frame) {
 export function makeHub({ coalesceMs = 200 } = {}) {
   const byUser = new Map() // userId -> Set<conn>
   let regCounter = 0
+  // Registration waiters (wake-before-spawn): approveSpawn parks here while
+  // a woken box boots, and register() releases it the moment that device's
+  // socket lands. A waiter is a one-shot resolver; the timer is cleared on
+  // release so a settled wait never fires twice.
+  const deviceWaiters = new Set() // { userId, deviceId, release }
+  let closed = false
   return {
     register(conn) {
       if (!byUser.has(conn.userId)) byUser.set(conn.userId, new Set())
       byUser.get(conn.userId).add(conn)
+      for (const w of deviceWaiters) {
+        if (w.userId === conn.userId && w.deviceId === conn.deviceId) w.release(true)
+      }
       // Monotonic registration stamp — sendRpcRequest's "most recently
       // registered live socket" rule needs an order that survives Set
       // deletion/re-insertion (insertion order alone doesn't).
@@ -50,6 +59,37 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     },
     connsOf(userId) {
       return [...(byUser.get(userId) || [])]
+    },
+    // Resolves true as soon as `deviceId` has a live registered socket —
+    // immediately if it already has one — or false after timeoutMs. The
+    // timer is ref'd on purpose (same stance as the RPC broker): an unref'd
+    // timer whose loop empties would abandon the awaited promise mid-flight,
+    // and the caller (approveSpawn) must always settle its row.
+    waitForDevice(userId, deviceId, timeoutMs) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.ws.readyState === 1) return Promise.resolve(true)
+      }
+      if (!(timeoutMs > 0) || closed) return Promise.resolve(false)
+      return new Promise((resolve) => {
+        const w = {
+          userId, deviceId,
+          release(ok) {
+            clearTimeout(timer)
+            deviceWaiters.delete(w)
+            resolve(ok)
+          },
+        }
+        const timer = setTimeout(() => w.release(false), timeoutMs)
+        deviceWaiters.add(w)
+      })
+    },
+    // Shutdown: release every parked waiter with false so the orchestration
+    // awaiting it settles its row now (agent_unreachable, the box never
+    // attached) instead of a ref'd timer holding the process open for the
+    // whole wake window after startServer.close(). Later waits never park.
+    close() {
+      closed = true
+      for (const w of [...deviceWaiters]) w.release(false)
     },
     // Global connected-socket count across every user — a /metrics-only
     // aggregate (no per-user scoping concern: it's just a number, not
@@ -150,6 +190,16 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     // what sendRpcResponse has always done (responses carry no side
     // effects; a mid-reconnect device briefly has two sockets and both may
     // hear). Also carries invite-lifecycle frames (agent chat phase 2).
+    // Every live CLIENT socket of one user — box-status fan-out: a box's
+    // capacity report is not about any conversation, so it rides neither
+    // the journal (nothing to replay) nor the per-convo ephemeral coalescer
+    // (keyed on convo_id). Agent sockets are skipped: they read box status
+    // through spawn_targets when they need it.
+    sendToClients(userId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.kind === 'client' && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
     sendToDevice(userId, deviceId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.deviceId === deviceId && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
