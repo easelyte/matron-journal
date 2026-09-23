@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { resolveApnsClient } from '../src/server.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 const APNS_VARS = ['MATRON_APNS_KEY_FILE', 'MATRON_APNS_KEY_ID', 'MATRON_APNS_TEAM_ID', 'MATRON_APNS_TOPIC', 'MATRON_PUSH_GATEWAY_URL']
 
@@ -25,7 +25,7 @@ function withEnv(t, vars) {
 
 function writeTestKey() {
   const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' })
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-key-'))
+  const dir = makeTmpDir('matron-key-')
   const keyFile = path.join(dir, 'AuthKey_TEST.p8')
   fs.writeFileSync(keyFile, privateKey.export({ type: 'pkcs8', format: 'pem' }))
   return keyFile

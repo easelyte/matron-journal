@@ -14,11 +14,12 @@ import { createUser, createAgent } from '../src/auth.js'
 import { makeHttpHandler } from '../src/http.js'
 import { pinAllowedRootsSync } from '../src/file-guard.js'
 import { assertNoProhibitedFileWriteRoots, pinProhibitedFileWriteRootsSync } from '../src/server.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 // Build a canonical read-root with a representative tree + adversarial entries.
 function makeFixture() {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-')))
-  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-outside-')))
+  const root = fs.realpathSync(makeTmpDir('matron-files-'))
+  const outside = fs.realpathSync(makeTmpDir('matron-files-outside-'))
 
   fs.writeFileSync(path.join(root, 'README.md'), '# hello\n')
   fs.writeFileSync(path.join(root, 'app.js'), 'console.log(1)\n')
@@ -516,7 +517,7 @@ test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated 
   const capture = captureHttpHandlerOptions()
   const s = await startTestServer({
     fileReadRoots: [root],
-    fileAuditDir: fs.mkdtempSync(path.join(os.tmpdir(), 'matron-files-audit-')),
+    fileAuditDir: makeTmpDir('matron-files-audit-'),
     httpHandlerFactory: capture.factory,
   })
   t.after(() => s.close())

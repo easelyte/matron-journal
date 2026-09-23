@@ -14,6 +14,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { sanitizeBasename } from '../src/files-write-http.js'
 import { FileLinkDenied } from '../src/file-guard.js'
+import { makeTmpDir } from './tmp-dir.js'
 
 const TRASH = '.matron-trash'
 
@@ -21,7 +22,7 @@ const TRASH = '.matron-trash'
 //   writable/           <- the write-root (strictly inside the read-root)
 //   readonly/           <- readable, never writable
 function makeFixture() {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-')))
+  const root = fs.realpathSync(makeTmpDir('matron-w-'))
   const writeRoot = path.join(root, 'writable')
   const readOnly = path.join(root, 'readonly')
   fs.mkdirSync(writeRoot)
@@ -30,7 +31,7 @@ function makeFixture() {
   fs.writeFileSync(path.join(writeRoot, 'existing.txt'), 'original\n')
   fs.mkdirSync(path.join(writeRoot, 'sub'))
   fs.writeFileSync(path.join(writeRoot, 'sub', 'nested.txt'), 'nested\n')
-  const auditDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-audit-')))
+  const auditDir = fs.realpathSync(makeTmpDir('matron-w-audit-'))
   return { root, writeRoot, readOnly, auditDir }
 }
 
@@ -710,7 +711,7 @@ test('T-2.6: every attempt is audited, and no destructive 2xx exists without one
 
 test('F2: a write-root that overlaps server-owned state is refused at boot', async () => {
   const f = makeFixture()
-  const dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-data-')))
+  const dataDir = fs.realpathSync(makeTmpDir('matron-w-data-'))
   const dbPath = path.join(dataDir, 'matron.db')
 
   // The data directory itself — holds the DB, the preapprove key and the audit.
@@ -771,7 +772,7 @@ test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not 
 
 test('R2-F1: a state path reached through a symlinked ancestor is still protected', async () => {
   const f = makeFixture()
-  const elsewhere = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-link-')))
+  const elsewhere = fs.realpathSync(makeTmpDir('matron-w-link-'))
   // `link` points INTO the write root, and the final component does not exist
   // yet — the case a plain realpath() cannot resolve and would wave through.
   fs.symlinkSync(f.writeRoot, path.join(elsewhere, 'link'))
@@ -826,7 +827,7 @@ test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) =
 test('R3-F1: enabling writes on a multi-user journal warns that the roots are global', async (t) => {
   const f = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
-  const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-w-db-')), 'matron.db')
+  const dbPath = path.join(makeTmpDir('matron-w-db-'), 'matron.db')
   const boot = (extra = {}) => startTestServer({
     dbPath, fileReadRoots: [f.root], fileWriteRoots: [f.writeRoot], fileAuditDir: f.auditDir, ...extra,
   })
