@@ -995,7 +995,7 @@ test('resolveOrphanBlobGraceHours: 7-day default, override beats env, 0/garbage 
 
 test('orphan-blob pass runs at boot from the retention scheduler', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-orphan-boot-'))
+  const dir = makeTmpDir('matron-orphan-boot-')
   const dbPath = path.join(dir, 'test.db')
   const mediaDir = resolveMediaDir(dbPath)
   const preDb = openDb(dbPath)
