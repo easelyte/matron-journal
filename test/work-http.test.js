@@ -776,3 +776,35 @@ test('vendored Work schema keeps the loop detail fields optional and typed', () 
   assert.equal(VALIDATE_WORK_ENVELOPE(withField('owner', '')), false)
   assert.equal(VALIDATE_WORK_ENVELOPE(withField('unexpected', 'x')), false)
 })
+
+test('GET /work keeps working when the producer is rolled back in place and stops accepting --include-detail', async (t) => {
+  const producer = makeFakeProducer(t, { detail: true })
+  const storePath = path.join(producer, 'fixture.json')
+  writeFixture(storePath, envelope('repo', [loop(1)]))
+  const errors = []
+  const s = startWorkServer(t, {
+    env: workEnv(producer, storePath),
+    logger: { error: (message) => errors.push(String(message)) },
+  })
+  const owner = addUser(s.db, 'rollback-owner')
+
+  // Roll the producer back to a CLI without the flag, without restarting the journal.
+  const legacy = makeFakeProducer(t)
+  writeFileSync(
+    path.join(producer, 'scripts', 'work_view_cli.py'),
+    readFileSync(path.join(legacy, 'scripts', 'work_view_cli.py'))
+  )
+
+  const first = await s.http('/work', { token: owner.token })
+  assert.equal(first.status, 200)
+  assert.equal(first.json.status, 'ok')
+  assertWorkEnvelopeUsesVendoredSchema(first.json)
+  assert.ok(errors.some((message) => /no longer accepts --include-detail/.test(message)))
+
+  // The capability is dropped, so later builds do not pay for a failed first attempt.
+  const errorCount = errors.length
+  const second = await s.http('/work', { token: owner.token })
+  assert.equal(second.status, 200)
+  assert.equal(second.json.status, 'ok')
+  assert.equal(errors.length, errorCount)
+})
