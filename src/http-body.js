@@ -11,7 +11,10 @@ export const json = (res, status, obj) => {
   res.end(JSON.stringify(obj))
 }
 
-export const readBody = (req) => new Promise((resolve, reject) => {
+// The raw text of a request body, with the same 1 MB cap and socket
+// handling as readBody. For the one non-JSON POST the journal accepts (the
+// browser form on the GitHub confirm page).
+export const readRawBody = (req) => new Promise((resolve, reject) => {
   let data = ''
   let settled = false
   const fail = (err) => { if (!settled) { settled = true; reject(err) } }
@@ -27,6 +30,13 @@ export const readBody = (req) => new Promise((resolve, reject) => {
   req.on('end', () => {
     if (settled) return
     settled = true
+    resolve(data)
+  })
+  req.on('close', () => fail(new Error('connection closed')))
+  req.on('error', fail)
+})
+
+export const readBody = (req) => readRawBody(req).then((data) => new Promise((resolve, reject) => {
     if (!data) { resolve({}); return }
     let parsed
     try {
@@ -46,7 +56,4 @@ export const readBody = (req) => new Promise((resolve, reject) => {
       return
     }
     resolve(parsed)
-  })
-  req.on('close', () => fail(new Error('connection closed')))
-  req.on('error', fail)
-})
+}))

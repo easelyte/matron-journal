@@ -9,7 +9,7 @@
   "steps": [
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": {
       "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "x" }, "idem_key": "fin:sneaky"

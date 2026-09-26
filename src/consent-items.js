@@ -55,6 +55,14 @@ export function spawnConsentItemFields(card) {
     `- **Box:** ${target}`,
     `- **Directory:** ${codeSpan(card.workdir)}`,
     ...(card.model ? [`- **Model:** ${codeSpan(card.model)}`] : []),
+    // "joins mission #N" (coordinator redesign §2d): the user approves the
+    // child AND where it lands. The title rides the card as mission_title —
+    // the mission was resolved through the asker's sieve, and this item
+    // is the user's, so it may be shown; plain() strips markdown like every
+    // other peer string in this body.
+    ...(card.mission_num
+      ? [`- **Joins mission #${Number(card.mission_num)}**${card.mission_title ? ` — ${plain(card.mission_title)}` : ''}`]
+      : []),
     ...(card.link ? [`- **Chat room back to ${from}:** yes — approving also opens a room between the two sessions.`] : []),
     '',
     '**Task the new session will be given, verbatim:**',

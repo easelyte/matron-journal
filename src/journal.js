@@ -5,6 +5,7 @@ import { CONVOS_MAX, getMission } from './missions.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
+import { parseRepo } from './repo-identity.js'
 
 export const MESSAGE_TYPES = [
   'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
@@ -164,7 +165,15 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, agentKind }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, agentKind, repo }) {
+  // repo: undefined = unchanged, null = clear, string = canonical host/org/name.
+  let repoCols = null // { repo, scope } to write, or null to leave alone
+  if (repo === null) repoCols = { repo: null, scope: null }
+  else if (repo !== undefined) {
+    const p = parseRepo(repo)
+    if (!p) throw new Error('bad repo')
+    repoCols = { repo: p.repo, scope: p.scope }
+  }
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
@@ -184,6 +193,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // nothing happened.
     const summaryChanged = summary != null && summary !== existing.summary
     if (summaryChanged) metaChanged = true
+    if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
     // recorded owner untouched.
@@ -215,6 +225,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
+    if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
   } else {
     const initialTitle = title || ''
     // Missions (spec 2026-09-10): a spawned conversation inherits its
@@ -237,6 +248,10 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // staleness this change exists to remove. An empty summary is not a
     // change and stays silent.
     if (initialTitle || parentConvoId || summary) metaChanged = true
+    if (repoCols && repoCols.repo) {
+      db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
+      metaChanged = true
+    }
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   return { ...convo, metaChanged, prevSessionState }
@@ -326,11 +341,19 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
 // anchor) and broadcast only after it commits. Same targeting rules.
 export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
   const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
-  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
-  const targets = isClientOnlyEvent(type, payload)
-    ? new Set()
-    : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)]))
+  const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
   hub.broadcastJournal(userId, frame, targets)
+}
+
+// The agent devices allowed to see a conversation's traffic — hub's
+// agentTargets (spec: agent chat phase 2 room fan-out): the recorded owner
+// plus joined participants. null = no recorded owner (legacy row), which
+// the hub treats as broadcast-to-every-agent. A private box's convos and an
+// unjoined room therefore never reach another agent. Shared by live journal
+// fan-out, hello replay, and ephemeral delivery so the rule lives once.
+export function agentTargetsFor(db, convoId) {
+  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+  return ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)])
 }
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
@@ -381,7 +404,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, summary_updated_at, created_at, agent_device_id, agent_kind,
+            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, agent_kind,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts

@@ -1,0 +1,47 @@
+{
+  "name": "viewing a set: one connection viewing two conversations receives ephemerals for both; bad convo_ids is rejected",
+  "description": "`viewing {convo_ids}` makes the connection's viewed set exactly those conversations (the Coordinator shows two live chats at once); ephemerals for both reach it, one outside the set does not. An invalid convo_ids (not an array of ≤4 non-empty strings) is bad_request and leaves the set unchanged. Barrier as in 10_activity: a durable `send` after `viewing` on the same connection, observed on the agent socket, proves the viewing op was applied.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-16" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }, { "id": "c2", "owner": "dan" }, { "id": "c3", "owner": "dan" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-16", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "mac_token" }, "device_id": { "$bind": "mac_device_id" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
+    { "kind": "ws_open", "conn": "mac" },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_ids": ["c1", "c2"] } },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "viewing", "convo_ids": ["c1", "c2", "c3", "c4", "c5"] } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "viewing", "detail": "convo_ids must be an array of at most 4 non-empty convo id strings" } },
+    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "barrier: viewing applied" }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c3", "state": "thinking" } },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c1", "state": "thinking" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "thinking" }
+    } },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "activity", "convo_id": "c2", "state": "tool" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": {
+      "kind": "ephemeral", "convo_id": "c2", "activity": { "state": "tool" }
+    } },
+    { "kind": "ws_expect_none", "conn": "mac", "ms": 250 }
+  ]
+}

@@ -29,9 +29,9 @@ function makeStubApnsClient(respond = () => ({ status: 200, reason: null })) {
 }
 
 // A fake WS connection registered directly with the hub (no real socket) —
-// hub.register/isViewing only touch userId/deviceId/viewingConvoId/ws.readyState.
+// hub.register/isViewing only touch userId/deviceId/viewingConvoIds/ws.readyState.
 function fakeConn({ userId, deviceId }) {
-  return { userId, deviceId, viewingConvoId: null, ws: { readyState: 1 } }
+  return { userId, deviceId, viewingConvoIds: new Set(), ws: { readyState: 1 } }
 }
 
 async function setup(t, { apnsClient, coalesceMs } = {}) {
@@ -287,7 +287,7 @@ test('viewing suppression: a device connected and viewing the convo is skipped',
   const deviceId = registerDevice(db, dan.id, 'phone')
   const conn = fakeConn({ userId: dan.id, deviceId })
   hub.register(conn)
-  conn.viewingConvoId = 'c1'
+  conn.viewingConvoIds = new Set(['c1'])
 
   const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
   pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
@@ -295,7 +295,7 @@ test('viewing suppression: a device connected and viewing the convo is skipped',
   assert.equal(stub.calls.length, 0)
 
   // viewing a different convo: not suppressed
-  conn.viewingConvoId = 'somewhere-else'
+  conn.viewingConvoIds = new Set(['somewhere-else'])
   const r2 = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi again' } })
   pipeline.onAppend(dan.id, { seq: r2.seq, convo_id: 'c1', ts: r2.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi again' } }, null)
   await new Promise((res) => setImmediate(res))
@@ -508,14 +508,14 @@ test('a pipeline that throws in onAppend never surfaces an error frame after a s
   const agentFrames = []
   const agentConn = {
     ws: { readyState: 1, send: (s) => agentFrames.push(JSON.parse(s)) },
-    userId: dan.id, deviceId: 7, kind: 'agent', name: 'dev-2', viewingConvoId: null, registered: true,
+    userId: dan.id, deviceId: 7, kind: 'agent', name: 'dev-2', viewingConvoIds: new Set(), registered: true,
   }
   // A second (client) connection registered with the hub, to prove the
   // broadcast itself still went out despite the pipeline blowing up.
   const clientFrames = []
   const clientConn = {
     ws: { readyState: 1, send: (s) => clientFrames.push(JSON.parse(s)) },
-    userId: dan.id, deviceId: 8, viewingConvoId: null,
+    userId: dan.id, deviceId: 8, viewingConvoIds: new Set(),
   }
   hub.register(clientConn)
   t.after(() => hub.unregister(clientConn))

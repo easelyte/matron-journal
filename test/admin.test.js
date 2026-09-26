@@ -683,3 +683,16 @@ test('device list: shows the private flag and its pin state', async () => {
   assert.match(out, /private=yes \(pinned\)/)
   db.close()
 })
+
+test('admin CLI: user admin on|off flips users.is_admin; unknown user and bad value are usage errors', async () => {
+  const db = openDb(':memory:')
+  await runAdmin(db, ['user', 'add', 'dan', '--password', 'pw123456'])
+  assert.equal(db.prepare("SELECT is_admin FROM users WHERE name='dan'").get().is_admin, 0)
+  assert.match(await runAdmin(db, ['user', 'admin', 'dan', 'on']), /dan is now a journal admin/)
+  assert.equal(db.prepare("SELECT is_admin FROM users WHERE name='dan'").get().is_admin, 1)
+  assert.match(await runAdmin(db, ['user', 'admin', 'dan', 'off']), /dan is no longer a journal admin/)
+  assert.equal(db.prepare("SELECT is_admin FROM users WHERE name='dan'").get().is_admin, 0)
+  await assert.rejects(runAdmin(db, ['user', 'admin', 'nobody', 'on']), /no such user/)
+  await assert.rejects(runAdmin(db, ['user', 'admin', 'dan', 'maybe']), /usage/i)
+  await assert.rejects(runAdmin(db, ['user', 'admin', 'dan']), /usage/i)
+})

@@ -19,10 +19,10 @@
 
     { "kind": "ws_open", "conn": "mac" },
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_open", "conn": "phone" },
     { "kind": "ws_send", "conn": "phone", "frame": { "op": "hello", "token": { "$ref": "phone_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
+    { "kind": "ws_expect", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
 
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
     { "kind": "ws_expect", "conn": "mac", "frame": {
@@ -45,8 +45,8 @@
     } },
 
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "mac_token" },
-      "expect": { "status": 200, "body": { "seq": 2, "agents": [], "conversations": [
-        { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": 2, "unread_count": 0, "snippet": "do it again", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+      "expect": { "status": 200, "body": { "coordinator_convo_id": null, "seq": 2, "agents": [], "conversations": [
+        { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": 2, "unread_count": 0, "snippet": "do it again", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }
   ]
 }

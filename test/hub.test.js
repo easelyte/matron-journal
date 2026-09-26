@@ -35,7 +35,7 @@ test('mergeEphemeral: end/sync/legacy/non-contiguous fall back to latest-wins', 
 test('sendEphemeral flush delivers concatenated appends; text overlays still latest-wins', async () => {
   const hub = makeHub({ coalesceMs: 20 })
   const sent = []
-  const conn = { userId: 1, deviceId: 7, kind: 'client', viewingConvoId: 'c1', ws: { readyState: 1, send: (d) => sent.push(JSON.parse(d)) } }
+  const conn = { userId: 1, deviceId: 7, kind: 'client', viewingConvoIds: new Set(['c1']), ws: { readyState: 1, send: (d) => sent.push(JSON.parse(d)) } }
   hub.register(conn)
   hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 0, chunk: 'ab' }))
   hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 2, chunk: 'cd' }))
@@ -168,4 +168,47 @@ test('close: every parked waiter is released with false at once, and its timer i
   // wait no longer parks (the hub is shut).
   hub.register({ userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } })
   assert.equal(await hub.waitForDevice(1, 9, 600000), false)
+})
+
+// Defence in depth for tracker #2851: even if an agent connection somehow
+// has a viewing set (the `viewing` op refuses agents), sendEphemeral applies
+// broadcastJournal's agent visibility rule — recorded owner + joined
+// participants, null = legacy broadcast — and fails CLOSED for agents when
+// the caller supplies no resolver.
+test('sendEphemeral scopes agent connections like broadcastJournal; clients unaffected', async () => {
+  const hub = makeHub({ coalesceMs: 10 })
+  const viewing = (deviceId, kind) => ({ ...rpcConn(1, deviceId, kind), viewingConvoIds: new Set(['c1']) })
+  const client = viewing(1, 'client')
+  const member = viewing(2, 'agent')
+  const outsider = viewing(3, 'agent')
+  for (const c of [client, member, outsider]) hub.register(c)
+  const frame = (n) => ({ kind: 'ephemeral', convo_id: 'c1', message_ref: `r${n}`, replace_text: 'x' })
+  const flush = () => new Promise((r) => setTimeout(r, 40))
+  const counts = () => [client.sent.length, member.sent.length, outsider.sent.length]
+
+  let resolved = 0
+  hub.sendEphemeral(1, 'c1', frame(1), () => { resolved++; return new Set([2]) })
+  await flush()
+  assert.deepEqual(counts(), [1, 1, 0], 'only the member agent, plus every client')
+  assert.equal(resolved, 1, 'targets resolved once per send, not per connection')
+
+  hub.sendEphemeral(1, 'c1', frame(2), () => null)
+  await flush()
+  assert.deepEqual(counts(), [2, 2, 1], 'null targets = legacy broadcast, as in broadcastJournal')
+
+  hub.sendEphemeral(1, 'c1', frame(3))
+  await flush()
+  assert.deepEqual(counts(), [3, 2, 1], 'no resolver: agents get nothing (fail closed), clients still do')
+
+  for (const c of [client, member, outsider]) hub.unregister(c)
+})
+
+test('sendEphemeral never resolves agent targets when no agent is viewing', async () => {
+  const hub = makeHub({ coalesceMs: 10 })
+  const client = { ...rpcConn(1, 1, 'client'), viewingConvoIds: new Set(['c1']) }
+  hub.register(client)
+  hub.sendEphemeral(1, 'c1', { kind: 'ephemeral', convo_id: 'c1', activity: { state: 'thinking' } }, () => { throw new Error('resolved needlessly') })
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(client.sent.length, 1)
+  hub.unregister(client)
 })

@@ -60,7 +60,10 @@ the machine-checkable version of this page.
   conversation just yields a shorter window, never an error. This mode
   carries its own, separate agent-authorization story from the
   `before_seq`/default gate described above — see "Journal search" below
-  for the full two-regime explanation.
+  for the full two-regime explanation. On another user's conversation that
+  passes *Shared visibility*, `around_seq` reads return the prose window
+  (`text`, `diff`), `limit` clamped to 30, logged as `journal: shared
+  context read …`; `before_seq` paging on it stays 404.
 - `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
   client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
   live}]}`. Full-text search over the prose the journal has indexed (see
@@ -103,8 +106,12 @@ the machine-checkable version of this page.
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and
   `Content-Disposition: attachment` so an uploader-chosen content-type can never
-  render as active content on the API origin. Owner-only; missing or not-owned
-  are indistinguishable, both 404 `{error:'not_found'}`.
+  render as active content on the API origin. Owner-only, with one exception:
+  a colleague under *Shared visibility* may fetch a blob that a prose event in
+  a shared conversation, or an attachment on a shared non-consent item, names
+  — provided the referencing row's owner owns the blob. Such reads are logged
+  (`journal: shared media read blob=… viewer=… device=…`). Missing, not-owned
+  and not-shared are indistinguishable, all 404 `{error:'not_found'}`.
   A blob may also disappear later via the quota-pressure reaper: once a user's
   total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
   quota, the retention scheduler deletes their oldest `file`/`image`
@@ -386,10 +393,13 @@ an agent token, selected by which query parameter is present:
 ## WebSocket
 
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
-  Server: `hello_ok {seq, device_id, name}`, then journal frames `> cursor`,
+  Server: `hello_ok {seq, device_id, name, coordinator_convo_id}`, then journal frames `> cursor`,
   then live. `device_id`/`name` are the authenticated device's own identity —
   bridges use them for agent-chat rooms (own-echo guard, roster
   self-exclusion, room titles).
+  `coordinator_convo_id` is the user's Coordinator (see *Coordinator*), or
+  null — null too for an ordinary agent when that conversation is
+  private-owned. `GET /snapshot` carries the same key.
   If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
   (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
   instead of replaying and closes the socket with code `4009` — the client
@@ -409,6 +419,28 @@ an agent token, selected by which query parameter is present:
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+- `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
+  conversations this connection has on screen; viewing-scoped ephemerals
+  (`stream`, `stream_append`, `activity`, `status`) go only to connections
+  viewing that conversation, and a device viewing it gets no push for it.
+  Each connection views a SET of conversations:
+  - `convo_ids: string[]` (optional) is the full set — e.g. the Coordinator
+    panel beside a chat, or a chat sheet over another chat. Each id a
+    non-empty string ≤ 128 chars; duplicates are collapsed; at most 4
+    distinct ids; `[]` views nothing. Anything else (not an array, a
+    non-string / empty / oversized id, more than 4) → `bad_request` with
+    `ref: 'viewing'`, and the connection's set is left unchanged. The
+    catch-up (tool-stream `sync` frames + cached `status`, see below) is
+    sent only for conversations newly added to the set — plus `convo_id`
+    when it is sent alongside `convo_ids` and is in the set, even if it was
+    already viewed. Clients send `convo_id` (the chat just opened or needing
+    a resync) with the full `convo_ids` to force its resync without
+    dropping and re-adding it.
+  - Without `convo_ids`, `convo_id` (string|null) sets the set to
+    `{convo_id}` or `{}` — the original single-conversation form, unchanged.
+    It still sends the catch-up on every `viewing`, even for the
+    conversation already viewed: clients re-send it to force a resync.
+  When both keys are present, `convo_ids` defines the set.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test
@@ -425,7 +457,7 @@ an agent token, selected by which query parameter is present:
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
   (`payload:{title, parent_convo_id, agent_device_id, agent_kind, summary,
-  summary_updated_at}`, sender = the agent device, e.g.
+  summary_updated_at, repo}`, sender = the agent device, e.g.
   `agent:dev-2`) whenever it changes an existing conversation's title, sets
   a non-empty title at creation, changes the stored `summary` (see
   "`convo_upsert` accepts an optional `summary`" below), or creates a child (`parent_convo_id` set,
@@ -441,6 +473,15 @@ an agent token, selected by which query parameter is present:
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
+  of the session's git remote (lower-cased host and org, e.g.
+  `github.com/matronhq/matron-journal`; regex
+  `^[a-z0-9.-]+/[a-z0-9_.-]+/[A-Za-z0-9_.-]+$`, ≤ 256 chars). Absent leaves
+  the stored value alone, `null` clears it, anything else is `bad_request`.
+  A change appends a `convo_meta` carrying the new `repo`; `/snapshot`
+  conversations carry `repo` too (`null` when unknown). The journal derives
+  `repo_scope` (`host/org`) from it — the unit shared visibility is decided
+  on (see "Shared visibility").
 - Room membership changes append a server-authored `convo_meta` (sender
   `journal`) whose payload is just `{participants}` — the same
   owner-plus-joined array `/snapshot` carries — so live clients re-chip a
@@ -1225,7 +1266,8 @@ A parent agent may ask a target agent to start a new session (child conversation
   "task": "string (the child's seed prompt, capped at 2000 chars)",
   "topic": "string (optional, title fragment for the card, capped at 200 chars)",
   "model": "string (optional, the Claude model the child should run, capped at 64 chars)",
-  "link": "boolean (optional, default false — also open a chat room between the parent and the child)"
+  "link": "boolean (optional, default false — also open a chat room between the parent and the child)",
+  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists)"
 }
 ```
 
@@ -1233,7 +1275,7 @@ A parent agent may ask a target agent to start a new session (child conversation
 
 Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
 
-**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
+**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below). With `mission_num`: `bad_request` (`detail:'bad mission_num'`) unless it is a positive integer; `no_mission` when no mission with that number is visible to both the asker and the target box (unknown and hidden are indistinguishable); `mission_closed` when it is closed. All three are checked before the wake and before the card, so nothing is parked or woken for them. The card payload carries `mission_num` and `mission_title` (both omitted when absent) and the consent item says "Joins mission #N — <title>".
 
 **`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
 
@@ -1359,6 +1401,23 @@ The four outcomes flow from: `started` (approval granted and target answered), `
 
 **Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
 
+### Spawning onto a mission
+
+(spec 2026-09-23 coordinator redesign §1c.) A row with `mission_num` is
+re-checked at approval, before any room or `start`: a mission closed or
+gone since the ask fails the spawn (`error_code` `mission_closed` /
+`no_mission`) and nothing is started. `start` carries `mission_num`
+(omitted when absent). On the `start` reply the journal creates the child's
+conversation row if its bridge has not published it yet (owned by the
+target box), runs `joinMission` for it, and appends a `mission` marker
+`joined` (`sender: journal`, `by: agent`) into it — all before the
+`started` outcome. The bridge injects the opening turn just before it
+answers `start`, so the order is: opening turn written, `start` answered,
+join committed, parent told; the bridge knows the mission from the `start`
+param. A join that fails at that point (the mission closed in the gap, the
+200-conversation cap, a mission the target box cannot see) is logged and
+the child runs unattached; the spawn still reports `started`.
+
 ### Expiry
 
 A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hours, same clock as agent-chat awaiting-user rows, clocked from `created_at`) is flipped to `expired` by the periodic sweep timer and the parent is notified. Unlike agent-chat, where expiry is masked as `reason:'refused'` (to hide from the requester that the user is unresponsive), **spawn expiry is reported honestly as `outcome:'expired'`** — spawn denials are already told plainly as `'declined'`, and there is no peer to hide behind, so distinguishing "the user never answered" from "the user said no" reveals nothing the parent doesn't already learn from a denial.
@@ -1410,11 +1469,12 @@ degrade path for clients predating the tracker, not a second timeline.
 
 | Route | Body / query | Response |
 |---|---|---|
-| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
+| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only; rows carry owner{user_id,name,github_login} and repo)` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
+| `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
+| `POST /items/:id/comments` | `{body?, attachments?, action?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the item's current `actions` is **400 `unknown_action`** — see *Action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
@@ -1424,7 +1484,7 @@ Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image, mission_id,
-mission_num, consent}`. `consent` is `'spawn'` or `'chat'` on the journal's
+mission_num, consent, actions[], chosen_action}`. `consent` is `'spawn'` or `'chat'` on the journal's
 mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
@@ -1438,10 +1498,36 @@ spawn and agent-chat consent cards — are invisible to every agent caller
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta}`.
-`meta` is `null` for an ordinary comment and `{from:{state,
+created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta, action}`.
+`meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
+tap, and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
-close/reopen writes. `idem_key` is an internal column on both and is never
+close/reopen writes. `action` is `meta.action` lifted to the top level — the
+tapped label, `null` on every other comment.
+
+**Action buttons** (2026-09-24 item-actions contract). `actions` is up to
+four one-tap answers an agent offers on an item (`["Go"]`, `["Option A",
+"Option B"]`) — `[]` when none, on every item. Set on `POST /items` or
+`PATCH /items/:id` (by anyone who may PATCH the item; `[]` clears). Each
+label is trimmed, 1–40 characters, on one line (no control characters or
+line/paragraph separators), and the list is unique case-insensitively;
+anything else — including a non-array — is **400 `{"error":"invalid_actions"}`**
+(duplicates are refused, not folded). A user taps one by posting an ordinary
+comment with `action: "<label>"`: the label must match one of the item's
+**current** `actions` exactly after trimming (checked in the comment's own
+transaction) or it is **400 `{"error":"unknown_action"}`**; an empty `body`
+becomes the label. Only a client may send `action` (an agent is **403**);
+`action: null` is the same as leaving it out. The comment stores
+`meta.action`, and the item's `chosen_action` becomes that label in the same
+write — it is always the most recent tap's label, `null` before any tap.
+Everything else is the ordinary user comment: it flips `awaiting` to
+`agent`, reopens a closed item, emits the `commented` marker (and its
+fallback text, whose prose is the label), wakes the box and pushes as any
+user comment does. A `PATCH` that changes `actions` clears `chosen_action`
+(the old tap no longer answers the new offer); re-sending the same list
+leaves it. An idempotent replay of a tap answers with the original comment
+even if the offer has changed since. Old clients ignore the new fields and
+see an action tap as a plain comment whose body is the label. `idem_key` is an internal column on both and is never
 returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
 strip); a comment omits `user_id` too — the caller is the owner by
 construction.
@@ -1546,8 +1632,13 @@ is unique per `(user_id, idem_key)` in the schema, not per item.
   "payload": { "item_id": "it_…", "num": 12, "kind": "question", "title": "…",
     "action": "created|commented|closed|reopened|reordered|updated", "by": "user|agent",
     "awaiting": "user|agent|null", "resolution": "…|null",
-    "comment": { "id": "ic_…", "body": "…", "attachments": [ … ] } } }
+    "actions": ["Go"], "chosen_action": "Go|null",
+    "comment": { "id": "ic_…", "body": "…", "action": "Go|null", "attachments": [ … ] } } }
 ```
+
+`actions` and `chosen_action` are the item's action buttons at the moment of
+the marker (see *Action buttons*), on every marker; `comment.action` is the
+tapped label when the comment is an action tap, else `null`.
 
 Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
 journal event. `comment` is present only when the action carried comment
@@ -1574,6 +1665,28 @@ unread-badge or conversation-preview-snippet effect — but the push body
 text still runs the event's payload through `snippetOf`, which formats an
 `❓`/`⚖`/`☐` glyph + `#num title` for the alert.
 
+## Coordinator
+
+Spec: matron-apple `docs/superpowers/specs/2026-09-23-coordinator-redesign-design.md` §1a.
+
+One conversation per user is the **Coordinator**, stored in `user_settings`
+(`src/coordinator.js`, `src/coordinator-http.js`) so every device and every
+bridge agrees which one it is.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id: string\|null}` | 200 `{convo_id}`. **404** for a conversation the user does not own; **400** when `convo_id` is absent, not a string/null, empty or over the id cap. `null` clears. An unchanged value is a 200 no-op. |
+
+On a change the journal appends a `coordinator` event — payload
+`{role: "assigned"}` into the conversation that gained the role,
+`{role: "released"}` into the one that lost it — through the ordinary
+append+broadcast path, `sender` `user:<name>`. Released is written first.
+Clearing emits only `released`; an unchanged `PUT` emits nothing. Agents
+cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
+snippet) and never pushes. `hello_ok` and `/snapshot` carry
+`coordinator_convo_id` so an app knows the Coordinator on connect.
+
 ## Missions & milestones
 
 Spec: `docs/superpowers/specs/2026-09-10-missions-milestones-design.md`.
@@ -1593,8 +1706,10 @@ mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
 — rather than minting one implicitly. `mission_start` (`POST /missions`)
 is the only way in.
 
-A conversation gains a mission in exactly three ways: `POST /missions`
-(which attaches its origin), `POST /missions/:id/join`, and **inheritance**
+A conversation gains a mission in exactly four ways: `POST /missions`
+(which attaches its origin unless `attach: false`), `POST /missions/:id/join`,
+a spawn that named the mission (`spawn_request` `mission_num`, see
+*Agent-spawned sessions*), and **inheritance**
 — a spawned conversation takes its parent's mission at creation, and never
 afterwards (like `parent_convo_id`, it is immutable once the row exists).
 Inheritance is a way *into* a mission, so `join`'s gates apply to it
@@ -1609,18 +1724,24 @@ one would hand the child a `mission_id` it can never read, join or post a
 milestone to. A child that fails any gate simply starts with no mission;
 its agent can `mission_start` its own.
 
+A mission is **unassigned** while it is `open` and has no conversations
+(`conversations: 0` on the list and detail rows) — typically one the
+Coordinator created with `attach: false`. Clients derive it; there is no
+column.
+
 ### Routes (Bearer, either device kind)
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). |
-| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
+| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
+| `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
 | `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
 | `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
 | `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
-| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. |
+| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
 | `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
 
 Errors follow the items routes: 400 on shape/limits, 404 on unknown or
@@ -1777,6 +1898,135 @@ The marker itself is never suppressed — the user's timeline still needs the
 event, and a missing event would be its own signal. Markers written into
 the origin conversation, or into another private-owned conversation, are
 unchanged: nothing crossed.
+
+## Shared visibility (GitHub-verified, per repo)
+
+Spec: `docs/superpowers/specs/2026-09-23-tracker-web-teams-and-item-links-design.md`.
+
+A user may read another user's conversation-scoped rows — items, missions,
+milestones, and a prose excerpt of the conversation — when **all** hold:
+
+1. the conversation has a `repo` (see `convo_upsert`) whose `repo_scope`
+   (`host/org`) is one the viewer is a verified member of;
+2. the conversation's owner is a verified member of the same scope;
+3. the conversation is not owned by a private device (the device-privacy
+   sieve is part of the rule and is never overridden by an org match).
+
+"Verified member" = the user has linked a GitHub account (below) whose
+link is in state `ok` and whose active org memberships include the scope.
+A stale link (GitHub refused the token on the last refresh) confers
+nothing until a later refresh succeeds (the daily job retries stale rows)
+or the user re-links. A repo under a personal login is in no
+one's org list, so it is private to its owner. Agent devices read with
+their owning user's visibility; writes stay owner-only.
+
+Attachments on shared rows are fetchable through `GET /media/:id` under the
+same rule (see the media routes above); consent-mirror items and non-prose
+events open nothing.
+
+Invisible rows answer `404 not_found`; a visible foreign row refused for
+writing answers `403 forbidden`. The rule lives in `src/visibility.js`
+and is the only copy.
+
+### GitHub account linking
+
+Client devices only (an agent never links). Configuration:
+`MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
+below is `404 not_configured`; will default to Matron's published OAuth
+App id once one is registered — not configured in this release),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
+`MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
+
+| Route | Body / query | Response |
+|---|---|---|
+| `POST /github/link` | `{flow:'device'}` | `{flow_id, user_code, verification_uri, interval, expires_in}` |
+| `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
+| `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
+| `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | **200 HTML confirm page** naming the GitHub login and the journal user, with the token parked on a `github_link_confirms` row (10 min, single-use nonce) — nothing is linked yet; or 302 to `/app/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
+| `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/app/account?linked=1` (linked) or `/app/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
+| `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
+| `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
+| `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |
+
+Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
+own pages name the OAuth App, never the journal user — so the person who
+authorizes is shown which journal account they are binding before anything
+is saved. The device flow has no equivalent hook (the authorizer only sees
+GitHub's device page), so a `user_code` handed to a victim can bind their
+identity to the attacker's journal account; the guards there are the 409 on
+an identity already linked elsewhere and the admin's ability to clear a
+link. Prefer the web flow where an OAuth App can be registered.
+
+The journal re-reads every linked user's memberships daily
+(`src/github-refresh.js`) and on `POST /github/refresh`. Flows expire
+after 10 minutes and are consumed by the poll or callback that finishes
+them.
+
+The token is never returned by any route and never logged. With
+`MATRON_TOKEN_KEY` set (64 hex characters — `openssl rand -hex 32`) it is
+stored sealed with AES-256-GCM (`enc1:` prefix); a journal that gains the
+key seals its existing rows at the next start (with `secure_delete` on, so
+the freed plaintext cells are zeroed, followed by a `TRUNCATE` checkpoint so
+no WAL frame still carries them). Unset, it is stored as-is.
+The refresh path recognises its own row by `token_hash` (SHA-256 of the
+plaintext), so sealing changes no behaviour. Starting without the key after
+rows were sealed marks nothing stale: refreshes answer `502 upstream`, the
+daily job logs `token_sealed`, and unlink/re-link work as usual. Losing the
+key means every user re-links. A key that is *changed* rather than removed
+behaves the same way, and the journal logs a warning at start naming how
+many tokens it can no longer read.
+
+## User administration
+
+Journal admins are users with `users.is_admin = 1`, bootstrapped from the
+shell: `matron-admin user admin <name> on|off`. Every route below is for a
+**client** device of an admin; any other caller — a non-admin, or an
+agent whatever its user's flag — gets `403 forbidden` for every verb,
+before any id is looked up. Mirrors `matron-admin` so the web app's admin
+page needs no shell.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /users` | — | `{users:[{id, name, is_admin, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
+| `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
+| `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
+| `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
+| `DELETE /users/:id/github-link` | — | `{ok:true}`; `404` if nothing linked. Resolves a `409 conflict` at link time |
+| `POST /users/:id/link-code` | `{ttl_seconds?}` (60–86400, default 600) | `{link_code, expires_in}` — the same pre-approved pairing code `matron-admin link-code` mints; the app builds `matron://link?v=1&server=<origin>&code=<link_code>` |
+
+Unknown `:id` is `404 not_found`. Self-service stays on the existing
+routes: `GET /devices`, `POST /devices/:id/revoke`, `POST /devices/:id/rename`,
+`POST /password`.
+
+## Static hosting and app links
+
+`MATRON_WEB_DIR` (unset by default — nothing changes) names a directory the
+journal serves read-only, before Bearer auth, for `GET`/`HEAD` only:
+
+- an existing regular file under it is served with its extension's
+  content type, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+  on HTML, and `Cache-Control: public, max-age=31536000, immutable` under
+  `/assets/` (Vite's hashed names) or `no-cache` elsewhere;
+- `/u/*`, `/app` and `/app/*` serve the directory's `index.html` (history
+  fallback) unless the request's `Accept` names `application/json`, which
+  is the JSON link lookup and reaches the API;
+- `/` redirects to `/app/`;
+- a path with a dot-segment (`..`, `.git`, `.env`), a backslash, a NUL, a
+  path resolving outside the directory, a directory, or no matching file
+  falls through to the API, which answers as it always has (`401`/`404`).
+  Do not place files named like API routes (`items`, `login`) in the
+  directory: an existing file wins.
+
+The app-link files are served unauthenticated from env and are
+`404 not_found` when unset:
+
+| Route | Env | Body |
+|---|---|---|
+| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}]}]}}` |
+| `GET /.well-known/assetlinks.json` | `MATRON_ANDROID_PACKAGE` and `MATRON_ANDROID_CERT_SHA256` (comma-separated colon-hex fingerprints; both required together) | `[{relation:["delegate_permission/common.handle_all_urls"], target:{namespace:"android_app", package_name, sha256_cert_fingerprints}}]` |
+
+Malformed values refuse to start the journal, naming the variable.
 
 ## Device privacy
 
@@ -2240,7 +2490,7 @@ considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
-  conversation, or when its acked cursor already covers the event's `seq`,
+  conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
   or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
   event's category — `wake` background pushes are never prefs-filtered.
 - `prompt` / `permission_request` push immediately at priority 10

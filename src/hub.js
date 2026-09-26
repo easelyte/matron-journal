@@ -30,6 +30,14 @@ export function mergeEphemeral(prev, frame) {
   return frame
 }
 
+// The agent visibility rule shared by every fan-out path: client devices
+// always receive, an agent device only when `agentTargets` is null (owner
+// unknown — legacy broadcast) or names it (recorded owner + joined room
+// participants; see agentTargetsFor in journal.js).
+function agentMayReceive(conn, agentTargets) {
+  return conn.kind !== 'agent' || agentTargets == null || agentTargets.has(conn.deviceId)
+}
+
 export function makeHub({ coalesceMs = 200 } = {}) {
   const byUser = new Map() // userId -> Set<conn>
   let regCounter = 0
@@ -108,11 +116,12 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       return out
     },
     // Per-device "is this device connected AND looking at this convo right
-    // now" — the push pipeline's suppression rule. conn.deviceId is already
-    // carried on every registered connection (see ws.js hello handling).
+    // now" — the push pipeline's suppression rule. A connection views a SET
+    // of convos (conn.viewingConvoIds, set by the `viewing` op). conn.deviceId
+    // is already carried on every registered connection (see ws.js hello).
     isViewing(userId, deviceId, convoId) {
       for (const c of byUser.get(userId) || []) {
-        if (c.deviceId === deviceId && c.viewingConvoId === convoId && c.ws.readyState === 1) return true
+        if (c.deviceId === deviceId && c.viewingConvoIds?.has(convoId) && c.ws.readyState === 1) return true
       }
       return false
     },
@@ -125,7 +134,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     // owner + joined participants.
     broadcastJournal(userId, frame, agentTargets = null) {
       for (const c of byUser.get(userId) || []) {
-        if (c.kind === 'agent' && agentTargets != null && !agentTargets.has(c.deviceId)) continue
+        if (!agentMayReceive(c, agentTargets)) continue
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },
@@ -147,9 +156,24 @@ export function makeHub({ coalesceMs = 200 } = {}) {
         c.ws.send(payload)
       }
     },
-    sendEphemeral(userId, convoId, frame) {
+    // Viewing-scoped, coalesced ephemerals. Agent connections obey the same
+    // visibility rule as broadcastJournal (tracker #2851): the `viewing` op
+    // refuses agents, so an agent never has a viewing set today — this is
+    // defence in depth, keeping a private box's or an unjoined room's live
+    // stream/activity/status off every other agent even if that changes.
+    // `resolveAgentTargets` returns broadcastJournal's agentTargets (see
+    // agentTargetsFor in journal.js); it is called lazily, at most once, and
+    // only when an agent connection is viewing — so the common all-clients
+    // case costs no DB read. Omitted = agents receive nothing (fail closed).
+    sendEphemeral(userId, convoId, frame, resolveAgentTargets = null) {
+      let agentTargets
       for (const c of byUser.get(userId) || []) {
-        if (c.viewingConvoId !== convoId || c.ws.readyState !== 1) continue
+        if (!c.viewingConvoIds?.has(convoId) || c.ws.readyState !== 1) continue
+        if (c.kind === 'agent') {
+          if (!resolveAgentTargets) continue
+          if (agentTargets === undefined) agentTargets = resolveAgentTargets()
+          if (!agentMayReceive(c, agentTargets)) continue
+        }
         // One pending slot per (convo, message_ref, frame family): activity,
         // status, and text/tool-stream overlays are distinct families that
         // must not clobber each other inside one coalesce window — the

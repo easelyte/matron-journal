@@ -11,20 +11,25 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment, isConsentMirror,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror, listSharedItems, getSharedItem,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const SORTS = ['rank', 'updated']
+const SCOPES = ['mine', 'shared']
 const STATES = ['open', 'closed']
 const POSITIONS = ['top', 'bottom']
 const ID_MAX = 128
 // The item transitions in items.js signal their one recoverable failure by
 // throwing a tagged Error; each maps to exactly one of the existing error
 // shapes. Anything else is a bug and must reach http.js's 500.
-const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409 }
+const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409, unknown_action: 400 }
+// The failures the item-actions contract names answer with their own code
+// rather than the generic one, so an app can tell "that button is gone" (the
+// agent changed the offer under it) from a malformed request.
+const NAMED_ERRORS = new Set(['unknown_action'])
 // Wake keys off the ACTION as well as the writer: a reorder is bookkeeping,
 // not something a sleeping box needs to be booted for.
 const WAKE_ACTIONS = new Set(['created', 'commented', 'closed', 'reopened'])
@@ -33,7 +38,15 @@ const WAKE_ACTIONS = new Set(['created', 'commented', 'closed', 'reopened'])
 function answerKnownError(res, err) {
   const status = ERROR_STATUS[err && err.message]
   if (!status) return false
+  if (NAMED_ERRORS.has(err.message)) { json(res, status, { error: err.message }); return true }
   return status === 409 ? conflict(res) : badRequest(res)
+}
+
+// A validateItemFields failure: its own named error when it carries one
+// (`invalid_actions`), the generic 400 otherwise.
+function badFields(res, v) {
+  if (v.error) { json(res, 400, { error: v.error }); return true }
+  return badRequest(res)
 }
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
@@ -130,6 +143,19 @@ function handleList(db, res, url, who) {
   const awaiting = oneOf(q.get('awaiting'), AWAITING)
   const sort = q.has('sort') ? oneOf(q.get('sort'), SORTS) : 'rank'
   if (kind === undefined || state === undefined || awaiting === undefined || sort === undefined) return badRequest(res)
+  const scope = q.has('scope') ? oneOf(q.get('scope'), SCOPES) : 'mine'
+  if (scope === undefined) return badRequest(res)
+  if (scope === 'shared') {
+    // Own-list-only filters (convo, label, sort, since) are meaningless
+    // across users and are rejected rather than ignored.
+    for (const k of ['convo', 'label', 'sort', 'since']) if (q.has(k)) return badRequest(res)
+    const sharedLimit = q.has('limit') ? Number(q.get('limit')) : 100
+    if (!Number.isInteger(sharedLimit) || sharedLimit < 1) return badRequest(res)
+    const r = listSharedItems(db, who.userId, { kind, state, awaiting, limit: sharedLimit, cursor: q.get('cursor') })
+    if (r.badCursor) return badRequest(res)
+    json(res, 200, { items: r.items, next_cursor: r.next_cursor })
+    return true
+  }
   let since = null
   if (q.has('since')) {
     since = Number(q.get('since'))
@@ -158,7 +184,7 @@ async function handleCreate(ctx, req, res, who) {
   const body = await readBody(req)
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
   const v = validateItemFields(body)
-  if (!v.ok) return badRequest(res)
+  if (!v.ok) return badFields(res, v)
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
   // `position` is exclusive: given alongside either neighbour, the intent is
@@ -234,7 +260,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // attempt is a bad request rather than a no-op field.
   if (body.attachments !== undefined) return badRequest(res)
   const v = validateItemFields(body, { partial: true })
-  if (!v.ok) return badRequest(res)
+  if (!v.ok) return badFields(res, v)
   const fields = { ...v.value }
   if (body.awaiting !== undefined) {
     if (body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
@@ -299,7 +325,17 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   // Unknown id, another user's id, and a private-owned one all answer the
   // same 404 — nothing here is an enumeration oracle.
   const item = visibleItem(db, who, idOrNum)
-  if (!item) return notFound(res)
+  if (!item) {
+    // Not mine: maybe a colleague's, readable under the shared rule. Read
+    // only — every other method on a shared row is 403 (visible, not
+    // yours), which is safe to distinguish from 404 because the caller can
+    // already read it.
+    const shared = getSharedItem(db, who.userId, idOrNum)
+    if (!shared) return notFound(res)
+    if (!sub && req.method === 'GET') { json(res, 200, { item: shared, comments: listComments(db, shared.id) }); return true }
+    json(res, 403, { error: 'forbidden' })
+    return true
+  }
 
   // No origin-conversation gate here: the tracker is scoped to the USER, not
   // to a conversation, so any of the user's boxes that can already see an
@@ -337,9 +373,24 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     const body = await readBody(req)
     const idemKey = idemKeyOf(req, who)
     if (idemKey === undefined) return badRequest(res)
+    // Action tap (2026-09-24 item-actions contract): `action` is the label of
+    // one of the item's action buttons. Only the USER taps a button — an
+    // agent answering its own question would forge the user's choice — so an
+    // agent sending the field is refused outright. null is "no action". The
+    // label is matched exactly (after trim) against the item's CURRENT
+    // actions inside addComment's transaction (unknown_action otherwise);
+    // everything else is the ordinary user-comment path.
+    let action = null
+    if (body.action != null) {
+      if (who.kind === 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+      if (typeof body.action !== 'string' || !body.action.trim()) { json(res, 400, { error: 'unknown_action' }); return true }
+      action = body.action.trim()
+    }
     const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments }, { partial: true })
     if (!v.ok) return badRequest(res)
-    const text = v.value.body ?? ''
+    // An empty body on a tap reads as the label: an old client, the fallback
+    // text and the agent's turn all see exactly what the user chose.
+    const text = action != null && !(v.value.body ?? '').trim() ? action : (v.value.body ?? '')
     // A user's voice note is transcribed here, on upload, when this journal
     // has whisper (ctx.itemTranscription.enabled): stored and announced as
     // pending so the origin bridge holds the turn for the words instead of
@@ -357,7 +408,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!text.trim() && attachments.length === 0) return badRequest(res)
     let out
     try {
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, idemKey })
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, idemKey })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err

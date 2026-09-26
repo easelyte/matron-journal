@@ -5,7 +5,8 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { recordJoined } from '../src/participants.js'
-import { closeItem } from '../src/items.js'
+import { closeItem, createItem } from '../src/items.js'
+import { saveGithubIdentity } from '../src/github-accounts.js'
 
 // Fleet: dan (client 'mac' + agent dev-2 managing c1), pat (own agent, own convo).
 async function fleet(t, serverOpts = {}) {
@@ -608,4 +609,104 @@ test('item and comment API shapes carry no internal columns', async (t) => {
   assert.ok(!('idem_key' in one.json.comments[0]))
   assert.ok(!('user_id' in one.json.comments[0]))
   assert.ok(!('idem_key' in (await s.http('/items', { token: client })).json.items[0]))
+})
+
+async function sharedFleet(t) {
+  const f = await fleet(t)
+  const { s, dan, pat, agent, patAgent } = f
+  const link = (u, gid, scopes) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: `${u.name}-gh`, scopes }, token: `t${gid}`, now: 1 })
+  link(dan, 1, ['github.com/matronhq']); link(pat, 2, ['github.com/matronhq'])
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  upsertConversation(s.db, { id: 'p1', ownerUserId: pat.id, agentDeviceId: patAgent.deviceId, repo: 'github.com/matronhq/bridge' })
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })
+  return { ...f, patClient: patLogin.json.token }
+}
+
+test('GET /items?scope=shared: a colleague in the same org sees my items, with owner and repo; not from repo-less or private conversations', async (t) => {
+  const { s, dan, agent, client, patClient, patAgent } = await sharedFleet(t)
+  const mine = await mkItem(s, agent.token, { title: 'Shared with pat' })
+  await mkItem(s, agent.token, { title: 'Not shared', convo_id: 'c2' }) // c2 has no repo
+  const r = await s.http('/items?scope=shared', { token: patClient })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.items.map((i) => i.title), ['Shared with pat'])
+  assert.deepEqual(r.json.items[0].owner, { user_id: mine.json.item.user_id, name: 'dan', github_login: 'dan-gh' })
+  assert.equal(r.json.items[0].repo, 'github.com/matronhq/journal')
+  assert.equal((await s.http('/items', { token: client })).json.items.length, 2, 'scope=mine is unchanged')
+  assert.equal((await s.http('/items?scope=shared', { token: client })).json.items.length, 0, 'never my own rows; pat has filed nothing')
+  assert.equal((await s.http('/items?scope=shared', { token: patAgent.token })).json.items.length, 1, 'pat\'s agent reads with pat\'s visibility')
+  // A private box of dan's inside the org stays invisible.
+  const priv = createAgent(s.db, dan.id, 'dan-private'); pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'c3', ownerUserId: dan.id, title: 'C3', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/journal' })
+  await mkItem(s, priv.token, { title: 'Private', convo_id: 'c3' })
+  assert.equal((await s.http('/items?scope=shared', { token: patClient })).json.items.length, 1)
+  assert.equal((await s.http('/items?scope=nope', { token: patClient })).status, 400)
+  assert.equal((await s.http('/items?scope=shared&convo=c1', { token: patClient })).status, 400, 'own-list filters are rejected on shared')
+})
+
+test('GET /items/:id on a shared item reads it; every write is 403; an unshared one is 404', async (t) => {
+  const { s, agent, patClient } = await sharedFleet(t)
+  const mine = await mkItem(s, agent.token, { title: 'Shared' })
+  const hidden = await mkItem(s, agent.token, { title: 'Hidden', convo_id: 'c2' })
+  const id = mine.json.item.id
+  const get = await s.http(`/items/${id}`, { token: patClient })
+  assert.equal(get.status, 200); assert.equal(get.json.item.title, 'Shared'); assert.equal(get.json.item.owner.name, 'dan')
+  assert.ok(Array.isArray(get.json.comments))
+  for (const [method, path, body] of [
+    ['PATCH', `/items/${id}`, { title: 'x' }],
+    ['POST', `/items/${id}/comments`, { body: 'hi' }],
+    ['POST', `/items/${id}/close`, { resolution: 'done' }],
+    ['POST', `/items/${id}/reopen`, {}],
+    ['POST', `/items/${id}/rank`, { position: 'top' }],
+  ]) {
+    const r = await s.http(path, { method, token: patClient, body })
+    assert.equal(r.status, 403, `${method} ${path}`); assert.equal(r.json.error, 'forbidden')
+  }
+  assert.equal((await s.http(`/items/${hidden.json.item.id}`, { token: patClient })).status, 404)
+  assert.equal((await s.http('/items/%231', { token: patClient })).status, 404, '#num stays owner-scoped: pat has no #1')
+})
+
+test('visibility follows the conversation\'s CURRENT repo (review focus 2)', async (t) => {
+  const { s, agent, patClient, dan } = await sharedFleet(t)
+  const it = await mkItem(s, agent.token, { title: 'Moves', convo_id: 'c2' })
+  assert.equal((await s.http(`/items/${it.json.item.id}`, { token: patClient })).status, 404)
+  upsertConversation(s.db, { id: 'c2', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/other' })
+  assert.equal((await s.http(`/items/${it.json.item.id}`, { token: patClient })).status, 200)
+  upsertConversation(s.db, { id: 'c2', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/danbarker/personal' })
+  assert.equal((await s.http(`/items/${it.json.item.id}`, { token: patClient })).status, 404)
+})
+
+test('a consent mirror on a shared conversation never crosses the user boundary', async (t) => {
+  const { s, dan, agent, client, patClient } = await sharedFleet(t)
+  const m = await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c1', title: 'Shared mission', body: 'goal' } })
+  assert.equal(m.status, 201)
+  const ordinary = await mkItem(s, agent.token, { title: 'Ordinary ask', awaiting: 'user' })
+  assert.equal(ordinary.status, 201)
+  const { item: consentItem } = createItem(s.db, {
+    userId: dan.id, kind: 'question', title: 'Spawn consent ask', body: '', labels: ['consent'],
+    awaiting: 'user', originConvoId: 'c1', originDeviceId: agent.deviceId, createdBy: 'agent', consent: 'spawn',
+  })
+  // Sanity: the owner's own CLIENT still sees it (consent mirrors are
+  // invisible to every agent, owner's own included — items-http.js
+  // visibleItem — but this is the user's own card, not this fix's concern).
+  assert.equal((await s.http(`/items/${consentItem.id}`, { token: client })).status, 200)
+
+  const list = await s.http('/items?scope=shared', { token: patClient })
+  assert.equal(list.status, 200)
+  assert.deepEqual(list.json.items.map((i) => i.title).sort(), ['Ordinary ask'])
+
+  assert.equal((await s.http(`/items/${consentItem.id}`, { token: patClient })).status, 404)
+
+  const detail = await s.http(`/missions/${m.json.mission.id}`, { token: patClient })
+  assert.equal(detail.status, 200)
+  assert.equal(detail.json.mission.open_items, 1, 'the consent mirror is not counted')
+  assert.equal(detail.json.mission.needs_you, 1, 'the consent mirror is not counted')
+  assert.deepEqual(detail.json.items.map((i) => i.title), ['Ordinary ask'], 'the consent mirror is absent from foreign detail')
+
+  const sharedList = await s.http('/missions?scope=shared', { token: patClient })
+  const row = sharedList.json.missions.find((x) => x.id === m.json.mission.id)
+  assert.equal(row.open_items, 1)
+  assert.equal(row.needs_you, 1)
+
+  assert.equal((await s.http(`/lookup?user=dan&num=${consentItem.num}`, { token: patClient })).status, 404)
+  assert.equal((await s.http(`/lookup?user=dan&num=${consentItem.num}`, { token: client })).status, 200, 'the owner\'s own client can still resolve their own consent item')
 })

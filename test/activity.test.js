@@ -24,7 +24,7 @@ test('agent activity reaches only the viewing client, carrying state+detail', as
   await other.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
 
   viewer.send({ op: 'viewing', convo_id: 'sess-act' })
-  // `other` is left not-viewing sess-act (viewingConvoId stays null).
+  // `other` is left not-viewing sess-act (its viewingConvoIds set stays empty).
   await new Promise((r) => setTimeout(r, 50))
 
   agent.send({ op: 'activity', convo_id: 'sess-act', state: 'thinking', detail: 'analyzing files' })

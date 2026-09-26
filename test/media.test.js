@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import net from 'node:net'
+import http from 'node:http'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { makeTmpDir } from './tmp-dir.js'
@@ -363,6 +364,77 @@ test('GET /media/:id: a DB row whose file is missing or size-mismatched on disk 
   assert.deepEqual(await missing.json(), { error: 'internal' })
 
   assert.ok(mute.mock.callCount() >= 2, 'both failure modes should be logged server-side')
+})
+
+test('media: a client that aborts mid-download never leaks the read stream or wedges the server', async (t) => {
+  const s = await startTestServer({ dbPath: tmpDbPath() })
+  t.after(() => s.close())
+  const token = await loginToken(s, 'dan', 'pw')
+
+  const FULL = 8 * 1024 * 1024
+  const up = await fetch(s.base + '/media', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}` },
+    body: crypto.randomBytes(FULL),
+  })
+  assert.equal(up.status, 200)
+  const { media_id } = await up.json()
+
+  // Same shape as static-http.test.js's abort test: fetch the first chunk
+  // over a raw socket (no keep-alive), then destroy the connection mid-body
+  // — .pipe() alone leaves the read stream (and its fd) open because it
+  // never forwards a destination error/close back to the source.
+  // Resolves only when a response chunk arrived and the response then closed
+  // short of the full body; anything else (no chunk, whole body, stall) rejects
+  // so the loop cannot pass without exercising the abort path.
+  function abortMidBody() {
+    return new Promise((resolve, reject) => {
+      let gotChunk = false
+      let received = 0
+      let req
+      const timer = setTimeout(() => { req.destroy(); reject(new Error('abort request stalled for 5s')) }, 5000)
+      req = http.request(s.base + `/media/${media_id}`, {
+        method: 'GET', agent: false, headers: { authorization: `Bearer ${token}`, connection: 'close' },
+      }, (res) => {
+        res.on('data', (chunk) => {
+          received += chunk.length
+          if (!gotChunk) { gotChunk = true; req.destroy() }
+        })
+        res.on('error', () => {}) // expected after destroy; 'close' decides the outcome
+        res.on('close', () => {
+          clearTimeout(timer)
+          if (!gotChunk) return reject(new Error('response closed before any chunk arrived'))
+          if (received >= FULL) return reject(new Error(`full body (${received} bytes) arrived; the abort did not cut the transfer`))
+          resolve()
+        })
+      })
+      req.on('error', () => {}) // ECONNRESET/aborted after destroy is the expected path
+      req.on('close', () => {
+        clearTimeout(timer)
+        if (!gotChunk) reject(new Error('request closed before any response chunk arrived'))
+      })
+      req.end()
+    })
+  }
+
+  const countFds = () => { try { return fs.readdirSync('/proc/self/fd').length } catch { return null } }
+  const fdsBefore = countFds()
+
+  const start = Date.now()
+  for (let i = 0; i < 50; i++) await abortMidBody()
+  assert.ok(Date.now() - start < 5000, `50 aborts should complete quickly, took ${Date.now() - start}ms`)
+
+  // The server must still be healthy and responsive right after.
+  const health = await fetch(s.base + `/media/${media_id}`, { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(health.status, 200)
+  const buf = Buffer.from(await health.arrayBuffer())
+  assert.equal(buf.length, FULL)
+
+  if (fdsBefore !== null) {
+    await new Promise((r) => setTimeout(r, 200)) // let already-destroyed handles finish unwinding
+    const fdsAfter = countFds()
+    assert.ok(fdsAfter - fdsBefore < 20, `expected no per-abort fd leak, went from ${fdsBefore} to ${fdsAfter} open fds`)
+  }
 })
 
 test('an agent-kind device can also upload media (not just client devices)', async (t) => {

@@ -3,6 +3,7 @@
 // tests, and any future WS op share one set of rules. No hub, no push, no
 // wake: those are src/items-http.js's job.
 import { randomBytes } from 'node:crypto'
+import { sharedConvoSql } from './visibility.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision']
 export const RESOLUTIONS = ['done', 'answered', 'decided', 'reversed', 'cancelled']
@@ -14,6 +15,8 @@ export const LABEL_MAX = 40
 export const LINKS_MAX = 50
 export const URL_MAX = 2048
 export const ATTACHMENTS_MAX = 20
+export const ACTIONS_MAX = 4
+export const ACTION_LABEL_MAX = 40
 export const RANK_GAP = 1024
 export const RANK_EPSILON = 1e-6
 
@@ -45,6 +48,29 @@ function validateAttachments(list, { allowTranscript = false } = {}) {
     out.push(att)
   }
   return { ok: true, value: out }
+}
+
+// Item action buttons (2026-09-24 item-actions contract): the one-tap answers
+// an agent offers on an item. 0–4 labels, each trimmed to 1–40 chars on a
+// single line (no C0/C1 control characters — which covers \n, \r and \t —
+// and no Unicode line/paragraph separators), unique case-insensitively so no
+// two buttons read the same. Duplicates are refused, not folded: the agent
+// asked for two buttons and would silently get one.
+const ACTION_BAD_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/
+function validateActions(list) {
+  if (!Array.isArray(list) || list.length > ACTIONS_MAX) return null
+  const out = []
+  const seen = new Set()
+  for (const a of list) {
+    if (typeof a !== 'string') return null
+    const s = a.trim()
+    if (!s || s.length > ACTION_LABEL_MAX || ACTION_BAD_CHARS.test(s)) return null
+    const key = s.toLowerCase()
+    if (seen.has(key)) return null
+    seen.add(key)
+    out.push(s)
+  }
+  return out
 }
 
 // Normalises and bounds every user/agent-writable field. `partial` (PATCH)
@@ -91,6 +117,14 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
       value.links.push(link)
     }
   }
+  if (fields.actions !== undefined) {
+    // The one field with its own error code: the contract names it
+    // (`invalid_actions`) so an agent can tell a bad button list apart from
+    // any other malformed field.
+    const actions = validateActions(fields.actions)
+    if (!actions) return { ok: false, error: 'invalid_actions' }
+    value.actions = actions
+  }
   const att = validateAttachments(fields.attachments, { allowTranscript })
   if (!att.ok) return { ok: false }
   if (fields.attachments !== undefined) value.attachments = att.value
@@ -104,12 +138,14 @@ const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return
 // and echoing another device's key would be a small leak.
 export function rowToItem(row) {
   if (!row) return null
-  const { labels, links, attachments, idem_key: _idemKey, ...rest } = row
+  const { labels, links, attachments, actions, idem_key: _idemKey, ...rest } = row
   const out = {
     ...rest,
     labels: parseJson(labels, []),
     links: parseJson(links, []),
     attachments: parseJson(attachments ?? '[]', []),
+    actions: parseJson(actions ?? '[]', []),
+    chosen_action: rest.chosen_action ?? null,
   }
   if ('comment_count' in out) out.comment_count = Number(out.comment_count)
   if ('has_image' in out) out.has_image = !!out.has_image
@@ -118,10 +154,14 @@ export function rowToItem(row) {
 
 // Same internal-column strip as rowToItem, plus `user_id`: every comment
 // route is already scoped to the caller's own user, so the field is noise.
+// `action` lifts meta.action (the label of the action button the user tapped)
+// to the top level, null on every other comment.
 export function rowToComment(row) {
   if (!row) return null
   const { attachments, meta, idem_key: _idemKey, user_id: _userId, ...rest } = row
-  return { ...rest, attachments: parseJson(attachments, []), meta: meta == null ? null : parseJson(meta, null) }
+  const m = meta == null ? null : parseJson(meta, null)
+  const action = typeof m?.action === 'string' ? m.action : null
+  return { ...rest, attachments: parseJson(attachments, []), meta: m, action }
 }
 
 // Default `awaiting` per kind at creation (spec: Semantics). Also the value
@@ -220,7 +260,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 }
 
 export function createItem(db, {
-  userId, kind, title, body = '', labels = [], links = [], attachments = [], awaiting, position, after, before,
+  userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], awaiting, position, after, before,
   originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, now = Date.now(),
 }) {
   return db.transaction(() => {
@@ -239,10 +279,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions))
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -368,6 +408,52 @@ export function listItems(db, userId, {
   return { items: page, next_cursor }
 }
 
+// Cross-user read (spec 2026-09-23 tracker web/teams, "Reads that widen").
+// Rows whose origin conversation passes the shared rule for @viewer, never
+// the viewer's own. Ordered newest-updated first; the cursor is
+// [updated_at, id] — item ids are random, so unlike `num` they are unique
+// across users.
+const OWNER_DECORATE = `
+  cv.repo AS repo,
+  json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
+const SHARED_FROM = `FROM items i
+  JOIN conversations cv ON cv.id = i.origin_convo_id
+  JOIN users u ON u.id = i.user_id
+  LEFT JOIN github_accounts ga ON ga.user_id = i.user_id`
+
+function rowToSharedItem(row) {
+  if (!row) return null
+  const { owner_json: ownerJson, ...rest } = row
+  const item = rowToItem(rest)
+  item.owner = parseJson(ownerJson, null)
+  return item
+}
+
+export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
+  limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
+  const where = [sharedConvoSql('cv'), 'i.consent IS NULL']
+  const args = { viewer: viewerUserId }
+  if (kind != null) { where.push('i.kind = @kind'); args.kind = kind }
+  if (state != null) { where.push('i.state = @state'); args.state = state }
+  if (awaiting != null) { where.push('i.awaiting = @awaiting'); args.awaiting = awaiting }
+  const cur = cursor ? decCursor(cursor) : null
+  if (cursor && !cur) return { badCursor: true }
+  if (cur) { where.push('(i.updated_at < @cu OR (i.updated_at = @cu AND i.id < @cid))'); args.cu = cur[0]; args.cid = cur[1] }
+  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
+    WHERE ${where.join(' AND ')} ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ ...args, lim: limit + 1 })
+  const page = rows.slice(0, limit).map(rowToSharedItem)
+  const last = page[page.length - 1]
+  const next_cursor = rows.length > limit && last ? encCursor([last.updated_at, last.id]) : null
+  return { items: page, next_cursor }
+}
+
+export function getSharedItem(db, viewerUserId, itemId) {
+  if (typeof itemId !== 'string' || !itemId.startsWith('it_')) return null
+  const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
+    WHERE i.id = @id AND i.consent IS NULL AND ${sharedConvoSql('cv')}`).get({ viewer: viewerUserId, id: itemId })
+  return rowToSharedItem(row)
+}
+
 function touch(db, itemId, now) {
   db.prepare('UPDATE items SET updated_at=? WHERE id=?').run(now, itemId)
 }
@@ -382,7 +468,14 @@ function insertComment(db, { itemId, userId, author, deviceId, kind, body, attac
 
 const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE id=? AND user_id=?').get(itemId, userId)
 
-export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], idemKey = null, now = Date.now() }) {
+// `action` (a user's tap on one of the item's action buttons, already
+// trimmed by the caller) must name one of the item's CURRENT actions: checked
+// here, inside the transaction, so a PATCH that swaps the list can never
+// interleave with the check. Throws Error('unknown_action') otherwise. The
+// comment records it as meta.action and the item's chosen_action follows it
+// in the same write. An idempotent replay is answered before the check — the
+// original tap was valid when it landed.
+export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], action = null, idemKey = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -395,9 +488,10 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
       const dup = db.prepare('SELECT * FROM item_comments WHERE user_id=? AND item_id=? AND idem_key=?').get(userId, itemId, idemKey)
       if (dup) return { item: getItem(db, userId, itemId), comment: rowToComment(dup), duplicate: true }
     }
+    if (action != null && !parseJson(row.actions, []).includes(action)) throw new Error('unknown_action')
     let comment
     try {
-      comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta: null, idemKey, now })
+      comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta: action == null ? null : { action }, idemKey, now })
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err
@@ -407,6 +501,7 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
       // closed item back up (spec: "any further user comment on a closed
       // item reopens it awaiting the agent").
       db.prepare("UPDATE items SET state='open', resolution=NULL, closed_at=NULL, awaiting='agent', updated_at=? WHERE id=?").run(now, itemId)
+      if (action != null) db.prepare('UPDATE items SET chosen_action=? WHERE id=?').run(action, itemId)
     } else {
       touch(db, itemId, now)
     }
@@ -456,6 +551,14 @@ export function updateItem(db, { userId, itemId, fields, missionId, now = Date.n
     if (fields.labels !== undefined) { sets.push('labels=?'); args.push(JSON.stringify(fields.labels)) }
     if (fields.links !== undefined) { sets.push('links=?'); args.push(JSON.stringify(fields.links)) }
     if (fields.awaiting !== undefined) { sets.push('awaiting=?'); args.push(fields.awaiting) }
+    if (fields.actions !== undefined) {
+      const next = JSON.stringify(fields.actions)
+      sets.push('actions=?'); args.push(next)
+      // A different list is a different question: the old tap no longer
+      // answers it. Re-sending the list unchanged (an agent patching every
+      // field at once) keeps the user's choice.
+      if (next !== row.actions) sets.push('chosen_action=NULL')
+    }
     db.prepare(`UPDATE items SET ${sets.join(', ')} WHERE id=?`).run(...args, itemId)
     return getItem(db, userId, itemId)
   })()

@@ -14,10 +14,10 @@
       } } },
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
       "payload": { "question": "ship it?", "options": ["yes", "no"], "allows_free_text": false } } },
@@ -27,9 +27,9 @@
       "payload": { "question": "ship it?", "options": ["yes", "no"], "allows_free_text": false }
     } },
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
-      "expect": { "status": 200, "body": { "seq": { "$ref": "prompt_seq" }, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2", "tag_char": null }], "conversations": [
+      "expect": { "status": 200, "body": { "coordinator_convo_id": null, "seq": { "$ref": "prompt_seq" }, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2", "tag_char": null }], "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": { "$ref": "prompt_seq" },
-          "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+          "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
@@ -67,9 +67,9 @@
     } },
 
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
-      "expect": { "status": 200, "body": { "seq": 7, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2", "tag_char": null }], "conversations": [
+      "expect": { "status": 200, "body": { "coordinator_convo_id": null, "seq": 7, "agents": [{ "device_id": { "$type": "integer" }, "name": "dev-2", "tag_char": null }], "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "session_outcome": null, "last_seq": 7,
-          "unread_count": 0, "snippet": "done", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+          "unread_count": 0, "snippet": "done", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }
   ]
 }

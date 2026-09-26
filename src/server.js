@@ -20,11 +20,17 @@ import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, wit
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
 import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs } from './retention.js'
 import { backfillSearchIndex } from './search.js'
+import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
+import { resolveWebDir, makeStaticHandler } from './static-http.js'
+import { makeWellKnown, parseList } from './well-known.js'
 import { makeWaker } from './wake.js'
 import { makeTranscriber } from './transcribe.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
+import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
+import { makeTokenBox } from './token-box.js'
+import { sealStoredTokens } from './github-accounts.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -391,11 +397,20 @@ export function startServer({
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
   fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, workViewOptions,
+  github, githubRefreshIntervalMs, webDir,
+  appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
+  // Token encryption at rest (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise. A key that appears after rows
+  // exist seals them here, once.
+  const tokenBox = makeTokenBox(tokenKey !== undefined ? tokenKey : process.env.MATRON_TOKEN_KEY)
+  const sealed = sealStoredTokens(db, tokenBox)
+  if (sealed.sealed) console.log(`github: sealed ${sealed.sealed} stored token(s) under MATRON_TOKEN_KEY`)
+  if (sealed.unreadable) console.warn(`github: ${sealed.unreadable} stored token(s) are sealed under a different or missing MATRON_TOKEN_KEY; those users must re-link`)
   // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
   // journal_size_limit lives in openDb). With synchronous=NORMAL the
   // auto-checkpoint is the only steady-state fsync and it runs INLINE in
@@ -563,6 +578,24 @@ export function startServer({
     transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
+  // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
+  // the test seam; env otherwise. An empty client id disables the routes.
+  const resolvedGithub = github !== undefined ? github : makeGithub({
+    clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
+    clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
+    host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
+  })
+  // Static hosting of the web app (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise; unset serves nothing.
+  const resolvedWebDir = resolveWebDir(webDir !== undefined ? webDir : process.env.MATRON_WEB_DIR)
+  const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
+  // App-link well-known files (spec 2026-09-23 tracker web/teams). The
+  // options are the test seam; env otherwise; unset claims nothing (404).
+  const handleWellKnown = makeWellKnown({
+    appleAppIds: appleAppIds !== undefined ? appleAppIds : parseList(process.env.MATRON_APPLE_APP_IDS),
+    androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
+    androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
+  })
   const server = http.createServer(httpHandlerFactory({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
@@ -572,6 +605,7 @@ export function startServer({
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     workViewOptions,
+    github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -587,6 +621,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let githubRefreshInterval = null
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
@@ -596,6 +631,7 @@ export function startServer({
         orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
@@ -617,10 +653,12 @@ export function startServer({
         itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.

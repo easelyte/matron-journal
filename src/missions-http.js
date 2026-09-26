@@ -11,9 +11,11 @@ import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
   updateMission, joinMission, closeMission, createMilestone, listMilestones, milestoneRow,
+  listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones,
 } from './missions.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
+import { canReadConvo } from './visibility.js'
 
 const STATES = ['open', 'closed']
 
@@ -70,6 +72,9 @@ async function handleCreate(ctx, req, res, who) {
   const body = await readBody(req)
   const v = validateMissionFields(body)
   if (!v.ok) return badRequest(res)
+  // Optional, default true (today's behaviour). Anything but a boolean is a
+  // bad ask, never coerced — `"false"` must not quietly attach.
+  if (body.attach !== undefined && typeof body.attach !== 'boolean') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
@@ -77,7 +82,8 @@ async function handleCreate(ctx, req, res, who) {
   try {
     out = createMission(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-      title: v.value.title, body: v.value.body ?? '', idemKey, excludePrivateOwned: filteredAgent(db, who),
+      title: v.value.title, body: v.value.body ?? '', idemKey, attach: body.attach !== false,
+      excludePrivateOwned: filteredAgent(db, who),
     })
   } catch (err) {
     // TOCTOU: writableConvo just confirmed the convo, but it can vanish
@@ -108,6 +114,13 @@ function handleList(ctx, res, url, who) {
   if (url.searchParams.has('since')) {
     since = Number(url.searchParams.get('since'))
     if (!Number.isFinite(since) || since < 0) return badRequest(res)
+  }
+  const scope = url.searchParams.get('scope') ?? 'mine'
+  if (scope !== 'mine' && scope !== 'shared') return badRequest(res)
+  if (scope === 'shared') {
+    if (state != null || since != null) return badRequest(res)
+    json(res, 200, { missions: listSharedMissions(db, who.userId) })
+    return true
   }
   json(res, 200, { missions: listMissions(db, who.userId, { state, since, excludePrivateOwned: filteredAgent(db, who) }) })
   return true
@@ -247,7 +260,14 @@ function handleMilestoneList(ctx, res, url, who) {
   const convoId = url.searchParams.get('convo')
   if (!convoId) return badRequest(res)
   const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
-  if (!convo || convo.owner_user_id !== who.userId) return notFound(res)
+  if (!convo) return notFound(res)
+  if (convo.owner_user_id !== who.userId) {
+    // A colleague's conversation: readable under the shared rule, else the
+    // same 404 as an unknown id. The rule already excludes private-owned.
+    if (!canReadConvo(db, who.userId, convoId)) return notFound(res)
+    json(res, 200, { milestones: listSharedMilestones(db, who.userId, convoId) })
+    return true
+  }
   if (filteredAgent(db, who) && privateOwnedConvo(db, convoId)) return notFound(res)
   json(res, 200, { milestones: listMilestones(db, who.userId, { convoId, excludePrivateOwned: filteredAgent(db, who) }) })
   return true
@@ -261,6 +281,12 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') return handleMilestoneList(ctx, res, url, who)
     return false
   }
+  // The cross-repo contract (coordinator redesign) names the create route
+  // POST /missions/create; the real one is POST /missions. Same handler.
+  // No mission id is ever 'create' (ids are ms_… or numbers), so this can
+  // never shadow a /missions/:id lookup. Any other method falls through to
+  // the ordinary 404.
+  if (path === '/missions/create') return req.method === 'POST' ? handleCreate(ctx, req, res, who) : false
   if (path !== '/missions' && !path.startsWith('/missions/')) return false
   if (path === '/missions') {
     if (req.method === 'POST') return handleCreate(ctx, req, res, who)
@@ -274,7 +300,13 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   try { idOrNum = decodeURIComponent(m[1]) } catch { return badRequest(res) }
   const sub = m[2] || null
   const mission = visibleMission(db, who, idOrNum)
-  if (!mission) return notFound(res)
+  if (!mission) {
+    const shared = getSharedMission(db, who.userId, idOrNum)
+    if (!shared) return notFound(res)
+    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared)); return true }
+    json(res, 403, { error: 'forbidden' })
+    return true
+  }
   if (!sub) {
     if (req.method === 'GET') {
       // Only null if the mission vanished between the gate above and this

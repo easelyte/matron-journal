@@ -29,6 +29,7 @@ Node 20+. A systemd unit template is in
 ### Create users and devices
 
     printf %s "$PW" | MATRON_DB=./matron.db npx matron-admin user add dan --password-stdin
+    MATRON_DB=./matron.db npx matron-admin user admin dan on
     MATRON_DB=./matron.db npx matron-admin agent add dan dev-2
     MATRON_DB=./matron.db npx matron-admin link-code dan --server-url https://journal.example.com --expires 30m
     MATRON_DB=./matron.db npx matron-admin device list dan
@@ -57,6 +58,14 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
+| `MATRON_GITHUB_CLIENT_ID` | unset (empty; linking disabled) | GitHub OAuth App client id for account linking (device flow). Empty disables linking; will default to Matron's published OAuth App id once one is registered |
+| `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
+| `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
+| `MATRON_TOKEN_KEY` | unset (tokens stored as-is) | 64 hex chars (`openssl rand -hex 32`). Seals stored GitHub tokens with AES-256-GCM; existing rows are sealed at the next start. Losing it means every user re-links |
+| `MATRON_WEB_DIR` | unset (nothing served) | Directory of the built tracker web app. Served read-only with `index.html` fallback for `/u/*` and `/app/*` |
+| `MATRON_APPLE_APP_IDS` | unset (404) | Comma-separated `TEAMID.bundle.id` list for `/.well-known/apple-app-site-association`, claiming `/u/*` |
+| `MATRON_ANDROID_PACKAGE` | unset (404) | Android package name for `/.well-known/assetlinks.json`; needs `MATRON_ANDROID_CERT_SHA256` too |
+| `MATRON_ANDROID_CERT_SHA256` | unset | Comma-separated signing-cert SHA-256 fingerprints (`AA:BB:…`) for assetlinks |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |
 | `MATRON_MEDIA_MAX_BYTES` | 50 MiB (`52428800`) | Upload size limit |
 | `MATRON_WHISPER_MODEL` | unset (off) | Path to a whisper.cpp model (`…/whisper.cpp/models/ggml-base.bin`). Set it and voice notes on tracker items are transcribed here on upload instead of waiting for the origin box; needs `ffmpeg` on `PATH`. Under the shipped systemd unit install whisper.cpp outside `/home` (e.g. `/opt/whisper.cpp`) — `ProtectHome=yes` hides it otherwise |
