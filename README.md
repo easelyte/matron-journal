@@ -85,6 +85,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
+| `MATRON_FILE_OWNER_USER_ID` | unset | Numeric journal user ID authorized to use the File Explorer (`/files*`, read and write). **Required** whenever `MATRON_FILE_READ_ROOTS` (or writes) are enabled: unset or malformed, every `/files` request answers 500. Every other user, admin or not, gets 403 |
 | `WORK_VIEW_OWNER_USER_ID` | unset | Numeric journal user ID authorized to access `GET /work`; required to activate the Work view |
 | `WORK_VIEW_PRODUCER_ROOT` | unset | Absolute directory containing `scripts/work_view_cli.py`; required to activate the Work view |
 | `WORK_VIEW_STORE_PATH` | producer default | Optional canonical loop-store path passed to the Work-view producer |

@@ -22,7 +22,7 @@ import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
-import { createWorkView, handleWorkRoute } from './work-http.js'
+import { createWorkView, handleWorkRoute, parseOwnerUserId } from './work-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
@@ -115,9 +115,13 @@ const rejectEarly = (req, res, status, obj) => {
 const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__', '.matron-trash'])
 const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
+// The whole File Explorer namespace: `/files` itself (DELETE) and every
+// `/files/*` route. One predicate, so the owner gate and the static-hosting
+// exclusion can never disagree about which paths are the file API's.
+const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -135,11 +139,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
   // before the listener is returned, and no request can supply or replace the
   // owner/root configuration.
   const workView = createWorkView({ ...workViewOptions, db })
+  // File Explorer owner (see the gate in the handler). Accepts the parsed
+  // number from startServer or a raw string; anything else is null, and null
+  // refuses every /files request.
+  const fileOwnerId = typeof fileOwnerUserId === 'number'
+    ? (Number.isSafeInteger(fileOwnerUserId) && fileOwnerUserId > 0 ? fileOwnerUserId : null)
+    : parseOwnerUserId(fileOwnerUserId)
+  const filesLive = !!fileReadRoots || !!(fileWriteCtx.fileEnableWrites && fileWriteCtx.fileWriteRoots && fileWriteCtx.audit)
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
-      if (await handleStatic(req, res, url)) return
+      // /files is the File Explorer's namespace and is owner-authorized below;
+      // static hosting (which runs before auth) must never answer for it.
+      if (!isFilesPath(url.pathname) && await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
         // (the tunnel is the only route in, so this header is trustworthy here).
@@ -306,6 +319,26 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // boundary and jailed server-side to the pinned read-roots + always-on
       // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
       // rejection reasons uniform.
+      // Owner gate (same shape as GET /work): the File Explorer exposes the
+      // server's own disk, which belongs to the journal's operator, not to
+      // whichever user a client device happens to be signed in as. A second
+      // user (including an admin one) must never inherit read access to the
+      // read-roots or write access to the write-roots. Checked ONCE, here,
+      // for every /files and /files/* path before any route-specific work —
+      // so no audit line, idempotency reservation, or fs call happens for a
+      // caller who is not the owner. Only while the feature is live: a
+      // disabled deploy keeps its fall-through 404 (feature-off parity).
+      // Fails closed: an absent or unparseable owner id serves nothing.
+      if (filesLive && isFilesPath(url.pathname)) {
+        // rejectEarly, not json: an upload/write body is still unread here,
+        // and those bytes must not be left on a keep-alive socket.
+        if (who.kind !== 'client') return rejectEarly(req, res, 403, { error: 'forbidden' })
+        if (fileOwnerId === null) {
+          console.error('file API: MATRON_FILE_OWNER_USER_ID is absent or is not a positive integer; refusing /files requests')
+          return rejectEarly(req, res, 500, { error: 'internal' })
+        }
+        if (who.userId !== fileOwnerId) return rejectEarly(req, res, 403, { error: 'forbidden' })
+      }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
