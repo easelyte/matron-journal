@@ -60,6 +60,18 @@ const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 // and a garbage MATRON_MAX_REPLAY would make the snapshot_required valve
 // never fire. Fails closed to `defaultValue` instead, with one warn log
 // naming the var, so a misconfiguration is loud rather than invisible.
+// On/off env flag: 1/true/on/yes and 0/false/off/no (case-insensitive);
+// unset -> default; anything else warns and falls back to the default, the
+// same fail-visible stance as resolveNumericEnv.
+export function resolveBooleanEnv(name, raw, defaultValue) {
+  if (raw === undefined) return defaultValue
+  const v = String(raw).trim().toLowerCase()
+  if (['1', 'true', 'on', 'yes'].includes(v)) return true
+  if (['0', 'false', 'off', 'no'].includes(v)) return false
+  console.warn(`${name}=${JSON.stringify(raw)} is invalid (expected 1/0, true/false, on/off, yes/no) — using default ${defaultValue}`)
+  return defaultValue
+}
+
 export function resolveNumericEnv(name, raw, defaultValue) {
   if (raw === undefined) return defaultValue
   const n = Number(raw)
@@ -387,7 +399,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
@@ -628,6 +640,9 @@ export function startServer({
     // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
     pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
+    // permessage-deflate for clients that offer it (see WS_DEFLATE_OPTIONS);
+    // MATRON_WS_DEFLATE=0 turns it off without a code change.
+    perMessageDeflate: wsDeflate ?? resolveBooleanEnv('MATRON_WS_DEFLATE', process.env.MATRON_WS_DEFLATE, true),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never

@@ -28,14 +28,14 @@ export async function startTestServer(opts = {}) {
   }
 }
 
-export function makeWsClient(base, { token, cursor }) {
+export function makeWsClient(base, { token, cursor, ...helloExtra }) {
   const ws = new WebSocket(base.replace('http', 'ws') + '/ws')
   const frames = []
   ws.on('message', (d) => frames.push(JSON.parse(d)))
   return new Promise((resolve, reject) => {
     ws.on('error', reject)
     ws.on('open', () => {
-      ws.send(JSON.stringify({ op: 'hello', token, cursor }))
+      ws.send(JSON.stringify({ op: 'hello', token, cursor, ...helloExtra }))
       resolve({
         ws,
         frames,
