@@ -140,7 +140,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     },
     // Host-global vitals fan-out (host_vitals op): the bridge samples the
     // machine (cpu/ram) with no convo scope, so this deliberately bypasses
-    // the viewingConvoId filter that sendEphemeral applies — every one of the
+    // the viewingConvoIds filter that sendEphemeral applies — every one of the
     // user's CLIENT connections receives it regardless of what convo (if any)
     // they're viewing. Agent connections are excluded (nothing to render).
     // Direct send, no coalescer: the cadence is slow (~5s) and the frame

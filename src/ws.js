@@ -2064,7 +2064,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // agent-only stance as status, but deliberately NOT convo-scoped: the
         // frame carries no convo_id, there is no authorize() ownership check
         // (host vitals belong to the machine, not a conversation), and the
-        // broadcast bypasses the viewingConvoId filter that sendEphemeral
+        // broadcast bypasses the viewingConvoIds filter that sendEphemeral
         // applies. Never journaled — pure ephemeral, so no appendAndFan. The
         // last sample is cached per user and replayed on client connect.
         // Payload is opaque to the server, validated only as a size-capped
