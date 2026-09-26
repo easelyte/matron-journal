@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
+import { pipeline } from 'node:stream/promises'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
@@ -11,6 +12,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
@@ -21,6 +23,12 @@ import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { createWorkView, handleWorkRoute } from './work-http.js'
+import { handleGithubRoute, handleGithubCallback } from './github-http.js'
+import { handleLookupRoute } from './lookup-http.js'
+import { handleUsersRoute } from './users-http.js'
+import { githubAccountView } from './github-accounts.js'
+import { handleCoordinatorRoute } from './coordinator-http.js'
+import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -109,7 +117,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, workViewOptions }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -130,6 +138,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
+      if (handleWellKnown(req, res, url)) return
+      if (await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
         // (the tunnel is the only route in, so this header is trustworthy here).
@@ -284,6 +294,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!l) return json(res, 429, { error: 'rate_limited' })
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
+      if (await handleGithubCallback({ db, github, tokenBox: tokenBox || undefined }, req, res, url)) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // --- File Explorer read API (spec: matron-file-explorer §5) -----------
@@ -486,6 +497,18 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleWorkRoute(workView, req, res, url, who)) return
+      if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
+      if (handleLookupRoute({ db }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (req.method === 'GET' && url.pathname === '/me') {
+        const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
+        return json(res, 200, {
+          user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
+          github: githubAccountView(db, who.userId),
+          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
+        })
+      }
+      if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
@@ -503,7 +526,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         //     agent only — same one-caller-rule predicate as /roster and
         //     /search, so /snapshot can't be used as an end-run around them.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
+        return json(res, 200, {
+          ...snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }),
+          coordinator_convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filtered }),
+        })
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
@@ -928,6 +954,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Shared conversations (spec 2026-09-23 tracker web/teams): a
+        // colleague's conversation under the org rule is readable as a
+        // context window only — the same prose-only, clamped, logged
+        // regime as a foreign agent's search-hit read below, with the
+        // owner's user id driving the query. canReadConvo runs the private
+        // sieve inside the rule, so a refused read never reaches the log.
+        const ownerRow = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+        if (ownerRow && ownerRow.owner_user_id !== who.userId) {
+          if (aroundSeq == null || !canReadConvo(db, who.userId, convoId)) return json(res, 404, { error: 'not_found' })
+          const events = messagesAroundIndexed(db, ownerRow.owner_user_id, convoId, { aroundSeq, limit: Math.min(limit, 30) })
+            .filter((e) => indexableBody(e.type, e.payload) != null)
+          console.log(`journal: shared context read convo=${convoId} viewer=${who.userId} device=${who.deviceId} anchor=${aroundSeq}`)
+          return json(res, 200, { events: events.map(toEventShape) })
+        }
         // Two agent read regimes (locked decision, search spec fold-in):
         //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
         //    reads full transcripts only for conversations it manages or has
@@ -1051,7 +1091,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // owner learns from a 403 that a 404 doesn't already hide just as well,
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
-        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        if (!blob) return json(res, 404, { error: 'not_found' })
+        if (blob.owner_user_id !== who.userId) {
+          // Shared visibility (spec 2026-09-23 tracker web/teams): a
+          // colleague reaches a blob only through a shared row that
+          // references it; canReadBlob is the one copy of that rule.
+          if (!canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
+          console.log(`journal: shared media read blob=${blob.id} viewer=${who.userId} device=${who.deviceId}`)
+        }
         // Stat the file before ever committing to a 200: the DB row can
         // outlive/disagree with the file on disk (deleted out from under
         // it, truncated by a disk issue, etc). Catching that here means a
@@ -1081,12 +1128,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           'x-content-type-options': 'nosniff',
           'content-disposition': 'attachment',
         })
-        await new Promise((resolve) => {
-          const stream = fs.createReadStream(blob.disk_path)
-          stream.on('error', () => { res.destroy(); resolve() })
-          stream.on('close', resolve)
-          stream.pipe(res)
-        })
+        // pipeline (not .pipe()) so a client abort mid-body destroys the read
+        // stream promptly instead of leaking its fd (.pipe() never forwards a
+        // destination close/error back to the source) — same fix as
+        // static-http.js's file serving.
+        await pipeline(fs.createReadStream(blob.disk_path), res).catch(() => {})
         return
       }
       return json(res, 404, { error: 'not_found' })

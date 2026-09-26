@@ -14,7 +14,7 @@
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "pre-revocation" }, "local_id": "p1" } },
     { "kind": "ws_expect", "conn": "client", "frame": {

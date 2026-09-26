@@ -1304,3 +1304,145 @@ test('the user may close a pending consent item by hand; an agent cannot even in
   assert.equal(s.db.prepare('SELECT state FROM items WHERE id=?').get(item.id).state, 'open')
   assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled' } })).status, 200)
 })
+
+// A mission parked on the parent's own conversation WITHOUT joining it —
+// the shape the Coordinator's mission_create produces (attach:false).
+async function missionFor(s, token, { close = false } = {}) {
+  const r = await s.http('/missions', { method: 'POST', token, body: { title: 'Spawned work', convo_id: 'parent-convo', attach: false } })
+  assert.equal(r.status, 201)
+  if (close) assert.equal((await s.http(`/missions/${r.json.mission.id}/close`, { method: 'POST', token, body: { summary: 'done' } })).status, 200)
+  return r.json.mission
+}
+const isError = (f) => f.kind === 'control' && f.op === 'error'
+
+test('spawn_request with mission_num: unknown → no_mission, closed → mission_closed, junk → bad_request; nothing parked, no card', async (t) => {
+  const { s, parentDev, targetDev, parent, client } = await spawnFleet(t)
+  const closed = await missionFor(s, parentDev.token, { close: true })
+  const ask = (rid, missionNum) => parent.send({
+    op: 'spawn_request', request_id: rid, from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', mission_num: missionNum,
+  })
+  ask('q1', 999)
+  assert.equal((await parent.waitFor(isError)).code, 'no_mission')
+  parent.frames.length = 0
+  ask('q2', closed.num)
+  assert.equal((await parent.waitFor(isError)).code, 'mission_closed')
+  for (const junk of ['one', 0, 1.5]) {
+    parent.frames.length = 0
+    ask(`q-${junk}`, junk)
+    assert.equal((await parent.waitFor(isError)).code, 'bad_request', `mission_num ${JSON.stringify(junk)}`)
+  }
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(client.frames.find(isSpawnCard), undefined)
+})
+
+test('spawn_request with an open mission parks mission_num on the row, the card and the consent item; without one the card has no key', async (t) => {
+  const { s, parentDev, targetDev, parent, client } = await spawnFleet(t)
+  parent.send({ op: 'spawn_request', request_id: 'q0', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'plain' })
+  await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  const plainCard = await client.waitFor(isSpawnCard)
+  assert.ok(!('mission_num' in plainCard.payload))
+  parent.frames.length = 0; client.frames.length = 0
+
+  const m = await missionFor(s, parentDev.token)
+  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'mission work', mission_num: m.num })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(getSpawn(s.db, ack.spawn_id).mission_num, m.num)
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.payload.mission_num, m.num)
+  assert.equal(card.payload.mission_title, 'Spawned work')
+  const body = s.db.prepare('SELECT i.body FROM items i JOIN agent_spawn_requests r ON r.item_id = i.id WHERE r.id=?').get(ack.spawn_id).body
+  assert.ok(body.includes(`- **Joins mission #${m.num}** — Spawned work`), body)
+})
+
+// Test gap (final review finding 2) — spawn_request's mission sieve
+// (ws.js ~917-930): excludePrivateOwned = !isPrivateDevice(asker) ||
+// !isPrivateDevice(target). A mission born in a private device's
+// conversation stays unfiltered ONLY when both the asker and the target
+// are private; if either is ordinary, the sieve applies and the mission is
+// no more visible than if it didn't exist.
+test('spawn_request mission sieve: a private-origin mission is invisible unless BOTH the asking and target devices are private', async (t) => {
+  const { s, parentDev, targetDev, parent } = await spawnFleet(t)
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(parentDev.deviceId)
+  const mission = await missionFor(s, parentDev.token) // origin_convo_id = 'parent-convo', now owned by a private device
+
+  // Private asker, ORDINARY target: excludePrivateOwned=true — the mission
+  // is sieved out, same no_mission an unknown number gets.
+  parent.send({
+    op: 'spawn_request', request_id: 'q-ord-target', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', mission_num: mission.num,
+  })
+  assert.equal((await parent.waitFor(isError)).code, 'no_mission')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+  parent.frames.length = 0
+
+  // Private asker AND private target: unfiltered — the request is accepted
+  // and the mission is parked on the row exactly like an ordinary mission.
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(targetDev.deviceId)
+  parent.send({
+    op: 'spawn_request', request_id: 'q-priv-target', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', mission_num: mission.num,
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(getSpawn(s.db, ack.spawn_id).mission_num, mission.num)
+})
+
+async function missionSpawn(t) {
+  const fleet = await spawnFleet(t)
+  const { s, parentDev, targetDev, parent, client } = fleet
+  const mission = await missionFor(s, parentDev.token)
+  parent.send({
+    op: 'spawn_request', request_id: 'qm', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do the mission work', mission_num: mission.num,
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  parent.frames.length = 0
+  client.frames.length = 0
+  return { ...fleet, mission, spawnId: ack.spawn_id }
+}
+const approve = (s, clientToken, spawnId) => s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+
+test('approve with a mission: start carries mission_num; the child is a mission member before the parent hears started; its bridge upsert lands on the row', async (t) => {
+  const { s, targetDev, clientToken, parent, target, client, spawnId, mission } = await missionSpawn(t)
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.mission_num, mission.num)
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-m1' } })
+  })
+  assert.equal((await approve(s, clientToken, spawnId)).status, 200)
+  await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started'); assert.equal(out.child_convo_id, 'child-m1')
+
+  const child = s.db.prepare('SELECT mission_id, agent_device_id FROM conversations WHERE id=?').get('child-m1')
+  assert.equal(child.mission_id, mission.id)
+  assert.equal(child.agent_device_id, targetDev.deviceId, 'the pre-created row belongs to the target box')
+  const seq = (type, convo) => s.db.prepare('SELECT seq FROM events WHERE type=? AND convo_id=?').get(type, convo).seq
+  assert.ok(seq('mission', 'child-m1') < seq('spawn_outcome', 'parent-convo'), 'joined before the outcome was journaled')
+  const joined = await target.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'child-m1')
+  assert.equal(joined.payload.action, 'joined'); assert.equal(joined.payload.num, mission.num)
+  const detail = await s.http(`/missions/${mission.num}`, { token: clientToken })
+  assert.deepEqual(detail.json.conversations.map((c) => c.id), ['child-m1'])
+  assert.equal(detail.json.mission.conversations, 1, 'no longer unassigned')
+
+  // The child's bridge publishes its conversation on its own schedule —
+  // after the journal already created the row. It must land in place.
+  target.send({ op: 'convo_upsert', convo_id: 'child-m1', title: 'child session', session_state: 'running' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'child-m1')
+  assert.equal(meta.payload.title, 'child session')
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child-m1').mission_id, mission.id)
+})
+
+test('approve after the mission closed: failed with mission_closed, no start rpc, nothing joined', async (t) => {
+  const { s, clientToken, parent, target, spawnId, mission } = await missionSpawn(t)
+  assert.equal((await s.http(`/missions/${mission.id}/close`, { method: 'POST', token: clientToken, body: { summary: 'called off' } })).status, 200)
+  target.frames.length = 0
+  assert.equal((await approve(s, clientToken, spawnId)).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'failed'); assert.equal(out.error_code, 'mission_closed')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(target.frames.find((f) => f.kind === 'rpc' && f.request?.method === 'start'), undefined, 'nothing spawned')
+  assert.equal(getSpawn(s.db, spawnId).state, 'failed')
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(mission.id).n, 0)
+})

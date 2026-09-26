@@ -976,6 +976,8 @@ test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing row
   const cols = db.prepare('PRAGMA table_info(agent_spawn_requests)').all().map((c) => c.name)
   assert.ok(cols.includes('link'), 'link column missing after migration')
   assert.ok(cols.includes('child_short'), 'child_short column missing after migration')
+  assert.ok(cols.includes('mission_num'), 'mission_num column missing after migration')
+  assert.equal(db.prepare('SELECT mission_num FROM agent_spawn_requests WHERE id=?').get('old').mission_num, null)
   assert.equal(db.prepare('SELECT link FROM agent_spawn_requests WHERE id=?').get('old').link, 1)
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
@@ -1025,4 +1027,84 @@ test('old-schema device_status (no cascade) is rebuilt in place: live rows kept,
   db.close()
 
   assert.doesNotThrow(() => openDb(dbPath).close())
+})
+
+test('schema: repo columns and github tables exist', () => {
+  const db = openDb(':memory:')
+  const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
+  assert.ok(cols('conversations').includes('repo'))
+  assert.ok(cols('conversations').includes('repo_scope'))
+  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at', 'token_hash'])
+  assert.deepEqual(cols('github_orgs'), ['user_id', 'scope'])
+  assert.deepEqual(cols('github_link_flows'), ['id', 'user_id', 'device_id', 'flow', 'device_code', 'state', 'expires_at', 'created_at'])
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(2,'pat','x',0)").run()
+  const ins = db.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, linked_at) VALUES(?, 'github.com', 7, 'dan', 't', 'ok', 0)")
+  ins.run(1)
+  assert.throws(() => ins.run(2), /UNIQUE/, 'one GitHub account binds to one user')
+  db.close()
+})
+
+test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing populated database in place', () => {
+  const dir = makeTmpDir('matron-repo-migration-')
+  const dbPath = path.join(dir, 'pre-repo.db')
+
+  // A conversations table shaped like the one before the tracker
+  // visibility branch: no repo, no repo_scope, and no github_* tables.
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  raw.prepare("INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c1',1,'legacy',0)").run()
+  raw.prepare("INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c2',1,'legacy two',0)").run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+  assert.ok(cols.includes('repo'), 'repo column missing after migration')
+  assert.ok(cols.includes('repo_scope'), 'repo_scope column missing after migration')
+  const indexes = db.prepare('PRAGMA index_list(conversations)').all().map((i) => i.name)
+  assert.ok(indexes.includes('idx_conversations_repo_scope'), 'repo_scope index missing after migration')
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((t) => t.name)
+  for (const t of ['github_accounts', 'github_orgs', 'github_link_flows']) assert.ok(tables.includes(t), `${t} missing after migration`)
+  // Pre-existing rows survive untouched, with the new columns NULL — so a
+  // legacy conversation is never mistaken for one in some org's scope.
+  const rows = db.prepare('SELECT id, title, repo, repo_scope FROM conversations ORDER BY id').all()
+  assert.deepEqual(rows, [
+    { id: 'c1', title: 'legacy', repo: null, repo_scope: null },
+    { id: 'c2', title: 'legacy two', repo: null, repo_scope: null },
+  ])
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM github_accounts').get().n, 0)
+  db.close()
+
+  // Re-opening (already migrated) is a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
+  const dir = makeTmpDir('matron-admin-migration-')
+  const dbPath = path.join(dir, 'pre-admin.db')
+  const raw = new Database(dbPath)
+  raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)')
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  raw.close()
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name)
+  assert.ok(cols.includes('is_admin'), 'is_admin column missing after migration')
+  assert.deepEqual(db.prepare('SELECT id, name, is_admin FROM users').all(), [{ id: 1, name: 'dan', is_admin: 0 }])
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
 })

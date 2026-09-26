@@ -38,6 +38,23 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   ordinary agent): a foreign read returns indexed prose only, clamps
   \`limit\` to 30, and is logged server-side.
 - \`GET /snapshot\` — bootstrap state for this device.
+- \`GET /items?scope=shared\` and \`GET /missions?scope=shared\` — a
+  colleague's items and missions you may read: filed from a conversation
+  whose repo belongs to a GitHub org both of you are verified members of
+  (see "Shared visibility" in docs/protocol.md). Rows carry \`owner\`;
+  item rows also carry \`repo\`. \`GET /items/:id\` / \`GET /missions/:id\`
+  read one such row; every write to it is 403. \`GET /milestones?convo=<id>\`
+  works on a shared conversation.
+- \`GET /lookup?user=<name>&num=<n>\` — resolves a shareable link
+  (\`https://<journal>/u/<name>/<n>\`) to \`{kind, id, owner}\`; 404 when
+  unknown or not visible to you.
+- \`GET /me\` — \`{user:{id, name, is_admin}, github, github_linking}\`: who
+  you are, whether your user is a journal admin, and your GitHub link
+  state. The users admin routes themselves are for the web app's client
+  session, never for an agent.
+- \`GET /convo/:id/messages?around_seq=<seq>&limit=<n>\` on a colleague's
+  shared conversation returns the prose window around \`seq\` (\`text\`
+  and \`diff\` only, \`limit\` clamped to 30, logged).
 
 ## Items (task & decision tracker)
 
@@ -59,11 +76,11 @@ transcribing is the origin bridge's job); those 404 on refusal.
   — one ranked list per user; \`{items, next_cursor}\`, limit ≤ 500.
 - \`GET /items/:id\` — \`{item, comments}\` (comments oldest first).
 - \`POST /items\` \`{kind, title, body?, labels?, links?, attachments?,
-  awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
+  actions?, awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
   position:'top'|'bottom' / after / before}\` → 201 \`{item}\`. Send
   \`on_behalf_of:'user'\` when the USER asked for the item, so it reads as
   theirs. Optional \`Idempotency-Key\` header (replay → 200, no second marker).
-- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?,
+- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?, actions?,
   mission?: id|"#num"|null}\` → 200 \`{item}\`; \`attachments\` is 400
   (create-only in v1), moving \`awaiting\` on a closed item is 409, and a
   \`mission\` that does not exist or that you cannot see is 404 (never 403).
@@ -73,6 +90,12 @@ transcribing is the origin bridge's job); those 404 on refusal.
 - \`POST /items/:id/comments\` \`{body?, attachments?}\` (at least one) → 201
   \`{item, comment}\`. A USER comment always flips \`awaiting\` to \`agent\`
   and reopens a closed item; yours as an agent never flips it.
+- \`actions\` (create/PATCH): up to 4 one-tap answer buttons the user sees on
+  the item, e.g. \`["Go"]\` or \`["Option A","Option B"]\` — each 1–40 chars,
+  one line, unique ignoring case (else 400 \`invalid_actions\`); \`[]\` clears.
+  A tap is a user comment whose body is the label, with \`comment.action\` set
+  to it and the item's \`chosen_action\` = the latest tap (changing
+  \`actions\` clears it). Only the user taps: \`action\` on your comment is 403.
 - \`PATCH /items/:id/comments/:cid\` \`{blob_ref, transcript}\` — agent-only
   write-back after transcribing a voice-note attachment; one sent on a
   create/comment is dropped. When the journal transcribes itself, a user's
@@ -103,12 +126,18 @@ same mission is a 200 no-op, a repeat close is 409 \`already_closed\`). The
 mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 \`publish\` yourself.
 
-- \`POST /missions\` \`{title, body?, convo_id}\` → 201 \`{mission}\`
+- \`POST /missions\` \`{title, body?, convo_id, attach?}\` → 201 \`{mission}\`
   with the next \`#num\`; 200 \`{mission, existing: true}\` if that
   conversation already has one (nothing changes), or 404 if that existing
   mission is one you cannot see — same 404 as an unknown conversation, never
   an existence oracle. Attaches the conversation and repoints its unassigned
-  items.
+  items. With \`attach: false\` it creates a NEW, unassigned mission whose
+  origin is that conversation but touches neither the conversation nor its
+  items (no \`existing\` short-circuit). \`POST /missions/create\` is the
+  same route.
+- \`GET /coordinator\` → \`{convo_id}\` — the user's Coordinator
+  conversation, or null. Only the user sets it; you hear a change as a
+  \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
   per-row \`open_items\`, \`needs_you\`, \`conversations\`,
   \`milestones\`, \`last_milestone\`; most recent activity first.

@@ -10,6 +10,7 @@ import {
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation, messagesBefore } from '../src/journal.js'
 import { refreshSpawnRoomTitle } from '../src/spawns.js'
+import { createMission } from '../src/missions.js'
 
 async function seed() {
   const db = openDb(':memory:')
@@ -17,6 +18,15 @@ async function seed() {
   const parent = createAgent(db, dan.id, 'dev-6')
   const target = createAgent(db, dan.id, 'eric')
   return { db, dan, parent, target }
+}
+
+// A mission parked on the parent's own conversation without joining it
+// (attach:false), the shape the Coordinator's mission_create produces.
+function makeMission(db, dan, parent) {
+  upsertConversation(db, { id: 'parent-convo', ownerUserId: dan.id, title: 'parent work', sessionState: 'running', agentDeviceId: parent.deviceId })
+  return createMission(db, {
+    userId: dan.id, deviceId: parent.deviceId, createdBy: 'user', convoId: 'parent-convo', title: 'Spawned work', attach: false,
+  }).mission
 }
 
 function makeRow(db, dan, parent, target, id = 'spawn-1', now = 1000, model = '', link = true) {
@@ -321,6 +331,7 @@ test('approveSpawn on a detached row: no room, no room_id on the wire, started o
   claimApprove(db, 's-detached')
   assert.equal(await approveSpawn({ db, hub, broker: okBroker(params), startTimeoutMs: 50 }, getSpawn(db, 's-detached')), 'started')
   assert.ok(!('room_id' in params[0]), 'a detached spawn must not hand the child a room')
+  assert.ok(!('mission_num' in params[0]), 'a spawn that named no mission sends none')
   assert.equal(params[0].prompt, 'do the thing')
   assert.equal(params[0].from_name, 'dev-6')
   assert.deepEqual(roomRows(db), [], 'no conversation row was minted')
@@ -398,6 +409,66 @@ test('the target side gains its tag once the child bridge publishes a title (at 
   assert.ok(metas.some((m) => m.payload.title === 'D:ab ↔️ E:ef — thing'))
   // A conversation that is nobody's spawn child is a no-op.
   assert.equal(refreshSpawnRoomTitle(db, hub, 'parent-convo'), false)
+})
+
+// ---- joinSpawnMission convo-exists branch (final review finding 1) ------
+//
+// The child conversation row can already exist by the time the `start`
+// reply lands — the target bridge's own convo_upsert can beat it, or (the
+// attack this guards) a buggy/hostile target bridge can answer `start`
+// with the id of some OTHER conversation the user already owns. Only
+// owner_user_id was checked before this fix; convo_upsert's own takeover
+// gate (ws.js ~1552) requires the row be unowned or owned by the caller's
+// own device, and this path must not bypass that gate just because it
+// writes through joinMission instead of convo_upsert.
+
+test('joinSpawnMission joins an existing child row owned by the target device, or not yet owned by anyone', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub } = quietHub()
+  const mission = makeMission(db, dan, parent)
+
+  // Already owned by the TARGET device (its own convo_upsert beat the
+  // start reply) — joined exactly as a fresh row would be.
+  upsertConversation(db, { id: 'child-owned', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: target.deviceId })
+  makeRow(db, dan, parent, target, 's-owned', 1000, '', false)
+  db.prepare('UPDATE agent_spawn_requests SET mission_num=? WHERE id=?').run(mission.num, 's-owned')
+  claimApprove(db, 's-owned')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker([], 'child-owned'), startTimeoutMs: 50 }, getSpawn(db, 's-owned')), 'started')
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child-owned').mission_id, mission.id)
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM events WHERE type='mission' AND convo_id=?").get('child-owned').c, 1)
+
+  // Not yet owned by any device (agent_device_id NULL) — also joined.
+  upsertConversation(db, { id: 'child-unowned', ownerUserId: dan.id, sessionState: 'running' })
+  makeRow(db, dan, parent, target, 's-unowned', 1000, '', false)
+  db.prepare('UPDATE agent_spawn_requests SET mission_num=? WHERE id=?').run(mission.num, 's-unowned')
+  claimApprove(db, 's-unowned')
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker([], 'child-unowned'), startTimeoutMs: 50 }, getSpawn(db, 's-unowned')), 'started')
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child-unowned').mission_id, mission.id)
+})
+
+test('joinSpawnMission skips an existing child row owned by a DIFFERENT device — no takeover, no marker, spawn still started', async () => {
+  const { db, dan, parent, target } = await seed()
+  const { hub } = quietHub()
+  const mission = makeMission(db, dan, parent)
+  const other = createAgent(db, dan.id, 'other-box')
+
+  // The id the (hostile/buggy) target bridge answers `start` with is really
+  // another of the user's own conversations, owned by a different device —
+  // exactly the shape convo_upsert's takeover gate blocks for an ordinary
+  // upsert.
+  upsertConversation(db, { id: 'private-convo', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: other.deviceId })
+  makeRow(db, dan, parent, target, 's-hostile', 1000, '', false)
+  db.prepare('UPDATE agent_spawn_requests SET mission_num=? WHERE id=?').run(mission.num, 's-hostile')
+  claimApprove(db, 's-hostile')
+  // Spawn orchestration itself still succeeds — the join is best-effort and
+  // must not turn a live, already-started session into a reported failure.
+  assert.equal(await approveSpawn({ db, hub, broker: okBroker([], 'private-convo'), startTimeoutMs: 50 }, getSpawn(db, 's-hostile')), 'started')
+  assert.equal(db.prepare('SELECT mission_id, agent_device_id FROM conversations WHERE id=?').get('private-convo').mission_id, null,
+    'the other device\'s conversation must not be silently pulled onto the mission')
+  assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('private-convo').agent_device_id, other.deviceId,
+    'ownership must not change either')
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM events WHERE type='mission' AND convo_id=?").get('private-convo').c, 0,
+    'no joined marker was appended into a conversation this spawn has no standing to touch')
 })
 
 test('a room title honours tag_char overrides and derives letters against the whole roster', async () => {

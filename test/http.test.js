@@ -4,6 +4,12 @@ import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { inviteParticipant, answerInvite } from '../src/participants.js'
+import { saveGithubIdentity, markGithubStale } from '../src/github-accounts.js'
+import { createItem } from '../src/items.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { pinDevicePrivate } from '../src/db.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
   const s = await startTestServer()
@@ -563,4 +569,92 @@ test('GET /snapshot exposes each convo agent_device_id and the agents id->name l
   s.db.prepare('UPDATE devices SET tag_char=? WHERE id=?').run('y', agent.deviceId)
   const tagged = await s.http('/snapshot', { token: login.json.token })
   assert.deepEqual(tagged.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: 'y' }])
+})
+
+test('GET /convo/:id/messages?around_seq on a colleague\'s shared conversation: prose only, clamped, logged; private-owned stays 404 unlogged (review focus 5)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const dan = await createUser(s.db, 'dan', 'pw'); const pat = await createUser(s.db, 'pat', 'pw')
+  const box = createAgent(s.db, dan.id, 'dan-box'); const priv = createAgent(s.db, dan.id, 'dan-private')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  for (const [u, gid] of [[dan, 1], [pat, 2]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, title: 'C1', agentDeviceId: box.deviceId, repo: 'github.com/matronhq/x' })
+  upsertConversation(s.db, { id: 'pv', ownerUserId: dan.id, title: 'PV', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  for (let i = 0; i < 40; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: `m${i}` } })
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:dan-box', type: 'tool_output', payload: { text: 'SECRET' } })
+  }
+  append(s.db, { userId: dan.id, convoId: 'pv', sender: 'user:dan', type: 'text', payload: { body: 'private words' } })
+  const patTok = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const r = await s.http('/convo/c1/messages?around_seq=40&limit=200', { token: patTok })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.events.length <= 30 && r.json.events.length > 0)
+  assert.ok(r.json.events.every((e) => e.type === 'text'))
+  assert.ok(!JSON.stringify(r.json).includes('SECRET'))
+  assert.ok(logs.some((l) => /shared context read convo=c1 viewer=/.test(l)))
+  assert.equal((await s.http('/convo/c1/messages?before_seq=40', { token: patTok })).status, 404, 'paging stays owner-only')
+  const before = logs.length
+  const pv = await s.http('/convo/pv/messages?around_seq=1', { token: patTok })
+  assert.equal(pv.status, 404)
+  assert.equal(logs.filter((l) => /context read convo=pv/.test(l)).length, 0, 'a refused read is never logged as a read')
+  assert.equal(logs.length, before)
+  const patAgent = createAgent(s.db, pat.id, 'pat-box')
+  assert.equal((await s.http('/convo/c1/messages?around_seq=40', { token: patAgent.token })).status, 200, 'an agent reads with its user\'s visibility')
+})
+
+test('GET /media/:id on a colleague\'s blob: only via a shared prose event or a shared non-consent item that its owner filed; logged; owner path unchanged', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-shared-media-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const s = await startTestServer({ dbPath: path.join(dir, 'j.db') })
+  t.after(() => s.close())
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const dan = await createUser(s.db, 'dan', 'pw'); const pat = await createUser(s.db, 'pat', 'pw'); const sam = await createUser(s.db, 'sam', 'pw')
+  const box = createAgent(s.db, dan.id, 'dan-box'); const priv = createAgent(s.db, dan.id, 'dan-private')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  for (const [u, gid] of [[dan, 1], [pat, 2], [sam, 3]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, title: 'C1', agentDeviceId: box.deviceId, repo: 'github.com/matronhq/x' })
+  upsertConversation(s.db, { id: 'pv', ownerUserId: dan.id, title: 'PV', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  const tok = async (name) => (await s.http('/login', { method: 'POST', body: { username: name, password: 'pw', device_name: 'mac' } })).json.token
+  const danTok = await tok('dan'); const patTok = await tok('pat'); const samTok = await tok('sam')
+  const upload = async (token, text) => {
+    const up = await fetch(`${s.base}/media`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: Buffer.from(text) })
+    return (await up.json()).media_id
+  }
+  const get = (token, id) => fetch(`${s.base}/media/${id}`, { headers: { authorization: `Bearer ${token}` } })
+  const b = {}
+  for (const k of ['prose', 'tool', 'item', 'consent', 'priv', 'loose']) b[k] = await upload(danTok, `blob ${k}`)
+  append(s.db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: 'see attached' }, blobRef: b.prose })
+  append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:dan-box', type: 'tool_output', payload: { text: 'x' }, blobRef: b.tool })
+  const att = (ref) => [{ blob_ref: ref, mime: 'image/png', name: 'a.png', size: 3 }]
+  const file = (extra) => createItem(s.db, { userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: box.deviceId, createdBy: 'agent', ...extra })
+  file({ attachments: att(b.item) })
+  file({ attachments: att(b.consent), consent: 'spawn', awaiting: 'user' })
+  file({ attachments: att(b.priv), originConvoId: 'pv', originDeviceId: priv.deviceId })
+  // Laundering: dan's item pointing at pat's blob opens it to nobody else.
+  const patBlob = await upload(patTok, 'pats file')
+  file({ attachments: att(patBlob) })
+
+  assert.equal((await get(patTok, b.prose)).status, 200, 'referenced by a prose event in a shared conversation')
+  assert.equal((await get(patTok, b.item)).status, 200, 'attached to an item on a shared conversation')
+  assert.equal((await get(patTok, b.tool)).status, 404, 'tool output is not prose')
+  assert.equal((await get(patTok, b.consent)).status, 404, 'consent mirrors never cross the boundary')
+  assert.equal((await get(patTok, b.priv)).status, 404, 'private device')
+  assert.equal((await get(patTok, b.loose)).status, 404, 'unreferenced')
+  assert.equal((await get(samTok, patBlob)).status, 404, 'a reference by someone other than the blob owner opens nothing')
+  assert.equal((await get(patTok, patBlob)).status, 200, 'the owner is unaffected')
+  const shared = logs.filter((l) => /^journal: shared media read blob=/.test(l))
+  assert.equal(shared.length, 2)
+  assert.match(shared[0], new RegExp(`blob=${b.prose} viewer=${pat.id} device=\\d+$`))
+  // A stale link confers nothing, and the owner's own reads are untouched.
+  markGithubStale(s.db, pat.id)
+  assert.equal((await get(patTok, b.item)).status, 404)
+  assert.equal((await get(danTok, b.tool)).status, 200)
+  assert.equal((await get(danTok, b.consent)).status, 200)
 })

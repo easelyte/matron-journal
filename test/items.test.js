@@ -14,7 +14,7 @@ test('schema: items, item_comments, item_counters exist with the expected column
   assert.deepEqual(cols('items'), [
     'id', 'user_id', 'num', 'kind', 'state', 'resolution', 'awaiting', 'rank', 'title', 'body',
     'labels', 'links', 'supersedes', 'origin_convo_id', 'origin_device_id', 'created_by',
-    'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent',
+    'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent', 'actions', 'chosen_action',
   ])
   assert.deepEqual(cols('item_comments'), [
     'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at',
@@ -116,7 +116,7 @@ test('rowToItem / rowToComment do not expose internal columns', async () => {
   assert.ok(!('idem_key' in c), 'comment shape must not carry idem_key')
   assert.ok(!('user_id' in c), 'comment shape must not carry user_id')
   assert.equal(db.prepare('SELECT idem_key FROM item_comments WHERE id=?').get(c.id).idem_key, 'c1')
-  assert.deepEqual(Object.keys(c).sort(), ['attachments', 'author', 'body', 'created_at', 'device_id', 'id', 'item_id', 'kind', 'meta'])
+  assert.deepEqual(Object.keys(c).sort(), ['action', 'attachments', 'author', 'body', 'created_at', 'device_id', 'id', 'item_id', 'kind', 'meta'])
 })
 
 test('createItem idempotency returns the original row', async () => {
@@ -509,7 +509,7 @@ test('itemMarkerPayload carries the spec fields and trims the comment', async ()
     attachments: [{ blob_ref: 'b', mime: 'audio/mp4', name: 'v.m4a', size: 1 }] })
   const p = itemMarkerPayload({ item: r.item, action: 'commented', by: 'user', comment: r.comment })
   assert.equal(ITEM_EVENT_TYPE, 'item')
-  assert.deepEqual(Object.keys(p).sort(), ['action', 'awaiting', 'by', 'comment', 'item_id', 'kind', 'num', 'origin_convo_id', 'origin_convo_title', 'resolution', 'title'])
+  assert.deepEqual(Object.keys(p).sort(), ['action', 'actions', 'awaiting', 'by', 'chosen_action', 'comment', 'item_id', 'kind', 'num', 'origin_convo_id', 'origin_convo_title', 'resolution', 'title'])
   assert.equal(p.comment.body, 'use A'); assert.equal(p.comment.attachments[0].transcript, null)
   // Origin conversation rides on the marker for client-side provenance labelling.
   assert.equal(p.origin_convo_id, 'c1'); assert.equal(p.origin_convo_title, 'C1')

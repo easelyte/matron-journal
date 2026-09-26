@@ -139,3 +139,13 @@ test('chatConsentClosing: approve and deny are decided by the user; expiry and a
   assert.deepEqual(chatConsentClosing('left'), { resolution: 'cancelled', author: 'agent', comment: 'The room was closed before you answered.' })
   assert.equal(chatConsentClosing('weird').resolution, 'cancelled')
 })
+
+test('spawnConsentItemFields: a spawn onto a mission says "joins mission #N" with its title; without one the line is absent', () => {
+  const plain = spawnConsentItemFields(card)
+  assert.ok(!/joins mission/i.test(plain.body), 'no mission line without mission_num')
+  const withMission = spawnConsentItemFields({ ...card, mission_num: 42, mission_title: 'Ship the *panel*' })
+  // Title passed through plain(): markdown/control characters stripped, same as every other peer string here.
+  assert.ok(withMission.body.includes('- **Joins mission #42** — Ship the panel'), withMission.body)
+  const untitled = spawnConsentItemFields({ ...card, mission_num: 42 })
+  assert.ok(untitled.body.includes('- **Joins mission #42**\n'), 'no dangling dash when the title is absent')
+})

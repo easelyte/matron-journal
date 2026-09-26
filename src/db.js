@@ -319,6 +319,15 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Per-user settings (spec 2026-09-23 coordinator redesign §1a). A table, not
+-- a users column, so later per-user settings have a home. No row = every
+-- setting at its default. coordinator_convo_id is not a foreign key — same
+-- stance as conversations.mission_id; ownership is checked on write.
+CREATE TABLE IF NOT EXISTS user_settings(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  coordinator_convo_id TEXT,
+  updated_at INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
@@ -826,6 +835,13 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'child_short')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
   }
+  // Spawning onto a mission (spec 2026-09-23 coordinator redesign §1c): the
+  // per-user mission #num the child joins as soon as its conversation is
+  // known. NULL = no mission (every row predating the column). A number,
+  // not an id — it is what the asking agent named and what the card shows.
+  if (!spawnCols.some((c) => c.name === 'mission_num')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN mission_num INTEGER')
+  }
   // Consent items (spec 2026-09-22 consent-items): the tracker item that
   // mirrors this ask, NULL for rows predating the mirror (they resolve
   // without one). Not a foreign key — same stance as mission_id.
@@ -865,6 +881,17 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
+  // Item action buttons (2026-09-24 item-actions contract): `actions` is the
+  // JSON array of one-tap answer labels an agent offered, `chosen_action` the
+  // label of the user's most recent tap (NULL until one, and again whenever
+  // the offered list changes). Every pre-existing row reads as [] / NULL.
+  const itemActionCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemActionCols.some((c) => c.name === 'actions')) {
+    db.exec("ALTER TABLE items ADD COLUMN actions TEXT NOT NULL DEFAULT '[]'")
+  }
+  if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
+    db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
+  }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security
@@ -899,6 +926,78 @@ export function openDb(path) {
     if (orphans > 0) {
       console.log(`device_status: dropped ${orphans} report(s) whose device was already revoked`)
     }
+  }
+  // Repo identity (spec 2026-09-23 tracker web/teams). `repo` is the
+  // bridge-reported canonical `host/org/name`; `repo_scope` is the derived
+  // `host/org`, the unit visibility is decided on. Both NULL for every row
+  // predating the column and every conversation with no git remote.
+  const repoCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!repoCols.some((c) => c.name === 'repo')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN repo TEXT')
+  }
+  if (!repoCols.some((c) => c.name === 'repo_scope')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN repo_scope TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_repo_scope ON conversations(repo_scope)')
+  // GitHub account linking. One GitHub identity per journal user and one
+  // journal user per GitHub identity (the unique index). `token` is the
+  // user's read:org OAuth token, stored as-is (spec: "Token at rest").
+  // `state='stale'` = GitHub refused the token on the last refresh; the
+  // orgs rows stay but confer nothing until the user re-links.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS github_accounts(
+      user_id    INTEGER PRIMARY KEY REFERENCES users(id),
+      host       TEXT NOT NULL DEFAULT 'github.com',
+      github_id  INTEGER NOT NULL,
+      login      TEXT NOT NULL,
+      token      TEXT NOT NULL,
+      state      TEXT NOT NULL CHECK(state IN ('ok','stale')),
+      checked_at INTEGER,
+      linked_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_github_accounts_id ON github_accounts(host, github_id);
+    CREATE TABLE IF NOT EXISTS github_orgs(
+      user_id INTEGER NOT NULL REFERENCES github_accounts(user_id) ON DELETE CASCADE,
+      scope   TEXT NOT NULL,
+      PRIMARY KEY(user_id, scope)
+    );
+    CREATE INDEX IF NOT EXISTS idx_github_orgs_scope ON github_orgs(scope);
+    CREATE TABLE IF NOT EXISTS github_link_flows(
+      id          TEXT PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id),
+      device_id   INTEGER NOT NULL,
+      flow        TEXT NOT NULL CHECK(flow IN ('device','web')),
+      device_code TEXT,
+      state       TEXT,
+      expires_at  INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_github_link_flows_state ON github_link_flows(state);
+    CREATE TABLE IF NOT EXISTS github_link_confirms(
+      id            TEXT PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id),
+      nonce         TEXT NOT NULL UNIQUE,
+      token         TEXT NOT NULL,
+      identity_json TEXT NOT NULL,
+      expires_at    INTEGER NOT NULL,
+      created_at    INTEGER NOT NULL
+    );
+  `)
+  // SHA-256 of the plaintext token: the refresh path's "only touch the row
+  // I read" guard compares this, so the token column itself can be sealed
+  // (src/token-box.js). NULL only until sealStoredTokens runs at boot.
+  const ghCols = db.prepare('PRAGMA table_info(github_accounts)').all()
+  if (!ghCols.some((c) => c.name === 'token_hash')) {
+    db.exec('ALTER TABLE github_accounts ADD COLUMN token_hash TEXT')
+  }
+  // Journal admins (spec 2026-09-23 tracker web/teams, "User
+  // administration"). Bootstrapped from the shell with
+  // `matron-admin user admin <name> on`; the users admin routes need at
+  // least one. Default 0: an upgraded journal has no admin until someone
+  // with shell access says so.
+  const userCols = db.prepare('PRAGMA table_info(users)').all()
+  if (!userCols.some((c) => c.name === 'is_admin')) {
+    db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
   }
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.

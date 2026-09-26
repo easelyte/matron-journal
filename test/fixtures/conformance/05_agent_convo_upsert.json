@@ -13,21 +13,21 @@
       } } },
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0 }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0 }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
@@ -42,7 +42,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0 }
+      "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
     } }
   ]
 }

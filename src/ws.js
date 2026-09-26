@@ -3,13 +3,16 @@ import { WebSocketServer } from 'ws'
 import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
-import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
-import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
+import { parseRepo, REPO_MAX } from './repo-identity.js'
+import { participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
+import { coordinatorFor } from './coordinator.js'
+import { getMission } from './missions.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -73,6 +76,22 @@ const VITALS_MIN_INTERVAL_MS = 1000
 const RPC_MAX_BYTES = 16384
 const RPC_ID_MAX_CHARS = 128
 const RPC_NAME_MAX_CHARS = 64 // method and error.code
+// `viewing {convo_ids}`: at most VIEWING_SET_MAX distinct conversations per
+// connection (the Coordinator shows two; headroom, not a use case). Returns
+// the de-duplicated Set, or null when the value is not an array of non-empty
+// strings each ≤ CONVO_ID_MAX_CHARS, or has more than the cap after de-dup.
+const VIEWING_SET_MAX = 4
+function parseViewingConvoIds(value) {
+  if (!Array.isArray(value)) return null
+  const out = new Set()
+  for (const id of value) {
+    if (typeof id !== 'string' || !id || id.length > CONVO_ID_MAX_CHARS) return null
+    out.add(id)
+    if (out.size > VIEWING_SET_MAX) return null
+  }
+  return out
+}
+
 // CONVO_ID_MAX_CHARS (128, imported above) caps a parent_convo_id sent by a
 // bridge — see its doc comment in journal.js for why it lives there.
 // Cap for a session_outcome sent by a bridge. Shape-only, like the
@@ -309,7 +328,7 @@ export function attachWs({
       // mid-command never finalizes, so its buffer must expire and any viewer
       // must learn the stream is dead. Runs before the early-return below —
       // buffers expire even when no connection is registered.
-      for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
+      for (const ev of toolStreams.sweepIdle()) notifyStale(db, hub, ev)
       // Invite expiry (spec: 30 min default, generous because busy is
       // reported honestly via the ack). Piggybacks on this sweep timer, same
       // as the tool-stream idle sweep above. The initiator (room owner for
@@ -471,7 +490,7 @@ export function attachWs({
           // for every op handled today: any journal append it triggers gets a seq greater
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
-          conn = { ws, ...who, viewingConvoId: null }
+          conn = { ws, ...who, viewingConvoIds: new Set() }
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
           const headSeq = head ? head.seq : 0
@@ -480,7 +499,13 @@ export function attachWs({
           // rooms (own-echo guard, roster self-exclusion, room titles); the
           // token is otherwise opaque to them. Reuses the row authToken already
           // resolved (`who`) — no extra lookup.
-          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name }))
+          // coordinator_convo_id (spec 2026-09-23 coordinator redesign §1a):
+          // the user's Coordinator, so an app knows it on connect without a
+          // separate GET /coordinator. Sieved exactly like that route — an
+          // ordinary agent never learns a private-owned conversation's id.
+          // applyBridgePrivate ran above, so the flag is already current.
+          const coordinator = coordinatorFor(db, who.userId, { excludePrivateOwned: who.kind === 'agent' && !isPrivateDevice(db, who.deviceId) })
+          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
@@ -502,9 +527,8 @@ export function attachWs({
             const replaysTo = (convoId) => {
               let d = decisionCache.get(convoId)
               if (d === undefined) {
-                const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
-                d = owner == null || owner === who.deviceId
-                  || !!db.prepare("SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='joined'").get(convoId, who.deviceId)
+                const targets = agentTargetsFor(db, convoId)
+                d = targets == null || targets.has(who.deviceId)
                 decisionCache.set(convoId, d)
               }
               return d
@@ -634,7 +658,7 @@ export function attachWs({
       // the store and can't double-emit. Only agent connections ever open
       // buffers, so a client close returns [] harmlessly.
       for (const ev of toolStreams.closeForProducer(conn)) {
-        notifyStale(hub, ev, 'disconnected')
+        notifyStale(db, hub, ev, 'disconnected')
       }
     })
   })
@@ -648,11 +672,11 @@ export function attachWs({
 // message_ref. `reason` distinguishes the teardown trigger for the client
 // ('stale' = idle sweep/eviction, 'disconnected' = producer connection drop);
 // the client treats any `end` frame as terminal regardless.
-export function notifyStale(hub, entry, reason = 'stale') {
+export function notifyStale(db, hub, entry, reason = 'stale') {
   hub.sendEphemeral(entry.userId, entry.convoId, {
     kind: 'ephemeral', convo_id: entry.convoId, message_ref: entry.ref,
     tool_stream: { event: 'end', reason },
-  })
+  }, () => agentTargetsFor(db, entry.convoId))
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
@@ -710,15 +734,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     // chat phase 2 room fan-out). null owner = legacy broadcast. The convo
     // row is already hot from append()'s own authorization read; the
     // participant lookup is a primary-key-prefix seek on convo_agents.
-    const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
     // Client-only events (the agent-chat approval card) skip every agent
     // device, including the room's own recorded owner — an empty Set here
     // is deliberately NOT the same as the null "legacy broadcast" case
     // below: broadcastJournal treats null as "no agent filtering at all"
     // and an empty Set as "every agent kind connection is excluded".
-    const targets = isClientOnlyEvent(frame.type, frame.payload)
-      ? new Set()
-      : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)]))
+    const targets = isClientOnlyEvent(frame.type, frame.payload) ? new Set() : agentTargetsFor(db, frame.convo_id)
     // Live frames carry the producing connection's device id: device names
     // have no unique constraint, so a bridge in a shared room can't reliably
     // tell its own echoes apart by sender name alone. Deliberately LIVE-only
@@ -783,7 +804,34 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   try {
     switch (msg.op) {
       case 'viewing': {
-        conn.viewingConvoId = msg.convo_id ?? null
+        // A client op: no bridge sends it, and an agent viewing set would
+        // subscribe that agent to live ephemerals for convos journal fan-out
+        // and hello replay hide from it — a private box's work, a room it has
+        // not joined (tracker #2851). hub.sendEphemeral also scopes agents.
+        if (conn.kind !== 'client') return fail('forbidden')
+        // `convo_ids` (optional) is the FULL set of conversations this
+        // connection is looking at — the Coordinator puts two live chats on
+        // screen at once. Without it, `convo_id` (string|null) means {convo_id}
+        // or {} exactly as before. A bad `convo_ids` is rejected and leaves
+        // the current set untouched.
+        //
+        // Catch-up (below) for the set form runs only for convos newly ADDED
+        // to the set, plus `convo_id` when it is sent alongside `convo_ids`
+        // (and is in the set) — even if already viewed. The single form keeps
+        // its old behaviour of catching up on every send. Both exist because
+        // clients re-send `viewing` for a convo to force a tool-stream resync.
+        let next
+        let prev
+        if (msg.convo_ids !== undefined) {
+          next = parseViewingConvoIds(msg.convo_ids)
+          if (!next) return fail('bad_request', `convo_ids must be an array of at most ${VIEWING_SET_MAX} non-empty convo id strings`)
+          prev = new Set(conn.viewingConvoIds)
+          prev.delete(msg.convo_id)
+        } else {
+          next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
+          prev = new Set()
+        }
+        conn.viewingConvoIds = next
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -793,10 +841,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // awaits mid-handler, so a message dispatched to that case can
         // interleave with other work between its awaits. Scoped to the conn's
         // own user; buffersFor enforces it too.
-        if (conn.viewingConvoId && conn.kind === 'client') {
-          for (const b of toolStreams.buffersFor(conn.userId, conn.viewingConvoId)) {
+        for (const convoId of next) {
+          if (!convoId || prev.has(convoId)) continue
+          for (const b of toolStreams.buffersFor(conn.userId, convoId)) {
             conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, message_ref: b.ref,
+              kind: 'ephemeral', convo_id: convoId, message_ref: b.ref,
               tool_stream: {
                 event: 'sync', meta: b.meta, offset: b.start,
                 content: b.content, head_truncated: b.headTruncated,
@@ -806,10 +855,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // Header catch-up: replay the last cached status (same direct-send
           // reasoning as the tool-stream syncs above) so the header populates
           // on open instead of waiting for the next turn end.
-          const cachedStatus = statusCache.get(conn.userId, conn.viewingConvoId)
+          const cachedStatus = statusCache.get(conn.userId, convoId)
           if (cachedStatus) {
             conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, status: cachedStatus,
+              kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
             }))
           }
         }
@@ -1009,6 +1058,28 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
           || fromConvo.parent_convo_id != null) return fail('not_found')
+        // Optional mission the child joins as soon as it exists (spec
+        // 2026-09-23 coordinator redesign §1c). Checked BEFORE the wake below
+        // so a doomed ask never starts a box, and before the card so the
+        // user is never asked about it. Resolved through the visibility sieve
+        // of BOTH ends: a mission the asker cannot see is no oracle
+        // (no_mission, same as unknown), and one the child could never read
+        // must not become its mission either. Unfiltered only when both are
+        // private devices.
+        let missionNum = null
+        let missionTitle = ''
+        if (msg.mission_num != null) {
+          if (!Number.isInteger(msg.mission_num) || msg.mission_num < 1) return fail('bad_request', 'bad mission_num')
+          const excludePrivateOwned = !isPrivateDevice(db, conn.deviceId) || !isPrivateDevice(db, msg.target_device_id)
+          const mission = getMission(db, conn.userId, msg.mission_num, { excludePrivateOwned })
+          if (!mission) return fail('no_mission', `mission #${msg.mission_num} not found`)
+          if (mission.state !== 'open') return fail('mission_closed', `mission #${msg.mission_num} is closed`)
+          missionNum = mission.num
+          // Shown on the client-only card (agents never receive it), so the
+          // user sees the mission they are sending the child to. Sieved like
+          // from_convo_title.
+          missionTitle = sanitizePeerText(mission.title, CARD_TITLE_MAX_CHARS)
+        }
         // A box with no live socket is asleep when this journal can wake it
         // (wake-before-spawn): fire the wake now and park the ask as usual —
         // the user's tap takes minutes anyway, and approveSpawn waits for the
@@ -1033,7 +1104,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, link,
+          workdir, task, topic, model, link, missionNum,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1065,6 +1136,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // one says nothing about a room — the common case stays the
           // card shape every client already renders.
           ...(link ? { link: true } : {}),
+          // Same omit-when-absent stance: the card says "joins mission #N"
+          // only for an ask that named one.
+          ...(missionNum ? { mission_num: missionNum } : {}),
+          ...(missionNum && missionTitle ? { mission_title: missionTitle } : {}),
         }
         let cardAppend
         try {
@@ -1605,6 +1680,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
           return fail('bad_request', 'bad summary')
         }
+        // repo (spec 2026-09-23 tracker web/teams): absent = unchanged,
+        // null = clear, string = canonical host/org/name from the bridge's
+        // remote normalisation. Shape-checked here; upsertConversation
+        // re-validates and would throw, so a bad string never reaches SQL.
+        if (msg.repo !== undefined && msg.repo !== null && (
+          typeof msg.repo !== 'string' || msg.repo.length > REPO_MAX || !parseRepo(msg.repo)
+        )) {
+          return fail('bad_request', 'bad repo')
+        }
         // Room-upsert ownership gate (fix: convo_upsert takeover bypass). A
         // conversation with at least one convo_agents row (any state) is a
         // "room" — once participants have been drawn into its lifecycle,
@@ -1650,6 +1734,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sessionOutcome: msg.session_outcome ?? null,
           summary: msg.summary ?? null,
           agentKind: msg.agent_kind ?? null,
+          repo: msg.repo,
         })
         // A spawned child's first published title carries the session short
         // its spawn room's title has been waiting for (the room is minted
@@ -1724,6 +1809,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               // "this event carries no summary news".
               summary: convo.summary ?? '',
               summary_updated_at: convo.summary_updated_at ?? 0,
+              repo: convo.repo ?? null,
             },
           })
         }
@@ -1886,7 +1972,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,
-        })
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'stream_append': {
@@ -1911,11 +1997,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           break
         }
         if (r.status === 'duplicate') break
-        for (const ev of r.evicted) notifyStale(hub, ev)
+        for (const ev of r.evicted) notifyStale(db, hub, ev)
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           tool_stream: { event: 'append', offset: r.offset, chunk: r.accepted },
-        })
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'activity': {
@@ -1931,7 +2017,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
-        })
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'box_status': {
@@ -1969,7 +2055,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         statusCache.set(conn.userId, msg.convo_id, msg.status)
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
-        })
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'host_vitals': {
@@ -1978,7 +2064,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // agent-only stance as status, but deliberately NOT convo-scoped: the
         // frame carries no convo_id, there is no authorize() ownership check
         // (host vitals belong to the machine, not a conversation), and the
-        // broadcast bypasses the viewingConvoId filter that sendEphemeral
+        // broadcast bypasses the viewingConvoIds filter that sendEphemeral
         // applies. Never journaled — pure ephemeral, so no appendAndFan. The
         // last sample is cached per user and replayed on client connect.
         // Payload is opaque to the server, validated only as a size-capped
