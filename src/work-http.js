@@ -10,6 +10,9 @@ const DEFAULT_MAX_CONCURRENT_BUILDERS = 2
 const DEFAULT_MAX_QUEUED_BUILDERS = 16
 const DEFAULT_BUILDER_SETTLEMENT_TIMEOUT_MS = 1000
 const STARTUP_PROBE_TIMEOUT_MS = 10000
+const STARTUP_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
+const INCLUDE_DETAIL_FLAG = '--include-detail'
+const INCLUDE_DETAIL_FLAG_PATTERN = /(^|\s)--include-detail(\s|$)/m
 const GROUP_BY_VALUES = new Set(['repo', 'domain'])
 const SESSION_LIVENESS = new Map([
   ['running', 'live'],
@@ -83,7 +86,10 @@ function resolveProducerRoot(raw, env, spawnSyncImpl, logger) {
       {
         cwd: producerRoot,
         env: childEnv(env),
-        stdio: 'ignore',
+        // stdout is read for feature detection (see includeDetail below); stderr stays closed.
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8',
+        maxBuffer: STARTUP_PROBE_MAX_OUTPUT_BYTES,
         timeout: STARTUP_PROBE_TIMEOUT_MS,
       }
     )
@@ -93,7 +99,11 @@ function resolveProducerRoot(raw, env, spawnSyncImpl, logger) {
   if (probe.error || probe.status !== 0) {
     return disable('does not resolve scripts.work_view_cli')
   }
-  return producerRoot
+  // The optional loop detail fields (opened / next_action / owner) are requested only from a
+  // producer that advertises the flag. An older producer rejects unknown arguments, so asking
+  // unconditionally would turn every /work into builder_failed after a journal-only deploy.
+  const help = typeof probe.stdout === 'string' ? probe.stdout : ''
+  return { producerRoot, includeDetail: INCLUDE_DETAIL_FLAG_PATTERN.test(help) }
 }
 
 function builderError(groupBy, code) {
@@ -200,6 +210,7 @@ function killBuilder(child) {
 function spawnBuilder(view, groupBy, signal) {
   const args = ['-m', 'scripts.work_view_cli', '--group-by', groupBy]
   if (view.storePath) args.push('--store', view.storePath)
+  if (view.includeDetail) args.push(INCLUDE_DETAIL_FLAG)
 
   return new Promise((resolve) => {
     let child
@@ -359,13 +370,15 @@ export function createWorkView({
   const ownerUserId = parseOwnerUserId(env[WORK_VIEW_REQUIRED_ENV[0]])
   const producerRootConfigured = typeof env[WORK_VIEW_REQUIRED_ENV[1]] === 'string' &&
     env[WORK_VIEW_REQUIRED_ENV[1]].trim() !== ''
-  const producerRoot = resolveProducerRoot(env[WORK_VIEW_REQUIRED_ENV[1]], env, spawnSyncImpl, logger)
+  const resolved = resolveProducerRoot(env[WORK_VIEW_REQUIRED_ENV[1]], env, spawnSyncImpl, logger)
+  const producerRoot = resolved?.producerRoot ?? null
+  const includeDetail = resolved?.includeDetail === true
   const storePath = typeof env.WORK_VIEW_STORE_PATH === 'string' && env.WORK_VIEW_STORE_PATH
     ? env.WORK_VIEW_STORE_PATH
     : null
   return {
     db, env, timeoutMs, maxOutputBytes, builderSettlementTimeoutMs, logger, spawnImpl,
-    ownerUserId, producerRoot, producerRootConfigured, storePath,
+    ownerUserId, producerRoot, producerRootConfigured, storePath, includeDetail,
     validatePayload: compileWorkViewValidator(),
     acquireBuilder: makeBuilderSemaphore(maxConcurrentBuilders, maxQueuedBuilders, builderQueueTimeoutMs),
   }
