@@ -14,6 +14,7 @@ import { deviceStatuses } from '../src/db.js'
 const LIMITS = { as_of: 1758460000000, lines: [{ id: '5h', label: 'Current session', percent: 42, resets: 'in 2h' }] }
 const ACTIVITY = { live_sessions: 2, last_hour: [{ path: '/home/dan/app', sessions: 1 }] }
 const DISK = { free_bytes: 10, total_bytes: 100 }
+const VITALS = { cpu_pct: 12.5, ram_pct: 63.1, sampled_at_ms: 1758460000000 }
 
 async function fleet(t) {
   const s = await startTestServer()
@@ -160,4 +161,23 @@ test('spawn_targets: a box_status that lands while recent_folders is in flight w
   assert.deepEqual(stored.limits, NEWER, 'the stale reply did not overwrite the row')
   assert.deepEqual(stored.account, { email: 'dan@example.com' })
   assert.equal(stored.reported_at, reportedAt)
+})
+
+test('box_status: a vitals block persists, fans live, and shows on /devices and /roster; a vitals-only report is accepted', async (t) => {
+  const { s, dan, agDev, clientToken, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', vitals: { ...VITALS, junk: 'x' } })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.equal(live.device_id, agDev.deviceId)
+  assert.deepEqual(live.vitals, VITALS)
+  assert.deepEqual(deviceStatuses(s.db, dan.id).get(agDev.deviceId).vitals, VITALS)
+  const devs = await s.http('/devices', { token: clientToken })
+  assert.deepEqual(devs.json.devices.find((d) => d.device_id === agDev.deviceId).status.vitals, VITALS)
+  const roster = await s.http('/roster', { token: clientToken })
+  assert.deepEqual(roster.json.agents.find((d) => d.device_id === agDev.deviceId).status.vitals, VITALS)
+  // A malformed vitals block is dropped alone; the rest of the report stands.
+  client.frames.length = 0
+  agent.send({ op: 'box_status', disk: DISK, vitals: { ...VITALS, cpu_pct: 101 } })
+  const second = await client.waitFor((f) => f.kind === 'box_status')
+  assert.equal('vitals' in second, false)
+  assert.deepEqual(second.disk, DISK)
 })

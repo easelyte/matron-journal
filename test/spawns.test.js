@@ -6,6 +6,7 @@ import {
   createSpawnRequest, getSpawn, denySpawn, claimApprove,
   markStarted, markFailed, expireSpawns, expireApproved, countPendingAsks, approveSpawn,
   sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk,
+  sanitizeBoxVitals, sanitizeBoxStatus,
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation, messagesBefore } from '../src/journal.js'
@@ -482,4 +483,36 @@ test('a room title honours tag_char overrides and derives letters against the wh
   claimApprove(db, 's-tags')
   await approveSpawn({ db, hub, broker: okBroker([]), startTimeoutMs: 50, roomId: 'room-tags' }, getSpawn(db, 's-tags'))
   assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-tags').title, '6:ab ↔️ 🦊:cd — thing')
+})
+
+test('sanitizeBoxVitals accepts a sane sample and copies only the three keys', () => {
+  const v = { cpu_pct: 12.5, ram_pct: 63.1, sampled_at_ms: 1758460000000 }
+  assert.deepEqual(sanitizeBoxVitals(v), v)
+  assert.deepEqual(sanitizeBoxVitals({ cpu_pct: 0, ram_pct: 100, sampled_at_ms: 1 }), { cpu_pct: 0, ram_pct: 100, sampled_at_ms: 1 })
+  assert.deepEqual(sanitizeBoxVitals({ cpu_pct: 1, ram_pct: 2, sampled_at_ms: 8640000000000000 }), { cpu_pct: 1, ram_pct: 2, sampled_at_ms: 8640000000000000 })
+  // Extra keys never ride through.
+  assert.deepEqual(sanitizeBoxVitals({ ...v, host: 'x\nevil', load: [1, 2, 3] }), v)
+})
+
+test('sanitizeBoxVitals rejects malformed samples whole', () => {
+  const ok = { cpu_pct: 12.5, ram_pct: 63.1, sampled_at_ms: 1758460000000 }
+  for (const bad of [
+    null, undefined, 'cpu 12%', 42, [], [ok],
+    { ...ok, cpu_pct: undefined }, { ...ok, ram_pct: undefined }, { ...ok, sampled_at_ms: undefined },
+    { ...ok, cpu_pct: -0.1 }, { ...ok, cpu_pct: 100.1 }, { ...ok, ram_pct: -1 }, { ...ok, ram_pct: 101 },
+    { ...ok, cpu_pct: NaN }, { ...ok, ram_pct: Infinity }, { ...ok, cpu_pct: '12.5' }, { ...ok, ram_pct: null },
+    { ...ok, cpu_pct: { v: 1 } }, { ...ok, ram_pct: [50] },
+    { ...ok, sampled_at_ms: 0 }, { ...ok, sampled_at_ms: -5 }, { ...ok, sampled_at_ms: 1.5 },
+    { ...ok, sampled_at_ms: 8640000000000001 }, { ...ok, sampled_at_ms: '1758460000000' },
+  ]) assert.equal(sanitizeBoxVitals(bad), null, JSON.stringify(bad))
+})
+
+test('sanitizeBoxStatus carries vitals as an optional block; a vitals-only report is valid; a bad vitals block is dropped alone', () => {
+  const vitals = { cpu_pct: 5, ram_pct: 40.2, sampled_at_ms: 1758460000000 }
+  const disk = { free_bytes: 1, total_bytes: 2 }
+  assert.deepEqual(sanitizeBoxStatus({ vitals }), { vitals })
+  assert.deepEqual(sanitizeBoxStatus({ disk, vitals: { ...vitals, extra: 1 } }), { disk, vitals })
+  assert.deepEqual(sanitizeBoxStatus({ disk, vitals: { ...vitals, cpu_pct: 900 } }), { disk })
+  assert.equal(sanitizeBoxStatus({ vitals: { ...vitals, ram_pct: NaN } }), null)
+  assert.equal('vitals' in sanitizeBoxStatus({ disk }), false)
 })

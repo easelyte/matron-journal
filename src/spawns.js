@@ -513,9 +513,25 @@ export function sanitizeSpawnDisk(raw) {
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
 }
 
+// Vitals block: the bridge's host-global CPU/RAM sample (hostVitals() in
+// matron-bridge lib/session-status.js), persisted with the box's report so
+// an ops view can show the last known load of a box that is asleep. All-or-
+// nothing like every other block: two finite percentages in 0..100 and a
+// sample time that is a positive integer ms no later than JS's Date ceiling
+// (AS_OF_MAX_MS, same RangeError reason as limits.as_of). Only the three
+// keys are copied; typeof 'number' already rules out nested objects/arrays.
+function isPct(v) { return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 }
+
+export function sanitizeBoxVitals(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!isPct(raw.cpu_pct) || !isPct(raw.ram_pct)) return null
+  if (!Number.isInteger(raw.sampled_at_ms) || raw.sampled_at_ms <= 0 || raw.sampled_at_ms > AS_OF_MAX_MS) return null
+  return { cpu_pct: raw.cpu_pct, ram_pct: raw.ram_pct, sampled_at_ms: raw.sampled_at_ms }
+}
+
 // A bridge's own box-status report (`box_status` op): the same optional
 // capacity blocks a recent_folders reply may carry, plus the account it
-// burns quota against. Each block is all-or-nothing on its own; a report
+// burns quota against and the host vitals sample. Each block is all-or-nothing on its own; a report
 // with no valid block at all is rejected (nothing to store).
 const ACCOUNT_EMAIL_CAP = 254
 
@@ -524,18 +540,20 @@ export function sanitizeBoxStatus(raw) {
   const activity = sanitizeSpawnActivity(raw.activity)
   const limits = sanitizeSpawnLimits(raw.limits)
   const disk = sanitizeSpawnDisk(raw.disk)
+  const vitals = sanitizeBoxVitals(raw.vitals)
   let account = null
   if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
     && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
     const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
     if (email) account = { email }
   }
-  if (!activity && !limits && !disk && !account) return null
+  if (!activity && !limits && !disk && !account && !vitals) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(account ? { account } : {}),
+    ...(vitals ? { vitals } : {}),
   }
 }
 
