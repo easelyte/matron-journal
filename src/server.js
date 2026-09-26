@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
+import { parseOwnerUserId } from './work-http.js'
 import { ensurePreapproveKey, resolvePreapproveKeyPath } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
 import { makeLinkStore } from './link.js'
@@ -396,7 +397,7 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileAuditDir, fileWriteMaxBytes, fileListMax, procSelfFdAvailable, workViewOptions,
+  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, workViewOptions,
   github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
@@ -551,6 +552,19 @@ export function startServer({
       console.warn(`SECURITY: file writes are enabled on a journal with ${userCount} users. The write roots are GLOBAL — they are not scoped per user, so every user's client devices can overwrite, move and delete anything inside them. Enable writes only on a single-operator journal, or narrow MATRON_FILE_WRITE_ROOTS accordingly.`)
     }
   }
+  // File Explorer owner (MATRON_FILE_OWNER_USER_ID): the one user whose client
+  // devices may use /files*. Authentication proves a device is ours; this is
+  // the authorization dimension — the read/write roots are the server's disk,
+  // not a per-user space, so no other user (admin or not) may reach them.
+  // Fails closed: absent/unparseable leaves the routes answering 500.
+  const resolvedFileOwnerUserId = parseOwnerUserId(
+    fileOwnerUserId !== undefined
+      ? (fileOwnerUserId === null ? undefined : String(fileOwnerUserId))
+      : process.env.MATRON_FILE_OWNER_USER_ID
+  )
+  if ((resolvedFileReadRoots || resolvedFileEnableWrites) && resolvedFileOwnerUserId === null) {
+    console.error('file API: MATRON_FILE_OWNER_USER_ID is absent or is not a positive integer — every /files request will be refused until it is set')
+  }
   const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
   const broker = makeRpcBroker()
@@ -604,6 +618,7 @@ export function startServer({
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
+    fileOwnerUserId: resolvedFileOwnerUserId,
     workViewOptions,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
   }))

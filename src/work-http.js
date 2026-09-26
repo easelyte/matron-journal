@@ -39,7 +39,9 @@ function childEnv(env) {
   return clean
 }
 
-function parseOwnerUserId(raw) {
+// Shared with the File Explorer owner gate (src/http.js): one parser, so the
+// two owner-scoped surfaces accept and reject exactly the same values.
+export function parseOwnerUserId(raw) {
   if (typeof raw !== 'string' || !/^[1-9]\d*$/.test(raw.trim())) return null
   const value = Number(raw.trim())
   return Number.isSafeInteger(value) ? value : null

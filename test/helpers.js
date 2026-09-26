@@ -2,7 +2,11 @@ import WebSocket from 'ws'
 import { startServer } from '../src/server.js'
 
 export async function startTestServer(opts = {}) {
-  const s = await startServer({ dbPath: ':memory:', port: 0, ...opts })
+  // fileOwnerUserId: 1 is the first user a test creates in a fresh :memory:
+  // DB — the File Explorer owner gate fails closed without one, so suites that
+  // exercise /files as "the operator" get it by default. Owner-gate tests
+  // override it (a different id, or null for the unconfigured case).
+  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,
