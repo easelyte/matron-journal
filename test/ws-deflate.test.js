@@ -20,13 +20,15 @@ async function seed(s) {
 // the client offering permessage-deflate.
 async function replayBytes(s, token, offerDeflate) {
   const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws', { perMessageDeflate: offerDeflate })
+  let negotiated = ''
+  ws.on('upgrade', (res) => { negotiated = res.headers['sec-websocket-extensions'] ?? '' })
   await new Promise((r) => ws.on('open', r))
   const frames = []
   ws.on('message', (d) => frames.push(JSON.parse(d)))
   ws.send(JSON.stringify({ op: 'hello', token, cursor: 0 }))
   const t0 = Date.now()
   while (frames.filter((f) => f.kind === 'journal').length < 2 && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 10))
-  const out = { extensions: ws.extensions, bytes: ws._socket.bytesRead, frames }
+  const out = { extensions: ws.extensions, negotiated, bytes: ws._socket.bytesRead, frames }
   ws.close()
   return out
 }
@@ -39,6 +41,9 @@ test('permessage-deflate is negotiated by default and shrinks large frames witho
   const deflated = await replayBytes(s, token, true)
   assert.equal(plain.extensions, '')
   assert.match(deflated.extensions, /permessage-deflate/)
+  // Bounded zlib state per socket (see WS_DEFLATE_OPTIONS): a 13-bit server window.
+  assert.match(deflated.negotiated, /server_max_window_bits=13/)
+  assert.match(deflated.negotiated, /server_no_context_takeover/)
   assert.deepEqual(
     deflated.frames.filter((f) => f.kind === 'journal'),
     plain.frames.filter((f) => f.kind === 'journal'),
