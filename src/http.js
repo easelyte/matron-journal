@@ -115,6 +115,10 @@ const rejectEarly = (req, res, status, obj) => {
 const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__', '.matron-trash'])
 const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
+// The whole File Explorer namespace: `/files` itself (DELETE) and every
+// `/files/*` route. One predicate, so the owner gate and the static-hosting
+// exclusion can never disagree about which paths are the file API's.
+const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
 export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
@@ -146,7 +150,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
-      if (await handleStatic(req, res, url)) return
+      // /files is the File Explorer's namespace and is owner-authorized below;
+      // static hosting (which runs before auth) must never answer for it.
+      if (!isFilesPath(url.pathname) && await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
         // (the tunnel is the only route in, so this header is trustworthy here).
@@ -323,7 +329,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // caller who is not the owner. Only while the feature is live: a
       // disabled deploy keeps its fall-through 404 (feature-off parity).
       // Fails closed: an absent or unparseable owner id serves nothing.
-      if (filesLive && (url.pathname === '/files' || url.pathname.startsWith('/files/'))) {
+      if (filesLive && isFilesPath(url.pathname)) {
         // rejectEarly, not json: an upload/write body is still unread here,
         // and those bytes must not be left on a keep-alive socket.
         if (who.kind !== 'client') return rejectEarly(req, res, 403, { error: 'forbidden' })

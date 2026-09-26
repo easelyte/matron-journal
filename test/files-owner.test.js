@@ -217,3 +217,32 @@ test('unauthenticated /files still answers 401 before the owner gate', async () 
     assert.equal(r.status, 401)
   } finally { await s.close() }
 })
+
+test('static hosting never answers for the /files namespace (no pre-auth bypass)', async () => {
+  const f = makeFixture()
+  const web = fs.realpathSync(makeTmpDir('matron-owner-web-'))
+  fs.writeFileSync(path.join(web, 'index.html'), '<!doctype html>')
+  fs.mkdirSync(path.join(web, 'files'))
+  fs.writeFileSync(path.join(web, 'files', 'list'), 'STATIC SHADOW')
+  fs.writeFileSync(path.join(web, 'files', 'meta.txt'), 'STATIC SHADOW')
+  const s = await start(f, { webDir: web })
+  try {
+    // Unauthenticated: the API's 401, never the static file.
+    let r = await call(s, '/files/list')
+    assert.equal(r.status, 401)
+    assert.ok(!(await r.text()).includes('STATIC SHADOW'))
+    r = await call(s, '/files/meta.txt')
+    assert.equal(r.status, 401)
+    assert.ok(!(await r.text()).includes('STATIC SHADOW'))
+    // A non-owner is still refused by the owner gate.
+    await login(s, 'op')
+    const other = await login(s, 'second')
+    r = await call(s, '/files/list', { token: other.token })
+    assert.equal(r.status, 403)
+    assert.ok(!(await r.text()).includes('STATIC SHADOW'))
+    // Static hosting itself still works outside the namespace.
+    r = await call(s, '/app/')
+    assert.equal(r.status, 200)
+    await r.arrayBuffer()
+  } finally { await s.close() }
+})
