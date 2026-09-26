@@ -1046,7 +1046,7 @@ test('schema: repo columns and github tables exist', () => {
 })
 
 test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing populated database in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-repo-migration-'))
+  const dir = makeTmpDir('matron-repo-migration-')
   const dbPath = path.join(dir, 'pre-repo.db')
 
   // A conversations table shaped like the one before the tracker
@@ -1094,7 +1094,7 @@ test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing p
 })
 
 test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-migration-'))
+  const dir = makeTmpDir('matron-admin-migration-')
   const dbPath = path.join(dir, 'pre-admin.db')
   const raw = new Database(dbPath)
   raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)')

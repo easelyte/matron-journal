@@ -13,16 +13,16 @@
       } } },
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "dev-2" } },
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-sum", "title": "first title", "summary": "• opened the repo" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "sess-sum", "ts": { "$type": "integer" },
       "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta",
-      "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo", "summary_updated_at": { "$bind": "stamp1" } }
+      "payload": { "title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo", "summary_updated_at": { "$bind": "stamp1" }, "repo": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-sum", "summary": "• opened the repo" } },
@@ -32,25 +32,26 @@
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "sess-sum", "ts": { "$type": "integer" },
       "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta",
-      "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo", "summary_updated_at": { "$ref": "stamp1" } }
+      "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo", "summary_updated_at": { "$ref": "stamp1" }, "repo": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-sum", "summary": "• opened the repo\n• fixed the parser" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "sess-sum", "ts": { "$type": "integer" },
       "sender": "agent:dev-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta",
-      "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo\n• fixed the parser", "summary_updated_at": { "$bind": "stamp2" } }
+      "payload": { "title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "• opened the repo\n• fixed the parser", "summary_updated_at": { "$bind": "stamp2" }, "repo": null }
     } },
 
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": {
+        "coordinator_convo_id": null,
         "seq": 3,
         "agents": [{ "device_id": { "$ref": "bridge.device_id" }, "name": "dev-2", "tag_char": { "$ignore": true } }],
         "conversations": [
           {
             "id": "sess-sum", "title": "renamed", "session_state": "running", "session_outcome": null,
             "last_seq": 3, "unread_count": 0, "snippet": "",
-            "parent_convo_id": null, "summary": "• opened the repo\n• fixed the parser", "summary_updated_at": { "$ref": "stamp2" },
+            "parent_convo_id": null, "summary": "• opened the repo\n• fixed the parser", "summary_updated_at": { "$ref": "stamp2" }, "repo": null,
             "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null,
             "created_at": { "$type": "integer" }, "last_ts": null
           }
