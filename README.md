@@ -109,6 +109,11 @@ journal user allowed to use the route. `WORK_VIEW_STORE_PATH` is optional when
 the producer's own default store location is correct. Restarting or reloading
 the service remains an operator-controlled deployment step.
 
+At startup the journal also reads the producer's `--help`. When it lists
+`--include-detail`, every build passes that flag and the response may carry the
+optional loop fields `opened`, `next_action` and `owner`; an older producer is
+called exactly as before, so the two can be upgraded in either order.
+
 Under a hardened systemd unit, filesystem permissions alone are not enough:
 `ProtectHome=yes` can hide paths under `/home`, `/root`, and `/run/user`, while
 `ProtectSystem=strict` can make other locations inaccessible to the service.

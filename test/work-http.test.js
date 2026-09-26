@@ -35,7 +35,7 @@ function workEnv(producerRoot, storePath, ownerUserId = '1') {
   }
 }
 
-function makeFakeProducer(t) {
+function makeFakeProducer(t, { detail = false } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'matron-work-producer-'))
   const scripts = path.join(root, 'scripts')
   mkdirSync(scripts)
@@ -55,6 +55,7 @@ if "WORK_VIEW_TEST_SECRET" in os.environ:
 parser = argparse.ArgumentParser()
 parser.add_argument("--group-by", choices=("repo", "domain"), default="repo")
 parser.add_argument("--store", type=Path)
+${detail ? 'parser.add_argument("--include-detail", action="store_true")' : ''}
 args = parser.parse_args()
 
 if args.store is None or not args.store.exists():
@@ -108,7 +109,8 @@ if mode == "count":
     update_counter(1)
     time.sleep(0.2)
     update_counter(-1)
-print(json.dumps(fixture[args.group_by]))
+key = args.group_by + ("_detail" if getattr(args, "include_detail", False) else "")
+print(json.dumps(fixture.get(key, fixture[args.group_by])))
 `.trimStart())
   t.after(() => rmSync(root, { recursive: true, force: true }))
   return root
@@ -714,4 +716,95 @@ test('a disconnected builder waiter is removed from the bounded queue', async (t
   const counts = JSON.parse(readFileSync(counterPath, 'utf8'))
   assert.equal(counts.started, 2)
   assert.equal(counts.active, 0)
+})
+
+test('GET /work requests the optional loop detail fields only from a producer that advertises them', async (t) => {
+  const detailed = (groupBy) => {
+    const payload = envelope(groupBy, [{
+      ...loop(1),
+      opened: '2026-09-01T09:00:00Z',
+      next_action: 'Build the detail view.',
+      owner: 'operator',
+    }])
+    return payload
+  }
+
+  // A producer with --include-detail in its --help: the journal passes the flag and relays the
+  // optional fields, which its vendored schema accepts.
+  const modern = makeFakeProducer(t, { detail: true })
+  const modernStore = path.join(modern, 'fixture.json')
+  writeFixture(modernStore, envelope('repo', [loop(1)]), null, {
+    repo_detail: detailed('repo'),
+    domain_detail: { ...detailed('domain'), groups: [{ key: 'infra', loops: detailed('repo').groups[0].loops }] },
+  })
+  const s1 = startWorkServer(t, { env: workEnv(modern, modernStore) })
+  const owner1 = addUser(s1.db, 'detail-owner')
+  for (const groupBy of ['repo', 'domain']) {
+    const result = await s1.http(`/work?group_by=${groupBy}`, { token: owner1.token })
+    assert.equal(result.status, 200)
+    assertWorkEnvelopeUsesVendoredSchema(result.json)
+    const wire = result.json.groups[0].loops[0]
+    assert.equal(wire.opened, '2026-09-01T09:00:00Z')
+    assert.equal(wire.next_action, 'Build the detail view.')
+    assert.equal(wire.owner, 'operator')
+  }
+
+  // An older producer whose argparse would reject the unknown flag: the journal must not pass it,
+  // and the legacy payload (no optional fields) still validates.
+  const legacy = makeFakeProducer(t)
+  const legacyStore = path.join(legacy, 'fixture.json')
+  writeFixture(legacyStore, envelope('repo', [loop(1)]), null, { repo_detail: detailed('repo') })
+  const s2 = startWorkServer(t, { env: workEnv(legacy, legacyStore) })
+  const owner2 = addUser(s2.db, 'legacy-owner')
+  const result = await s2.http('/work', { token: owner2.token })
+  assert.equal(result.status, 200)
+  assert.equal(result.json.status, 'ok')
+  assertWorkEnvelopeUsesVendoredSchema(result.json)
+  const wire = result.json.groups[0].loops[0]
+  assert.equal('opened' in wire || 'next_action' in wire || 'owner' in wire, false)
+})
+
+test('vendored Work schema keeps the loop detail fields optional and typed', () => {
+  const base = envelope('repo', [loop(1)])
+  assert.equal(VALIDATE_WORK_ENVELOPE(base), true)
+  const withField = (field, value) => envelope('repo', [{ ...loop(1), [field]: value }])
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('opened', '2026-09-01T09:00:00Z')), true)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('opened', 'yesterday')), false)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('next_action', 'Ship it')), true)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('next_action', '')), false)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('owner', 'claude')), true)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('owner', '')), false)
+  assert.equal(VALIDATE_WORK_ENVELOPE(withField('unexpected', 'x')), false)
+})
+
+test('GET /work keeps working when the producer is rolled back in place and stops accepting --include-detail', async (t) => {
+  const producer = makeFakeProducer(t, { detail: true })
+  const storePath = path.join(producer, 'fixture.json')
+  writeFixture(storePath, envelope('repo', [loop(1)]))
+  const errors = []
+  const s = startWorkServer(t, {
+    env: workEnv(producer, storePath),
+    logger: { error: (message) => errors.push(String(message)) },
+  })
+  const owner = addUser(s.db, 'rollback-owner')
+
+  // Roll the producer back to a CLI without the flag, without restarting the journal.
+  const legacy = makeFakeProducer(t)
+  writeFileSync(
+    path.join(producer, 'scripts', 'work_view_cli.py'),
+    readFileSync(path.join(legacy, 'scripts', 'work_view_cli.py'))
+  )
+
+  const first = await s.http('/work', { token: owner.token })
+  assert.equal(first.status, 200)
+  assert.equal(first.json.status, 'ok')
+  assertWorkEnvelopeUsesVendoredSchema(first.json)
+  assert.ok(errors.some((message) => /no longer accepts --include-detail/.test(message)))
+
+  // The capability is dropped, so later builds do not pay for a failed first attempt.
+  const errorCount = errors.length
+  const second = await s.http('/work', { token: owner.token })
+  assert.equal(second.status, 200)
+  assert.equal(second.json.status, 'ok')
+  assert.equal(errors.length, errorCount)
 })

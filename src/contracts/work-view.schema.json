@@ -177,6 +177,21 @@
               "$ref": "#/definitions/claim"
             }
           ]
+        },
+        "opened": {
+          "description": "Optional. When the loop was filed (RFC 3339). Absent from producers that predate it or when the stored value is not a timestamp.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "next_action": {
+          "description": "Optional. One-line summary of the loop's next step.",
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "description": "Optional. Who owns the loop's next step (for example operator or claude).",
+          "type": "string",
+          "minLength": 1
         }
       }
     },
