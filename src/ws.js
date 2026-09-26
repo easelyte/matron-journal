@@ -241,6 +241,30 @@ export function makeVitalsCache(max = VITALS_CACHE_MAX) {
 
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
+// permessage-deflate (RFC 7692), negotiated per connection: a client that
+// does not offer the extension gets plain frames exactly as before, so this is
+// wire-compatible with every existing client. Only frames of >= 1 KiB are
+// compressed (tool_output / diff rows; short text and control frames are not
+// worth the zlib call). No context takeover on either side, so no per-socket
+// zlib window outlives a message — flat memory per connection at the cost of
+// some ratio. Measured over a day of the live journal's frames: 29.5 MB ->
+// 12.5 MB (2.4x) for ~1 s of deflate CPU per connected client.
+// Memory: ws keeps a socket's (reset) zlib stream allocated until the socket
+// closes, so each socket that has received a large frame retains one deflate
+// state; memLevel 7 makes that ~192 KiB instead of zlib's default ~256 KiB.
+// Deliberately NO serverMaxWindowBits / clientMaxWindowBits: with either set,
+// ws REJECTS (HTTP 400, no plain fallback) a valid offer that does not carry
+// the matching parameter or asks for a smaller window — e.g. Firefox's bare
+// `permessage-deflate` offer. Negotiation must only ever add compression,
+// never cost a client its connection.
+export const WS_DEFLATE_OPTIONS = Object.freeze({
+  threshold: 1024,
+  zlibDeflateOptions: { level: 6, memLevel: 7 },
+  serverNoContextTakeover: true,
+  clientNoContextTakeover: true,
+  concurrencyLimit: 10,
+})
+
 // Between replay batches, a slow/paused reader must not let the server
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
 const REPLAY_BACKPRESSURE_BYTES = 4 * 1024 * 1024 // 4 MB
@@ -287,12 +311,16 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null,
+  perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
   // since wake-before-spawn, the wake wait that may precede it.
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
-  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  const wss = new WebSocketServer({
+    server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES,
+    perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
+  })
   const statusCache = makeStatusCache()
   const vitalsCache = makeVitalsCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -511,7 +539,14 @@ export function attachWs({
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
             // with the fresh cursor instead. Close 4009 right after; the socket
             // is never registered (no live traffic for this abandoned attempt).
-            if (headSeq - msg.cursor > maxReplay) {
+            // A client may LOWER the valve for its own connection with an optional
+            // hello `max_replay` (non-negative integer; anything else is ignored,
+            // not rejected — it is an additive field). A client that applies rows
+            // one by one knows its own replay cost; the web client asks for a
+            // snapshot past a few hundred rows instead of receiving tens of
+            // thousands of frames. It can never raise the server's limit.
+            const clientMax = Number.isInteger(msg.max_replay) && msg.max_replay >= 0 ? msg.max_replay : Infinity
+            if (headSeq - msg.cursor > Math.min(maxReplay, clientMax)) {
               ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
               ws.close(4009)
               return

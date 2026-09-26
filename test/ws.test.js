@@ -732,6 +732,73 @@ test('snapshot_required: a replay gap at or under MATRON_MAX_REPLAY still replay
   c.close()
 })
 
+async function helloRaw(s, token, hello) {
+  const raw = new (await import('ws')).default(s.base.replace('http', 'ws') + '/ws')
+  await new Promise((r) => raw.on('open', r))
+  const frames = []
+  raw.on('message', (d) => frames.push(JSON.parse(d)))
+  let closeCode = null
+  const closed = new Promise((r) => raw.on('close', (code) => { closeCode = code; r() }))
+  raw.send(JSON.stringify({ op: 'hello', token, ...hello }))
+  return { raw, frames, closed, closeCode: () => closeCode }
+}
+
+async function seedTen(s) {
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  for (let i = 0; i < 10; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  return { dan, token: login.json.token }
+}
+
+test('hello max_replay: a client limit below the gap trips snapshot_required before any replay', async (t) => {
+  const s = await startTestServer({ maxReplay: 100 })
+  t.after(() => s.close())
+  const { dan, token } = await seedTen(s)
+  const c = await helloRaw(s, token, { cursor: 2, max_replay: 5 }) // gap 8 > client limit 5
+  await c.closed
+  assert.ok(c.frames.some((f) => f.op === 'hello_ok' && f.seq === 10), 'hello_ok (with the head seq) still comes first')
+  assert.ok(c.frames.some((f) => f.kind === 'control' && f.op === 'snapshot_required'))
+  assert.equal(c.frames.filter((f) => f.kind === 'journal').length, 0)
+  assert.equal(c.closeCode(), 4009)
+  assert.equal(s.hub.connsOf(dan.id).length, 0)
+})
+
+test('hello max_replay: a gap within the client limit replays normally', async (t) => {
+  const s = await startTestServer({ maxReplay: 100 })
+  t.after(() => s.close())
+  const { token } = await seedTen(s)
+  const c = await makeWsClient(s.base, { token, cursor: 2, max_replay: 8 }) // gap 8, not over 8
+  await c.waitFor((f) => f.kind === 'journal' && f.seq === 10)
+  assert.equal(c.journal().length, 8)
+  assert.ok(!c.frames.some((f) => f.op === 'snapshot_required'))
+  c.close()
+})
+
+test('hello max_replay: can only lower the server limit, never raise it', async (t) => {
+  const s = await startTestServer({ maxReplay: 5 })
+  t.after(() => s.close())
+  const { token } = await seedTen(s)
+  const c = await helloRaw(s, token, { cursor: 0, max_replay: 1000 })
+  await c.closed
+  assert.ok(c.frames.some((f) => f.op === 'snapshot_required'), 'server valve (5) still applies to a gap of 10')
+  assert.equal(c.closeCode(), 4009)
+})
+
+test('hello max_replay: a malformed value is ignored (additive field), not rejected', async (t) => {
+  const s = await startTestServer({ maxReplay: 100 })
+  t.after(() => s.close())
+  const { token } = await seedTen(s)
+  for (const bad of [-1, 2.5, '3', null, { n: 1 }]) {
+    const c = await makeWsClient(s.base, { token, cursor: 0, max_replay: bad })
+    await c.waitFor((f) => f.kind === 'journal' && f.seq === 10)
+    assert.equal(c.journal().length, 10, `max_replay=${JSON.stringify(bad)} must fall back to the server limit`)
+    c.close()
+  }
+})
+
 test('revoked device: its next WS frame gets error {code:"revoked"} and closes 4001; the same token also 401s over HTTP', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

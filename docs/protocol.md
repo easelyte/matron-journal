@@ -406,6 +406,14 @@ an agent token, selected by which query parameter is present:
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
+  `hello` may carry an optional `max_replay` (non-negative integer) that
+  **lowers** the valve for that connection only: the server trips
+  `snapshot_required` when the gap exceeds `min(MATRON_MAX_REPLAY,
+  max_replay)`. It can never raise the server's limit, and any other value
+  (negative, fractional, non-number) is ignored rather than rejected, so an
+  older client that omits it is unaffected. The web client sends 500: it
+  applies replayed rows one at a time, and past a few hundred rows a
+  snapshot is far cheaper than the replay.
   Client ops: send (type text, or file/image with a top-level blob_ref from a
   prior POST /media — payload mirrors the agent-publish media shape),
   prompt_reply, read_marker, ack, viewing.

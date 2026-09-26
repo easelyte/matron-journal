@@ -1,0 +1,173 @@
+{
+  "name": "ws hello: a client max_replay below the gap sends snapshot_required even under the server's limit",
+  "description": "With the server valve at 100 and a 10-event backlog, hello with cursor:0 and max_replay:5 (gap 10 > 5) gets hello_ok, then {kind:'control', op:'snapshot_required'} instead of any replay, then close 4009. max_replay is an optional, additive hello field that can only lower the server's MATRON_MAX_REPLAY for this connection.",
+  "server": {
+    "maxReplay": 100
+  },
+  "seed": {
+    "users": [
+      {
+        "as": "dan",
+        "name": "dan",
+        "password": "fixture-pw-6b"
+      }
+    ],
+    "conversations": [
+      {
+        "id": "c1",
+        "owner": "dan"
+      }
+    ],
+    "events": [
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m2"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m3"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m4"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m5"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m6"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m7"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m8"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:dev-2",
+        "type": "text",
+        "payload": {
+          "body": "m9"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/login",
+      "body": {
+        "username": "dan",
+        "password": "fixture-pw-6b",
+        "device_name": "mac"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "token": {
+            "$bind": "dan_token"
+          },
+          "device_id": {
+            "$type": "integer"
+          },
+          "user_id": {
+            "$ref": "dan.user_id"
+          }
+        }
+      }
+    },
+    {
+      "kind": "ws_open",
+      "conn": "client"
+    },
+    {
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "dan_token"
+        },
+        "cursor": 0,
+        "max_replay": 5
+      }
+    },
+    {
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "seq": 10,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "snapshot_required"
+      }
+    },
+    {
+      "kind": "ws_expect_close",
+      "conn": "client",
+      "code": 4009
+    }
+  ]
+}
