@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import WebSocket from 'ws'
+import http from 'node:http'
+import crypto from 'node:crypto'
 import { resolveBooleanEnv } from '../src/server.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser } from '../src/auth.js'
@@ -41,8 +43,7 @@ test('permessage-deflate is negotiated by default and shrinks large frames witho
   const deflated = await replayBytes(s, token, true)
   assert.equal(plain.extensions, '')
   assert.match(deflated.extensions, /permessage-deflate/)
-  // Bounded zlib state per socket (see WS_DEFLATE_OPTIONS): a 13-bit server window.
-  assert.match(deflated.negotiated, /server_max_window_bits=13/)
+  // No zlib context carried between messages (see WS_DEFLATE_OPTIONS).
   assert.match(deflated.negotiated, /server_no_context_takeover/)
   assert.deepEqual(
     deflated.frames.filter((f) => f.kind === 'journal'),
@@ -87,4 +88,43 @@ test('ordinary clients keep working over a deflated socket (live fan-out after r
   await c.waitFor((f) => f.kind === 'journal' && f.seq === 2)
   assert.match(c.ws.extensions, /permessage-deflate/)
   c.close()
+})
+
+// A raw upgrade with an arbitrary Sec-WebSocket-Extensions offer; resolves to
+// the handshake status and the negotiated extension header.
+function rawUpgrade(base, offer) {
+  const u = new URL(base)
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: u.hostname, port: u.port, path: '/ws',
+      headers: {
+        Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
+        ...(offer === undefined ? {} : { 'Sec-WebSocket-Extensions': offer }),
+      },
+    })
+    req.on('upgrade', (res, socket) => { socket.destroy(); resolve({ status: res.statusCode, ext: res.headers['sec-websocket-extensions'] ?? '' }) })
+    req.on('response', (res) => { res.resume(); resolve({ status: res.statusCode, ext: '' }) })
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+test('every valid deflate offer shape still completes the handshake (never a 400)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const offers = [
+    undefined, // no extension offered at all
+    'permessage-deflate', // bare offer (Firefox shape): no client_max_window_bits
+    'permessage-deflate; client_max_window_bits', // Chromium / ws shape
+    'permessage-deflate; server_max_window_bits=9', // asks for a small server window
+    'permessage-deflate; client_max_window_bits=10; server_no_context_takeover',
+    'x-webkit-deflate-frame', // an unknown extension only
+  ]
+  for (const offer of offers) {
+    const r = await rawUpgrade(s.base, offer)
+    assert.equal(r.status, 101, `offer ${JSON.stringify(offer)} must upgrade`)
+    if (offer && offer.startsWith('permessage-deflate')) assert.match(r.ext, /^permessage-deflate/, `offer ${offer} negotiates`)
+    else assert.equal(r.ext, '')
+  }
 })

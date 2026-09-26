@@ -248,18 +248,18 @@ const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 // worth the zlib call). No context takeover on either side, so no per-socket
 // zlib window outlives a message — flat memory per connection at the cost of
 // some ratio. Measured over a day of the live journal's frames: 29.5 MB ->
-// 12.6 MB (2.3x) for ~1 s of deflate CPU per connected client.
+// 12.5 MB (2.4x) for ~1 s of deflate CPU per connected client.
 // Memory: ws keeps a socket's (reset) zlib stream allocated until the socket
-// closes, so each socket that has sent a large frame retains one deflate
-// state. A 13-bit window and memLevel 7 make that ~96 KiB instead of zlib's
-// default ~256 KiB (window 15, memLevel 8) at a measured ratio cost of under
-// 1% on the same day of frames; the client window is capped the same way for
-// the inflate side.
+// closes, so each socket that has received a large frame retains one deflate
+// state; memLevel 7 makes that ~192 KiB instead of zlib's default ~256 KiB.
+// Deliberately NO serverMaxWindowBits / clientMaxWindowBits: with either set,
+// ws REJECTS (HTTP 400, no plain fallback) a valid offer that does not carry
+// the matching parameter or asks for a smaller window — e.g. Firefox's bare
+// `permessage-deflate` offer. Negotiation must only ever add compression,
+// never cost a client its connection.
 export const WS_DEFLATE_OPTIONS = Object.freeze({
   threshold: 1024,
   zlibDeflateOptions: { level: 6, memLevel: 7 },
-  serverMaxWindowBits: 13,
-  clientMaxWindowBits: 13,
   serverNoContextTakeover: true,
   clientNoContextTakeover: true,
   concurrencyLimit: 10,
