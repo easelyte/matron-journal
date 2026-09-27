@@ -168,11 +168,10 @@ test('getItem accepts id, #num, num; other user 404s', async () => {
   assert.deepEqual(getItem(db, dan.id, a.id).labels, [])
 })
 
-test('item read shape exposes origin_convo_id + origin_convo_title for provenance labelling', async () => {
-  const { db, dan } = await seed() // seed() creates c1 (title 'C1') and c2 (title 'C2')
+test('item read shape exposes origin_convo_title for provenance labelling', async () => {
+  const { db, dan } = await seed() // c1 (title 'C1'), c2 (title 'C2')
   const a = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
   const b = createItem(db, base({ userId: dan.id, originConvoId: 'c2' })).item
-  // getItem
   assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
   assert.equal(getItem(db, dan.id, a.id).origin_convo_title, 'C1')
   assert.equal(getItem(db, dan.id, b.id).origin_convo_title, 'C2')
@@ -180,24 +179,27 @@ test('item read shape exposes origin_convo_id + origin_convo_title for provenanc
   const byId = Object.fromEntries(listItems(db, dan.id, {}).items.map((it) => [it.id, it]))
   assert.equal(byId[a.id].origin_convo_title, 'C1')
   assert.equal(byId[b.id].origin_convo_title, 'C2')
-  // A gone origin conversation degrades to null title, never throws.
+  // An untitled conversation ('' is the column default) reads as null, not ''.
+  db.prepare("UPDATE conversations SET title='' WHERE id=?").run('c2')
+  assert.equal(getItem(db, dan.id, b.id).origin_convo_title, null)
+  // A gone origin conversation degrades to a null title, never throws.
   db.prepare('DELETE FROM conversations WHERE id=?').run('c1')
   assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
   assert.equal(getItem(db, dan.id, a.id).origin_convo_title, null)
 })
 
-test('origin_convo_title never leaks a title from a conversation owned by another user', async () => {
+test('origin_convo_title never discloses the title of another user\'s conversation', async () => {
   const { db, dan, pat, agent } = await seed()
-  // A conversation id is a global PK. If dan holds an item whose origin_convo_id was later reused
-  // by pat, the title lookup must resolve through DAN's ownership, not pat's row.
+  // Conversation ids are a global PK: if dan's item points at an id that pat
+  // now owns, the lookup must resolve through dan's ownership, not pat's row.
   upsertConversation(db, { id: 'shared-id', ownerUserId: pat.id, title: "pat's private title", agentDeviceId: agent.deviceId })
   const danItem = createItem(db, base({ userId: dan.id, originConvoId: 'shared-id' })).item
   const seen = getItem(db, dan.id, danItem.id)
   assert.equal(seen.origin_convo_id, 'shared-id')
-  assert.equal(seen.origin_convo_title, null) // owner mismatch -> no title, not pat's
+  assert.equal(seen.origin_convo_title, null)
 })
 
-test('origin_convo_title is bounded so one oversized title cannot amplify a response', async () => {
+test('origin_convo_title is length-bounded', async () => {
   const { db, dan } = await seed()
   db.prepare('UPDATE conversations SET title=? WHERE id=?').run('x'.repeat(5000), 'c1')
   const it = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
@@ -511,7 +513,7 @@ test('itemMarkerPayload carries the spec fields and trims the comment', async ()
   assert.equal(ITEM_EVENT_TYPE, 'item')
   assert.deepEqual(Object.keys(p).sort(), ['action', 'actions', 'awaiting', 'by', 'chosen_action', 'comment', 'item_id', 'kind', 'num', 'origin_convo_id', 'origin_convo_title', 'resolution', 'title'])
   assert.equal(p.comment.body, 'use A'); assert.equal(p.comment.attachments[0].transcript, null)
-  // Origin conversation rides on the marker for client-side provenance labelling.
+  // Fork-only: origin conversation rides on the marker for client-side provenance labelling.
   assert.equal(p.origin_convo_id, 'c1'); assert.equal(p.origin_convo_title, 'C1')
   const created = itemMarkerPayload({ item: q, action: 'created', by: 'agent' })
   assert.equal(created.comment, undefined); assert.equal(created.awaiting, 'user')

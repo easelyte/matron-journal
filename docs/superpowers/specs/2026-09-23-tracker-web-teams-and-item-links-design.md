@@ -57,7 +57,7 @@ decided, but they only exist inside Matron and only for one user.
 | Question | Decision |
 |---|---|
 | Item refs on GitHub (#2769) | Never `#N` or `matron://`; say it in words; the https link once it exists. Shipped. |
-| Link format (#2771) | https on the journal host is canonical. In-app opening via a registered `matron://` scheme; universal links optional per build. See "Why not universal links alone". |
+| Link format (#2771) | https on the journal host is the only link form. The apps open it through universal / app links (associated domains per build); no `matron://open` scheme. See "Why not a custom scheme". |
 | Web access (#2772) | A new, focused web app on the journal HTTP API. Not matron-web. |
 | Visibility (#2773, #2784) | Per repo, audience derived from the GitHub org in the remote. |
 | Membership (#2791) | Verified: each user links their GitHub account; the journal reads their org memberships. Replaces the manual teams of revision 1. |
@@ -349,31 +349,28 @@ poll while a shared view is open.
 
 ## Apps (matron-apple, matron-android)
 
-- **Register the `matron` URL scheme** with the OS (`CFBundleURLTypes`,
-  an `intent-filter` with `android:scheme="matron"`). Handle
-  `matron://open?v=1&server=<url-encoded base>&user=<name>&num=<n>`:
-  if the app is signed into that server, open the row (existing item and
-  mission detail hosts, via `/lookup`); otherwise show "not signed in to
-  <host>". The existing `matron://link?…` pairing URL rides the same
-  registration.
-- **Handle the https form** the same way, both from the OS (universal /
-  app links, when a build configures them) and inside message bodies:
-  the markdown link handlers that already catch `matron://item/<n>` also
-  catch `https://<this server>/u/<user>/<num>`.
-- **Associated domains are per build, optional.** `project.yml` and
-  `build.gradle` read the journal host from a build setting
-  (`MATRON_LINK_HOSTS`); a build without it simply has no universal links
-  and relies on the scheme.
+- **Handle the https form** `https://<this server>/u/<user>/<num>`, both
+  from the OS (universal / app links) and inside message bodies: the
+  markdown link handlers that already catch `matron://item/<n>` also
+  catch the https form. Opening resolves the row through `/lookup` and
+  shows the existing item or mission detail host; a link to a server the
+  app is not signed into opens in the browser instead.
+- **Associated domains are per build.** `project.yml` and `build.gradle`
+  read the journal host from a build setting (`MATRON_LINK_HOSTS`) and
+  declare it under associated domains / `autoVerify` intent filters. A
+  build without it has no universal links: the https link opens the web
+  app in the browser, which is the intended fallback.
 
-### Why not universal links alone
+### Why not a custom scheme
 
 Universal Links and App Links require the domain to be baked into the
 app at build time and a site-association file on that domain. Matron is
-self-hosted, so the App Store build cannot know every journal's host. The
-scheme works for any host; universal links are a per-deployment upgrade
-for installations that build their own apps. The web app's item page
-therefore shows an **Open in Matron** button that launches the scheme
-URL, and on iOS and Android tries it automatically once per page load.
+self-hosted, so a store build cannot know every journal's host, and a
+`matron://open?…` scheme would cover that gap. Dan chose not to: a
+scheme link opens nothing when the app is not installed, every
+deployment that matters builds its own apps with the host configured,
+and the web app is a complete fallback. The scheme can be added later
+if a self-hoster on a store build asks for it.
 
 ## Web app (new repo)
 
@@ -441,11 +438,11 @@ event types, not a second data layer.
 - **Admin.** Users: create, reset password, admin flag, see and clear a
   GitHub link. Journal admins only.
 
-### Open in Matron
+### Sharing
 
-Every item, mission and milestone page shows the button described under
-the apps section. The page's own URL is the shareable link; a copy button
-puts it on the clipboard.
+The page's own URL is the shareable link; a copy button puts it on the
+clipboard. No "Open in Matron" button: on a device whose app build claims
+the journal host, the OS already opens the app for the https link.
 
 ## Error handling
 
@@ -519,8 +516,8 @@ puts it on the clipboard.
   both link flows; one end-to-end run against a journal started from
   `test/` fixtures with a fake GitHub (sign in, link, open a link,
   comment, a colleague in the same org sees the item).
-- **Apps**: link-handler unit tests for the scheme and https forms; the
-  existing snapshot tests for item links extended with the https form.
+- **Apps**: link-handler unit tests for the https form; the existing
+  snapshot tests for item links extended with the https form.
 
 ## Rollout
 
@@ -538,5 +535,5 @@ no `MATRON_WEB_DIR` behaves exactly as today after every step.
    before or after step 3.
 5. **matron-tracker** web app, deployed by setting `MATRON_WEB_DIR` on the
    journal host.
-6. **Apps**: scheme registration and https link handling, then optional
-   associated domains for installations that build their own.
+6. **Apps**: https link handling and associated domains from the build
+   setting.

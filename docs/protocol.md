@@ -888,9 +888,14 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   requester's own conversations** is doing the asking, so the consent card
   can say who is asking rather than just which device. Validated the same
   way and for the same reason — a top-level conversation this connection's
-  own device owns, else `not_found`. It is display-only: unlike
-  `target_convo_id` it is not persisted or relayed, only resolved to a title
-  for the card.
+  own device owns, else `not_found`. Resolved to a title for the card, and
+  also persisted on the `convo_agents` row (`initiator_convo_id`) and
+  relayed verbatim as `from_convo_id` on the `request` frame — omitted,
+  never null, when the caller sent none. The receiving bridge keys its
+  one-room-per-pair lookup on the peer device plus the peer's conversation,
+  so without it the invited side could only record the device, and a guest
+  later calling the inviter back opened a second room in the other
+  direction.
 
   Every ask parks: it creates/renews an `awaiting_user` row and the target
   agent is sent **nothing** — the justification never leaves the journal
@@ -1492,7 +1497,15 @@ Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image, mission_id,
-mission_num, consent, actions[], chosen_action}`. `consent` is `'spawn'` or `'chat'` on the journal's
+mission_num, consent, actions[], chosen_action, origin_convo_title}`.
+`origin_convo_title` is the title of the item's origin conversation (at most
+200 characters), so a client can say where an item was filed without a second
+fetch; `null` when that conversation is untitled, gone, or not owned by the
+item's user. It is read at request time and is not part of the item's own
+state: renaming the conversation does not bump the item's `updated_at`, so a
+`since` delta does not re-deliver the item. A client that also holds the
+conversation list should prefer that list's live title and use this field for
+origins it has not loaded. `consent` is `'spawn'` or `'chat'` on the journal's
 mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
@@ -1939,10 +1952,14 @@ and is the only copy.
 ### GitHub account linking
 
 Client devices only (an agent never links). Configuration:
-`MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
-below is `404 not_configured`; will default to Matron's published OAuth
-App id once one is registered — not configured in this release),
-`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
+`MATRON_GITHUB_CLIENT_ID` (default: Matron's published OAuth App id,
+`Ov23likaFmqoegaDMTtz`, so the device flow works out of the box; set it
+to the empty string to disable linking, in which case every route below
+is `404 not_configured`),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow — it must
+belong to the same OAuth App as `MATRON_GITHUB_CLIENT_ID`, so a journal
+that sets a secret also sets its own app's client id; the default id has
+no secret to pair with),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 
 | Route | Body / query | Response |

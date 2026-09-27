@@ -165,3 +165,50 @@ test('a parked invite with no target delivers without the field', async (t) => {
   deliverPendingInvites(s.db, hub, { deviceId: agB.deviceId })
   assert.ok(!('target_convo_id' in calls[0][2]), 'absent, not null')
 })
+
+// `from_convo_id` on the delivered `request` frame (tracker: reverse-direction
+// duplicate rooms). The owner keys its one-room-per-pair lookup on the peer
+// device plus the peer's conversation; the invited side could only ever
+// record the device, because the frame never said which of the inviter's
+// conversations was asking. So when the guest later called the inviter back
+// it found no room and opened a second one in the other direction.
+test('the requester conversation rides the delivered frame as from_convo_id', async (t) => {
+  const { s, agA, agB } = await fleet(t)
+  parkInvite(s.db, {
+    convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId,
+    justification: 'need logs', topic: 'ci', targetConvoId: 'b-work', initiatorConvoId: 'a-work',
+  })
+  assert.ok(answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true }))
+  const calls = []
+  const hub = { calls, sendRpcRequest: (u, d, f) => { calls.push([u, d, f]); return true } }
+  assert.equal(deliverPendingInvites(s.db, hub, { deviceId: agB.deviceId }), 1)
+  assert.equal(calls[0][2].from_convo_id, 'a-work')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).initiator_convo_id, 'a-work')
+})
+
+test('a parked invite with no requester conversation delivers without from_convo_id', async (t) => {
+  const { s, agA, agB } = await fleet(t)
+  parkInvite(s.db, {
+    convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x',
+  })
+  answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true })
+  const calls = []
+  const hub = { calls, sendRpcRequest: (u, d, f) => { calls.push([u, d, f]); return true } }
+  deliverPendingInvites(s.db, hub, { deviceId: agB.deviceId })
+  assert.ok(!('from_convo_id' in calls[0][2]), 'absent, not null')
+})
+
+test('agent_invite persists the validated from_convo_id on the parked row', async (t) => {
+  const { s, a, agA, agB } = await fleet(t)
+  a.send({ op: 'convo_upsert', convo_id: 'a-work', title: 'A at work', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === 'a-work')
+  a.send({
+    op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId,
+    target_convo_id: 'b-work', from_convo_id: 'a-work', justification: 'need your logs',
+  })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const row = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.initiator_convo_id, 'a-work')
+  assert.equal(agA.deviceId, row.initiator_device_id)
+})

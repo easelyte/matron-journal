@@ -791,6 +791,18 @@ export function openDb(path) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
   }
+  // Which of the REQUESTER's conversations asked (agent_invite's
+  // from_convo_id). The card always showed it; now it is also persisted and
+  // relayed on the request frame, because the invited bridge keys its
+  // one-room-per-pair lookup on the peer device PLUS the peer's conversation
+  // and could only ever learn the device — so a guest calling the inviter
+  // back found no room and opened a second one in the other direction. NULL
+  // for a pre-existing row or a requester that named no conversation. After
+  // both rebuilds above, for the reason target_convo_id is.
+  const caColsBefore = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caColsBefore.some((c) => c.name === 'initiator_convo_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN initiator_convo_id TEXT')
+  }
   // Consent items (spec 2026-09-22 consent-items): the tracker item that
   // mirrors a parked chat ask, NULL for rows predating the mirror. After
   // BOTH convo_agents rebuilds above for the reason target_convo_id is: a
