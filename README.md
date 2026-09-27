@@ -58,7 +58,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
-| `MATRON_GITHUB_CLIENT_ID` | unset (empty; linking disabled) | GitHub OAuth App client id for account linking (device flow). Empty disables linking; will default to Matron's published OAuth App id once one is registered |
+| `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
 | `MATRON_TOKEN_KEY` | unset (tokens stored as-is) | 64 hex chars (`openssl rand -hex 32`). Seals stored GitHub tokens with AES-256-GCM; existing rows are sealed at the next start. Losing it means every user re-links |

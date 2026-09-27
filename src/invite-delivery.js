@@ -30,7 +30,13 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
           // guessing at its most recently active one. Omitted (never null)
           // for a pre-3.5 requester that stored no target, so the receiver
           // can tell "not addressed" from "addressed to nothing".
-          ...(row.target_convo_id ? { target_convo_id: row.target_convo_id } : {}) }
+          ...(row.target_convo_id ? { target_convo_id: row.target_convo_id } : {}),
+          // Which of the REQUESTER's conversations is asking, so the
+          // receiving bridge can key its one-room-per-pair lookup on it and
+          // reuse this room when the guest later calls the inviter back
+          // instead of opening a second room in the other direction. Same
+          // omitted-not-null discipline as target_convo_id.
+          ...(row.initiator_convo_id ? { from_convo_id: row.initiator_convo_id } : {}) }
     if (hub.sendRpcRequest(row.owner_user_id, recipient, frame)) {
       markDelivered(db, { convoId: row.convo_id, agentDeviceId: row.agent_device_id })
       sent += 1

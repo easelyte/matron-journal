@@ -8,10 +8,11 @@
 //
 // `fetchImpl` is the test seam. Nothing here logs a token or a code.
 
-// Matron's published OAuth App client id. Empty until the app is registered
-// (tracker task #2797); an empty id means "linking not configured" unless
-// MATRON_GITHUB_CLIENT_ID overrides it.
-export const DEFAULT_GITHUB_CLIENT_ID = ''
+// Matron's published OAuth App (Matronhq org). A client id is public by
+// design; the device flow needs nothing else, so linking works out of the
+// box. MATRON_GITHUB_CLIENT_ID overrides it — set it to the empty string to
+// disable linking, or to your own app's id (with its secret) for the web flow.
+export const DEFAULT_GITHUB_CLIENT_ID = 'Ov23likaFmqoegaDMTtz'
 export const GITHUB_SCOPE = 'read:org'
 
 export class GithubError extends Error {

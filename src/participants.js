@@ -20,24 +20,25 @@ const RENEWABLE = new Set(['refused', 'denied', 'left', 'expired'])
 // row lands in. `delivered_at` is always reset to NULL here — a renewed row
 // is a brand new ask, not a continuation of whatever was or wasn't delivered
 // before.
-function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null }) {
+function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null, initiatorConvoId = null }) {
   const existing = db.prepare(
     'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId)
   if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
   db.prepare(`
-    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, created_at, answered_at, delivered_at)
-    VALUES(?,?,?,?,?,?,?,?,NULL,NULL)
+    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at)
+    VALUES(?,?,?,?,?,?,?,?,?,NULL,NULL)
     ON CONFLICT(convo_id, agent_device_id) DO UPDATE SET
       initiator_device_id=excluded.initiator_device_id,
       state=excluded.state,
       justification=excluded.justification,
       topic=excluded.topic,
       target_convo_id=excluded.target_convo_id,
+      initiator_convo_id=excluded.initiator_convo_id,
       created_at=excluded.created_at,
       answered_at=NULL,
       delivered_at=NULL
-  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, Date.now())
+  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, Date.now())
   return { ok: true, prior: existing ?? null }
 }
 
@@ -45,16 +46,16 @@ function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justi
 // BEFORE this call (null if no row existed) — a caller whose delivery then
 // fails needs the WHOLE prior row, not just its state, to restore it exactly
 // rather than erasing it (see undoInvite below).
-export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', targetConvoId = null }) {
-  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'invited', justification, topic: '', targetConvoId })
+export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', targetConvoId = null, initiatorConvoId = null }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'invited', justification, topic: '', targetConvoId, initiatorConvoId })
 }
 
 // Parks a request awaiting the user's consent — same renew/conflict
 // semantics as inviteParticipant, but the row lands in 'awaiting_user'
 // (never delivered to the target) and carries the topic the user will see
 // on the approval card. See answerParkedInvite for how a park resolves.
-export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', topic = '', targetConvoId = null }) {
-  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic, targetConvoId })
+export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', topic = '', targetConvoId = null, initiatorConvoId = null }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic, targetConvoId, initiatorConvoId })
 }
 
 // A direct joined row, no invite round-trip — the spawn approval path
@@ -99,7 +100,7 @@ export function markDelivered(db, { convoId, agentDeviceId, now = Date.now() }) 
 // feeds).
 export function undeliveredInvites(db) {
   return db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id,
            c.owner_user_id, c.agent_device_id AS room_agent_device_id
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.state='invited' AND ca.delivered_at IS NULL
@@ -178,9 +179,9 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
     return
   }
   db.prepare(`
-    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, created_at=?, answered_at=?, delivered_at=?
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, created_at=?, answered_at=?, delivered_at=?
     WHERE convo_id=? AND agent_device_id=?
-  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
 }
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
@@ -256,7 +257,7 @@ export function participantIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, topic, target_convo_id, created_at, answered_at, delivered_at, item_id FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at, item_id FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 

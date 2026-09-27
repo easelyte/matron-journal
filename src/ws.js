@@ -1402,7 +1402,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId, initiatorConvoId: msg.from_convo_id ?? null })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // An asleep target is started now, while the ask waits for the user:
         // by the time they approve, the box is usually up to receive it, and
