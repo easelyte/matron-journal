@@ -138,6 +138,16 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /coordinator\` → \`{convo_id}\` — the user's Coordinator
   conversation, or null. Only the user sets it; you hear a change as a
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
+- \`GET /memories\` → \`{memories}\` — the user's shared agent memory:
+  standing rules and facts, one row per kebab-case \`name\`, ordered by
+  name. \`GET /memories/:name\` (or the \`me_…\` id) → \`{memory}\`.
+- \`PUT /memories/:name\` \`{description (≤200 chars, one line), body?
+  (markdown ≤8 KB), type?: user|feedback|project|reference, convo_id?
+  (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
+  The same name overwrites — the whole memory, so send the body back when
+  updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
+  200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
+  conversation and on the Coordinator's.
 - \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
   per-row \`open_items\`, \`needs_you\`, \`conversations\`,
   \`milestones\`, \`last_milestone\`; most recent activity first.
