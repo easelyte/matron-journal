@@ -92,12 +92,27 @@ test('read policy survives withProtectedPaths and denies configured state paths'
   fs.mkdirSync(path.join(root, 'data'))
   fs.writeFileSync(path.join(root, 'data', 'matron.db'), 'x')
   const pinned = withProtectedPaths(
-    withReadPolicy(pinAllowedRootsSync([root]), { denyPaths: [path.join(root, 'data')], homeDir: null }),
+    withReadPolicy(pinAllowedRootsSync([root]), { denyTrees: [path.join(root, 'data')], homeDir: null }),
     [path.join(root, 'data', 'matron.db')])
   assert.equal(isDeniedPath(path.join(root, 'data', 'matron.db'), pinned), true)
   assert.equal(isDeniedPath(path.join(root, 'data', 'other.txt'), pinned), true)
   assert.equal(isDeniedPath(path.join(root, 'readme.md'), pinned), false)
   assert.ok(pinned.protectedPaths.length > 0)
+})
+
+test('a denied tree yields only inside a root configured within it, never to a broader root', () => {
+  const root = fs.realpathSync(makeTmpDir('matron-files-'))
+  const data = path.join(root, 'data')
+  fs.mkdirSync(path.join(data, 'uploads'), { recursive: true })
+  const policy = withReadPolicy(pinAllowedRootsSync([root, path.join(data, 'uploads')]),
+    { denyPaths: [path.join(data, 'matron.db')], denyTrees: [data], homeDir: null })
+  assert.equal(isDeniedPath(path.join(data, 'bridge-notes.txt'), policy), true)
+  assert.equal(isDeniedPath(path.join(data, 'uploads', 'a.png'), policy), false)
+  // The named state stays denied even under a root configured AT the tree.
+  const atTree = withReadPolicy(pinAllowedRootsSync([data]),
+    { denyPaths: [path.join(data, 'matron.db')], denyTrees: [data], homeDir: null })
+  assert.equal(isDeniedPath(path.join(data, 'matron.db'), atTree), true)
+  assert.equal(isDeniedPath(path.join(data, 'notes.txt'), atTree), false)
 })
 
 async function clientToken(s) {

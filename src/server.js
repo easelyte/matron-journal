@@ -541,16 +541,14 @@ export function startServer({
   ].filter(Boolean)
   // The same state is also refused to READS (2026-09-27): the database holds
   // every transcript and device-token hash, and its directory also holds the
-  // bridge's agent credentials. The whole data directory is denied when it
-  // sits strictly inside the read roots; if an operator rooted the data
-  // directory itself (or an ancestor of it) only the named state is denied, so
-  // the configured root does not silently vanish.
-  const readDenyPaths = [...serverStatePaths]
-  if (resolvedDbPath !== ':memory:') {
-    const dataDir = canonicalizeThroughExistingAncestor(path.dirname(resolvedDbPath))
-    if (!resolvedFileReadRoots?.roots.some((root) => contains(dataDir, root.realPath))) readDenyPaths.push(dataDir)
+  // bridge's agent credentials. The named state files are always denied; the
+  // data directory is a denied TREE, which yields only inside a root that was
+  // configured within it (a broader root never reaches into it).
+  const readPolicy = {
+    denyPaths: serverStatePaths,
+    denyTrees: resolvedDbPath === ':memory:' ? [] : [path.dirname(resolvedDbPath)],
+    homeDir: fileHomeDir !== undefined ? fileHomeDir : serviceUserHome(),
   }
-  const readPolicy = { denyPaths: readDenyPaths, homeDir: fileHomeDir !== undefined ? fileHomeDir : serviceUserHome() }
   if (resolvedFileReadRoots) resolvedFileReadRoots = withReadPolicy(resolvedFileReadRoots, readPolicy)
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {

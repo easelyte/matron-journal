@@ -117,9 +117,7 @@ function isHomeDotPath(realPath, homeDir, pinnedRoots) {
   if (!homeDir || !contains(homeDir, realPath) || realPath === homeDir) return false;
   const first = path.relative(homeDir, realPath).split(path.sep)[0];
   if (!first.startsWith('.')) return false;
-  const dotEntry = path.join(homeDir, first);
-  return !pinnedRoots.some((root) =>
-    contains(dotEntry, root.realPath) && contains(root.realPath, realPath));
+  return isInDeniedTree(realPath, path.join(homeDir, first), pinnedRoots);
 }
 
 // Read/write denial for the FILE API: the name/path denylist, the server's own
@@ -133,7 +131,18 @@ export function isDeniedPath(realPath, allowedRoots) {
   for (const denied of allowedRoots.readDenyPaths || []) {
     if (contains(denied, realPath)) return true;
   }
+  for (const tree of allowedRoots.readDenyTrees || []) {
+    if (isInDeniedTree(realPath, tree, allowedRoots.roots)) return true;
+  }
   return isHomeDotPath(realPath, allowedRoots.homeDir || null, allowedRoots.roots);
+}
+
+// A denied TREE (e.g. the journal data directory) yields only to a root that
+// was configured inside it, and only within that root: a broader root that
+// merely contains the tree never reaches into it.
+function isInDeniedTree(realPath, tree, pinnedRoots) {
+  if (!contains(tree, realPath)) return false;
+  return !pinnedRoots.some((root) => contains(tree, root.realPath) && contains(root.realPath, realPath));
 }
 
 // Path-boundary-safe containment: /a/b contains /a/b and /a/b/c, not /a/bc.
@@ -330,24 +339,28 @@ export function withProtectedPaths(pinnedRoots, protectedPaths) {
 // "inside scope" and the denylist becomes the only boundary. `homeDir` is the
 // service user's home; it is canonicalized so a symlinked $HOME still matches
 // the /proc/self/fd real paths the guards compare against.
-export function withReadPolicy(pinnedRoots, { denyPaths = [], homeDir = null } = {}) {
+export function withReadPolicy(pinnedRoots, { denyPaths = [], denyTrees = [], homeDir = null } = {}) {
   const { isPinnedApi } = pinnedRootsOf(pinnedRoots);
   if (!isPinnedApi) throw new FileLinkDenied('bad-workdir');
   if (pinnedRoots.roots.some((root) => root.realPath === path.sep)) {
     throw new Error('file API: a read-root of / is refused — it puts every path on the host in scope');
   }
-  const deny = [];
-  for (const candidate of denyPaths) {
-    if (!candidate) continue;
-    for (const spelling of [path.resolve(candidate), canonicalizeThroughExistingAncestor(candidate)]) {
-      if (!deny.includes(spelling)) deny.push(spelling);
+  const spellingsOf = (list) => {
+    const out = [];
+    for (const candidate of list) {
+      if (!candidate) continue;
+      for (const spelling of [path.resolve(candidate), canonicalizeThroughExistingAncestor(candidate)]) {
+        if (!out.includes(spelling)) out.push(spelling);
+      }
     }
-  }
+    return Object.freeze(out);
+  };
   return Object.freeze({
     ...pinnedRoots,
     [PINNED_ROOTS]: true,
     roots: pinnedRoots.roots,
-    readDenyPaths: Object.freeze(deny),
+    readDenyPaths: spellingsOf(denyPaths),
+    readDenyTrees: spellingsOf(denyTrees),
     homeDir: homeDir ? canonicalizeThroughExistingAncestor(homeDir) : null,
   });
 }
