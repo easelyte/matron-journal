@@ -18,7 +18,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths } from './file-guard.js'
+import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
 import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs } from './retention.js'
 import { backfillSearchIndex } from './search.js'
@@ -45,7 +45,9 @@ export const DEFAULT_MAX_REPLAY = 50000
 // no host-specific default read-root (review F1) — the feature is OFF unless
 // MATRON_FILE_READ_ROOTS is set at deploy (or fileReadRoots is passed). When
 // enabled, reads are broad by operator preference; the always-on secret
-// denylist (isSensitivePath) bounds exposure regardless of root breadth.
+// denylist (isDeniedPath: name patterns, the server's own state, and every
+// top-level dot entry of the service user's home) bounds exposure regardless
+// of root breadth. A read-root of / is refused at boot.
 export const DEFAULT_FILE_LIST_MAX = 2000
 // Broad directories that can never be a file write-root. The service user's
 // home joins the fixed set, so a non-root deploy refuses its own home the same
@@ -427,7 +429,7 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, workViewOptions,
+  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, workViewOptions, fileHomeDir,
   github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
@@ -537,6 +539,19 @@ export function startServer({
     resolvedMediaDir,
     resolvedFileAuditDir ? path.join(resolvedFileAuditDir, FILE_AUDIT_BASENAME) : null,
   ].filter(Boolean)
+  // The same state is also refused to READS (2026-09-27): the database holds
+  // every transcript and device-token hash, and its directory also holds the
+  // bridge's agent credentials. The whole data directory is denied when it
+  // sits strictly inside the read roots; if an operator rooted the data
+  // directory itself (or an ancestor of it) only the named state is denied, so
+  // the configured root does not silently vanish.
+  const readDenyPaths = [...serverStatePaths]
+  if (resolvedDbPath !== ':memory:') {
+    const dataDir = canonicalizeThroughExistingAncestor(path.dirname(resolvedDbPath))
+    if (!resolvedFileReadRoots?.roots.some((root) => contains(dataDir, root.realPath))) readDenyPaths.push(dataDir)
+  }
+  const readPolicy = { denyPaths: readDenyPaths, homeDir: fileHomeDir !== undefined ? fileHomeDir : serviceUserHome() }
+  if (resolvedFileReadRoots) resolvedFileReadRoots = withReadPolicy(resolvedFileReadRoots, readPolicy)
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
     resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
@@ -548,7 +563,7 @@ export function startServer({
     }
     // Belt-and-braces: the per-request guards refuse these paths too, so a
     // future root-resolution change cannot quietly reopen the hole.
-    resolvedFileWriteRoots = withProtectedPaths(resolvedFileWriteRoots, serverStatePaths)
+    resolvedFileWriteRoots = withProtectedPaths(withReadPolicy(resolvedFileWriteRoots, readPolicy), serverStatePaths)
   }
   // The write audit (plan T-1.3) is a PRECONDITION for writes, not a
   // decoration: every destructive op writes its intent line before the first

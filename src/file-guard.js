@@ -61,6 +61,28 @@ const SENSITIVE_BASENAME_PATTERNS = [
   /service[-_]?account.*\.json$/i,
   /^\.htpasswd$/i,
   /^config\.json$/i,
+  // 2026-09-27 hardening (maintainer review of the File Explorer stack found
+  // these reachable under a $HOME read-root):
+  //   ~/.secrets holds operator-submitted secrets for up to an hour, and other
+  //   secret files are named *_secret / *-secret rather than secrets.json.
+  /^\.secrets?$/i,
+  /[-_.]secrets?$/i,
+  //   Bearer material with no .json/.txt extension: the journal agent-token,
+  //   access-token files (e.g. ~/.supabase/access-token), and the bridge's
+  //   *-agent-creds.txt / *-agent-token.txt next to the journal DB.
+  /(^|[-_.])(agent|access|refresh|api|auth|bearer)[-_]?tokens?(\.(txt|json))?$/i,
+  /(^|[-_.])creds?(\.(txt|json|ya?ml|toml))?$/i,
+  //   Bridge state files: session map, secret-request ledger, in-flight turns,
+  //   timers, agent rooms, queued-release / run-state outboxes, the journal
+  //   cursor. They carry convo ids, room bindings and secret-request metadata.
+  /^\.claude-matrix-/i,
+  /^\.matron-bridge-/i,
+  /^\.claude-(queued-release|run-state)-outbox\.json$/i,
+  /^\.claude-subagent-running\.json$/i,
+  /^run-state-outbox\.json$/i,
+  /^journal-cursor\.json$/i,
+  //   Shell / REPL history routinely holds pasted tokens.
+  /^\.[a-z0-9]*_?history$/i,
 ];
 
 const SENSITIVE_PATH_PATTERNS = [
@@ -82,6 +104,36 @@ export function isSensitivePath(filePath) {
   if (segments.some((seg) => SENSITIVE_BASENAME_PATTERNS.some((re) => re.test(seg)))) return true;
   if (SENSITIVE_PATH_PATTERNS.some((re) => re.test(filePath))) return true;
   return false;
+}
+
+// The service user's home directory is where dotfiles and dot-directories keep
+// credentials the name patterns cannot enumerate (~/.acme.sh/account.conf,
+// ~/.anton/approval_grant_secret, ~/.bashrc exports, tool caches). When a
+// read-root is $HOME or an ancestor of it, every top-level dot entry under
+// $HOME is denied — unless a configured root itself lives inside that dot
+// entry (an operator who roots ~/.openclaw/workspace explicitly opted in to
+// that subtree, and only that subtree).
+function isHomeDotPath(realPath, homeDir, pinnedRoots) {
+  if (!homeDir || !contains(homeDir, realPath) || realPath === homeDir) return false;
+  const first = path.relative(homeDir, realPath).split(path.sep)[0];
+  if (!first.startsWith('.')) return false;
+  const dotEntry = path.join(homeDir, first);
+  return !pinnedRoots.some((root) =>
+    contains(dotEntry, root.realPath) && contains(root.realPath, realPath));
+}
+
+// Read/write denial for the FILE API: the name/path denylist, the server's own
+// state (database, WAL/SHM, preapprove key, media, audit log, and the data
+// directory that also holds the bridge agent credentials), and the $HOME
+// dot-entry rule. The legacy workdir form (no pinned roots object) only gets
+// the denylist, as before.
+export function isDeniedPath(realPath, allowedRoots) {
+  if (isSensitivePath(realPath)) return true;
+  if (allowedRoots?.[PINNED_ROOTS] !== true) return false;
+  for (const denied of allowedRoots.readDenyPaths || []) {
+    if (contains(denied, realPath)) return true;
+  }
+  return isHomeDotPath(realPath, allowedRoots.homeDir || null, allowedRoots.roots);
 }
 
 // Path-boundary-safe containment: /a/b contains /a/b and /a/b/c, not /a/bc.
@@ -266,9 +318,37 @@ export function withProtectedPaths(pinnedRoots, protectedPaths) {
     }
   }
   return Object.freeze({
+    ...pinnedRoots,
     [PINNED_ROOTS]: true,
     roots: pinnedRoots.roots,
     protectedPaths: Object.freeze(resolved),
+  });
+}
+
+// Attach the read policy (see isDeniedPath) to a pinned-roots object. Rejects
+// a filesystem-root `/` read-root outright: with it every path on the host is
+// "inside scope" and the denylist becomes the only boundary. `homeDir` is the
+// service user's home; it is canonicalized so a symlinked $HOME still matches
+// the /proc/self/fd real paths the guards compare against.
+export function withReadPolicy(pinnedRoots, { denyPaths = [], homeDir = null } = {}) {
+  const { isPinnedApi } = pinnedRootsOf(pinnedRoots);
+  if (!isPinnedApi) throw new FileLinkDenied('bad-workdir');
+  if (pinnedRoots.roots.some((root) => root.realPath === path.sep)) {
+    throw new Error('file API: a read-root of / is refused — it puts every path on the host in scope');
+  }
+  const deny = [];
+  for (const candidate of denyPaths) {
+    if (!candidate) continue;
+    for (const spelling of [path.resolve(candidate), canonicalizeThroughExistingAncestor(candidate)]) {
+      if (!deny.includes(spelling)) deny.push(spelling);
+    }
+  }
+  return Object.freeze({
+    ...pinnedRoots,
+    [PINNED_ROOTS]: true,
+    roots: pinnedRoots.roots,
+    readDenyPaths: Object.freeze(deny),
+    homeDir: homeDir ? canonicalizeThroughExistingAncestor(homeDir) : null,
   });
 }
 
@@ -414,7 +494,7 @@ function prepareWriteTarget(targetPath, writeRoots) {
     const canonicalTarget = path.resolve(pinnedAncestor, relativeTarget);
     const root = mostSpecificRoot(pinnedRoots, canonicalTarget);
     if (!root) throw new FileLinkDenied('outside-scope');
-    if (isSensitivePath(canonicalTarget)) throw new FileLinkDenied('sensitive');
+    if (isDeniedPath(canonicalTarget, writeRoots)) throw new FileLinkDenied('sensitive');
     assertTrashProtected(canonicalTarget);
     assertNotProtected(canonicalTarget, writeRoots.protectedPaths || []);
     for (const segment of relativeTarget.split(path.sep)) {
@@ -1360,7 +1440,7 @@ export async function validateAndOpen(filePath, { workdir, allowedRoots, maxByte
         throw new FileLinkDenied('outside-scope');
       }
     }
-    if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    if (isDeniedPath(realPath, allowedRoots)) throw new FileLinkDenied('sensitive');
     if (!pinnedRoots.length && workdir) {
       let realWorkdir;
       try {
@@ -1428,7 +1508,7 @@ export async function openGuarded(filePath, { allowedRoots } = {}) {
         throw new FileLinkDenied('outside-scope');
       }
     }
-    if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    if (isDeniedPath(realPath, allowedRoots)) throw new FileLinkDenied('sensitive');
     handedOff = true;
     // The caller owns fd from here (streams then closes it).
     return { fd, size: stat.size, mtimeMs: stat.mtimeMs, realPath };
@@ -1466,7 +1546,7 @@ export async function metaGuarded(targetPath, { allowedRoots } = {}) {
         throw new FileLinkDenied('outside-scope');
       }
     }
-    if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    if (isDeniedPath(realPath, allowedRoots)) throw new FileLinkDenied('sensitive');
     const kind = stat.isDirectory() ? 'dir' : 'file';
     return {
       realPath,
@@ -1503,7 +1583,7 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
       throw new FileLinkDenied('outside-scope');
     }
   }
-  if (isSensitivePath(realDir)) throw new FileLinkDenied('sensitive');
+  if (isDeniedPath(realDir, allowedRoots)) throw new FileLinkDenied('sensitive');
 
   let st;
   try {
@@ -1526,7 +1606,7 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
     const full = path.join(realDir, de.name);
     // Drop by listed name/path first (cheap; catches sensitively-named entries
     // regardless of what they point at).
-    if (isSensitivePath(full)) continue;
+    if (isDeniedPath(full, allowedRoots)) continue;
     // Resolve the entry's real path: drops broken symlinks (throws) and lets
     // us enforce symlink-out + symlink-to-secret defenses.
     let entryReal;
@@ -1536,7 +1616,7 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
       continue;
     }
     if (pinnedRoots.length && !pinnedRoots.some((root) => contains(root.realPath, entryReal))) continue;
-    if (isSensitivePath(entryReal)) continue;
+    if (isDeniedPath(entryReal, allowedRoots)) continue;
     let estat;
     try {
       estat = fs.statSync(full);
