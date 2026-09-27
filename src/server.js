@@ -1,5 +1,6 @@
 import http from 'node:http'
 import { accessSync, constants as fsConstants, realpathSync, readlinkSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 const { resolve } = path
 import { fileURLToPath } from 'node:url'
@@ -46,7 +47,15 @@ export const DEFAULT_MAX_REPLAY = 50000
 // enabled, reads are broad by operator preference; the always-on secret
 // denylist (isSensitivePath) bounds exposure regardless of root breadth.
 export const DEFAULT_FILE_LIST_MAX = 2000
-const PROHIBITED_FILE_WRITE_ROOTS = new Set(['/', '/root', '/opt/matron'])
+// Broad directories that can never be a file write-root. The service user's
+// home joins the fixed set, so a non-root deploy refuses its own home the same
+// way /root is refused; as root the set is unchanged.
+export function prohibitedFileWriteRoots(home = os.homedir()) {
+  const roots = new Set(['/', '/root', '/opt/matron'])
+  if (home && path.isAbsolute(home)) roots.add(path.resolve(home))
+  return roots
+}
+const PROHIBITED_FILE_WRITE_ROOTS = prohibitedFileWriteRoots()
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
