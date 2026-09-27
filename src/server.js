@@ -49,8 +49,17 @@ export const DEFAULT_MAX_REPLAY = 50000
 export const DEFAULT_FILE_LIST_MAX = 2000
 // Broad directories that can never be a file write-root. The service user's
 // home joins the fixed set, so a non-root deploy refuses its own home the same
-// way /root is refused; as root the set is unchanged.
-export function prohibitedFileWriteRoots(home = os.homedir()) {
+// way /root is refused; as root the set is unchanged. The home comes from the
+// passwd entry (not $HOME), so an overridden HOME cannot change the set.
+export function serviceUserHome() {
+  try {
+    return os.userInfo().homedir
+  } catch {
+    return os.homedir()
+  }
+}
+
+export function prohibitedFileWriteRoots(home = serviceUserHome()) {
   const roots = new Set(['/', '/root', '/opt/matron'])
   if (home && path.isAbsolute(home)) roots.add(path.resolve(home))
   return roots

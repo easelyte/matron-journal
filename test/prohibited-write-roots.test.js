@@ -31,25 +31,30 @@ test('an empty or relative home adds nothing', () => {
   assert.deepEqual(prohibitedFileWriteRoots('relative/home'), new Set(LEGACY_ROOTS))
 })
 
-test('the default prohibited set follows os.homedir()', () => {
-  assert.deepEqual(prohibitedFileWriteRoots(), prohibitedFileWriteRoots(os.homedir()))
+test("the default prohibited set follows the service user's passwd home", () => {
+  assert.deepEqual(prohibitedFileWriteRoots(), prohibitedFileWriteRoots(os.userInfo().homedir))
 })
 
-test("the service user's home is refused as a write-root at boot", () => {
+test('an overridden HOME does not change the default set', () => {
   const home = makeTmpDir('matron-fake-home-')
   const out = execFileSync(process.execPath, [
     '--input-type=module', '-e',
     `const m = await import(${JSON.stringify(SERVER_JS)});
-     process.stdout.write(JSON.stringify(m.pinProhibitedFileWriteRootsSync().roots.map((r) => r.realPath)))`,
+     process.stdout.write(JSON.stringify([...m.prohibitedFileWriteRoots()]))`,
   ], { env: { ...process.env, HOME: home }, encoding: 'utf8' })
-  assert.ok(JSON.parse(out).includes(home), `default pin set ${out} lacks HOME ${home}`)
+  assert.deepEqual(new Set(JSON.parse(out)), prohibitedFileWriteRoots(os.userInfo().homedir))
+  assert.ok(!JSON.parse(out).includes(home), `default set ${out} picked up HOME ${home}`)
+  if (process.getuid?.() === 0) assert.deepEqual(new Set(JSON.parse(out)), new Set(LEGACY_ROOTS))
+})
 
+test("the service user's home is refused as a write-root, directories below it are not", () => {
+  const home = makeTmpDir('matron-fake-home-')
   const prohibited = pinProhibitedFileWriteRootsSync(prohibitedFileWriteRoots(home))
+  assert.ok(prohibited.roots.some((r) => r.realPath === home))
   assert.throws(
     () => assertNoProhibitedFileWriteRoots(pinAllowedRootsSync([home]), prohibited),
     (err) => err?.message === `file writes: configured write-root is prohibited because it is too broad: ${home}`,
   )
-  // A directory BELOW the home stays allowed (only an exact-root match is refused).
   const below = path.join(home, 'workspace')
   mkdirSync(below)
   assert.doesNotThrow(() => assertNoProhibitedFileWriteRoots(pinAllowedRootsSync([below]), prohibited))
