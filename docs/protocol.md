@@ -1708,6 +1708,97 @@ cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
 snippet) and never pushes. `hello_ok` and `/snapshot` carry
 `coordinator_convo_id` so an app knows the Coordinator on connect.
 
+## Memories
+
+Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`.
+
+A memory is the user's shared agent memory: a standing rule or fact any of
+their agents may save and every one of them may read, shaped like a Claude
+Code memory file so an agent's own memory instructions apply to it. Per
+user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
+per `name`, overwritten in place. A bridge with the memories update
+(matron-bridge, the `memory_*` tools) injects the index (name, type,
+description) into the Coordinator's instructions at spawn; against an
+older bridge the memories are stored and shown in the apps only.
+
+```
+{ id: "me_<16 hex>", name, type, description, body,
+  origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
+```
+
+- `name`: `^[a-z0-9][a-z0-9-]{0,63}$`, unique per user.
+- `type`: `user | feedback | project | reference`; `feedback` when omitted
+  on create, kept when omitted on update.
+- `description`: 1–200 characters, trimmed, one line (no C0/C1 control
+  characters, no U+2028/U+2029). It is the line the Coordinator sees at
+  spawn, so it must be the actionable one-liner.
+- `body`: markdown, at most 8192 UTF-8 bytes, may be empty.
+- `origin_convo_id` / `origin_device_id`: where the memory was first
+  saved; set once. `origin_convo_id` is not a foreign key — deleting the
+  conversation does not delete the memory. `origin_private` is the origin
+  device's privacy flag **snapshotted at save time** (a revoked device, or
+  a new device reusing its id, never changes who may read the memory).
+  `created_by` / `updated_by` are `user` or `agent`.
+- At most **200 memories per user**.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
+| `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
+| `PUT /memories/:name` | `{description, body?, type?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request`; 409 `too_many`; 404 |
+| `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
+
+`PUT` is the only write and is an **upsert by name**: the same name from
+any device overwrites `description`, `body` and `type` and bumps
+`updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
+`body` on an update **clears** it. Retries are therefore free; there is no
+`Idempotency-Key`. An invalid `:name` is 400, not 404.
+
+`convo_id` is optional and only meaningful from an **agent**: the bridge
+sends the session's conversation so the memory records where it came from
+and the marker lands on that timeline. It clears the gate every
+agent-authored write clears — the conversation is the user's, the agent
+owns or has joined it (`authorizeAgentWrite`), and an ordinary agent may
+not name a private-owned conversation — answering **404** otherwise, never
+403. A client sending `convo_id` is 400.
+
+**Privacy.** A memory saved from a private agent device is invisible to an
+ordinary (filtered) agent: absent from `GET /memories`, 404 on `GET`, `PUT`
+and `DELETE` by key. A filtered agent's `PUT` on such a name is a 404, not
+a second row (`UNIQUE(user_id, name)` holds). Clients and private agents
+see everything. Memories are never shared across users.
+
+### Marker event
+
+Every successful `PUT` and `DELETE` appends a `memory` event **after** the
+row's transaction has committed (a marker append that itself fails is
+logged and swallowed; the write stands):
+
+```json
+{ "seq": 123, "convo_id": "…", "ts": 1790550000000,
+  "sender": "user:dan" | "agent:bev", "type": "memory",
+  "payload": { "memory_id": "me_…", "name": "avoid-eric", "type": "feedback",
+    "description": "Never start sessions on eric.",
+    "action": "saved" | "deleted", "created": true | false, "by": "user" | "agent" } }
+```
+
+Appended to, in order: (1) the writer's `convo_id` when the write was an
+agent `PUT` carrying one, else the memory's `origin_convo_id` when set;
+(2) the user's Coordinator conversation (`GET /coordinator`) when one is set
+and it is not already (1). A client write with no Coordinator set appends
+nothing. Two conversations means two events with the same `memory_id`;
+clients dedupe on it and refetch the list. Across the privacy boundary —
+the origin device is private and the target conversation is not
+private-owned — the payload carries `memory_id`, `action`, `created` and
+`by` only.
+
+`memory` is not a `MESSAGE_TYPES` entry (no unread, no snippet), not an
+`AGENT_PUBLISH_TYPES` member (a bare publish is `bad_request`), never
+pushes, never wakes, and has no old-client text fallback: a client that
+predates it ignores the type.
+
 ## Missions & milestones
 
 Spec: `docs/superpowers/specs/2026-09-10-missions-milestones-design.md`.
