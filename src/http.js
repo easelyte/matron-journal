@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
+import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, isDeniedPath, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { pipeline } from 'node:stream/promises'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
@@ -342,16 +342,41 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const p = url.searchParams.get('path')
-        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
-        const showAll = url.searchParams.get('all') === '1'
-        let listed
-        try {
-          listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
-        } catch (e) {
-          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
-          throw e
+        // No `path` => the server's default folder, so a client never has to
+        // hardcode a host path: the first write root that accepts writes right
+        // now (where the operator works, even nested below a read root), else
+        // the first read root. Each candidate goes through the same read guard
+        // as an explicit path. Only a read-POLICY refusal skips a write root;
+        // an operational failure (unreadable, gone) is answered as-is so a
+        // broken working folder fails visible instead of silently opening the
+        // read root. An explicit but empty/relative `path` is still a 400.
+        const explicit = url.searchParams.has('path')
+        const candidates = explicit
+          ? [url.searchParams.get('path')]
+          : [
+              ...(fileWriteCtx.fileWriteRoots?.roots ?? [])
+                .filter((w) => listingIsWritable(fileWriteCtx, w.realPath))
+                .map((w) => w.realPath),
+              fileReadRoots.roots[0]?.realPath,
+            ]
+        if (explicit && (typeof candidates[0] !== 'string' || !path.isAbsolute(candidates[0]))) {
+          return json(res, 400, { error: 'bad_request' })
         }
+        let listed
+        let denied = null
+        for (const p of candidates) {
+          if (typeof p !== 'string') continue
+          try {
+            listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
+            break
+          } catch (e) {
+            if (!(e instanceof FileLinkDenied)) throw e
+            denied = e
+            if (e.reason !== 'sensitive' && e.reason !== 'outside-scope') break
+          }
+        }
+        if (!listed) return json(res, denied ? denialToStatus(denied.reason) : 404, { error: denied ? 'denied' : 'not_found' })
+        const showAll = url.searchParams.get('all') === '1'
         // Sensitive entries are already dropped by the guard; this is only the
         // dev-noise/dotfile display filter, toggled off by ?all=1.
         const visible = showAll ? listed.entries : listed.entries.filter((e) => !isHiddenListEntry(e.name))
@@ -368,7 +393,22 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // NEVER points above the jail. `path ∈ root` was already enforced by
         // the guard, so dirname(path) stays within/at `root`; when `path` IS a
         // read-root, `parent` is null (top boundary).
-        const containingRoot = fileReadRoots.roots.find((r) => contains(r.realPath, listed.realDir))?.realPath ?? null
+        // With overlapping roots, the SHALLOWEST containing root whose
+        // breadcrumb is navigable: every directory between it and this one
+        // passes the read policy. /work + /work/project keeps browsing up to
+        // /work; $HOME + a workspace inside a denied dot entry stops at the
+        // workspace, so no crumb or parent points at a refused directory.
+        const containingRoots = fileReadRoots.roots
+          .map((r) => r.realPath)
+          .filter((r) => contains(r, listed.realDir))
+          .sort((a, b) => a.length - b.length)
+        const navigableFrom = (root) => {
+          for (let d = path.dirname(listed.realDir); d !== root && contains(root, d); d = path.dirname(d)) {
+            if (isDeniedPath(d, fileReadRoots)) return false
+          }
+          return true
+        }
+        const containingRoot = containingRoots.find(navigableFrom) ?? containingRoots.at(-1) ?? null
         const parent = (containingRoot === null || listed.realDir === containingRoot)
           ? null
           : path.dirname(listed.realDir)
