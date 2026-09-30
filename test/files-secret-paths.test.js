@@ -146,6 +146,49 @@ test('server: $HOME root hides ~/.secrets and dotfiles; an explicit workspace ro
   assert.equal(ok.status, 200)
 })
 
+// The production shape: $HOME and a workspace inside one of its (denied) dot entries are both read
+// roots, and the workspace is the write root. The path-less default opens the workspace, and its
+// breadcrumb root is the workspace itself (the DEEPEST containing root), so no crumb or parent
+// points into the denied ~/.openclaw.
+test('server: path-less list opens the workspace write root with a navigable breadcrumb', async (t) => {
+  const home = makeHome()
+  const ws = path.join(home, '.openclaw', 'workspace')
+  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
+  const s = await startTestServer({
+    fileReadRoots: [home, ws], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const body = await (await get(s, '/files/list', token)).json()
+  assert.equal(body.path, ws)
+  assert.equal(body.root, ws)
+  assert.equal(body.parent, null)
+  assert.equal(body.writable, true)
+  const sub = await (await get(s, `/files/list?path=${encodeURIComponent(path.join(ws, 'src'))}`, token)).json()
+  assert.equal(sub.root, ws)
+  assert.equal(sub.parent, ws)
+  // $HOME itself still lists with $HOME as its root.
+  assert.equal((await (await get(s, `/files/list?path=${encodeURIComponent(home)}`, token)).json()).root, home)
+})
+
+// A write root the READ policy refuses (inside a denied $HOME dot entry, no read root of its own)
+// is skipped: the default falls through to the first read root instead of answering 403.
+test('server: path-less list skips a write root the read policy denies', async (t) => {
+  const home = makeHome()
+  const ws = path.join(home, '.openclaw', 'workspace')
+  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
+  const s = await startTestServer({
+    fileReadRoots: [home], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const r = await get(s, '/files/list', token)
+  assert.equal(r.status, 200)
+  const body = await r.json()
+  assert.equal(body.path, home)
+  assert.equal(body.root, home)
+})
+
 test('server: the journal data directory is not readable through the file API', async (t) => {
   const root = fs.realpathSync(makeTmpDir('matron-files-'))
   fs.mkdirSync(path.join(root, 'data'))

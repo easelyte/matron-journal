@@ -344,22 +344,36 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         // No `path` => the server's default folder, so a client never has to
         // hardcode a host path: the first write root that accepts writes right
-        // now and is browsable (inside a read root) -- where the operator works,
-        // even when it is nested below a read root -- else the first read root.
+        // now (where the operator works, even nested below a read root), else
+        // the first read root. Each candidate goes through the same read guard
+        // as an explicit path, and one the read policy refuses is skipped.
         // An explicit but empty/relative `path` is still a 400.
-        const p = url.searchParams.has('path')
-          ? url.searchParams.get('path')
-          : (fileWriteCtx.fileWriteRoots?.roots.find((w) => listingIsWritable(fileWriteCtx, w.realPath)
-              && fileReadRoots.roots.some((r) => contains(r.realPath, w.realPath))) ?? fileReadRoots.roots[0])?.realPath
-        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
-        const showAll = url.searchParams.get('all') === '1'
-        let listed
-        try {
-          listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
-        } catch (e) {
-          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
-          throw e
+        const explicit = url.searchParams.has('path')
+        const candidates = explicit
+          ? [url.searchParams.get('path')]
+          : [
+              ...(fileWriteCtx.fileWriteRoots?.roots ?? [])
+                .filter((w) => listingIsWritable(fileWriteCtx, w.realPath))
+                .map((w) => w.realPath),
+              fileReadRoots.roots[0]?.realPath,
+            ]
+        if (explicit && (typeof candidates[0] !== 'string' || !path.isAbsolute(candidates[0]))) {
+          return json(res, 400, { error: 'bad_request' })
         }
+        let listed
+        let denied = null
+        for (const p of candidates) {
+          if (typeof p !== 'string') continue
+          try {
+            listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
+            break
+          } catch (e) {
+            if (!(e instanceof FileLinkDenied)) throw e
+            denied = e
+          }
+        }
+        if (!listed) return json(res, denied ? denialToStatus(denied.reason) : 404, { error: denied ? 'denied' : 'not_found' })
+        const showAll = url.searchParams.get('all') === '1'
         // Sensitive entries are already dropped by the guard; this is only the
         // dev-noise/dotfile display filter, toggled off by ?all=1.
         const visible = showAll ? listed.entries : listed.entries.filter((e) => !isHiddenListEntry(e.name))
@@ -376,7 +390,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // NEVER points above the jail. `path ∈ root` was already enforced by
         // the guard, so dirname(path) stays within/at `root`; when `path` IS a
         // read-root, `parent` is null (top boundary).
-        const containingRoot = fileReadRoots.roots.find((r) => contains(r.realPath, listed.realDir))?.realPath ?? null
+        // The DEEPEST containing root: with overlapping roots (e.g. $HOME and a
+        // workspace inside one of its denied dot entries) a shallower root
+        // would offer a breadcrumb/parent the read policy refuses.
+        const containingRoot = fileReadRoots.roots
+          .filter((r) => contains(r.realPath, listed.realDir))
+          .reduce((deepest, r) => (deepest === null || r.realPath.length > deepest.length ? r.realPath : deepest), null)
         const parent = (containingRoot === null || listed.realDir === containingRoot)
           ? null
           : path.dirname(listed.realDir)
