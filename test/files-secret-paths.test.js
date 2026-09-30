@@ -189,6 +189,25 @@ test('server: path-less list skips a write root the read policy denies', async (
   assert.equal(body.root, home)
 })
 
+// Fail visible: a write root that is merely UNREADABLE right now (an operational failure, not a
+// read-policy refusal) is reported, not papered over by silently opening the first read root.
+test('server: path-less list surfaces an unreadable write root instead of falling back', { skip: process.getuid?.() === 0 }, async (t) => {
+  const root = fs.realpathSync(makeTmpDir('matron-files-'))
+  const work = path.join(root, 'work')
+  fs.mkdirSync(work)
+  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
+  const s = await startTestServer({
+    fileReadRoots: [root], fileHomeDir: null, fileWriteRoots: [work], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  fs.chmodSync(work, 0o000)
+  t.after(() => fs.chmodSync(work, 0o755))
+  const r = await get(s, '/files/list', token)
+  assert.notEqual(r.status, 200)
+  assert.deepEqual(await r.json(), { error: 'denied' })
+})
+
 test('server: the journal data directory is not readable through the file API', async (t) => {
   const root = fs.realpathSync(makeTmpDir('matron-files-'))
   fs.mkdirSync(path.join(root, 'data'))

@@ -243,6 +243,17 @@ test('GET /files/list without a path lists the default folder: first writable re
   assert.equal(nBody.root, second)
   assert.equal(nBody.parent, second)
   assert.equal(nBody.writable, true)
+
+  // Overlapping READABLE roots keep upward navigation: /second + /second/project both read roots,
+  // the listing of project still reports the shallower /second as its breadcrumb root.
+  const overlap = await startTestServer({
+    fileReadRoots: [first, second, project], fileWriteRoots: [project], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => overlap.close())
+  const oBody = await (await authGet(overlap, '/files/list', await clientToken(overlap))).json()
+  assert.equal(oBody.path, project)
+  assert.equal(oBody.root, second)
+  assert.equal(oBody.parent, second)
 })
 
 test('GET /files/meta: file + dir metadata; sensitive/outside denied', async (t) => {
