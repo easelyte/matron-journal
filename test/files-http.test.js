@@ -229,6 +229,20 @@ test('GET /files/list without a path lists the default folder: first writable re
   })
   t.after(() => dry.close())
   assert.equal((await (await authGet(dry, '/files/list', await clientToken(dry))).json()).path, first)
+
+  // A write root NESTED below a later read root is still where the default opens; its read root
+  // is the breadcrumb root, so the operator can still browse up from it.
+  const project = path.join(second, 'project')
+  fs.mkdirSync(project)
+  const nested = await startTestServer({
+    fileReadRoots: [first, second], fileWriteRoots: [project], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => nested.close())
+  const nBody = await (await authGet(nested, '/files/list', await clientToken(nested))).json()
+  assert.equal(nBody.path, project)
+  assert.equal(nBody.root, second)
+  assert.equal(nBody.parent, second)
+  assert.equal(nBody.writable, true)
 })
 
 test('GET /files/meta: file + dir metadata; sensitive/outside denied', async (t) => {
