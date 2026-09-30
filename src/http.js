@@ -342,7 +342,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const p = url.searchParams.get('path')
+        // No `path` => the server's default folder, so a client never has to
+        // hardcode a host path: the first read root that currently accepts
+        // writes (where the operator works), else the first read root. An
+        // explicit but empty/relative `path` is still a 400.
+        const p = url.searchParams.has('path')
+          ? url.searchParams.get('path')
+          : (fileReadRoots.roots.find((r) => listingIsWritable(fileWriteCtx, r.realPath)) ?? fileReadRoots.roots[0])?.realPath
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
         const showAll = url.searchParams.get('all') === '1'
         let listed

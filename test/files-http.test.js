@@ -188,7 +188,47 @@ test('GET /files/list: outside-root -> 403, missing -> 404, a file path -> 404 (
   assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'nope'))}`, token)).status, 404)
   assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
   assert.equal((await authGet(s, `/files/list?path=relative`, token)).status, 400)
-  assert.equal((await authGet(s, `/files/list`, token)).status, 400)
+  // An explicit but empty path is still malformed; only an ABSENT path means "the default".
+  assert.equal((await authGet(s, `/files/list?path=`, token)).status, 400)
+})
+
+// The client has no business hardcoding a host path, so a pathless list is the server's default
+// folder: the first read root that accepts writes right now, else the first read root.
+test('GET /files/list without a path lists the default folder: first writable read root, else first read root', async (t) => {
+  const first = fs.realpathSync(makeTmpDir('matron-files-first-'))
+  const second = fs.realpathSync(makeTmpDir('matron-files-second-'))
+  fs.writeFileSync(path.join(first, 'in-first.txt'), 'a\n')
+  fs.writeFileSync(path.join(second, 'in-second.txt'), 'b\n')
+  const auditDir = fs.realpathSync(makeTmpDir('matron-files-audit-'))
+
+  const readOnly = await startTestServer({ fileReadRoots: [first, second] })
+  t.after(() => readOnly.close())
+  const roToken = await clientToken(readOnly)
+  const roRes = await authGet(readOnly, '/files/list', roToken)
+  assert.equal(roRes.status, 200)
+  const ro = await roRes.json()
+  assert.equal(ro.path, first)
+  assert.equal(ro.root, first)
+  assert.equal(ro.parent, null)
+  assert.deepEqual(ro.entries.map((e) => e.name), ['in-first.txt'])
+  // ?all=1 still applies to the default listing.
+  assert.equal((await authGet(readOnly, '/files/list?all=1', roToken)).status, 200)
+
+  const writes = await startTestServer({
+    fileReadRoots: [first, second], fileWriteRoots: [second], fileEnableWrites: true, fileAuditDir: auditDir,
+  })
+  t.after(() => writes.close())
+  const wBody = await (await authGet(writes, '/files/list', await clientToken(writes))).json()
+  assert.equal(wBody.path, second)
+  assert.equal(wBody.writable, true)
+
+  // Dry-run reports nothing writable, so the default falls back to the first read root.
+  const dry = await startTestServer({
+    fileReadRoots: [first, second], fileWriteRoots: [second], fileEnableWrites: true, fileWritesDryRun: true,
+    fileAuditDir: auditDir,
+  })
+  t.after(() => dry.close())
+  assert.equal((await (await authGet(dry, '/files/list', await clientToken(dry))).json()).path, first)
 })
 
 test('GET /files/meta: file + dir metadata; sensitive/outside denied', async (t) => {
