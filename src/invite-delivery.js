@@ -19,10 +19,15 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
     if (recipient == null) continue
     if (deviceId != null && recipient !== deviceId) continue
     const from = db.prepare('SELECT name FROM devices WHERE id=?').get(row.initiator_device_id)
+    // approved_by: who let this ask through — 'coordinator' when the user's
+    // Coordinator answered the card on their behalf (spec: 2026-09-29
+    // coordinator consent), so the receiving bridge can say so rather than
+    // "your user approved this". Omitted for a tap (the pre-field shape).
+    const approvedBy = row.answered_by === 'coordinator' ? { approved_by: 'coordinator' } : {}
     const frame = isJoin
       ? { kind: 'invite', event: 'join_request', room_id: row.convo_id,
-          from_device_id: row.initiator_device_id, from_name: from?.name ?? '', justification: row.justification }
-      : { kind: 'invite', event: 'request', room_id: row.convo_id,
+          from_device_id: row.initiator_device_id, from_name: from?.name ?? '', justification: row.justification, ...approvedBy }
+      : { kind: 'invite', event: 'request', room_id: row.convo_id, ...approvedBy,
           from_device_id: row.initiator_device_id, from_name: from?.name ?? '',
           topic: row.topic, justification: row.justification,
           // Which of the recipient's OWN conversations this ask was aimed at

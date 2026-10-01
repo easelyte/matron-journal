@@ -128,7 +128,7 @@ test('close: a hidden open item on a private-owned conversation still blocks the
   assert.deepEqual(asPrivate.json.items, [{ num: hidden.num, title: 'Hidden task' }])
 })
 
-test('join: attaches c2 and repoints its items; refuses a second mission for a convo; PATCH updates and emits the marker on the origin', async (t) => {
+test('join: attaches c2 and repoints its items; a conversation on another mission joins it (200, was 409); PATCH updates and emits the marker on the origin', async (t) => {
   const { s, agent, client } = await fleet(t)
   const m = (await start(s, agent.token, {})).json.mission
   const it2 = (await item(s, agent.token, { convo_id: 'c2', kind: 'task', title: 'T2' })).json.item
@@ -139,8 +139,8 @@ test('join: attaches c2 and repoints its items; refuses a second mission for a c
   assert.equal(other.status, 200); assert.equal(other.json.existing, true); assert.equal(other.json.mission.id, m.id)
   upsertConversation(s.db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: agent.deviceId })
   const b = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'B', convo_id: 'c3' } })).json.mission
-  const bad = await s.http(`/missions/${b.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
-  assert.equal(bad.status, 409); assert.equal(bad.json.blocked_by, 'other_mission')
+  const moved = await s.http(`/missions/${b.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  assert.equal(moved.status, 200); assert.equal(moved.json.mission.id, b.id)
   const ws = await makeWsClient(s.base, { token: client, cursor: null })
   await ws.waitFor((f) => f.op === 'hello_ok')
   const p = await s.http(`/missions/${m.id}`, { method: 'PATCH', token: agent.token, body: { title: 'Renamed' } })
@@ -177,9 +177,8 @@ test('privacy sieve: an ordinary agent cannot see a mission born in a private co
   const priv = createAgent(s.db, dan.id, 'private-box')
   pinDevicePrivate(s.db, priv.deviceId, true)
   upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
-  // A second private-owned convo, deliberately never given its own mission —
-  // 'secret' already owns 'm' below, so reusing it to join 'pub' would
-  // correctly 409 other_mission (a convo may join at most one mission).
+  // A second private-owned convo, deliberately never given its own mission,
+  // so joining it to 'pub' below is a plain first join, not a move off 'm'.
   upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
   const m = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Hidden', convo_id: 'secret' } })).json.mission
   assert.equal((await s.http('/missions', { token: agent.token })).json.missions.length, 0)
@@ -482,20 +481,23 @@ test('GET /milestones?convo=: 400 without a convo; 404 for unknown, another user
 
 // Final review, I4(b): the 200-conversation cap is a real 400, and seeding
 // the conversations straight into SQL keeps it a millisecond test.
-test('POST /missions/:id/join: 400 once the mission already holds CONVOS_MAX conversations', async (t) => {
+test('POST /missions/:id/join: 400 once the mission already holds CONVOS_MAX top-level conversations; sub-chats never count', async (t) => {
   const { s, agent } = await fleet(t)
   const m = (await start(s, agent.token, {})).json.mission
-  const ins = s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,?,'pad','running',?,0)")
   const userId = s.db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get('c1').owner_user_id
-  for (let i = 0; i < CONVOS_MAX - 1; i++) ins.run(`pad${i}`, userId, m.id)
-  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  const full = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  const conv = s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,?,'pad','running',?,0)")
+  const link = s.db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at) VALUES(?,?,?,'joined',0)")
+  for (let i = 0; i < CONVOS_MAX - 1; i++) { conv.run(`pad${i}`, userId, m.id); link.run(m.id, `pad${i}`, userId) }
+  const joinC = (id) => s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: id } })
+  const full = await joinC('c2')
   assert.equal(full.status, 400)
   assert.deepEqual(full.json, { error: 'bad_request' })
   assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, null)
-  // One slot back and the same call succeeds — the cap is the only reason.
-  s.db.prepare('UPDATE conversations SET mission_id=NULL WHERE id=?').run('pad0')
-  assert.equal((await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })).status, 200)
+  upsertConversation(s.db, { id: 'kid', ownerUserId: userId, title: 'k', agentDeviceId: agent.deviceId, parentConvoId: 'c2' })
+  assert.equal((await joinC('kid')).status, 200, 'a sub-chat is never counted')
+  // One slot back (an ended link) and the same call succeeds — the cap is the only reason.
+  s.db.prepare("UPDATE mission_conversations SET ended_at=1 WHERE convo_id='pad0'").run()
+  assert.equal((await joinC('c2')).status, 200)
 })
 
 // Final review, I4(c): the 502 path over real HTTP. The anchor marker is
@@ -888,3 +890,268 @@ test('POST /missions: a non-boolean attach is 400 and writes nothing', async (t)
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM missions').get().n, 0)
   assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c1').mission_id, null)
 })
+
+// Spec 2026-09-28 missions dashboard §1 — mission status.
+const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
+const patch = (s, token, id, body) => s.http(`/missions/${id}`, { method: 'PATCH', token, body })
+const updatedMarkers = (s) => s.db.prepare(
+  "SELECT convo_id, payload FROM events WHERE type='mission' AND json_extract(payload,'$.action')='updated' ORDER BY seq",
+).all().map((r) => ({ convo_id: r.convo_id, ...JSON.parse(r.payload) }))
+
+test('PATCH /missions/:id {status}: set, overwrite, clear; status_by follows the caller; GET list and detail carry the four fields; every status write marks status_changed', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const m = (await start(s, agent.token, {})).json.mission
+  for (const k of STATUS_FIELDS) assert.equal(m[k], null, k)
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const before = Date.now()
+  const set = await patch(s, agent.token, m.id, { status: '  Migration done; routes next.  ', convo_id: 'c1' })
+  assert.equal(set.status, 200)
+  assert.equal(set.json.mission.status, 'Migration done; routes next.')
+  assert.equal(set.json.mission.status_by, 'agent'); assert.equal(set.json.mission.status_convo_id, 'c1')
+  assert.ok(set.json.mission.status_updated_at >= before)
+  assert.equal(set.json.mission.updated_at, set.json.mission.status_updated_at)
+  assert.equal(set.json.mission.title, 'Missions'); assert.equal(set.json.mission.body, 'goal')
+  assert.equal('status_device_id' in set.json.mission, false)
+  const live = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'updated')
+  assert.equal(live.convo_id, 'c1'); assert.equal(live.payload.status_changed, true); assert.equal(live.payload.by, 'agent')
+  assert.equal('status' in live.payload, false)
+  ws.close()
+
+  const listed = (await s.http('/missions', { token: client })).json.missions.find((x) => x.id === m.id)
+  const detail = (await s.http(`/missions/${m.num}`, { token: agent.token })).json.mission
+  for (const row of [listed, detail]) {
+    assert.equal(row.status, 'Migration done; routes next.'); assert.equal(row.status_by, 'agent')
+    assert.equal(row.status_convo_id, 'c1'); assert.equal(row.status_updated_at, set.json.mission.status_updated_at)
+    assert.equal('status_device_id' in row, false)
+  }
+
+  const over = await patch(s, client, m.id, { status: 'Waiting on Dan', convo_id: 'c1' })
+  assert.equal(over.status, 200)
+  assert.equal(over.json.mission.status, 'Waiting on Dan'); assert.equal(over.json.mission.status_by, 'user')
+  assert.equal(over.json.mission.status_convo_id, null, 'convo_id is honoured for agents only')
+  const renamed = await patch(s, agent.token, m.id, { title: 'Renamed' })
+  assert.equal(renamed.json.mission.status, 'Waiting on Dan')
+  const cleared = await patch(s, agent.token, m.id, { status: null })
+  assert.equal(cleared.status, 200)
+  for (const k of STATUS_FIELDS) assert.equal(cleared.json.mission[k], null, k)
+
+  assert.deepEqual(updatedMarkers(s).map((p) => [p.convo_id, p.by, p.status_changed ?? false]), [
+    ['c1', 'agent', true], ['c1', 'user', true], ['c1', 'agent', false], ['c1', 'agent', true],
+  ])
+  const since = (await s.http(`/missions?since=${cleared.json.mission.updated_at}`, { token: client })).json.missions
+  assert.deepEqual(since.map((x) => x.id), [m.id])
+})
+
+test('PATCH /missions/:id {status}: 400 on empty, whitespace, over 600, control characters and non-strings with nothing written; CRLF folds; 409 closed; 404 invisible', async (t) => {
+  const { s, dan, agent, patAgent, client } = await fleet(t)
+  const m = (await start(s, agent.token, {})).json.mission
+  const markersBefore = updatedMarkers(s).length
+  for (const status of ['', '   ', '\n\t', 'x'.repeat(601), '😀'.repeat(300) + 'x', 'a\u0007b', 'a\rb', 'a b', 42, false, {}, []]) {
+    const r = await patch(s, agent.token, m.id, { status })
+    assert.equal(r.status, 400, JSON.stringify(status)); assert.equal(r.json.error, 'bad_request')
+  }
+  assert.equal(updatedMarkers(s).length, markersBefore)
+  assert.equal(s.db.prepare('SELECT status FROM missions WHERE id=?').get(m.id).status, null)
+  assert.equal((await patch(s, agent.token, m.id, { convo_id: 'c1' })).status, 400, 'convo_id alone is not an update')
+  assert.equal((await patch(s, agent.token, m.id, { status: 'x'.repeat(600) })).status, 200)
+  assert.equal((await patch(s, agent.token, m.id, { status: '😀'.repeat(300) })).status, 200)
+  const crlf = await patch(s, client, m.id, { status: 'Done:\r\n\t- migration' })
+  assert.equal(crlf.status, 200); assert.equal(crlf.json.mission.status, 'Done:\n\t- migration')
+
+  assert.equal((await patch(s, patAgent.token, m.id, { status: 'foreign' })).status, 404)
+  assert.equal((await patch(s, agent.token, 'ms_nope', { status: 'x' })).status, 404)
+  assert.equal((await s.http(`/missions/${m.id}`, { method: 'PATCH', body: { status: 'x' } })).status, 401)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
+  const hidden = (await start(s, priv.token, { convo_id: 'secret', title: 'Hidden' })).json.mission
+  assert.equal((await patch(s, agent.token, hidden.id, { status: 'peek' })).status, 404)
+  assert.equal((await patch(s, agent.token, hidden.num, { status: 'peek' })).status, 404)
+  assert.equal(s.db.prepare('SELECT status FROM missions WHERE id=?').get(hidden.id).status, null)
+
+  await s.http(`/missions/${m.id}/close`, { method: 'POST', token: client, body: { summary: 'done' } })
+  const stamp = s.db.prepare('SELECT status, status_updated_at FROM missions WHERE id=?').get(m.id)
+  const markersAtClose = updatedMarkers(s).length
+  const late = await patch(s, agent.token, m.id, { status: 'too late' })
+  assert.equal(late.status, 409); assert.equal(late.json.blocked_by, 'closed')
+  assert.equal((await patch(s, client, m.id, { status: null })).status, 409)
+  assert.deepEqual(s.db.prepare('SELECT status, status_updated_at FROM missions WHERE id=?').get(m.id), stamp)
+  assert.equal(updatedMarkers(s).length, markersAtClose)
+})
+
+test('PATCH /missions/:id {status, convo_id}: convo_id is recorded only for an agent naming a conversation of its own user (never a private-owned one for an ordinary agent); anything else records null', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const m = (await start(s, agent.token, {})).json.mission
+  const convoOf = async (token, convoId) => {
+    const r = await patch(s, token, m.id, { status: `from ${convoId}`, convo_id: convoId })
+    assert.equal(r.status, 200)
+    return r.json.mission.status_convo_id
+  }
+  assert.equal(await convoOf(agent.token, 'c2'), 'c2', 'any conversation of the same user — the Coordinator writes from its own')
+  assert.equal(await convoOf(agent.token, 'p1'), null, "another user's conversation")
+  assert.equal(await convoOf(agent.token, 'nope'), null)
+  assert.equal(await convoOf(agent.token, 42), null)
+  assert.equal(await convoOf(agent.token, undefined), null)
+  assert.equal(await convoOf(client, 'c1'), null, 'a client write never carries a conversation')
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
+  assert.equal(await convoOf(agent.token, 'secret'), null, 'an ordinary agent never files its status under a private-owned conversation')
+  assert.equal(await convoOf(priv.token, 'secret'), 'secret')
+})
+
+test("mission status sieve over HTTP: a private agent's status is null for an ordinary agent in list, detail and its own PATCH response; the client and the private agent see it", async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
+  const pub = (await start(s, agent.token, {})).json.mission
+  assert.equal((await s.http(`/missions/${pub.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  const own = await patch(s, priv.token, pub.id, { status: 'Private plan: rotate the keys', convo_id: 'secret2' })
+  assert.equal(own.status, 200)
+  assert.equal(own.json.mission.status, 'Private plan: rotate the keys'); assert.equal(own.json.mission.status_convo_id, 'secret2')
+  const asAgent = async () => [
+    (await s.http('/missions', { token: agent.token })).json.missions.find((x) => x.id === pub.id),
+    (await s.http(`/missions/${pub.id}`, { token: agent.token })).json.mission,
+  ]
+  for (const row of await asAgent()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Missions')
+  }
+  // The ordinary agent's own title PATCH hands back the sieved row too.
+  const renamed = await patch(s, agent.token, pub.id, { title: 'Renamed' })
+  assert.equal(renamed.status, 200); assert.equal(renamed.json.mission.status, null)
+  for (const token of [client, priv.token]) {
+    const row = (await s.http(`/missions/${pub.id}`, { token })).json.mission
+    assert.equal(row.status, 'Private plan: rotate the keys'); assert.equal(row.status_by, 'agent'); assert.equal(row.status_convo_id, 'secret2')
+  }
+  // No convo_id from the private device: still withheld (the device rule).
+  const bare = await patch(s, priv.token, pub.id, { status: 'Still private' })
+  assert.equal(bare.json.mission.status_convo_id, null)
+  for (const row of await asAgent()) assert.equal(row.status, null)
+  // The marker never carries the status text, so its replay crosses nothing.
+  for (const p of updatedMarkers(s)) assert.equal('status' in p, false)
+  // An ordinary agent overwriting it makes it visible again.
+  assert.equal((await patch(s, agent.token, pub.id, { status: 'Public again', convo_id: 'c1' })).status, 200)
+  for (const row of await asAgent()) assert.equal(row.status, 'Public again')
+})
+
+test("mission status for a colleague: shown when written by the owner's client or from a conversation the colleague can read, null otherwise", async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = (await start(s, agent.token, { title: 'Shared mission' })).json.mission
+  const asPat = async () => [
+    (await s.http('/missions?scope=shared', { token: patClient })).json.missions.find((x) => x.id === m.id),
+    (await s.http(`/missions/${m.id}`, { token: patClient })).json.mission,
+  ]
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From the shared convo', convo_id: 'c1' })).status, 200)
+  for (const row of await asPat()) { assert.equal(row.status, 'From the shared convo'); assert.equal(row.status_convo_id, 'c1') }
+  assert.equal((await patch(s, client, m.id, { status: 'From Dan' })).status, 200)
+  for (const row of await asPat()) { assert.equal(row.status, 'From Dan'); assert.equal(row.status_by, 'user') }
+  // Finding 1: an agent status naming NO conversation is a synthesis across
+  // the mission's conversations, which may include ones this colleague can't
+  // read, so it fails closed for the colleague even though it isn't
+  // private-owned — unlike a client write with no conversation, which is
+  // shared like the title and body (asserted just above).
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From the agent, unnamed' })).status, 200)
+  for (const row of await asPat()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Shared mission')
+  }
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.status, 'From the agent, unnamed',
+    'the owner still sees it')
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From an unshared convo', convo_id: 'c2' })).status, 200)
+  for (const row of await asPat()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Shared mission')
+  }
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.status, 'From an unshared convo')
+})
+
+// Coordinator mission close (spec: matron-bridge
+// docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md,
+// "Coordinator mission close"): an agent close that names its conversation
+// is allowed when that conversation is ON the mission, or when it is the
+// user's Coordinator — which may close any mission the user owns. Anyone
+// else is 403 not_coordinator. The two item tiers still block.
+test('close with convo_id: on-mission conversation closes; a stranger is 403 not_coordinator; the Coordinator closes another mission and is blocked by user items; junk convo_id is 404', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const other = createAgent(s.db, dan.id, 'other-box')
+  upsertConversation(s.db, { id: 'coord', ownerUserId: dan.id, title: 'Coordinator', agentDeviceId: other.deviceId })
+  const m = (await start(s, agent.token, {})).json.mission
+  const close = (token, body) => s.http(`/missions/${m.id}/close`, { method: 'POST', token, body: { summary: 's', ...body } })
+  // A conversation this device does not own, a child, a stranger's, junk: 404.
+  assert.equal((await close(agent.token, { convo_id: 'coord' })).status, 404)
+  assert.equal((await close(agent.token, { convo_id: 'nope' })).status, 404)
+  assert.equal((await close(agent.token, { convo_id: 42 })).status, 400)
+  // Owned, top-level, but not on the mission and not the Coordinator: 403.
+  const stranger = await close(other.token, { convo_id: 'coord' })
+  assert.equal(stranger.status, 403); assert.equal(stranger.json.error, 'forbidden'); assert.equal(stranger.json.detail, 'not_coordinator')
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.state, 'open')
+  // Make 'coord' the Coordinator: user items block it exactly as any agent.
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'coord' } })).status, 200)
+  const q = (await item(s, agent.token, {})).json.item
+  let r = await close(other.token, { convo_id: 'coord' })
+  assert.equal(r.status, 409); assert.equal(r.json.blocked_by, 'user_items'); assert.deepEqual(r.json.items, [{ num: q.num, title: 'Q?' }])
+  await s.http(`/items/${q.id}/close`, { method: 'POST', token: client, body: { resolution: 'answered' } })
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  r = await close(other.token, { convo_id: 'coord' })
+  assert.equal(r.status, 200); assert.equal(r.json.mission.state, 'closed'); assert.equal(r.json.mission.closed_by, 'agent'); assert.equal(r.json.mission.closed_convo_id, 'coord')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(marker.convo_id, 'c1'); assert.equal(marker.payload.by, 'agent'); assert.equal(marker.payload.by_convo_id, 'coord')
+  ws.close()
+  assert.equal((await close(other.token, { convo_id: 'coord' })).json.blocked_by, 'closed')
+  // An on-mission conversation (the origin, or a child of it) closes its own
+  // mission with convo_id and no Coordinator role at all.
+  const m2 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Second', convo_id: 'c2' } })).json.mission
+  const own = await s.http(`/missions/${m2.id}/close`, { method: 'POST', token: agent.token, body: { summary: 's', convo_id: 'c2' } })
+  assert.equal(own.status, 200); assert.equal(own.json.mission.closed_convo_id, 'c2')
+  upsertConversation(s.db, { id: 'p', ownerUserId: dan.id, title: 'P', agentDeviceId: agent.deviceId })
+  const m3 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Third', convo_id: 'p' } })).json.mission
+  upsertConversation(s.db, { id: 'sub', ownerUserId: dan.id, title: 'Sub', agentDeviceId: agent.deviceId, parentConvoId: 'p' })
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('sub').mission_id, m3.id)
+  const viaChild = await s.http(`/missions/${m3.id}/close`, { method: 'POST', token: agent.token, body: { summary: 's', convo_id: 'sub' } })
+  assert.equal(viaChild.status, 200); assert.equal(viaChild.json.mission.closed_convo_id, 'sub')
+  // A client close ignores convo_id (the apps never send one).
+  upsertConversation(s.db, { id: 'c4', ownerUserId: dan.id, title: 'C4', agentDeviceId: agent.deviceId })
+  const m4 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Fourth', convo_id: 'c4' } })).json.mission
+  assert.equal((await s.http(`/missions/${m4.id}/close`, { method: 'POST', token: client, body: { summary: 's', convo_id: 'nope' } })).status, 200)
+})
+
+test('close by a private Coordinator: closed_convo_id and the marker\'s by_convo_id stay behind the privacy boundary for an ordinary agent', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'pcoord', ownerUserId: dan.id, title: 'Private Coordinator', agentDeviceId: priv.deviceId })
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'pcoord' } })).status, 200)
+  // Public origin (c1, the ordinary agent's), closed by the private Coordinator.
+  const m = (await start(s, agent.token, {})).json.mission
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/missions/${m.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })
+  assert.equal(r.status, 200); assert.equal(r.json.mission.closed_convo_id, 'pcoord')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(marker.payload.by, 'agent'); assert.equal('by_convo_id' in marker.payload, false)
+  ws.close()
+  assert.equal((await s.http(`/missions/${m.id}`, { token: agent.token })).json.mission.closed_convo_id, null)
+  assert.equal((await s.http(`/missions/${m.id}`, { token: priv.token })).json.mission.closed_convo_id, 'pcoord')
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.closed_convo_id, 'pcoord')
+  const listed = (await s.http('/missions?state=closed', { token: agent.token })).json.missions.find((x) => x.id === m.id)
+  assert.equal(listed.closed_convo_id, null); assert.equal('closed_hidden' in listed, false)
+  // Private origin closed from the private side: the marker may carry the id
+  // (its readers are already behind the boundary).
+  upsertConversation(s.db, { id: 'porigin', ownerUserId: dan.id, title: 'PO', agentDeviceId: priv.deviceId })
+  const pm = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private', convo_id: 'porigin' } })).json.mission
+  const pws = await makeWsClient(s.base, { token: priv.token, cursor: null })
+  await pws.waitFor((f) => f.op === 'hello_ok')
+  assert.equal((await s.http(`/missions/${pm.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })).status, 200)
+  const pmarker = await pws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(pmarker.payload.by_convo_id, 'pcoord')
+  pws.close()
+})
+

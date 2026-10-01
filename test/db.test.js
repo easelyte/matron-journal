@@ -7,6 +7,7 @@ import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePu
 import { createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { makeTmpDir } from './tmp-dir.js'
+import { participantConvoIds } from '../src/participants.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')
@@ -1107,4 +1108,35 @@ test('openDb adds users.is_admin (default 0) to a pre-existing users table in pl
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+// participant_convos storage (room_owner_convos + convo_agents.spawn_id):
+// the one-time backfill must reproduce exactly what the previous derivation
+// showed, so no live room's list changes at deploy — and a room with no
+// joined row (dissolved) must not get its old owner sessions back.
+test('room_owner_convos + spawn_id backfill reproduce the pre-migration participant_convos', (t) => {
+  const dir = makeTmpDir('matron-owner-convos-migration-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  preMigrationDb(dbPath, (raw) => {
+    for (const id of [1, 2, 3]) seedDevice(raw, id)
+    raw.exec(`DROP TABLE room_owner_convos;
+      ALTER TABLE convo_agents DROP COLUMN spawn_id;
+      INSERT INTO conversations(id, owner_user_id, title, agent_device_id, created_at) VALUES
+        ('room', 1, 'room', 1, 0), ('dead', 1, 'dead', 1, 0);
+      INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, target_convo_id, initiator_convo_id, created_at) VALUES
+        ('room', 2, 1, 'left', 'b-sess', 'a-sess', 10),
+        ('room', 3, 1, 'joined', NULL, NULL, 20),
+        ('dead', 2, 1, 'left', 'b-old', 'a-old', 10);
+      INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id, workdir, task, state, room_id, child_convo_id, created_at, resolved_at) VALUES
+        ('sp1', 1, 1, 'a-par', 3, '/w', 't', 'started', 'room', 'child-1', 15, 30);`)
+  })
+
+  const db = openDb(dbPath)
+  assert.equal(db.prepare("SELECT spawn_id FROM convo_agents WHERE convo_id='room' AND agent_device_id=3").get().spawn_id, 'sp1')
+  assert.deepEqual(participantConvoIds(db, 'room'), ['a-sess', 'a-par', 'child-1'])
+  assert.deepEqual(db.prepare("SELECT convo_id FROM room_owner_convos WHERE room_id='dead'").all(), [])
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
 })

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { resolveNumericEnv, DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MAX_REPLAY } from '../src/server.js'
+import { resolveNumericEnv, resolveConsentDailyCap, DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MAX_REPLAY } from '../src/server.js'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { append } from '../src/journal.js'
@@ -76,6 +76,19 @@ test('resolveNumericEnv: non-integer, zero, negative, or non-numeric garbage all
     assert.equal(result, 42, `raw=${JSON.stringify(bad)} should fall back to the default`)
     assert.equal(warn.mock.callCount(), 1, `raw=${JSON.stringify(bad)} should log exactly one warning`)
     assert.match(warn.mock.calls[0].arguments[0], /MATRON_X/)
+    warn.mock.restore()
+  }
+})
+
+test('resolveConsentDailyCap: 0 means no cap; unset is the default 20; anything else is validated like every numeric knob', (t) => {
+  assert.equal(resolveConsentDailyCap(undefined), 20)
+  assert.equal(resolveConsentDailyCap('0'), 0)
+  assert.equal(resolveConsentDailyCap(' 0 '), 0)
+  assert.equal(resolveConsentDailyCap('60'), 60)
+  for (const bad of ['-1', 'abc', '1.5', '']) {
+    const warn = t.mock.method(console, 'warn', () => {})
+    assert.equal(resolveConsentDailyCap(bad), 20, `raw=${JSON.stringify(bad)} should fall back to the default`)
+    assert.equal(warn.mock.callCount(), 1)
     warn.mock.restore()
   }
 })

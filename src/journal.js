@@ -1,21 +1,14 @@
 import { authorize } from './auth.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
-import { CONVOS_MAX, getMission } from './missions.js'
+import { getMission, ORIGIN_SIEVE } from './missions.js'
+import { activateLink } from './mission-links.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
-import { joinedAgentIds } from './participants.js'
+import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
-
-export const MESSAGE_TYPES = [
-  'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
-]
-
-// SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
-// roster in http.js). Safe to inline — the list is a compile-time constant
-// of bare identifiers, and a placeholder spread inside a correlated
-// subquery would force every caller to append the same seven arguments.
-export const MESSAGE_TYPES_SQL = MESSAGE_TYPES.map((t) => `'${t}'`).join(',')
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
 // Conversation-list order: newest last-MESSAGE time first (last_ts, falling
 // back to created_at for a conversation with no message events), tie-broken by
@@ -60,6 +53,10 @@ export function isClientOnlyEvent(type, payload) {
   if (!payload || typeof payload !== 'object') return false
   if (type === 'permission_request') return payload.kind === 'agent_chat' || payload.kind === 'agent_spawn'
   if (type === 'item') return typeof payload.consent === 'string' && payload.consent !== ''
+  // The Coordinator's answer to a consent card (spec: 2026-09-29 coordinator
+  // consent): the apps' "approved by the Coordinator" badge, never an
+  // agent's business — least of all the requester's.
+  if (type === 'consent_decision') return true
   return false
 }
 
@@ -105,6 +102,8 @@ export function snippetOf(type, payload) {
     if (p.action === 'closed') return `🏁 Mission #${n} closed`
     if (p.action === 'created') return (p.title ? `🏁 Mission #${n} started: ${String(p.title)}` : `🏁 Mission #${n} started`).slice(0, 120)
     if (p.action === 'joined') return `🏁 Joined mission #${n}`
+    if (p.action === 'left') return `🏁 Left mission #${n}`
+    if (p.action === 'current_changed') return `🏁 Now on mission #${n}`
     return `🏁 Mission #${n} updated`
   }
   if (p.snippet) return String(p.snippet).slice(0, 120)
@@ -130,9 +129,10 @@ export function snippetOf(type, payload) {
 //      private-owned PARENT or through a public parent the user had joined
 //      to a private-ORIGIN mission (both are ways around the sieve, and
 //      the second is invisible from the parent row alone);
-//   2. the mission must be OPEN — a closed mission accepts no joins;
-//   3. it must hold fewer than CONVOS_MAX conversations — a spawn must
-//      never push a mission past a cap `join` refuses at.
+//   2. the mission must be OPEN — a closed mission accepts no joins.
+//
+// Sub-chats are never counted toward CONVOS_MAX (spec 2026-09-30 §3), so
+// there is no cap gate: a full mission still takes its sub-chats.
 //
 // A child that fails any gate simply starts with no mission. A creator with
 // no device id (an internal or test upsert) counts as unfiltered, like
@@ -145,10 +145,6 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
   if (filtered && privateOwnedConvo(db, parentConvoId)) return null
   const mission = getMission(db, ownerUserId, missionId, { excludePrivateOwned: filtered })
   if (!mission || mission.state !== 'open') return null
-  // The RAW count, never the row's `conversations` — that one is sieved for
-  // a filtered caller, and the cap is a limit on the table, not on what
-  // this creator happens to be allowed to see.
-  if (db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(missionId).n >= CONVOS_MAX) return null
   return missionId
 }
 
@@ -233,11 +229,17 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // inheritableMission above. Set once here and never on the update path
     // — same immutability as parent_convo_id.
     const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
+    const createdAt = Date.now()
+    // The row and its inherited link are one write: the invariant "a
+    // non-null mission_id has an active link" must hold from birth.
     // A creation that carries a summary stamps it now; one that doesn't gets
     // 0 ("never"), the same value every pre-existing row has.
-    db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? Date.now() : 0, agentKind ?? null, inheritedMission, Date.now())
+    db.transaction(() => {
+      db.prepare(
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, agentKind ?? null, inheritedMission, createdAt)
+      if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
+    })()
     // A non-empty creation summary counts, for the same reason a creation
     // title does: without it, a conversation minted by a summary-only upsert
     // (no title, no parent, no state) appends NO event at all, so live clients
@@ -401,10 +403,19 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // block the event loop. Sorting the already-fetched rows costs nothing at
   // per-user conversation counts, and uses the exact comparator the web client
   // applies (database.ts), keeping server and client order identical.
+  // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
+  // a fetch — the current mission and how many missions this conversation
+  // ever touched; a filtered caller never counts or names a private-origin
+  // mission.
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
             parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, agent_kind,
+            ${excludePrivateOwned
+              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
+              : 'mission_id'} AS mission_id,
+            (SELECT COUNT(*) FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
+              WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
@@ -415,31 +426,54 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   ).all(userId)
   conversations.sort(byLastMessageThenId)
   // Room membership, so a client can chip every participating box, not just
-  // the recorded owner (spec: multi-agent room tags). One grouped query for
-  // all of this user's joined convo_agents rows, attached per-convo as
-  // `participants` (owner + joined, deduped, sorted). Convos with no joined
-  // row — solo sessions, dissolved rooms — omit the key entirely, so the
-  // wire stays byte-identical for everything that is not a live room. Same
-  // private-device sieve as the `agents` list below: a filtered caller must
-  // not learn a private box's id from a membership array.
+  // the recorded owner (spec: multi-agent room tags), and place a room under
+  // its participants' missions (spec: 2026-10-01 rooms under missions).
+  // Every ROOM row carries both keys; every other row omits both, so the wire
+  // stays byte-identical for solo sessions:
+  //   - `participants`: owner + joined device ids, deduped, ascending — the
+  //     array membership convo_meta frames carry (participantIds);
+  //   - `participant_convos`: the room's participant sessions
+  //     (participantConvoIds in participants.js), [] when unknown or when
+  //     nobody is joined.
+  // A room is any conversation that has, or ever had, a convo_agents row or
+  // a spawn naming it as its room — so a dissolved room still carries
+  // `participants: [owner]` and `participant_convos: []`, the same values its
+  // dissolve convo_meta carried. Clients keep a stored value when the key is
+  // absent, so omitting it there would strand a client that missed the
+  // dissolve frame with the old membership forever. Same private-device
+  // sieve as the `agents` list below: a filtered caller must not learn a
+  // private box's id from a membership array, nor that a room exists only
+  // because a private box was in it — rows involving a private device
+  // neither count as members nor make a conversation a room.
+  const sieve = (col) => excludePrivateOwned
+    ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=${col} AND d.private=1)`
+    : ''
+  const roomIds = new Set(db.prepare(
+    `SELECT ca.convo_id AS id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=?${sieve('ca.agent_device_id')}${sieve('ca.initiator_device_id')}
+     UNION
+     SELECT s.room_id FROM agent_spawn_requests s
+     JOIN conversations c ON c.id = s.room_id
+     WHERE c.owner_user_id=?${sieve('s.from_device_id')}${sieve('s.target_device_id')}`
+  ).all(userId, userId).map((r) => r.id))
   const joinedRows = db.prepare(
     `SELECT ca.convo_id, ca.agent_device_id FROM convo_agents ca
      JOIN conversations c ON c.id = ca.convo_id
-     WHERE c.owner_user_id=? AND ca.state='joined'${excludePrivateOwned
-       ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=ca.agent_device_id AND d.private=1)`
-       : ''}`
+     WHERE c.owner_user_id=? AND ca.state='joined'${sieve('ca.agent_device_id')}`
   ).all(userId)
   const joinedByConvo = new Map()
   for (const r of joinedRows) {
     if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
     joinedByConvo.get(r.convo_id).push(r.agent_device_id)
   }
+  const convosByRoom = participantConvosByRoom(db, userId, { excludePrivateOwned })
   for (const c of conversations) {
-    const joined = joinedByConvo.get(c.id)
-    if (!joined) continue
-    const ids = new Set(joined)
+    if (!roomIds.has(c.id)) continue
+    const ids = new Set(joinedByConvo.get(c.id) ?? [])
     if (c.agent_device_id != null) ids.add(c.agent_device_id)
     c.participants = [...ids].sort((a, b) => a - b)
+    c.participant_convos = convosByRoom.get(c.id) ?? []
   }
   // id -> name for the user's agent boxes, so a client can render the
   // owning box of each conversation without a second round-trip. Same

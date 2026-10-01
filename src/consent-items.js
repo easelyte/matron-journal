@@ -83,12 +83,26 @@ export function spawnConsentItemFields(card) {
 // deny are the user's decision; expiry and failure are the ask lapsing).
 // `author` is who the closing status row is attributed to — the user for
 // the two outcomes only a tap produces, the asking agent otherwise.
-export function spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link = false }) {
+// `decidedBy` (spec: 2026-09-29 coordinator consent) is {reason} when the
+// Coordinator, not a tap, answered: the note says so, in the Coordinator's
+// words, and is attributed to an agent (the Coordinator's device) rather
+// than the user — the whole point of the audit line.
+export function spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link = false, decidedBy = null }) {
+  const room = link && roomId ? ' A chat room between the two sessions was opened.' : ''
+  if (decidedBy) {
+    const why = ` — ${decidedBy.reason || 'no reason given'}`
+    switch (outcome) {
+      case 'started': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. The session started on ${targetName}.${room}` }
+      case 'declined': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Declined by the Coordinator${why}.` }
+      case 'failed': return { resolution: 'cancelled', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}, but the session could not be started (${errorCode || 'unknown'}).` }
+      default: break
+    }
+  }
   switch (outcome) {
     case 'started':
       return {
         resolution: 'decided', author: 'user',
-        comment: `Approved — the session started on ${targetName}.${link && roomId ? ' A chat room between the two sessions was opened.' : ''}`,
+        comment: `Approved — the session started on ${targetName}.${room}`,
       }
     case 'declined':
       return { resolution: 'decided', author: 'user', comment: 'Declined.' }
@@ -172,8 +186,11 @@ export function closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCo
     if (!row || !row.item_id) return false
     const targetName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(row.target_device_id)?.name, PEER_NAME_CAP)
       || `box ${row.target_device_id}`
-    const c = spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link: !!row.link })
-    const deviceId = c.author === 'user' && answeredByDeviceId != null ? answeredByDeviceId : row.from_device_id
+    const decidedBy = row.answered_by === 'coordinator' ? { reason: row.answer_reason } : null
+    const c = spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link: !!row.link, decidedBy })
+    // The note's device: the tapping client for a user decision, the
+    // Coordinator's box for its decision, the asking box otherwise.
+    const deviceId = (c.author === 'user' || c.byCoordinator) && answeredByDeviceId != null ? answeredByDeviceId : row.from_device_id
     const out = closeItem(db, { userId: row.user_id, itemId: row.item_id, resolution: c.resolution, author: c.author, deviceId, comment: c.comment })
     if (!out) return false
     // No connection here to read the asking device's name from; the
@@ -228,7 +245,12 @@ export function chatConsentItemFields(card) {
 
 // How each way a parked chat row leaves 'awaiting_user' closes the item.
 // 'left' is the owner dissolving the room under a parked join ask.
-export function chatConsentClosing(outcome) {
+export function chatConsentClosing(outcome, decidedBy = null) {
+  if (decidedBy) {
+    const why = ` — ${decidedBy.reason || 'no reason given'}`
+    if (outcome === 'approved') return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. The invitation is on its way.` }
+    if (outcome === 'denied') return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Declined by the Coordinator${why}.` }
+  }
   switch (outcome) {
     case 'approved': return { resolution: 'decided', author: 'user', comment: 'Approved — the invitation is on its way.' }
     case 'denied': return { resolution: 'decided', author: 'user', comment: 'Declined.' }
@@ -274,12 +296,12 @@ export function fileChatConsentItem({ db, hub }, { userId, fromDeviceId, fromNam
 export function closeChatConsentItem({ db, hub }, roomId, agentDeviceId, { outcome, answeredByDeviceId = null }) {
   try {
     const row = db.prepare(`
-      SELECT ca.item_id, ca.initiator_device_id, c.owner_user_id
+      SELECT ca.item_id, ca.initiator_device_id, ca.answered_by, ca.answer_reason, c.owner_user_id
       FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
       WHERE ca.convo_id=? AND ca.agent_device_id=?`).get(roomId, agentDeviceId)
     if (!row || !row.item_id) return false
-    const c = chatConsentClosing(outcome)
-    const deviceId = c.author === 'user' && answeredByDeviceId != null ? answeredByDeviceId : row.initiator_device_id
+    const c = chatConsentClosing(outcome, row.answered_by === 'coordinator' ? { reason: row.answer_reason } : null)
+    const deviceId = (c.author === 'user' || c.byCoordinator) && answeredByDeviceId != null ? answeredByDeviceId : row.initiator_device_id
     const out = closeItem(db, { userId: row.owner_user_id, itemId: row.item_id, resolution: c.resolution, author: c.author, deviceId, comment: c.comment })
     if (!out) return false
     if (!hub) return true

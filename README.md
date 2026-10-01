@@ -71,6 +71,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_WHISPER_MODEL` | unset (off) | Path to a whisper.cpp model (`…/whisper.cpp/models/ggml-base.bin`). Set it and voice notes on tracker items are transcribed here on upload instead of waiting for the origin box; needs `ffmpeg` on `PATH`. Under the shipped systemd unit install whisper.cpp outside `/home` (e.g. `/opt/whisper.cpp`) — `ProtectHome=yes` hides it otherwise |
 | `MATRON_WHISPER_CLI` | `<model dir>/../build/bin/whisper-cli` | whisper-cli binary, if not in whisper.cpp's own layout |
 | `MATRON_WHISPER_LANGUAGE` | `en` | Language passed to whisper |
+| `MATRON_WHISPER_PROMPT` | built-in Matron vocabulary | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set your own list, or the empty string to send no prompt |
 | `MATRON_MEDIA_USER_QUOTA_BYTES` | 2 GiB (`2147483648`) | Per-user media storage quota |
 | `MATRON_MEDIA_REAP_HIGH_PCT` | `90` | Reap a user's oldest attachments once their footprint hits this % of the quota. `0`, a non-integer, or a value over `100` disables the reaper |
 | `MATRON_MEDIA_REAP_LOW_PCT` | `70` | Reap down to this % of the quota; reaped events tombstone to `expired: true`. Must be lower than the high %, or the reaper is disabled (same invalid-value rules) |

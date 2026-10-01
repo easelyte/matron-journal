@@ -6,24 +6,98 @@ import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
+import { MESSAGE_TYPES_SQL } from './message-types.js'
+import { activateLink, endLink, hasActiveLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
 export const CONVOS_MAX = 200
+export const STATUS_MAX = 600
+// Status (spec 2026-09-28 missions dashboard §1) is markdown, so \n and \t
+// stay; every other C0/C1 control and U+2028/2029 is refused — the set
+// items' action labels refuse (ACTION_BAD_CHARS), minus the two a
+// paragraph needs. CRLF is folded to \n before this runs, so only a LONE
+// \r is refused.
+const STATUS_BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/
+// Shared with projects.js: the four status columns a withheld status nulls.
+export const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
+
+// Spec 2026-09-30 §2/§4.2 activity. quiet = nothing for 7 days; the clock
+// is read at row-building time.
+export const QUIET_MS = 7 * 24 * 60 * 60 * 1000
+
+export function activityOf({ state, running, waiting, needsYou, lastActivityAt }, nowMs = Date.now()) {
+  if (state === 'closed') return 'closed'
+  if (running > 0) return 'running'
+  if (waiting > 0 || needsYou > 0) return 'waiting'
+  if (nowMs - lastActivityAt >= QUIET_MS) return 'quiet'
+  return 'idle'
+}
+
+// The three per-caller inputs activity needs, over ACTIVE links only.
+// `sieve` is the caller's conversation predicate on alias c (the same one
+// the counts use), so a hidden session is never "running" and a hidden
+// conversation's messages are never "activity". A conversation's activity
+// is its newest MESSAGE event (the /snapshot last_ts rule — session_status
+// and markers are not activity) or when it joined, whichever is later.
+// Indexes: the link scans ride mission_conversations' PRIMARY KEY
+// (mission_id, convo_id); c is a conversations PK lookup; the newest-message
+// probe walks idx_events_convo (convo_id, seq) backwards from the top.
+function activitySql(sieve) {
+  return `
+    (SELECT COUNT(*) FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL AND c.session_state = 'running' ${sieve}) AS running_convos,
+    (SELECT COUNT(*) FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL AND c.session_state = 'waiting' ${sieve}) AS waiting_convos,
+    (SELECT MAX(max(al.joined_at, COALESCE((SELECT e.ts FROM events e WHERE e.convo_id = c.id
+                 AND e.type IN (${MESSAGE_TYPES_SQL}) ORDER BY e.seq DESC LIMIT 1), 0)))
+       FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL ${sieve}) AS convo_activity_at`
+}
 
 const now = () => Date.now()
 
 // idem_key is internal (same stance as rowToItem). `sieved_last_milestone_at`
 // (fix round 3, B2) is a sort key countsSql computes for listMissions' ORDER
-// BY — never part of the wire shape.
+// BY — never part of the wire shape. `status_device_id` (spec 2026-09-28
+// missions dashboard §1) is internal too: the device that wrote the status,
+// kept only so the privacy sieve can key on it. `status_hidden` is the
+// per-caller sieve verdict countsSql/sharedCountsSql compute — never on the wire.
+// `running_convos`, `waiting_convos` and `convo_activity_at` are activity
+// inputs, never on the wire.
 export function missionRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt, ...rest } = row
-  const out = { ...rest, closed_over_open_items: Number(rest.closed_over_open_items || 0) }
+  const {
+    idem_key: _idemKey, sieved_last_milestone_at: sievedLastMilestoneAt,
+    status_device_id: _statusDeviceId, status_hidden: statusHidden,
+    running_convos: runningConvos, waiting_convos: waitingConvos, convo_activity_at: convoActivityAt, ...rest
+  } = row
+  const { closed_hidden: closedHidden, ...bare } = rest
+  const out = { ...bare, closed_over_open_items: Number(bare.closed_over_open_items || 0) }
+  // Same sieve for the closing conversation (CLOSED_PRIVATE): a private
+  // Coordinator's conversation id must not reach an ordinary agent through
+  // the mission row it closed. Null reads exactly as "none named".
+  if (Number(closedHidden || 0) && 'closed_convo_id' in out) out.closed_convo_id = null
   for (const k of ['open_items', 'needs_you', 'conversations', 'milestones']) if (k in out) out[k] = Number(out[k])
   if ('last_milestone_json' in out) {
     out.last_milestone = out.last_milestone_json ? JSON.parse(out.last_milestone_json) : null
     delete out.last_milestone_json
+  }
+  // The sieve's verdict (STATUS_PRIVATE, below) — computed per caller by
+  // countsSql / sharedCountsSql. A withheld status reads as four nulls, the
+  // same shape as "never set", so its absence says nothing.
+  if (Number(statusHidden || 0)) for (const k of STATUS_FIELDS) out[k] = null
+  // Spec 2026-09-30 §2 activity — computed after the status sieve, so a
+  // withheld status_updated_at never counts. Every input here is the
+  // caller's own sieved view (countsSql / sharedCountsSql). One argument
+  // only (rows are built with .map(missionRow)); the clock is read here.
+  if (runningConvos !== undefined) {
+    out.last_activity_at = Math.max(...[out.created_at, sievedLastMilestoneAt, out.status_updated_at, convoActivityAt]
+      .filter((v) => v != null).map(Number))
+    out.activity = activityOf({
+      state: out.state, running: Number(runningConvos), waiting: Number(waitingConvos),
+      needsYou: out.needs_you ?? 0, lastActivityAt: out.last_activity_at,
+    })
   }
   return out
 }
@@ -50,8 +124,40 @@ export function validateMissionFields(body, { partial = false } = {}) {
     if (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX) return { ok: false }
     value.body = body.body
   }
+  // PATCH only: POST /missions ignores a status rather than storing one.
+  // null is the explicit clear; a string is trimmed, then 1–STATUS_MAX
+  // UTF-16 code units (JS .length, like TITLE_MAX).
+  if (partial && body.status !== undefined) {
+    if (body.status === null) value.status = null
+    else {
+      if (typeof body.status !== 'string') return { ok: false }
+      const s = body.status.replace(/\r\n/g, '\n').trim()
+      if (!s || s.length > STATUS_MAX || STATUS_BAD_CHARS.test(s)) return { ok: false }
+      value.status = s
+    }
+  }
   return { ok: true, value }
 }
+
+// Spec 2026-09-28 missions dashboard §1, privacy: a status written from a
+// private-owned conversation is withheld from an ordinary agent the way that
+// conversation's milestones are. Keyed on the writing DEVICE too: a private
+// agent that named no conversation (or a public one) wrote it all the same.
+// Evaluated at read time against the current private flag, like every other
+// private-owned sieve here.
+// `alias` names the row's table alias, so projects.js applies the same
+// sieve to its own status columns (projects p).
+export const statusPrivateSql = (alias) => `(
+  EXISTS (SELECT 1 FROM devices sd WHERE sd.id = ${alias}.status_device_id AND sd.private = 1)
+  OR EXISTS (SELECT 1 FROM conversations sc JOIN devices sd ON sd.id = sc.agent_device_id
+             WHERE sc.id = ${alias}.status_convo_id AND sd.private = 1)
+)`
+const STATUS_PRIVATE = statusPrivateSql('m')
+
+// The closing conversation (closed_convo_id) is withheld from an ordinary
+// agent when it is private-owned, as status_convo_id is above.
+const CLOSED_PRIVATE = `EXISTS (SELECT 1 FROM conversations cc JOIN devices cd ON cd.id = cc.agent_device_id
+             WHERE cc.id = m.closed_convo_id AND cd.private = 1)`
 
 // Review fix (Task 7, Critical 1): every COUNTS subquery must apply the same
 // private-owned-conversation sieve the caller's OWN arrays get in
@@ -74,12 +180,17 @@ function countsSql(excludePrivateOwned) {
   return `
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${itemSieve}) AS open_items,
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' ${itemSieve}) AS needs_you,
-    (SELECT COUNT(*) FROM conversations c WHERE c.mission_id = m.id ${convoSieve}) AS conversations,
+    (SELECT COUNT(*) FROM mission_conversations cl JOIN conversations c ON c.id = cl.convo_id
+       WHERE cl.mission_id = m.id AND cl.ended_at IS NULL AND c.parent_convo_id IS NULL ${convoSieve}) AS conversations,
     (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
        FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
     (SELECT l.created_at FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}
-       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
+    ${excludePrivateOwned ? STATUS_PRIVATE : '0'} AS status_hidden,
+    ${excludePrivateOwned ? CLOSED_PRIVATE : '0'} AS closed_hidden
+    ,${activitySql(convoSieve)},
+    (SELECT p.num FROM projects p WHERE p.id = m.project_id) AS project_num
   `
 }
 
@@ -91,7 +202,7 @@ function countsSql(excludePrivateOwned) {
 // used to hand back (and, for milestones, write into) the unsieved row.
 // Same predicate listMissions applies to its WHERE clause; one caller
 // passing `excludePrivateOwned` now gets one consistent answer everywhere.
-const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
+export const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
   WHERE cv.id = m.origin_convo_id AND d.private = 1)`
 
 // Cross-user variant of ORIGIN_SIEVE: fails closed when the origin
@@ -124,11 +235,18 @@ export function repointItems(db, userId, convoId, missionId, ts) {
 }
 
 function attachConversation(db, userId, convoId, missionId, ts) {
-  db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=? AND mission_id IS NULL').run(missionId, convoId, userId)
+  const r = db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=? AND mission_id IS NULL').run(missionId, convoId, userId)
+  if (r.changes) activateLink(db, { missionId, convoId, userId, how: 'origin', ts })
   repointItems(db, userId, convoId, missionId, ts)
 }
 
-export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true }) {
+// D5 note: `projectId` only ever reaches the INSERT below — the idem_key
+// replay and the attach-existing short-circuits both return first, without
+// touching it. missions-http.js's handleCreate mirrors that same pair of
+// conditions (createsNewMission) so it can skip validating `project` before
+// either of those short-circuits fires; if either condition here changes,
+// that peek must change with it.
+export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true, projectId = null }) {
   return db.transaction(() => {
     if (idemKey) {
       const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
@@ -145,8 +263,8 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
     const num = nextNum(db, userId)
     const ts = now()
     try {
-      db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
-        VALUES(?,?,?,'open',?,?,?,?,?,?,?,?)`).run(id, userId, num, title, body, convoId, deviceId, createdBy, idemKey, ts, ts)
+      db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,project_id)
+        VALUES(?,?,?,'open',?,?,?,?,?,?,?,?,?)`).run(id, userId, num, title, body, convoId, deviceId, createdBy, idemKey, ts, ts, projectId)
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
@@ -159,11 +277,15 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
   })()
 }
 
-export function listMissions(db, userId, { state = null, since = null, excludePrivateOwned = false } = {}) {
+export function listMissions(db, userId, { state = null, since = null, projectId = null, filed = false, excludePrivateOwned = false } = {}) {
   const where = ['m.user_id = ?']
   const args = [userId]
   if (state) { where.push('m.state = ?'); args.push(state) }
   if (since != null) { where.push('m.updated_at >= ?'); args.push(since) }
+  if (projectId) { where.push('m.project_id = ?'); args.push(projectId) }
+  // filed: only missions in SOME project — listProjects' rollups never need
+  // the (usually far larger) unfiled rest.
+  if (filed) where.push('m.project_id IS NOT NULL')
   // Same shape as listItems' excludePrivateOwned: a mission born in a private
   // device's conversation is invisible to an ordinary agent. One predicate,
   // shared with getMission (see ORIGIN_SIEVE) so the list and the single-row
@@ -186,7 +308,76 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
 
 const PRIVATE_CONVO = `EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
 
-export function missionDetail(db, userId, missionId, { excludePrivateOwned = false } = {}) {
+// Fold the LEFT JOINed conversation_status columns into one `status` block
+// (omitted when the session never reported), the shape GET /roster serves
+// (spec 2026-09-29 coordinator session control §1). Own-user detail only:
+// sharedMissionDetail deliberately carries no session header.
+function withConvoStatus({ status_reported_at, status_json, ...row }) {
+  if (status_json == null) return row
+  try { return { ...row, status: { reported_at: status_reported_at, ...JSON.parse(status_json) } } } catch { return row }
+}
+
+// Spec 2026-09-30 §3: every sub-chat whose parent (or any ancestor) is also
+// among `rows` folds into that nearest listed ancestor's row — it is counted
+// in that row's subchat_count and, unless `subchats`, left out of the list.
+// A sub-chat whose parent is not among the rows stands as its own row:
+// folding never hides a link. A parent cycle (never written by the journal,
+// but not guarded by the schema either) folds nothing: each row on it is its
+// own root. Callers run it AFTER the privacy sieve, so a hidden sub-chat is
+// neither listed nor counted. Input order is kept; input rows are not mutated.
+export function foldSubchats(rows, { subchats = false } = {}) {
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  const rootOf = (r) => {
+    let cur = r
+    const seen = new Set([r.id])
+    while (cur.parent_convo_id && byId.has(cur.parent_convo_id)) {
+      if (seen.has(cur.parent_convo_id)) return r
+      cur = byId.get(cur.parent_convo_id); seen.add(cur.id)
+    }
+    return cur
+  }
+  const counts = new Map()
+  const folded = new Set()
+  for (const r of rows) {
+    const root = rootOf(r)
+    if (root !== r) { counts.set(root.id, (counts.get(root.id) || 0) + 1); folded.add(r.id) }
+  }
+  const out = rows.map((r) => ({ ...r, subchat_count: counts.get(r.id) || 0 }))
+  return subchats ? out : out.filter((r) => !folded.has(r.id))
+}
+
+// Mockup 03's "also on #N" / "moved to #N" on a mission page's conversation
+// rows (spec 2026-09-30 §3): each listed row names the conversation's links
+// to OTHER missions — current first, then active, then ended newest first
+// (conversationMissions' order), at most OTHER_MISSIONS_MAX. A slim shape,
+// not a mission row: the page needs a chip, not counts. ORIGIN_SIEVE keeps
+// a private-origin mission (the user may have joined this public
+// conversation to one) from being named to an ordinary agent. Folded
+// sub-chats are not listed, so they carry none.
+export const OTHER_MISSIONS_MAX = 5
+
+function otherMissionsStmt(db, excludePrivateOwned) {
+  return db.prepare(`SELECT m.id, m.num, m.title, (c.mission_id = m.id) AS current, (l.ended_at IS NULL) AS active,
+      l.joined_at, l.ended_at
+    FROM mission_conversations l
+    JOIN missions m ON m.id = l.mission_id AND m.user_id = ?
+    JOIN conversations c ON c.id = l.convo_id
+    WHERE l.convo_id = ? AND l.mission_id <> ? ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''}
+    ORDER BY current DESC, (l.ended_at IS NULL) DESC, COALESCE(l.ended_at, l.joined_at) DESC
+    LIMIT ${OTHER_MISSIONS_MAX}`)
+}
+
+const otherMissionRow = (r) => ({ ...r, current: !!r.current, active: !!r.active })
+
+// `conversations[]` lists the conversations LINKED to this mission (spec
+// 2026-09-30 §3). By default only ACTIVE links (controller ruling D3, spec
+// §7: an old app copies this list into its members table without reading
+// ended_at, so a conversation that left must not appear); `history` appends
+// the ended links after every active row, each with its ended_at. Folding
+// runs within each group: an ended sub-chat never folds into an active row
+// (nor an active one into an ended row), so an active row's subchat_count
+// is the same with or without history.
+export function missionDetail(db, userId, missionId, { excludePrivateOwned = false, subchats = false, history = false } = {}) {
   const mission = getMission(db, userId, missionId, { excludePrivateOwned })
   if (!mission) return null
   const sieve = excludePrivateOwned ? `AND NOT ${PRIVATE_CONVO}` : ''
@@ -196,42 +387,139 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
     FROM items i JOIN conversations c ON c.id = i.origin_convo_id
     WHERE i.mission_id=? AND i.state='open' ${sieve}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)
-  const conversations = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box
-    FROM conversations c LEFT JOIN devices d ON d.id = c.agent_device_id
-    WHERE c.mission_id=? ${sieve} ORDER BY c.created_at`).all(mission.id)
+  // A sub-chat whose parent the caller cannot see (a filtered agent and a
+  // private-device parent) must not name it: parent_convo_id is withheld.
+  const parentHidden = excludePrivateOwned
+    ? `EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
+         WHERE pc.id = c.parent_convo_id AND pd.private = 1)`
+    : '0'
+  const rows = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box, c.parent_convo_id,
+      ${parentHidden} AS parent_hidden,
+      (c.mission_id IS NOT NULL AND c.mission_id = l.mission_id) AS current, l.how, l.joined_at, l.ended_at,
+      s.reported_at AS status_reported_at, s.status AS status_json
+    FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
+    LEFT JOIN devices d ON d.id = c.agent_device_id
+    LEFT JOIN conversation_status s ON s.convo_id = c.id
+    WHERE l.mission_id = ? ${history ? '' : 'AND l.ended_at IS NULL'} ${sieve}
+    ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)
+    .map(({ parent_hidden: hidden, ...r }) => withConvoStatus({ ...r, current: !!r.current, parent_convo_id: hidden ? null : r.parent_convo_id }))
+  const conversations = [
+    ...foldSubchats(rows.filter((r) => r.ended_at == null), { subchats }),
+    ...foldSubchats(rows.filter((r) => r.ended_at != null), { subchats }),
+  ]
+  const others = otherMissionsStmt(db, excludePrivateOwned)
+  for (const c of conversations) c.other_missions = others.all(userId, c.id, mission.id).map(otherMissionRow)
   return { mission, milestones, items, conversations }
 }
 
-export function updateMission(db, { userId, missionId, fields, excludePrivateOwned = false }) {
+// GET /conversations/:id/missions (spec 2026-09-30 §3): every mission this
+// conversation is or was linked to — current first, then the other active
+// links newest-joined first, then ended links newest-ended first. Full
+// mission rows (same countsSql, same sieve as GET /missions) plus the link.
+// ORIGIN_SIEVE drops a private-origin mission for a filtered caller: the
+// user may have joined this public conversation to it.
+export function conversationMissions(db, userId, convoId, { excludePrivateOwned = false } = {}) {
+  const sieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
+  return db.prepare(`SELECT m.*, ${countsSql(excludePrivateOwned)},
+      (c.mission_id IS NOT NULL AND c.mission_id = m.id) AS link_current, l.how AS link_how, l.joined_at AS link_joined_at, l.ended_at AS link_ended_at
+    FROM mission_conversations l
+    JOIN missions m ON m.id = l.mission_id AND m.user_id = ?
+    JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
+    WHERE l.convo_id = ? ${sieve}
+    ORDER BY link_current DESC, (l.ended_at IS NULL) DESC, COALESCE(l.ended_at, l.joined_at) DESC`)
+    .all(userId, userId, convoId)
+    .map(({ link_current: cur, link_how: how, link_joined_at: joinedAt, link_ended_at: endedAt, ...row }) => ({
+      ...missionRow(row), current: !!cur, active: endedAt == null, how, joined_at: joinedAt, ended_at: endedAt,
+    }))
+}
+
+// `statusWriter` {by, convoId, deviceId} (spec 2026-09-28 missions dashboard
+// §1) is required whenever fields.status is a string: the status columns are
+// always written as one set, never one of them alone, with the same `ts` as
+// updated_at. A null status clears all of them, status_device_id included.
+export function updateMission(db, { userId, missionId, fields, statusWriter = null, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const cur = db.prepare('SELECT state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!cur) return null
-    if (cur.state === 'closed') throw new Error('closed')
+    // Refiling (spec 2026-09-30 §4.2) stays legal on a closed mission — a
+    // finished mission must stay correctable, like an item's move target —
+    // but nothing else about it changes.
+    const onlyProject = Object.keys(fields).length > 0 && Object.keys(fields).every((k) => k === 'projectId')
+    if (cur.state === 'closed' && !onlyProject) throw new Error('closed')
+    const ts = now()
     const sets = []; const args = []
     if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
     if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
-    sets.push('updated_at=?'); args.push(now())
+    if (fields.status !== undefined) {
+      if (fields.status !== null && !statusWriter) throw new Error('status_writer_required')
+      const w = fields.status === null ? { by: null, convoId: null, deviceId: null } : statusWriter
+      sets.push('status=?', 'status_by=?', 'status_convo_id=?', 'status_device_id=?', 'status_updated_at=?')
+      args.push(fields.status, w.by, w.convoId ?? null, w.deviceId ?? null, fields.status === null ? null : ts)
+    }
+    if (fields.projectId !== undefined) { sets.push('project_id=?'); args.push(fields.projectId) }
+    sets.push('updated_at=?'); args.push(ts)
     db.prepare(`UPDATE missions SET ${sets.join(', ')} WHERE id=? AND user_id=?`).run(...args, missionId, userId)
     return getMission(db, userId, missionId, { excludePrivateOwned })
   })()
 }
 
-export function joinMission(db, { userId, missionId, convoId, excludePrivateOwned = false }) {
+// Spec 2026-09-30 §3: join adds (or reactivates) a link and makes it
+// CURRENT. The previous current mission stays active ("also on") — a
+// conversation on another mission is no longer refused. `action` tells the
+// HTTP layer which marker to write: 'joined' (a new or reactivated link),
+// 'current_changed' (an already-active link became current) or null (it
+// already was current: a no-op, no marker). The cap counts active
+// top-level links; a sub-chat never fills a mission.
+export function joinMission(db, { userId, missionId, convoId, how = 'joined', excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
     if (m.state === 'closed') throw new Error('closed')
+    const convo = db.prepare('SELECT mission_id, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    if (!convo) throw new Error('no_convo')
+    const link = linkRow(db, m.id, convoId)
+    const active = !!link && link.ended_at == null
+    if (active && convo.mission_id === m.id) return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: null }
+    if (!active && convo.parent_convo_id == null && topLevelActiveCount(db, m.id) >= CONVOS_MAX) throw new Error('too_many_convos')
+    const ts = now()
+    activateLink(db, { missionId: m.id, convoId, userId, how, ts })
+    db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=?').run(m.id, convoId, userId)
+    repointItems(db, userId, convoId, m.id, ts)
+    db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
+    if (convo.mission_id && convo.mission_id !== m.id) db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, convo.mission_id)
+    return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: active ? 'current_changed' : 'joined' }
+  })()
+}
+
+// Spec 2026-09-30 §3: leave ends a link (kept as history). Leaving the
+// CURRENT one moves current to the most recently joined remaining active
+// link on an open mission, else to none (nextCurrent). An already-ended
+// link is a no-op (left:false) so a retried leave is safe; no link at all
+// is 'no_link'. Items stay where they are. A closed mission may be left.
+export function leaveMission(db, { userId, missionId, convoId, excludePrivateOwned = false }) {
+  return db.transaction(() => {
+    const m = db.prepare('SELECT id FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
+    if (!m) throw new Error('no_mission')
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (convo.mission_id && convo.mission_id !== m.id) throw new Error('other_mission')
-    if (!convo.mission_id) {
-      const n = db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n
-      if (n >= CONVOS_MAX) throw new Error('too_many_convos')
-      const ts = now()
-      attachConversation(db, userId, convoId, m.id, ts)
-      db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
+    const link = linkRow(db, m.id, convoId)
+    if (!link) throw new Error('no_link')
+    if (link.ended_at != null) {
+      return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), left: false, currentChanged: false, currentMissionId: convo.mission_id ?? null }
     }
-    return getMission(db, userId, m.id, { excludePrivateOwned })
+    const ts = now()
+    endLink(db, { missionId: m.id, convoId, ts })
+    let current = convo.mission_id ?? null
+    const wasCurrent = current === m.id
+    if (wasCurrent) {
+      current = nextCurrent(db, convoId)
+      db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=?').run(current, convoId, userId)
+    }
+    db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
+    return {
+      mission: getMission(db, userId, m.id, { excludePrivateOwned }),
+      left: true, currentChanged: wasCurrent && current !== null, currentMissionId: current,
+    }
   })()
 }
 
@@ -242,7 +530,10 @@ export function joinMission(db, { userId, missionId, convoId, excludePrivateOwne
 // ordinary agent's 409 never names a private item or its title.
 // `by === 'agent'` covers both an ordinary and a private agent; only the
 // ordinary one passes excludePrivateOwned true.
-export function closeMission(db, { userId, missionId, by, summary, excludePrivateOwned = false }) {
+// `closedConvoId` is the conversation the closing agent named (validated by
+// the HTTP layer: on the mission, or the Coordinator) — stored for the
+// record and echoed on the marker; null when none was named.
+export function closeMission(db, { userId, missionId, by, summary, closedConvoId = null, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
@@ -260,8 +551,8 @@ export function closeMission(db, { userId, missionId, by, summary, excludePrivat
       if (open.length) { const e = new Error('agent_items'); e.items = open.filter(visible).map(({ num, title }) => ({ num, title })); throw e }
     }
     const ts = now()
-    db.prepare(`UPDATE missions SET state='closed', close_summary=?, closed_by=?, closed_over_open_items=?, closed_at=?, updated_at=?
-      WHERE id=?`).run(summary, by, open.length, ts, ts, m.id)
+    db.prepare(`UPDATE missions SET state='closed', close_summary=?, closed_by=?, closed_convo_id=?, closed_over_open_items=?, closed_at=?, updated_at=?
+      WHERE id=?`).run(summary, by, closedConvoId, open.length, ts, ts, m.id)
     return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), openItemNums: open.map((i) => i.num) }
   })()
 }
@@ -270,7 +561,7 @@ export function closeMission(db, { userId, missionId, by, summary, excludePrivat
 // this transaction (append() is itself a sync better-sqlite3 transaction,
 // nested as a savepoint) and the returned seq is the row's anchor. If the
 // append throws, nothing — not even the number — survives.
-export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker, excludePrivateOwned = false }) {
+export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker, excludePrivateOwned = false, missionRef = null }) {
   return db.transaction(() => {
     if (!MILESTONE_KINDS.includes(kind)) throw new Error('bad_kind')
     if (idemKey) {
@@ -285,12 +576,22 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (!convo.mission_id) throw new Error('no_mission')
+    // Spec 2026-09-30 §3: `missionRef` (id, "#n" or n) may name ANY mission
+    // this conversation has an active link to; the default stays the current
+    // one. Unknown, invisible (the caller's own sieve) and unlinked are one
+    // answer — not_linked — so the name is never an existence oracle.
+    let targetId = convo.mission_id
+    if (missionRef != null) {
+      const named = getMission(db, userId, missionRef, { excludePrivateOwned })
+      if (!named || !hasActiveLink(db, named.id, convoId)) throw new Error('not_linked')
+      targetId = named.id
+    }
+    if (!targetId) throw new Error('no_mission')
     // Resolved THROUGH the caller's own sieve (C1): a conversation the user
     // joined to a private-origin mission must not become a write path into
     // it for an ordinary agent. Refused before the marker append, so nothing
     // — not the row, not the number, not the event — is written.
-    const mission = getMission(db, userId, convo.mission_id, { excludePrivateOwned })
+    const mission = getMission(db, userId, targetId, { excludePrivateOwned })
     if (!mission) throw new Error('no_mission')
     if (mission.state === 'closed') throw new Error('closed')
     const id = newId('ml')
@@ -352,7 +653,8 @@ const MISSION_SHARED = `(
   ${ORIGIN_SHARED_SIEVE}
   AND (
     EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
-    OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})
+    OR EXISTS (SELECT 1 FROM mission_conversations sl JOIN conversations cv ON cv.id = sl.convo_id
+               WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND ${sharedConvoSql('cv')})
   )
 )`
 const OWNER_JSON = `json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
@@ -371,13 +673,21 @@ const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts g
 // Items also exclude consent mirrors (i.consent IS NULL), matching
 // sharedMissionDetail's own items query — a consent ask is the mission
 // owner's alone and must never surface to a colleague, not even as a count.
+// Status: hidden when privately written, written from a conversation this
+// viewer cannot read, or written by an agent that named NO conversation at
+// all — a status is a synthesis across the mission's conversations, which
+// may include ones this colleague can't read, so an unattributed agent
+// write fails closed rather than being taken on faith. A client write with
+// no conversation is still shared like the title and body: the owner's own
+// device vouches for it the way it vouches for everything else it writes.
 function sharedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
        WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS open_items,
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
        WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS needs_you,
-    (SELECT COUNT(*) FROM conversations cc WHERE cc.mission_id = m.id AND ${sharedConvoSql('cc')}) AS conversations,
+    (SELECT COUNT(*) FROM mission_conversations sl JOIN conversations cc ON cc.id = sl.convo_id
+       WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND cc.parent_convo_id IS NULL AND ${sharedConvoSql('cc')}) AS conversations,
     (SELECT COUNT(*) FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
@@ -385,7 +695,15 @@ function sharedCountsSql() {
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
     (SELECT l.created_at FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}
-       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
+    (${STATUS_PRIVATE}
+      OR (m.status_by = 'agent' AND m.status_convo_id IS NULL)
+      OR (m.status_convo_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden,
+    (m.closed_convo_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM conversations cc WHERE cc.id = m.closed_convo_id AND ${sharedConvoSql('cc')})) AS closed_hidden
+    ,${activitySql(`AND ${sharedConvoSql('c')}`)},
+    NULL AS project_num
   `
 }
 
@@ -394,6 +712,8 @@ function sharedMissionRow(row) {
   const { owner_json: ownerJson, ...rest } = row
   const mission = missionRow(rest)
   mission.owner = JSON.parse(ownerJson)
+  // Projects are never shared with colleagues (spec 2026-09-30 §9).
+  mission.project_id = null
   return mission
 }
 
@@ -410,7 +730,11 @@ export function getSharedMission(db, viewerUserId, missionId) {
     WHERE m.id = @id AND ${MISSION_SHARED}`).get({ viewer: viewerUserId, id: missionId }))
 }
 
-export function sharedMissionDetail(db, viewerUserId, mission) {
+// The colleague's conversation list reads ACTIVE links (never history: a
+// colleague has no members table to reconcile) and folds sub-chats exactly
+// like the owner's (controller ruling D8), so its `conversations` count —
+// active top-level links — matches the folded list.
+export function sharedMissionDetail(db, viewerUserId, mission, { subchats = false } = {}) {
   const args = { viewer: viewerUserId, mid: mission.id }
   const milestones = db.prepare(`SELECT l.* FROM milestones l JOIN conversations cv ON cv.id = l.convo_id
     WHERE l.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`).all(args).map(milestoneRow)
@@ -418,9 +742,13 @@ export function sharedMissionDetail(db, viewerUserId, mission) {
     FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
     WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
-  const conversations = db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box
-    FROM conversations cv LEFT JOIN devices d ON d.id = cv.agent_device_id
-    WHERE cv.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY cv.created_at`).all(args)
+  // parent_convo_id is withheld when the colleague cannot read the parent.
+  const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box,
+      CASE WHEN EXISTS (SELECT 1 FROM conversations pc WHERE pc.id = cv.parent_convo_id AND ${sharedConvoSql('pc')})
+        THEN cv.parent_convo_id END AS parent_convo_id
+    FROM mission_conversations sl JOIN conversations cv ON cv.id = sl.convo_id
+    LEFT JOIN devices d ON d.id = cv.agent_device_id
+    WHERE sl.mission_id = @mid AND sl.ended_at IS NULL AND ${sharedConvoSql('cv')} ORDER BY sl.joined_at, cv.created_at`).all(args), { subchats })
   return { mission, milestones, items, conversations }
 }
 

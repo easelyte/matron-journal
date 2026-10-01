@@ -57,7 +57,7 @@ export function makeItemTranscription({
       // must never pull words out of another user's audio.
       const blob = db.prepare('SELECT disk_path FROM blobs WHERE id=? AND owner_user_id=?').get(blobRef, userId)
       if (!blob) throw new Error('blob not found for this user')
-      transcript = await transcriber.transcribeFile(blob.disk_path, { signal: abort.signal })
+      transcript = await transcriber.transcribeFile(blob.disk_path, { signal: abort.signal, userId })
     } catch (err) {
       // Shutting down: leave it pending — the next boot's recover() redoes it.
       if (closed) return

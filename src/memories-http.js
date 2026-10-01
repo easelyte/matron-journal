@@ -42,7 +42,7 @@ export function emitMemoryMarker({ db, hub }, who, { memory, action, created, wr
     const withTitle = !hidden || privateOwnedConvo(db, convoId)
     const payload = {
       memory_id: memory.id,
-      ...(withTitle ? { name: memory.name, type: memory.type, description: memory.description } : {}),
+      ...(withTitle ? { name: memory.name, type: memory.type, scope: memory.scope, description: memory.description } : {}),
       action, created, by: byOf(who),
     }
     try {

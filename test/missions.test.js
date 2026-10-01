@@ -12,7 +12,7 @@ import { markerTitleAllowed } from '../src/privacy.js'
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
-  createMilestone, listMilestones, CONVOS_MAX,
+  createMilestone, listMilestones, STATUS_MAX,
 } from '../src/missions.js'
 import { createItem } from '../src/items.js'
 
@@ -22,6 +22,7 @@ test('schema: missions and milestones exist with the expected columns; mission_i
   assert.deepEqual(cols('missions'), [
     'id', 'user_id', 'num', 'state', 'title', 'body', 'close_summary', 'closed_by', 'closed_over_open_items',
     'origin_convo_id', 'origin_device_id', 'created_by', 'idem_key', 'created_at', 'updated_at', 'last_milestone_at', 'closed_at',
+    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id', 'closed_convo_id', 'project_id',
   ])
   assert.deepEqual(cols('milestones'), [
     'id', 'mission_id', 'user_id', 'num', 'kind', 'title', 'body', 'convo_id', 'seq', 'device_id', 'created_by', 'idem_key', 'created_at',
@@ -102,7 +103,7 @@ test('marker payloads carry exactly the documented fields', () => {
   assert.deepEqual(missionMarkerPayload({ mission, action: 'closed', by: 'user', openItemNums: [64, 70] }),
     { mission_id: 'ms_1', num: 61, title: 'Missions & milestones', action: 'closed', by: 'user', open_item_nums: [64, 70] })
   assert.equal(MISSION_EVENT_TYPE, 'mission'); assert.equal(MILESTONE_EVENT_TYPE, 'milestone')
-  assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed'])
+  assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed', 'left', 'current_changed'])
 })
 
 // Fix round 2, Critical: across the privacy boundary a marker carries
@@ -161,6 +162,8 @@ test('snippetOf renders both markers; classify never pushes them', () => {
   assert.equal(snippetOf('mission', { num: 61, action: 'created' }), '🏁 Mission #61 started')
   assert.equal(snippetOf('mission', { num: 61, action: 'joined' }), '🏁 Joined mission #61')
   assert.equal(snippetOf('mission', { num: 61, action: 'updated' }), '🏁 Mission #61 updated')
+  assert.equal(snippetOf('mission', { num: 61, action: 'left' }), '🏁 Left mission #61')
+  assert.equal(snippetOf('mission', { num: 61, action: 'current_changed' }), '🏁 Now on mission #61')
   assert.equal(snippetOf('mission', { num: 61, action: 'closed' }), '🏁 Mission #61 closed')
   assert.equal(classify('milestone', { num: 63 }, 'agent:dev-2'), null)
   assert.equal(classify('mission', { num: 61, action: 'closed' }, 'user:dan'), null)
@@ -217,7 +220,7 @@ test('validateMissionFields: title ≤200, body ≤32 KiB, partial allows either
   assert.equal(validateMissionFields({}).ok, false)
 })
 
-test('join: attaches a second conversation and repoints its items; refuses a convo with another mission or a closed mission', () => {
+test('join: attaches a second conversation and repoints its items; a conversation on another mission now joins it; a closed mission refuses', () => {
   const db = seeded()
   const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   const { item } = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' })
@@ -226,7 +229,9 @@ test('join: attaches a second conversation and repoints its items; refuses a con
   assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(item.id).mission_id, a.id)
   upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 7 })
   const b = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c3', title: 'B' }).mission
-  assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c2' }), /other_mission/)
+  const moved = joinMission(db, { userId: 1, missionId: b.id, convoId: 'c2' })
+  assert.equal(moved.action, 'joined')
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, b.id)
   closeMission(db, { userId: 1, missionId: b.id, by: 'agent', summary: 'done' })
   upsertConversation(db, { id: 'c4', ownerUserId: 1, title: 'C4', agentDeviceId: 7 })
   assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c4' }), /closed/)
@@ -519,34 +524,15 @@ test('createMilestone: a filtered caller on a conversation whose mission is hidd
 
 // ---------------------------------------------------------------------------
 // Final review, I1: inheritance is a way INTO a mission, so join's own gates
-// apply to it — an open mission, under the conversation cap, and never a
+// apply to it — an open mission (sub-chats never count toward the cap), never a
 // private-owned parent for an ordinary agent.
 // ---------------------------------------------------------------------------
-function packConvos(db, missionId, n, prefix) {
-  const ins = db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,1,'x','running',?,0)")
-  for (let i = 0; i < n; i++) ins.run(`${prefix}${i}`, missionId)
-}
-
 test('inheritance gate: a closed parent mission is not inherited', () => {
   const db = seeded()
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 'done' })
   upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
   assert.equal(missionOf(db, 'kid'), null)
-})
-
-test('inheritance gate: a parent mission already at CONVOS_MAX is not inherited (the cap is never exceeded)', () => {
-  const db = seeded()
-  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
-  packConvos(db, m.id, CONVOS_MAX - 1, 'pad')  // c1 + 199 = 200
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
-  assert.equal(missionOf(db, 'kid'), null)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  // One under the cap still inherits.
-  db.prepare('UPDATE conversations SET mission_id=NULL WHERE id=?').run('pad0')
-  upsertConversation(db, { id: 'kid2', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
-  assert.equal(missionOf(db, 'kid2'), m.id)
 })
 
 test('inheritance gate: a private-owned parent is not inherited by an ordinary agent, but is by a private one', () => {
@@ -596,5 +582,137 @@ test('milestoneRow: create, replay and list all return the same key set, without
   for (const row of [fresh, replayed, listed]) {
     assert.equal('user_id' in row, false)
     assert.equal('idem_key' in row, false)
+  }
+})
+
+// Spec 2026-09-28 missions dashboard §1 — mission status.
+const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
+
+test('schema: an existing database gains the mission status columns once, all NULL on old rows', () => {
+  const dbPath = path.join(os.tmpdir(), `mission-status-migration-${process.pid}-${Date.now()}.sqlite`)
+  const cols = [...STATUS_FIELDS, 'status_device_id']
+  try {
+    const db1 = openDb(dbPath)
+    db1.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db1.prepare(`INSERT INTO missions(id,user_id,num,state,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
+      VALUES('ms_old',1,1,'open','t','c1',1,'agent',0,0)`).run()
+    db1.close()
+    // Simulate the pre-status shape on a raw handle.
+    const raw = new Database(dbPath)
+    for (const c of cols) raw.exec(`ALTER TABLE missions DROP COLUMN ${c}`)
+    raw.close()
+
+    const db2 = openDb(dbPath)
+    const names = () => db2.prepare('PRAGMA table_info(missions)').all().map((c) => c.name)
+    for (const c of cols) assert.ok(names().includes(c), c)
+    const old = db2.prepare('SELECT * FROM missions WHERE id=?').get('ms_old')
+    for (const c of cols) assert.equal(old[c], null, c)
+    const after = names()
+    db2.close()
+
+    const db3 = openDb(dbPath)
+    assert.deepEqual(db3.prepare('PRAGMA table_info(missions)').all().map((c) => c.name), after)
+    assert.throws(() => db3.prepare("UPDATE missions SET status_by='robot' WHERE id='ms_old'").run(), /CHECK/)
+    db3.close()
+  } finally {
+    fs.rmSync(dbPath, { force: true })
+    fs.rmSync(`${dbPath}-wal`, { force: true })
+    fs.rmSync(`${dbPath}-shm`, { force: true })
+  }
+})
+
+test('validateMissionFields: status is PATCH-only, trimmed, 1–600 UTF-16 units, \\n and \\t allowed, other controls refused, null clears', () => {
+  const p = (status) => validateMissionFields({ status }, { partial: true })
+  assert.equal(STATUS_MAX, 600)
+  assert.deepEqual(p('  Blocked on review.  ').value, { status: 'Blocked on review.' })
+  assert.deepEqual(p(null).value, { status: null })
+  assert.deepEqual(p('Done:\n\t- migration').value, { status: 'Done:\n\t- migration' })
+  assert.deepEqual(p('one\r\ntwo').value, { status: 'one\ntwo' })
+  assert.equal(p('').ok, false)
+  assert.equal(p('   \n\t ').ok, false)
+  assert.equal(p('x'.repeat(600)).ok, true)
+  assert.equal(p('x'.repeat(601)).ok, false)
+  assert.equal(p(`  ${'x'.repeat(600)}  `).ok, true, 'the limit applies after trimming')
+  assert.equal(p('😀'.repeat(300)).ok, true, '600 UTF-16 code units')
+  assert.equal(p('😀'.repeat(300) + 'x').ok, false)
+  for (const bad of ['a\u0000b', 'a\u0007b', 'a\rb', 'a\u000bb', 'a\u001bb', 'a\u007fb', 'a\u0085b', 'a  b', 'a  b']) {
+    assert.equal(p(bad).ok, false, JSON.stringify(bad))
+  }
+  for (const bad of [42, true, {}, []]) assert.equal(p(bad).ok, false, JSON.stringify(bad))
+  assert.deepEqual(validateMissionFields({ title: ' T ', status: 'S' }, { partial: true }).value, { title: 'T', status: 'S' })
+  assert.equal('status' in validateMissionFields({ title: 'T', status: 'ignored on create' }).value, false)
+})
+
+test('updateMission: status sets, overwrites and clears all four columns together; title-only leaves it; a string needs a writer; closed refuses', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'M' }).mission
+  for (const k of STATUS_FIELDS) assert.equal(m[k], null, k)
+  assert.equal('status_device_id' in m, false)
+
+  const set = updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'Wiring the migration' }, statusWriter: { by: 'agent', convoId: 'c1', deviceId: 7 } })
+  assert.equal(set.status, 'Wiring the migration'); assert.equal(set.status_by, 'agent'); assert.equal(set.status_convo_id, 'c1')
+  assert.equal(typeof set.status_updated_at, 'number'); assert.equal(set.updated_at, set.status_updated_at)
+  assert.equal(set.title, 'M')
+  assert.equal('status_device_id' in set, false)
+  assert.equal(db.prepare('SELECT status_device_id FROM missions WHERE id=?').get(m.id).status_device_id, 7)
+
+  const over = updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'Waiting on Dan' }, statusWriter: { by: 'user', convoId: null, deviceId: 7 } })
+  assert.equal(over.status, 'Waiting on Dan'); assert.equal(over.status_by, 'user'); assert.equal(over.status_convo_id, null)
+
+  const renamed = updateMission(db, { userId: 1, missionId: m.id, fields: { title: 'Renamed' } })
+  assert.equal(renamed.status, 'Waiting on Dan'); assert.equal(renamed.status_updated_at, over.status_updated_at)
+  assert.equal(getMission(db, 1, m.id).status, 'Waiting on Dan')
+  assert.equal(listMissions(db, 1).find((x) => x.id === m.id).status, 'Waiting on Dan')
+  assert.equal(missionDetail(db, 1, m.id).mission.status, 'Waiting on Dan')
+
+  assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'no writer' } }), /status_writer_required/)
+  assert.equal(getMission(db, 1, m.id).status, 'Waiting on Dan')
+
+  const cleared = updateMission(db, { userId: 1, missionId: m.id, fields: { status: null } })
+  for (const k of STATUS_FIELDS) assert.equal(cleared[k], null, k)
+  assert.equal(db.prepare('SELECT status_device_id FROM missions WHERE id=?').get(m.id).status_device_id, null)
+
+  closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 's' })
+  assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'late' }, statusWriter: { by: 'user', convoId: null, deviceId: 7 } }), /closed/)
+  assert.equal(getMission(db, 1, m.id).status, null)
+})
+
+test('missionMarkerPayload: status_changed appears only when statusChanged is true, and never carries the status text', () => {
+  const mission = { id: 'ms_1', num: 61, title: 'M', status: 'secret words' }
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: true }),
+    { mission_id: 'ms_1', num: 61, title: 'M', action: 'updated', by: 'agent', status_changed: true })
+  assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent' }), false)
+  assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: false }), false)
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'user', statusChanged: true, withTitle: false }),
+    { mission_id: 'ms_1', num: 61, action: 'updated', by: 'user', status_changed: true })
+  assert.equal(missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent', projectChanged: true }).project_changed, true)
+  assert.equal('project_changed' in missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent' }), false)
+})
+
+test('mission status sieve: withheld from a filtered reader when written from a private-owned conversation or by a private device; the unfiltered reader always sees it', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 9 })
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Pub' }).mission
+  const rows = (excludePrivateOwned) => [
+    getMission(db, 1, m.id, { excludePrivateOwned }),
+    listMissions(db, 1, { excludePrivateOwned }).find((x) => x.id === m.id),
+    missionDetail(db, 1, m.id, { excludePrivateOwned }).mission,
+  ]
+  for (const [convoId, deviceId, withheld] of [
+    ['c1', 7, false], [null, 7, false], ['c3', 9, true], [null, 9, true], ['c1', 9, true], ['c3', 7, true],
+  ]) {
+    const text = `by ${deviceId} in ${convoId}`
+    updateMission(db, { userId: 1, missionId: m.id, fields: { status: text }, statusWriter: { by: 'agent', convoId, deviceId } })
+    for (const row of rows(true)) {
+      if (withheld) for (const k of STATUS_FIELDS) assert.equal(row[k], null, `${text}: ${k}`)
+      else assert.equal(row.status, text)
+      assert.equal(row.title, 'Pub', 'only the status is withheld')
+      assert.equal('status_hidden' in row, false); assert.equal('status_device_id' in row, false)
+    }
+    for (const row of rows(false)) {
+      assert.equal(row.status, text); assert.equal(row.status_convo_id, convoId); assert.equal(row.status_by, 'agent')
+      assert.equal('status_hidden' in row, false)
+    }
   }
 })

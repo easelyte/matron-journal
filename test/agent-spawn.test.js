@@ -1069,6 +1069,12 @@ test('a linked spawn room is titled like a bridge room and gains the child tag w
   const born = client.frames.find((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId)
   assert.equal(born.payload.title, 'D:ab ↔️ eric — job')
   assert.deepEqual(born.payload.participants, [parentDev.deviceId, targetDev.deviceId].sort((a, b) => a - b))
+  // The child's id is unknown at creation; the start reply completes the
+  // room's participant sessions, and with no retitle possible yet a
+  // membership-only meta carries them to live clients.
+  assert.deepEqual(born.payload.participant_convos, [])
+  const started = client.frames.find((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId && f.payload.title === undefined)
+  assert.deepEqual(started.payload.participant_convos, ['parent-convo', 'child-t'])
   // The child's bridge publishes its seed title — the room retitles and
   // every live client hears it.
   client.frames.length = 0
@@ -1417,6 +1423,7 @@ test('approve with a mission: start carries mission_num; the child is a mission 
 
   const child = s.db.prepare('SELECT mission_id, agent_device_id FROM conversations WHERE id=?').get('child-m1')
   assert.equal(child.mission_id, mission.id)
+  assert.equal(s.db.prepare('SELECT how FROM mission_conversations WHERE mission_id=? AND convo_id=?').get(mission.id, 'child-m1').how, 'spawned')
   assert.equal(child.agent_device_id, targetDev.deviceId, 'the pre-created row belongs to the target box')
   const seq = (type, convo) => s.db.prepare('SELECT seq FROM events WHERE type=? AND convo_id=?').get(type, convo).seq
   assert.ok(seq('mission', 'child-m1') < seq('spawn_outcome', 'parent-convo'), 'joined before the outcome was journaled')

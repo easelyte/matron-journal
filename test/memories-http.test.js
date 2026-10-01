@@ -36,12 +36,13 @@ test('PUT /memories/:name: agent creates (201) then updates (200); marker on the
   assert.equal(r.json.memory.name, 'avoid-eric'); assert.equal(r.json.memory.created_by, 'agent'); assert.equal(r.json.memory.origin_convo_id, 'c1')
   const live = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'memory')
   assert.equal(live.convo_id, 'c1'); assert.equal(live.sender, 'agent:dev-2')
-  assert.deepEqual(live.payload, { memory_id: r.json.memory.id, name: 'avoid-eric', type: 'feedback', description: 'Never use eric.', action: 'saved', created: true, by: 'agent' })
+  assert.equal(r.json.memory.scope, 'global')
+  assert.deepEqual(live.payload, { memory_id: r.json.memory.id, name: 'avoid-eric', type: 'feedback', scope: 'global', description: 'Never use eric.', action: 'saved', created: true, by: 'agent' })
   ws.close()
   const u = await put(s, agent.token, 'avoid-eric', { description: 'Eric is reserved.', convo_id: 'c1' })
   assert.equal(u.status, 200); assert.equal(u.json.memory.id, r.json.memory.id); assert.equal(u.json.memory.body, ''); assert.equal(u.json.memory.type, 'feedback')
   assert.equal(markers(s).length, 2); assert.equal(markers(s)[1].payload.created, false)
-  for (const [name, body] of [['Bad Name', {}], ['ok', { description: '' }], ['ok', { description: 'a\nb' }], ['ok', { type: 'rule' }], ['ok', { body: 'é'.repeat(4097) }], ['ok', { convo_id: 42 }]]) {
+  for (const [name, body] of [['Bad Name', {}], ['ok', { description: '' }], ['ok', { description: 'a\nb' }], ['ok', { type: 'rule' }], ['ok', { body: 'é'.repeat(4097) }], ['ok', { convo_id: 42 }], ['ok', { scope: 'team' }], ['ok', { scope: 'repo:a/b' }]]) {
     assert.equal((await put(s, agent.token, name, body)).status, 400, `${name} ${JSON.stringify(body)}`)
   }
   assert.equal((await s.http('/memories/ok', { method: 'PUT', token: agent.token, body: [] })).status, 400)
@@ -52,6 +53,22 @@ test('PUT /memories/:name: agent creates (201) then updates (200); marker on the
   const noAuth = await s.http('/memories/ok', { method: 'PUT', body: { description: 'x' } })
   assert.equal(noAuth.status, 401)
   assert.equal(markers(s).length, 2)
+})
+
+test('PUT /memories/:name with a scope: stored, shown, carried by the marker; omitted on an update keeps it', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  setCoordinatorConvoId(s.db, dan.id, 'coord')
+  const r = await put(s, agent.token, 'merge-train', { scope: 'repo:yearbook-app', convo_id: 'c1' })
+  assert.equal(r.status, 201); assert.equal(r.json.memory.scope, 'repo:yearbook-app')
+  assert.equal(markers(s)[0].payload.scope, 'repo:yearbook-app')
+  const kept = await put(s, client, 'merge-train', { description: 'The train merges.' })
+  assert.equal(kept.status, 200); assert.equal(kept.json.memory.scope, 'repo:yearbook-app')
+  const moved = await put(s, client, 'merge-train', { scope: 'coordinator' })
+  assert.equal(moved.status, 200); assert.equal(moved.json.memory.scope, 'coordinator')
+  assert.equal(markers(s).at(-1).payload.scope, 'coordinator')
+  const list = await s.http('/memories', { token: client })
+  assert.deepEqual(list.json.memories.map((m) => [m.name, m.scope]), [['merge-train', 'coordinator']])
+  assert.equal((await s.http('/memories/merge-train', { token: agent.token })).json.memory.scope, 'coordinator')
 })
 
 test('PUT by a client: no convo_id, created_by user, marker only on the Coordinator convo when one is set', async (t) => {

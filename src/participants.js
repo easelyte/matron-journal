@@ -19,15 +19,16 @@ const RENEWABLE = new Set(['refused', 'denied', 'left', 'expired'])
 // gate, same conflict target, differing only in which state (and topic) the
 // row lands in. `delivered_at` is always reset to NULL here — a renewed row
 // is a brand new ask, not a continuation of whatever was or wasn't delivered
-// before.
-function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null, initiatorConvoId = null }) {
+// before. `spawn_id` likewise: a renewed row is a new membership generation,
+// never the one a spawn created (see recordJoined).
+function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null, initiatorConvoId = null, spawnId = null }) {
   const existing = db.prepare(
     'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId)
   if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
   db.prepare(`
-    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at)
-    VALUES(?,?,?,?,?,?,?,?,?,NULL,NULL)
+    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, initiator_convo_id, spawn_id, created_at, answered_at, delivered_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)
     ON CONFLICT(convo_id, agent_device_id) DO UPDATE SET
       initiator_device_id=excluded.initiator_device_id,
       state=excluded.state,
@@ -35,10 +36,11 @@ function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justi
       topic=excluded.topic,
       target_convo_id=excluded.target_convo_id,
       initiator_convo_id=excluded.initiator_convo_id,
+      spawn_id=excluded.spawn_id,
       created_at=excluded.created_at,
       answered_at=NULL,
       delivered_at=NULL
-  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, Date.now())
+  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, spawnId, Date.now())
   return { ok: true, prior: existing ?? null }
 }
 
@@ -62,8 +64,33 @@ export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, just
 // (spec: "records both agents as joined; approving the spawn approved the
 // pair"). The room owner is recorded on conversations.agent_device_id as
 // everywhere else, so only the NON-owner participant gets a row here.
-export function recordJoined(db, { convoId, agentDeviceId, initiatorDeviceId }) {
-  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'joined', justification: '', topic: '' })
+// `spawnId` stamps this membership generation with the spawn that created
+// it: approveSpawn awaits the start RPC after this write, and the target can
+// leave and accept a fresh invite meanwhile — the started spawn's child then
+// belongs to THIS generation only (participantConvoIds), never to the
+// renewal, which upsertRow resets to NULL.
+export function recordJoined(db, { convoId, agentDeviceId, initiatorDeviceId, spawnId = null }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'joined', justification: '', topic: '', spawnId })
+}
+
+// The room owner's sessions (room_owner_convos): one row per owner session
+// that ACCEPTED membership brought into the room — an owner invite's
+// initiator_convo_id when the invite is accepted (answerInvite), a started
+// spawn's parent from_convo_id (spawns.js markStarted). Kept apart from the
+// membership row on purpose: a re-invite renews that row (upsertRow
+// overwrites initiator_convo_id with the new, still unaccepted ask's
+// source), but the owner's earlier accepted session is still in the room.
+// Recorded only while the room is live and only for the room's recorded
+// owner (conversations.agent_device_id); first write wins (journal order).
+// leaveAllParticipants (dissolve) deletes the room's rows, so a dissolved
+// room repopulated later starts from the new memberships alone.
+export function recordOwnerConvo(db, { roomId, convoId, deviceId, createdAt }) {
+  if (!convoId) return
+  db.prepare(`
+    INSERT OR IGNORE INTO room_owner_convos(room_id, convo_id, device_id, created_at)
+    SELECT r.id, ?, ?, ? FROM conversations r
+     WHERE r.id = ? AND r.agent_device_id = ? AND ${ROOM_LIVE('r.id')}
+  `).run(convoId, deviceId, createdAt, roomId, deviceId)
 }
 
 // Resolves a parked row per the user's decision. Approve restarts
@@ -73,10 +100,13 @@ export function recordJoined(db, { convoId, agentDeviceId, initiatorDeviceId }) 
 // terminal and stamps answered_at, same shape as answerInvite's refusal.
 // Scoped to state='awaiting_user' so answering twice, or answering a row
 // that was never parked, is a no-op false rather than a silent state stomp.
-export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now() }) {
+// `answeredBy` / `answerReason` (spec: 2026-09-29 coordinator consent) name
+// the Coordinator and its reason when it, not a tap, answered; null for a
+// tap, which is the pre-field row shape.
+export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now(), answeredBy = null, answerReason = null }) {
   const r = approve
-    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
-    : db.prepare("UPDATE convo_agents SET state='denied', answered_at=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
+    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
+    : db.prepare("UPDATE convo_agents SET state='denied', answered_at=?, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
   return r.changes === 1
 }
 
@@ -100,7 +130,7 @@ export function markDelivered(db, { convoId, agentDeviceId, now = Date.now() }) 
 // feeds).
 export function undeliveredInvites(db) {
   return db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id, ca.answered_by,
            c.owner_user_id, c.agent_device_id AS room_agent_device_id
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.state='invited' AND ca.delivered_at IS NULL
@@ -142,9 +172,15 @@ export function expireAwaiting(db, ttlMs, now = Date.now()) {
 }
 
 export function answerInvite(db, { convoId, agentDeviceId, accept, now = Date.now() }) {
-  return db.prepare(
-    "UPDATE convo_agents SET state=?, answered_at=? WHERE convo_id=? AND agent_device_id=? AND state='invited'"
-  ).run(accept ? 'joined' : 'refused', now, convoId, agentDeviceId).changes > 0
+  const row = db.prepare(
+    "UPDATE convo_agents SET state=?, answered_at=? WHERE convo_id=? AND agent_device_id=? AND state='invited' RETURNING initiator_device_id, initiator_convo_id, created_at"
+  ).get(accept ? 'joined' : 'refused', now, convoId, agentDeviceId)
+  if (!row) return false
+  // An accepted OWNER invite brings the owner's asking session into the
+  // room for good (until dissolve) — recordOwnerConvo drops it for a
+  // joiner-initiated row, whose initiator is not the owner.
+  if (accept) recordOwnerConvo(db, { roomId: convoId, convoId: row.initiator_convo_id, deviceId: row.initiator_device_id, createdAt: row.created_at })
+  return true
 }
 
 export function leaveConvo(db, { convoId, agentDeviceId, now = Date.now() }) {
@@ -179,9 +215,9 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
     return
   }
   db.prepare(`
-    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, created_at=?, answered_at=?, delivered_at=?
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, spawn_id=?, created_at=?, answered_at=?, delivered_at=?
     WHERE convo_id=? AND agent_device_id=?
-  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.spawn_id ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
 }
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
@@ -218,6 +254,9 @@ export function leaveAllParticipants(db, convoId, now = Date.now()) {
   db.prepare(
     "UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND state IN ('invited','joined','awaiting_user')"
   ).run(now, convoId)
+  // The owner left: its sessions are out of the room. A later join into the
+  // same convo id starts a new room as far as participant_convos goes.
+  db.prepare('DELETE FROM room_owner_convos WHERE room_id=?').run(convoId)
   return {
     joined: live.filter((r) => r.state === 'joined').map((r) => r.agent_device_id),
     pending: live.filter((r) => r.state !== 'joined')
@@ -257,7 +296,7 @@ export function participantIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at, item_id FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, spawn_id, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 
@@ -303,4 +342,87 @@ export function expireInvites(db, ttlMs, now = Date.now()) {
   return db.prepare(
     "UPDATE convo_agents SET state='expired', answered_at=? WHERE state='invited' AND delivered_at IS NOT NULL AND delivered_at<=? RETURNING convo_id, agent_device_id, initiator_device_id"
   ).all(now, now - ttlMs)
+}
+
+// The CONVERSATIONS in a room, alongside participantIds' devices (spec:
+// 2026-10-01 rooms under missions): a room is its own top-level convo, and a
+// client can only place it under its participants' missions if it knows
+// which of their sessions are talking in it. Two halves, gated differently:
+//   - OWNER side — room_owner_convos (see recordOwnerConvo): the session an
+//     ACCEPTED owner invite was sent from, and a started spawn's parent.
+//     The owner stays in `participants` until it dissolves the room, so its
+//     sessions stay for as long as the room has ANY joined row — not just
+//     while the member whose acceptance brought them in is still there, and
+//     not undone by that member's row being renewed by a re-invite (whose
+//     own source session only counts once accepted). Dissolution deletes
+//     the room's rows, so nothing stale returns if the room fills again.
+//   - MEMBER side — an invited member's target_convo_id, a joiner's own
+//     initiator_convo_id (agent_join's from_convo_id), and a spawn's
+//     child_convo_id: only while that member's row is joined, so a leaver's
+//     session drops exactly as its device drops out of `participants`. A
+//     spawn row stays 'started' forever, so the child additionally requires
+//     the joined row to be the very membership the spawn created
+//     (convo_agents.spawn_id, stamped by recordJoined and reset by any
+//     renewal) — a leave + re-invite, even one that lands while the start
+//     RPC is still in flight, must not bind the child to the new membership.
+// Each id's owning device (`own`) is the one the write path validated it
+// against (agent_invite/agent_join: from_convo_id owned by the caller,
+// target_convo_id by the target; a spawn's child comes from the target's own
+// `start` reply).
+// Order: owner side first, then member side, each in journal order (row
+// creation; a joined row's target before a spawn child), deduped keeping the
+// first. `excludePrivateOwned` is snapshot's filtered-caller sieve: rows
+// whose participant device is private drop out (as they do from
+// `participants`), and so does any convo a private device owns — by its
+// CURRENT conversations row when it has one (convo_upsert can hand a
+// participant-less session to a private device after the invite), else by
+// the device the write path recorded (a spawn child's row usually lands
+// after markStarted).
+const ROOM_LIVE = (roomCol) => `EXISTS(SELECT 1 FROM convo_agents j WHERE j.convo_id = ${roomCol} AND j.state='joined')`
+const PARTICIPANT_CONVO_SQL = (scope, excludePrivateOwned) => `
+  SELECT p.room_id, p.convo_id FROM (
+    SELECT o.room_id, o.convo_id, o.device_id AS own, o.device_id AS dev, 0 AS side, o.created_at AS ord, o.rowid AS rk, 0 AS sub
+      FROM room_owner_convos o WHERE ${ROOM_LIVE('o.room_id')}
+    UNION ALL
+    SELECT ca.convo_id, ca.initiator_convo_id, ca.initiator_device_id, ca.agent_device_id, 1, ca.created_at, ca.rowid, 0
+      FROM convo_agents ca
+      WHERE ca.initiator_device_id = ca.agent_device_id AND ca.state='joined'
+    UNION ALL
+    SELECT ca.convo_id, ca.target_convo_id, ca.agent_device_id, ca.agent_device_id, 1, ca.created_at, ca.rowid, 1
+      FROM convo_agents ca WHERE ca.state='joined'
+    UNION ALL
+    SELECT s.room_id, s.child_convo_id, s.target_device_id, ca.agent_device_id, 1, ca.created_at, ca.rowid, 2
+      FROM agent_spawn_requests s
+      JOIN convo_agents ca ON ca.convo_id=s.room_id AND ca.agent_device_id=s.target_device_id AND ca.state='joined'
+        AND ca.spawn_id = s.id
+      WHERE s.state='started'
+  ) p
+  JOIN conversations room ON room.id = p.room_id
+  WHERE p.convo_id IS NOT NULL AND ${scope}${excludePrivateOwned ? `
+    AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id = p.dev AND d.private=1)
+    AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.private=1 AND d.id = COALESCE(
+      (SELECT c.agent_device_id FROM conversations c WHERE c.id = p.convo_id), p.own))` : ''}
+  ORDER BY p.room_id, p.side, p.ord, p.rk, p.sub`
+
+function groupConvoIds(rows) {
+  const byRoom = new Map()
+  for (const r of rows) {
+    if (!byRoom.has(r.room_id)) byRoom.set(r.room_id, new Set())
+    byRoom.get(r.room_id).add(r.convo_id)
+  }
+  return new Map([...byRoom].map(([room, ids]) => [room, [...ids]]))
+}
+
+// One room's participant conversation ids — the `participant_convos` array
+// membership convo_meta frames carry next to `participants`. Empty for a
+// room with no joined pair (or a convo that is no room at all).
+export function participantConvoIds(db, roomId, { excludePrivateOwned = false } = {}) {
+  const rows = db.prepare(PARTICIPANT_CONVO_SQL('room.id = ?', excludePrivateOwned)).all(roomId)
+  return groupConvoIds(rows).get(roomId) ?? []
+}
+
+// Every room of one user at once, for snapshot: Map roomId -> ids. Rooms
+// with no resolvable conversation are absent from the map.
+export function participantConvosByRoom(db, userId, { excludePrivateOwned = false } = {}) {
+  return groupConvoIds(db.prepare(PARTICIPANT_CONVO_SQL('room.owner_user_id = ?', excludePrivateOwned)).all(userId))
 }

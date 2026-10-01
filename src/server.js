@@ -32,7 +32,13 @@ import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 import { makeTokenBox } from './token-box.js'
+import { startUnseenNudge } from './unseen-nudge.js'
+import { makeRoutineFirer, startRoutinesSweep } from './routines-sweep.js'
+import { seedRoutines } from './routines.js'
+import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
+import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
+import { warnAlertWebhookConfig } from './alerts-http.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -154,6 +160,15 @@ export function assertNoProhibitedFileWriteRoots(fileWriteRoots, prohibitedRoots
   if (prohibitedRoot) {
     throw new Error(`file writes: configured write-root is prohibited because it is too broad: ${prohibitedRoot.realPath}`)
   }
+}
+
+// The consent cap is the one knob where 0 is a value, not garbage: it means
+// "no cap" — the operator has decided the reason on every decision and the
+// audit trail are guardrail enough (Dan, 2026-09-30, after a routine day
+// hit 20). Anything else is validated like every other numeric knob.
+export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEFAULT) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
 }
 
 // `override` is startServer's `retentionDays` opt — when given, it takes
@@ -428,11 +443,27 @@ export function startServer({
   // wake is actually under way, so a journal without MATRON_WAKE_CMD never
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
+  sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
+  // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
+  // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
+  consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  stallWakeIntervalMs = null,
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  unseenNudgeIntervalMs = null,
+  unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
+  // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
+  // the sweep (the routes and `run` still work).
+  routinesSweepIntervalMs = null,
+  routinesTriggerIntervalMs = null,
+  routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
   fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, workViewOptions, fileHomeDir,
   github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
+  // Alertmanager webhook (src/alerts-http.js): {token, username}. The
+  // option is the test seam; env otherwise. Off unless both are usable.
+  alertWebhook,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -618,6 +649,23 @@ export function startServer({
   // orphan sweep TTL (derived in attachWs from this value) stays what it
   // always was, rather than growing by a window that can never be used.
   const effectiveWakeWaitMs = resolvedWaker.enabled ? spawnWakeWaitMs : 0
+  // Stall wake sweep (src/stall-wake.js): a box whose stalled session's
+  // usage-limit reset has passed is woken so its bridge can carry on. No-op
+  // without a waker; stopped in close().
+  const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
+  const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
+  // Coordinator routines (spec 2026-10-01): one firer per process (the
+  // sweep and POST /routines/:key/run share its in-flight bound), the
+  // once-a-minute sweep, and the one-off seed for users who already have a
+  // Coordinator (new assignments seed in coordinator-http.js).
+  const routineFirer = makeRoutineFirer({ db, hub, broker, waker: resolvedWaker, wakeWaitMs: effectiveWakeWaitMs, timeoutMs: sessionControlTimeoutMs })
+  const routinesSweeper = startRoutinesSweep({ db, firer: routineFirer, enabled: routinesSweep, ...(routinesSweepIntervalMs ? { intervalMs: routinesSweepIntervalMs } : {}), ...(routinesTriggerIntervalMs ? { triggerIntervalMs: routinesTriggerIntervalMs } : {}) })
+  try {
+    for (const { user_id: userId } of db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL AND routines_seeded_at IS NULL').all()) {
+      const n = seedRoutines(db, userId)
+      if (n > 0) console.log(`routines: seeded ${n} starter routine(s) for user ${userId}`)
+    }
+  } catch (err) { console.error('routines: boot seeding failed', err) }
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -632,7 +680,9 @@ export function startServer({
   // `null` forces it off.
   const itemTranscription = makeItemTranscription({
     db,
-    transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
+    transcriber: transcriber === undefined
+      ? makeTranscriber({ deviceNames: (userId) => db.prepare('SELECT DISTINCT name FROM devices WHERE user_id=? ORDER BY name').all(userId).map((r) => r.name) })
+      : transcriber,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
@@ -653,17 +703,23 @@ export function startServer({
     androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
     androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
   })
+  const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
+    token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
+    username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
+  }
+  if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
   const server = http.createServer(httpHandlerFactory({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, consentDailyCap,
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     fileOwnerUserId: resolvedFileOwnerUserId,
     workViewOptions,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -678,7 +734,7 @@ export function startServer({
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
-    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker,
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
@@ -714,12 +770,18 @@ export function startServer({
         itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        unseenNudge: unseenNudgeSweep,
+        routinesSweep: routinesSweeper,
+        routineFirer,
         github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
+          stallWakeSweep.stop()
+          unseenNudgeSweep.stop()
+          routinesSweeper.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.

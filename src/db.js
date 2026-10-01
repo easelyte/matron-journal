@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
+import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -319,6 +320,19 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Per-conversation session header (spec 2026-09-29 coordinator session
+-- control §1): the persisted subset of the bridge's status op — model,
+-- context gauge, usage-limit stall, account meters — so the roster and a
+-- mission's conversations can answer "how full is that session" for a box
+-- that is asleep or a journal that has restarted. Same shape as
+-- device_status: JSON per row, latest wins, goes with the conversation.
+CREATE TABLE IF NOT EXISTS conversation_status(
+  convo_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  reported_at INTEGER NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_status_user ON conversation_status(user_id);
 -- Per-user settings (spec 2026-09-23 coordinator redesign §1a). A table, not
 -- a users column, so later per-user settings have a home. No row = every
 -- setting at its default. coordinator_convo_id is not a foreign key — same
@@ -326,8 +340,23 @@ CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
 CREATE TABLE IF NOT EXISTS user_settings(
   user_id INTEGER PRIMARY KEY REFERENCES users(id),
   coordinator_convo_id TEXT,
+  coordinator_consent INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL
 );
+-- Coordinator consent decisions (spec: matron-bridge 2026-09-29 coordinator
+-- consent): one row per ask the Coordinator answered — the audit record and
+-- the rolling 24 h approval cap's counter. A user's own tap never writes one.
+CREATE TABLE IF NOT EXISTS consent_decisions(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  ask_id     TEXT NOT NULL,
+  decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
+  convo_id   TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consent_decisions_user ON consent_decisions(user_id, created_at);
 -- Memories (spec: 2026-09-27 memories): the user's shared agent memory.
 -- One row per name; PUT /memories/:name overwrites. origin_convo_id is
 -- deliberately not a foreign key — deleting the conversation a memory was
@@ -350,9 +379,145 @@ CREATE TABLE IF NOT EXISTS memories(
   updated_by       TEXT NOT NULL CHECK(updated_by IN ('user','agent')),
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
+  scope            TEXT NOT NULL DEFAULT 'global',
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, updated_at);
+-- Conversation ↔ mission links (spec 2026-09-30 projects & mission links
+-- §3). One row per (mission, conversation) the conversation ever worked on:
+-- ended_at NULL = active ("on it now"), set = history ("earlier").
+-- conversations.mission_id stays as the CURRENT pointer — invariant: when it
+-- is non-null an active link exists for it. No foreign keys (same stance as
+-- conversations.mission_id); ownership is checked on write.
+CREATE TABLE IF NOT EXISTS mission_conversations(
+  mission_id TEXT NOT NULL,
+  convo_id   TEXT NOT NULL,
+  user_id    INTEGER NOT NULL,
+  how        TEXT NOT NULL CHECK(how IN ('origin','joined','spawned','inherited','backfill')),
+  joined_at  INTEGER NOT NULL,
+  ended_at   INTEGER,
+  PRIMARY KEY(mission_id, convo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mc_convo ON mission_conversations(convo_id, ended_at);
+-- Projects (spec 2026-09-30 §4): groups of missions. Numbered from
+-- item_counters like items/missions/milestones. status_device_id and
+-- idem_key are internal (never on the wire). merged_into names the project a
+-- merge closed this one into.
+CREATE TABLE IF NOT EXISTS projects(
+  id                        TEXT PRIMARY KEY,
+  user_id                   INTEGER NOT NULL REFERENCES users(id),
+  num                       INTEGER NOT NULL,
+  state                     TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','closed')),
+  title                     TEXT NOT NULL,
+  body                      TEXT NOT NULL DEFAULT '',
+  status                    TEXT,
+  status_by                 TEXT CHECK(status_by IN ('user','agent')),
+  status_convo_id           TEXT,
+  status_device_id          INTEGER,
+  status_updated_at         INTEGER,
+  close_summary             TEXT,
+  closed_by                 TEXT CHECK(closed_by IN ('user','agent')),
+  closed_over_open_missions INTEGER NOT NULL DEFAULT 0,
+  closed_at                 INTEGER,
+  merged_into               TEXT,
+  origin_convo_id           TEXT,
+  origin_device_id          INTEGER NOT NULL,
+  created_by                TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key                  TEXT,
+  created_at                INTEGER NOT NULL,
+  updated_at                INTEGER NOT NULL,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_projects_user_state ON projects(user_id, state);
+-- Read state (spec 2026-09-30 read state). What the user has actually SEEN,
+-- as reported by their client apps: separate from read_marker/unread_count,
+-- which stay the badge's business. Seq ranges per conversation, coalesced on
+-- write (src/seen.js) so a normally-read conversation is one or a few rows.
+-- No foreign keys: same stance as mission_conversations; ownership is checked
+-- on write.
+CREATE TABLE IF NOT EXISTS seen_ranges(
+  user_id   INTEGER NOT NULL,
+  convo_id  TEXT NOT NULL,
+  from_seq  INTEGER NOT NULL,
+  to_seq    INTEGER NOT NULL,
+  seen_at   INTEGER NOT NULL,
+  PRIMARY KEY(user_id, convo_id, from_seq)
+);
+-- Client devices that report precise ranges. A client read_marker from a
+-- device NOT listed here counts as "seen up to that seq" (the legacy
+-- fallback for apps that don't send ranges yet).
+CREATE TABLE IF NOT EXISTS seen_devices(
+  device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  first_at  INTEGER NOT NULL
+);
+-- Item threads: the item itself, and its comments up to a created_at.
+CREATE TABLE IF NOT EXISTS item_seen(
+  user_id                 INTEGER NOT NULL,
+  item_id                 TEXT NOT NULL,
+  seen_through_comment_at INTEGER NOT NULL DEFAULT 0,
+  seen_at                 INTEGER NOT NULL,
+  PRIMARY KEY(user_id, item_id)
+);
+-- What an agent has already raised with the user (the no-repeat rule).
+CREATE TABLE IF NOT EXISTS unseen_flags(
+  user_id             INTEGER NOT NULL,
+  ref                 TEXT NOT NULL,
+  flagged_at          INTEGER NOT NULL,
+  flagged_in_convo_id TEXT NOT NULL,
+  PRIMARY KEY(user_id, ref)
+);
+-- The unseen nudge's memory: when the Coordinator was last nudged, and
+-- every entry a nudge has named, so an entry is nudged about once (even one
+-- that only becomes important after a later entry was nudged).
+CREATE TABLE IF NOT EXISTS unseen_nudges(
+  user_id INTEGER PRIMARY KEY,
+  last_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unseen_nudged(
+  user_id  INTEGER NOT NULL,
+  ref      TEXT NOT NULL,
+  nudged_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, ref)
+);
+-- Coordinator routines (spec 2026-10-01 coordinator routines): a schedule
+-- (or a trigger) and a prompt the journal owns and fires into whichever
+-- conversation holds the Coordinator role. Exactly one of schedule (5-field
+-- cron in tz) and trigger (JSON: context_over / stalled / disk_under) is
+-- set. next_at is the next scheduled fire in ms (NULL while paused, and
+-- always NULL for a triggered routine); retry_at the one retry after a
+-- failed delivery (internal, never on the wire). Names are the handle
+-- agents and prompts use, unique per user.
+CREATE TABLE IF NOT EXISTS routines(
+  id            TEXT PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  name          TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  schedule      TEXT,
+  trigger       TEXT,
+  tz            TEXT NOT NULL,
+  prompt        TEXT NOT NULL,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  origin        TEXT NOT NULL CHECK(origin IN ('seed','user','agent')),
+  next_at       INTEGER,
+  retry_at      INTEGER,
+  last_fired_at INTEGER,
+  last_outcome  TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  UNIQUE(user_id, name),
+  CHECK((schedule IS NULL) <> (trigger IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_at);
+-- A triggered routine's currently-tripped subjects (convo:<id> or
+-- device:<id>): a row means this crossing has been fired for; it is removed
+-- when the condition clears, so the next crossing fires again.
+CREATE TABLE IF NOT EXISTS routine_trigger_state(
+  routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+  subject    TEXT NOT NULL,
+  tripped_at INTEGER NOT NULL,
+  PRIMARY KEY(routine_id, subject)
+);
 `
 
 export function openDb(path) {
@@ -838,6 +1003,57 @@ export function openDb(path) {
     db.exec('ALTER TABLE convo_agents ADD COLUMN item_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_convo_agents_item ON convo_agents(item_id)')
+  // Room participant conversations (participant_convos, see
+  // participantConvoIds in participants.js). Both additive; each backfills
+  // exactly what the previous derivation produced, once, when it first
+  // appears, so no live room's list changes at deploy.
+  //
+  // convo_agents.spawn_id: the spawn whose approval created this membership
+  // generation (recordJoined), reset to NULL by any renewal. A started
+  // spawn's child counts only while that same generation is joined. After
+  // both convo_agents rebuilds above, for the reason target_convo_id is.
+  // Backfill: the old rule (a joined row created no later than the start).
+  const caColsSpawn = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caColsSpawn.some((c) => c.name === 'spawn_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN spawn_id TEXT')
+    db.exec(`
+      UPDATE convo_agents SET spawn_id = (
+        SELECT s.id FROM agent_spawn_requests s
+         WHERE s.room_id = convo_agents.convo_id AND s.target_device_id = convo_agents.agent_device_id
+           AND s.state = 'started' AND convo_agents.created_at <= s.resolved_at
+         ORDER BY s.created_at DESC LIMIT 1)
+       WHERE state = 'joined'`)
+  }
+  // room_owner_convos: the room owner's sessions that accepted membership
+  // brought in (an accepted owner invite's initiator_convo_id, a started
+  // spawn's from_convo_id) — kept off the membership row because a re-invite
+  // renews that row. Dissolve deletes a room's rows. Backfill: the old
+  // owner-side rule, for rooms with a joined row (others were not showing
+  // any owner session and a dissolved one must not get them back).
+  const hasOwnerConvos = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='room_owner_convos'").get()
+  if (!hasOwnerConvos) {
+    db.exec(`
+      CREATE TABLE room_owner_convos(
+        room_id TEXT NOT NULL,
+        convo_id TEXT NOT NULL,
+        device_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(room_id, convo_id)
+      );
+      INSERT OR IGNORE INTO room_owner_convos(room_id, convo_id, device_id, created_at)
+        SELECT room_id, convo_id, device_id, created_at FROM (
+          SELECT ca.convo_id AS room_id, ca.initiator_convo_id AS convo_id, ca.initiator_device_id AS device_id, ca.created_at AS created_at, ca.rowid AS rk, 0 AS sub
+            FROM convo_agents ca JOIN conversations r ON r.id = ca.convo_id
+           WHERE ca.initiator_device_id = r.agent_device_id AND ca.state IN ('joined','left') AND ca.initiator_convo_id IS NOT NULL
+          UNION ALL
+          SELECT s.room_id, s.from_convo_id, s.from_device_id, s.created_at, s.rowid, 1
+            FROM agent_spawn_requests s JOIN conversations r ON r.id = s.room_id
+           WHERE s.state = 'started' AND s.from_device_id = r.agent_device_id
+        ) o
+        WHERE EXISTS(SELECT 1 FROM convo_agents j WHERE j.convo_id = o.room_id AND j.state = 'joined')
+        ORDER BY created_at, rk, sub;
+    `)
+  }
   // Which Claude model the spawned session should run (spec: agent-spawned
   // sessions). An alias like 'opus' or a full model id — the target bridge's
   // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
@@ -891,12 +1107,13 @@ export function openDb(path) {
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
-  // Missions (spec 2026-09-10): a conversation belongs to at most one
-  // mission, set once and never changed; an item follows its origin
-  // conversation but can be moved (PATCH /items/:id {mission}). Both are
-  // NULL for every row predating the column. Placed here, after every
-  // table-rebuild block, so a rebuild can never drop them. Not foreign
-  // keys — same stance as parent_convo_id.
+  // Missions (spec 2026-09-10): conversations.mission_id is the
+  // conversation's CURRENT mission (spec 2026-09-30: see
+  // mission_conversations); an item follows its origin conversation but
+  // can be moved (PATCH /items/:id {mission}). Both are NULL for every row
+  // predating the column. Placed here, after every table-rebuild block, so
+  // a rebuild can never drop them. Not foreign keys — same stance as
+  // parent_convo_id.
   const missionConvoCols = db.prepare('PRAGMA table_info(conversations)').all()
   if (!missionConvoCols.some((c) => c.name === 'mission_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN mission_id TEXT')
@@ -928,6 +1145,59 @@ export function openDb(path) {
   }
   if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
     db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
+  }
+  // Mission status (spec 2026-09-28 missions dashboard §1): one short
+  // markdown paragraph agents keep current — who wrote it (status_by), from
+  // which conversation (status_convo_id), and when. status_device_id is
+  // internal and never on the wire: the privacy sieve keys on the WRITING
+  // DEVICE as well as the conversation, so a private agent that names no
+  // conversation is still withheld from ordinary agents. No backfill —
+  // every existing row reads all NULL.
+  const missionStatusCols = db.prepare('PRAGMA table_info(missions)').all()
+  const addMissionCol = (name, ddl) => {
+    if (!missionStatusCols.some((c) => c.name === name)) db.exec(`ALTER TABLE missions ADD COLUMN ${ddl}`)
+  }
+  addMissionCol('status', 'status TEXT')
+  addMissionCol('status_by', "status_by TEXT CHECK(status_by IN ('user','agent'))")
+  addMissionCol('status_convo_id', 'status_convo_id TEXT')
+  addMissionCol('status_updated_at', 'status_updated_at INTEGER')
+  addMissionCol('status_device_id', 'status_device_id INTEGER')
+  // Which conversation closed the mission, when the closing agent named one
+  // (spec 2026-09-29 coordinator session control, "Coordinator mission
+  // close"): the audit line behind "closed by the Coordinator". NULL for a
+  // client close and for a bridge that predates the field.
+  addMissionCol('closed_convo_id', 'closed_convo_id TEXT')
+  // The project a mission is filed in (spec 2026-09-30 §4.1): at most one,
+  // NULL = unfiled. Not a foreign key. The index cannot live in SCHEMA: on an
+  // upgraded database SCHEMA runs before this ALTER adds the column.
+  addMissionCol('project_id', 'project_id TEXT')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_missions_project ON missions(project_id, state)')
+  // Spec 2026-09-30 §3 backfill: once, while the link table is empty. After
+  // every mission/conversation/item column it reads has been added above.
+  const backfilled = backfillMissionLinks(db)
+  if (backfilled > 0) console.log(`mission_conversations: backfilled ${backfilled} link(s)`)
+  // And on EVERY open: a pointer written without a link (old code after a
+  // rollback) gets its active link back, so the invariant always holds.
+  const healed = healMissionLinks(db)
+  if (healed > 0) console.log(`mission_conversations: healed ${healed} link(s)`)
+  // Coordinator consent approval (spec: matron-bridge 2026-09-29 coordinator
+  // consent): the off switch (default ON, the choice Dan made), and on both
+  // ask tables who answered a parked row and why — 'coordinator' + reason
+  // when the Coordinator did, NULL for a tap or a sweep. No backfill.
+  const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
+  }
+  // Coordinator routines (spec 2026-10-01): when the starter set was seeded
+  // for this user, so it happens once — never again after the user empties
+  // the list. NULL = not yet.
+  if (!settingsCols.some((c) => c.name === 'routines_seeded_at')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN routines_seeded_at INTEGER')
+  }
+  for (const table of ['convo_agents', 'agent_spawn_requests']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all()
+    if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
+    if (!cols.some((c) => c.name === 'answer_reason')) db.exec(`ALTER TABLE ${table} ADD COLUMN answer_reason TEXT`)
   }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
@@ -976,6 +1246,14 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN repo_scope TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_repo_scope ON conversations(repo_scope)')
+  // Memory scopes (spec 2026-10-01 memory scopes): who a memory is for —
+  // 'global' (every session, how every memory worked before the column),
+  // 'coordinator', or 'repo:<name>'. Additive: every pre-migration row is
+  // global, which is exactly what it was.
+  const memoryCols = db.prepare('PRAGMA table_info(memories)').all()
+  if (!memoryCols.some((c) => c.name === 'scope')) {
+    db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
+  }
   // GitHub account linking. One GitHub identity per journal user and one
   // journal user per GitHub identity (the unique index). `token` is the
   // user's read:org OAuth token, stored as-is (spec: "Token at rest").

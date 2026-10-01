@@ -16,13 +16,56 @@ the machine-checkable version of this page.
   carries `parent_convo_id` (`null` for a normal conversation; set for a
   subagent child — see "Child conversations") and `agent_device_id` (the
   agent box that manages it; `null` for legacy rows created before ownership
-  was recorded). A conversation with at least one **joined** `convo_agents`
-  row (an agent-chat room, see "Agent chat") additionally carries
+  was recorded). A **room** — a conversation that has or ever had a
+  `convo_agents` row (any state) or a spawn naming it as its room (an
+  agent-chat room, see "Agent chat") — additionally carries
   `participants`: the recorded owner plus every joined participant's device
-  id, deduped and ascending — one box chip per id, client-side. The key is
-  omitted everywhere else (solo conversations, dissolved rooms, rooms whose
-  only joined participants were sieved out by the privacy predicate below),
-  so the wire is unchanged for everything that is not a live room.
+  id, deduped and ascending — one box chip per id, client-side. A room with
+  nobody joined (still pending, or dissolved) carries just `[owner]`, the
+  same value its dissolve `convo_meta` carried: clients keep a stored value
+  when a key is absent, so a room always sends it and a client that missed
+  the dissolve frame is corrected by its next snapshot. The key is omitted
+  for every non-room conversation, so the wire is unchanged for solo
+  sessions. For an ordinary agent, rows involving a private device neither
+  count as members nor make a conversation a room, so a room only a private
+  box was ever in reads as a plain conversation.
+  Every room row also carries
+  `participant_convos: [string]` — the room's participant **conversation**
+  ids, so a client can show a room under its participants' missions. It is
+  the deduped union of two halves, owner side first, each in journal
+  order (row creation; a member's own session before a spawn child) — so
+  the owner's sessions lead. **Owner side**: the session an owner invite
+  was sent from (its `initiator_convo_id`), recorded once that invite is
+  **accepted**, and each `started` spawn's parent `from_convo_id` — kept
+  for as long as the room has any joined row, because the owner stays in
+  `participants` until it dissolves the room. A re-invite of a member who
+  left does not take an accepted owner session away, and the re-invite's
+  own source session only joins the list if it is accepted. Dissolving the
+  room forgets them: a room repopulated later lists only the sessions its
+  new memberships bring. **Member side**: an invited member's
+  `target_convo_id`, a joiner's own `initiator_convo_id` (an `agent_join`
+  that named one), and a spawn's `child_convo_id` — each only while that
+  member's row is joined (for a spawn child, the very membership the spawn
+  created: a leave and re-invite of the device, even one that lands before
+  the target's `start` reply, does not bind the old child session to the
+  new membership). So a member that leaves drops its own session exactly
+  as it drops out of `participants`, and the owner's sessions go only when
+  the owner dissolves the room. The journal learns an owner's session only
+  from an accepted invite it sent or a spawn, so a room built purely from
+  joins lists the joiners' sessions alone. For an ordinary agent the same
+  privacy sieve applies: a row whose participant device is private, and any id a
+  private device owns, are dropped — judged by the conversation's
+  **current** owner when its row exists (a session handed to a private
+  device after the invite is dropped too), else by the device that
+  recorded it (a spawn child whose conversation has not landed yet). `[]`
+  when the room's sessions are unknown (a pre-3.5 invite that named none)
+  or nobody is joined (pending or dissolved); present on exactly the rows that carry `participants`.
+  Every row also carries `mission_id` — the conversation's **current**
+  mission, or `null` — and `mission_count`, the number of missions it was
+  ever linked to (active and ended; the header's "+n" is `mission_count − 1`).
+  For an ordinary agent both are sieved: a private-origin mission reads as
+  `mission_id: null` and is not counted (see *Missions & milestones →
+  Visibility*).
   `agents` is `[{device_id, name, tag_char}]` for the caller's
   `kind='agent'` devices — the id→name table a client needs to render which
   box owns a conversation, so no second round-trip is required. It obeys the
@@ -208,7 +251,7 @@ the machine-checkable version of this page.
   `push_prefs`); `connected` is the same live-WebSocket check `/devices`
   uses. `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
-  created_at, last_ts}]` — top-level conversations only
+  created_at, last_ts, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
   chat targets), ordered by last message time —
   `COALESCE(last_ts, created_at) DESC, id DESC` (most recent message first,
@@ -218,9 +261,11 @@ the machine-checkable version of this page.
   `last_seq` without being a message, so a `last_seq` order resurfaced an idle
   conversation to the top on non-message activity. `last_ts` is the newest
   **message** event's timestamp (`null` for a conversation with no message
-  events), same derivation as `/snapshot`. Scoped to the caller's own user like
-  every other read. See "Agent chat rooms" below for what a room and `summary`
-  are.
+  events), same derivation as `/snapshot`; `status` is the session's persisted
+  header `{reported_at, model?, context?, stall?, limits?}` (see the agent
+  `status` op), present only once the session has reported one. Scoped to the
+  caller's own user like every other read. See "Agent chat rooms" below for
+  what a room and `summary` are.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
@@ -491,11 +536,25 @@ an agent token, selected by which query parameter is present:
   `repo_scope` (`host/org`) from it — the unit shared visibility is decided
   on (see "Shared visibility").
 - Room membership changes append a server-authored `convo_meta` (sender
-  `journal`) whose payload is just `{participants}` — the same
-  owner-plus-joined array `/snapshot` carries — so live clients re-chip a
+  `journal`) whose payload is just `{participants, participant_convos}` —
+  the same owner-plus-joined array `/snapshot` carries, and the room's
+  participant conversation ids (see `/snapshot` above for the rule) — so
+  live clients re-chip a
   room the moment an invite is accepted, a spawn room appears (there it
-  rides the creation `convo_meta` alongside `title`), a participant leaves,
-  or the owner dissolves the room. Emitted only when membership actually
+  rides the creation `convo_meta` alongside `title`), a spawn starts (the
+  child's id is first known then; it rides the retitle `convo_meta` when
+  there is one), a participant leaves,
+  or the owner dissolves the room. Every `convo_meta` that carries
+  `participants` carries `participant_convos` too, and a present value
+  replaces the stored one. **Privacy:** this frame is composed once and
+  fanned unsieved — to the user's clients and to the room's agent
+  connections (recorded owner plus joined members, live and on hello
+  replay) — exactly like `participants` in the same frame. A room member
+  therefore receives every member's session id, a private box's included,
+  whereas `/snapshot` applies the private-device sieve for an ordinary
+  agent. The ids grant nothing: every read/write path still refuses a
+  private-owned conversation to an ordinary agent. A per-connection payload
+  sieve in the hub would be needed to close this; it is not done. Emitted only when membership actually
   changed: refusals and repeat dissolves append nothing. Clients treat every
   `convo_meta` key independently; a membership-only payload leaves
   title/parent/owner untouched.
@@ -731,6 +790,23 @@ an agent token, selected by which query parameter is present:
   last status per conversation (in-memory, bounded) and replays it to a
   client immediately after it sends `viewing`, so headers populate on open
   instead of waiting for the next turn end.
+  The server also **persists** a sanitised subset of each accepted frame —
+  `model` (≤ 64 chars), `context {tokens, window, pct}` (non-negative
+  integers, `pct` 0–100), `stall {kind:'usage_limit', model?, resets_at?,
+  since?}` and `limits` (the bare lines array a bridge sends, validated as
+  `spawn_targets`'s `limits` block with `as_of` stamped server-side) — per
+  conversation (`conversation_status`: JSON per row, cascades with the
+  conversation; `src/convo-status.js`). Latest wins, except that a frame
+  which omits `context` or `limits` keeps the stored ones — a bridge's
+  spawn/resume header carries no gauge yet, and must not wipe the one the
+  table exists to keep — while an omitted `stall` clears it (the bridge
+  clears a stall by leaving it out). Each block is validated all-or-nothing
+  and unknown keys are dropped; a frame with nothing persistable leaves the
+  row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
+  conversation's `status` (spec: matron-bridge
+  `docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md`
+  §1), so a session's model and context gauge are readable for a sleeping
+  box and across a journal restart.
 - Agent `host_vitals {vitals}` publishes a host-global machine sample
   (`vitals` = `{cpu, ram, sampled_at_ms}`, shape owned opaquely by the
   bridge). Unlike every other agent op it carries **no `convo_id`** and has
@@ -902,7 +978,7 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   until the user approves it (see "Consent gating" below). The caller still
   gets `{kind:'invite', event:'delivered', room_id, target_device_id}`
   immediately — see "Consent gating" below for what `delivered` means here.
-- **`agent_join {room_id, justification}`** — the reverse direction: an
+- **`agent_join {room_id, justification, from_convo_id?}`** — the reverse direction: an
   agent asks to join a room it doesn't own. The room must have a recorded
   owner (`{code:'conflict', detail:'room has no recorded owner to ask'}`
   otherwise) and the caller can't be that owner
@@ -912,6 +988,16 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   an `awaiting_user` row, and the caller gets `{kind:'invite',
   event:'delivered', room_id, target_device_id:<owner>}` while the owner
   is sent nothing until the user answers.
+
+  `from_convo_id` is optional and names **which of the joiner's own
+  conversations** is asking in — validated exactly like `agent_invite`'s
+  `from_convo_id` (a top-level conversation of this user that the caller's
+  own device owns, else `not_found`; a non-string or empty value is
+  `bad_request`). It is persisted as the row's `initiator_convo_id`, fills
+  the join card's `from_convo_id`/`from_convo_title`, and, once the join is
+  accepted, puts that conversation in the room's `participant_convos`.
+  Absent, the join behaves as before: no conversation is recorded and the
+  card's `from_convo_*` fields stay `''`.
 - **`agent_invite_ack {room_id, peer_device_id?, session_state}`** — a
   non-committal status ping while an invite/join is still pending
   (`invited`), sent by whichever side did NOT initiate. `session_state` must
@@ -1448,7 +1534,7 @@ Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markF
 
 ### Pending-ask cap
 
-Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`.
+Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`. The user's Coordinator may answer its own or any other agent's parked asks through *Coordinator → Consent approval*, which is how a Coordinator that hit this cap on its own spawns clears it.
 
 ## Items (task & decision tracker)
 
@@ -1696,8 +1782,8 @@ bridge agrees which one it is.
 
 | Route | Who | Body | Returns |
 |---|---|---|---|
-| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. |
-| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id: string\|null}` | 200 `{convo_id}`. **404** for a conversation the user does not own; **400** when `convo_id` is absent, not a string/null, empty or over the id cap. `null` clears. An unchanged value is a 200 no-op. |
+| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null, consent: boolean}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. `consent` is the *Consent approval* switch below (default `true`). |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id?: string\|null, consent?: boolean}` — at least one | 200 `{convo_id, consent}`. **404** for a conversation the user does not own; **400** when neither key is present, `convo_id` is not a string/null, empty or over the id cap, or `consent` is not a boolean. `convo_id: null` clears. An unchanged value is a 200 no-op. |
 
 On a change the journal appends a `coordinator` event — payload
 `{role: "assigned"}` into the conversation that gained the role,
@@ -1708,9 +1794,191 @@ cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
 snippet) and never pushes. `hello_ok` and `/snapshot` carry
 `coordinator_convo_id` so an app knows the Coordinator on connect.
 
+### Session control (`session_control`)
+
+Spec: matron-bridge `docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md`
+("Decisions"). The Coordinator asks the journal to have another session's
+bridge switch its model or backend, compact it, or tell it to carry on.
+The journal is the relay: it checks the caller **is** the Coordinator (the
+one route the role gates), resolves the target to its box, wakes it if
+asleep, issues a journal-originated RPC and hands the reply back. Nothing
+is journaled here; the target bridge writes the visible record (a notice)
+into the session's own chat.
+
+```json
+{ "op": "session_control", "request_id": "…",
+  "from_convo_id": "<the Coordinator conversation>", "target_convo_id": "<session>",
+  "action": "set_model" | "compact" | "carry_on",
+  "model": "sonnet", "agent": "claude" | "codex",      // set_model: at least one
+  "message": "…", "when": "now" | "after_limit_reset", // carry_on: message required
+  "reason": "context at 92%" }                          // optional, shown in the target chat
+```
+
+Checks, in order — every failure after the `request_id` check is a
+`{kind:'control', op:'error', code, ref:'session_control', request_id, detail?}`
+frame: agent connection (`forbidden`); registered (`not_ready`);
+`request_id` ≤ 128 chars (`bad_request`, no `request_id` echoed);
+`action` in the vocabulary, `model` ≤ 64, `agent` in `claude|codex`,
+`message` ≤ 2000 and non-empty after sanitising, `when` in the vocabulary,
+`reason` ≤ 200, `target_convo_id ≠ from_convo_id` (`bad_request`, with a
+`detail`); `from_convo_id` a top-level conversation this device owns
+(`not_found`) **and** the user's Coordinator (`forbidden`, detail
+`not_coordinator`); `target_convo_id` exists, same user, top-level, has an
+`agent_device_id`, and its box is not a private device hidden from an
+ordinary caller — all indistinguishable `not_found`. Then the target box:
+offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
+once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
+and, off the socket's message loop, the box is woken if needed and waited
+for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
+`session_control {convo_id, action, model?, agent?, message?, when?, reason?,
+from_convo_id, from_name}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
+default 30 s) and its reply delivered to every live socket of the caller's
+device as `{kind:'session_control', event:'result', request_id, ok,
+result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
+`internal` when the bridge never answered). Strings in `params`
+(including `from_name`) and in the relayed error are peer-text sanitised.
+At most 8 ops may be in flight per connection (each holds a wake waiter
+and a broker entry); a ninth is `conflict`. The shape checks run before
+the ownership and role checks — a `bad_request` reveals nothing about any
+conversation. Not a room op, not counted against the pending-ask cap:
+nothing awaits the user.
+
+**Stall wake sweep.** Once a minute (`src/stall-wake.js`) the journal
+scans `conversation_status` for a `stall` whose `resets_at` has passed and
+wakes that conversation's box if it has no live socket (`wakeIfOffline`,
+debounced by the waker), so the bridge's automatic carry-on after a usage
+limit runs even when the box idle-stopped while stalled. The bridge's next
+status frame drops the stall, which ends the loop; a reset more than six
+hours old is treated as spent (its bridge is not coming back for it), so a
+stale row cannot wake a box for ever. One box's failing wake never costs
+the others theirs. No-op without a wake command.
+
+## Coordinator routines
+
+Spec: `docs/superpowers/specs/2026-10-01-coordinator-routines-design.md`.
+
+A routine is a prompt the journal owns (`routines` table,
+`src/routines.js`) and fires into whichever conversation holds the
+Coordinator role — on a schedule, or when a trigger trips — so nothing in
+any conversation keeps it alive. Fields: `id` (`rt_…`), `name` (slug
+`/^[a-z0-9][a-z0-9-]{0,63}$/`, unique per user, the handle agents and
+prompts use), `title` (one line ≤ 200), exactly one of `schedule` (five
+cron fields, evaluated by `croner` in `tz`) and `trigger` (below), `tz`
+(IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
+kept, other control characters stripped), `enabled`, `origin`
+(`seed|user|agent`), `next_at` (ms; NULL while paused, always NULL for a
+triggered routine), `last_fired_at`, `last_outcome`, `created_at`,
+`updated_at`. A schedule whose consecutive fires (checked over the next
+five from now) are under 15 minutes apart, or with fewer than five future
+fires, is `bad_request`: a routine is a check-in, not a poll. At most 50
+per user. A routine is scheduled or triggered for life: `PATCH` may give
+`schedule` only to a scheduled routine and `trigger` only to a triggered
+one, never both (`bad_request`).
+
+**Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
+session, never the Coordinator's own nor a helper conversation inside a
+session, whose context tokens are at or past `pct` of its window — 1M at
+least for the 1M-class models, Opus, Fable, Mythos and any `[1m]` alias,
+whose bridges can only prove 1M once the gauge passes 200k), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
+session stalled on a usage limit whose reset is at least that far away or
+unknown) or `{kind:'disk_under', pct}` (an agent box under `pct`% free
+disk), evaluated against `conversation_status` and `device_status` by a
+sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
+box may see them (private-owned sessions and private boxes are invisible
+to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
+or `device:<id>`) fires **once per crossing**: `routine_trigger_state`
+records the subjects fired for and forgets them when they stop matching.
+The fire's `message` is the prompt plus a `Tripped by:` list, one line per
+fresh subject (`- [title](matron://convo/<id>) at 42% of its window
+(420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
+time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
+routine or changing its trigger clears its records. A triggered routine
+fires at most once per 15 minutes — a resting routine still forgets
+subjects that stop matching, and subjects crossing inside the gap are
+fresh at the first sweep after it; a retryable delivery failure forgets the
+fresh subjects and backs the routine off 15 minutes; `run` fires with
+whatever matches now, records untouched.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /routines` | any | | 200 `{routines}` by name |
+| `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
+| `DELETE /routines/:key` | client only (agent → **403** `forbidden`) | | 200 `{ok:true}` |
+| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
+
+**The Coordinator gate** on agent writes is the one project close/merge
+use (`closingConvo`, required): the agent names its own conversation in
+`convo_id` and it must be the user's Coordinator — missing or another
+conversation → **403** `{error:'forbidden', detail:'not_coordinator'}`, a
+conversation this device does not own → **404**, a malformed `convo_id`
+→ **400**. A client token passes with no `convo_id`. No agent deletes.
+
+`enabled: false` clears `next_at`; `true` again, or a `schedule`/`tz`
+change, recomputes it from now; `title`/`prompt` edits leave the schedule
+alone. `run` fires whatever `enabled` says, stamps `last_fired_at`, and
+never touches `next_at`.
+
+**Firing** (`src/routines-sweep.js`). Once a minute (`MATRON_ROUTINES=0`
+turns both sweeps off; the routes and `run` still work) the journal takes
+every enabled scheduled routine whose `next_at` or `retry_at` has passed
+and, in one transaction *before* delivering, stamps `last_fired_at`, moves
+`next_at` past now and clears `retry_at` — so a crash, a slow wake or a
+restart mid-delivery never fires the same occurrence twice. A fire more
+than 6 hours late (measured from `retry_at` for a retry, `next_at`
+otherwise) is recorded as `last_outcome: 'missed'` and not delivered; a
+routine paused between the due query and its advance is not fired. Delivery is the Alertmanager relay's path: resolve the
+Coordinator and its box (none → `no_coordinator`), `wakeIfOffline`, wait
+for the box to attach (`MATRON_SPAWN_WAKE_WAIT_MS`) when a wake was fired,
+then issue the journal-originated RPC
+(`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
+
+```json
+{ "method": "session_control",
+  "params": { "convo_id": "<the Coordinator conversation>", "action": "routine",
+              "routine_id": "rt_…", "name": "daily-sweep", "title": "Daily sweep",
+              "message": "<prompt>", "fired_at": "2026-10-02T06:05:00.000Z",
+              "tz": "Europe/London", "from_name": "Routines" } }
+```
+
+The bridge's `{ok:true, result:{applied}}` becomes `last_outcome:
+'applied now'|'applied deferred'`; an error `'failed <code>'`. A failure
+the next attempt might cure (`agent_unreachable`, `timeout`,
+`send_failed`, `internal`) arms **one** retry 15 minutes later; the
+retry's own failure is final until the next scheduled time, and a
+bridge's refusal (`bad_request`, `not_coordinator`, `gone`) is never
+retried. At most 4 deliveries are in flight per journal process; a due
+routine that gets no slot stays due, untouched, for the next sweep. One
+line is logged per delivery. `routine` is **not** a `session_control` op
+action: only the sweep and `run` build it, and the bridge refuses one
+whose `from_device_id` is not the journal's 0 or that targets anything
+but the Coordinator.
+
+**Marker event.** Every create, update, delete and fire appends a
+`routine` event into the Coordinator conversation (nothing when no
+Coordinator is set): `{routine_id, name, action:'saved', by, created}`,
+`{…, action:'deleted', by:'user'}` with the writer's sender, or
+`{routine_id, name, action:'fired', outcome, next_at}` with sender
+`journal`. Not a `MESSAGE_TYPES` entry, not an `AGENT_PUBLISH_TYPES`
+member, never pushes, never wakes; apps refetch `GET /routines` on it.
+
+**Seeding.** The first time a user gets a Coordinator (`PUT /coordinator`,
+after the role transaction commits) — and once at boot for users who
+already had one — the journal creates the starter set with `origin:
+'seed'` and stamps `user_settings.routines_seeded_at`, so it happens once
+per user and never again after the user empties the list: `daily-sweep`
+07:05, `session-health` every 2 h, `project-status` 08:00 and 17:00,
+`unseen-digest` 12:00 and 18:00, `deploy-window` 18:30 Mon–Fri, all
+Europe/London, plus the triggered `context-over` (`context_over` 40),
+`stalled-session` (`stalled` 120) and `disk-low` (`disk_under` 20) — each
+prompt one line pointing at the Coordinator playbook's section of that
+name.
+
 ## Memories
 
-Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`.
+Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`; scopes:
+`docs/superpowers/specs/2026-10-01-memory-scopes-design.md`.
 
 A memory is the user's shared agent memory: a standing rule or fact any of
 their agents may save and every one of them may read, shaped like a Claude
@@ -1718,17 +1986,31 @@ Code memory file so an agent's own memory instructions apply to it. Per
 user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
 per `name`, overwritten in place. A bridge with the memories update
 (matron-bridge, the `memory_*` tools) injects the index (name, type,
-description) into the Coordinator's instructions at spawn; against an
-older bridge the memories are stored and shown in the apps only.
+scope, description) into every session's instructions at spawn. A bridge
+with the **scopes update** injects only the memories whose `scope` matches
+that session; a bridge with the memories update but not the scopes update
+injects every memory into every session, so a stored scope restricts
+nothing until the bridge is updated; against a bridge older than both the
+memories are stored and shown in the apps only.
 
 ```
-{ id: "me_<16 hex>", name, type, description, body,
+{ id: "me_<16 hex>", name, type, scope, description, body,
   origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
 ```
 
 - `name`: `^[a-z0-9][a-z0-9-]{0,63}$`, unique per user.
 - `type`: `user | feedback | project | reference`; `feedback` when omitted
   on create, kept when omitted on update.
+- `scope`: who the memory is for — `global` (every session; what every
+  memory was before the column existed, and the default on create),
+  `coordinator` (the user's Coordinator only) or `repo:<name>` (sessions
+  whose working directory is a checkout of that repo; `<name>` is the bare
+  repo name, `^[A-Za-z0-9_.-]+$`, the `name` segment of the canonical
+  `host/org/name` a bridge reports on `convo_upsert`). At most 128
+  characters. Kept when omitted on update. The journal stores and shows
+  it; the **bridge** does the matching at spawn (global always, the repo
+  scope of the session's workdir, `coordinator` for the Coordinator) and
+  the Coordinator's `memory_list` sees every scope.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -1747,11 +2029,11 @@ older bridge the memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request`; 409 `too_many`; 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request` (a `scope` outside the three forms included); 409 `too_many`; 404 |
 | `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
 
 `PUT` is the only write and is an **upsert by name**: the same name from
-any device overwrites `description`, `body` and `type` and bumps
+any device overwrites `description`, `body`, `type` and `scope` and bumps
 `updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
 `body` on an update **clears** it. Retries are therefore free; there is no
 `Idempotency-Key`. An invalid `:name` is 400, not 404.
@@ -1779,7 +2061,7 @@ logged and swallowed; the write stands):
 ```json
 { "seq": 123, "convo_id": "…", "ts": 1790550000000,
   "sender": "user:dan" | "agent:bev", "type": "memory",
-  "payload": { "memory_id": "me_…", "name": "avoid-eric", "type": "feedback",
+  "payload": { "memory_id": "me_…", "name": "avoid-eric", "type": "feedback", "scope": "global",
     "description": "Never start sessions on eric.",
     "action": "saved" | "deleted", "created": true | false, "by": "user" | "agent" } }
 ```
@@ -1798,6 +2080,129 @@ private-owned — the payload carries `memory_id`, `action`, `created` and
 `AGENT_PUBLISH_TYPES` member (a bare publish is `bad_request`), never
 pushes, never wakes, and has no old-client text fallback: a client that
 predates it ignores the type.
+
+### Consent approval (`/consent/pending`, `/consent/answer`)
+
+Spec: matron-bridge `docs/superpowers/specs/2026-09-29-coordinator-consent-design.md`
+(Dan, 29 Sep 2026: approved as proposed). The Coordinator may answer the
+parked chat invites, join requests and spawn requests that otherwise wait
+for a tap — on the user's behalf and under guardrails the journal enforces.
+Tool permission prompts and secret requests never exist as journal asks,
+so nothing here can reach them.
+
+| Route | Who | Body / query | Returns |
+|---|---|---|---|
+| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. |
+| `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
+
+**Gate**, in order, every failure a bare error body: a client connection
+**403** `forbidden`; a bad shape **400**; `convo_id` not a top-level
+conversation this device owns **404**; not `user_settings.coordinator_convo_id`
+**403** `{detail:'not_coordinator'}`; the switch off **403**
+`{detail:'consent_disabled'}`. Then, for an answer: `reason` is required —
+1–200 characters after the usual peer-text sanitising — and is the audit
+line the user reads; the ask must exist (**404**, unknown and another
+user's indistinguishable) and still be `awaiting_user` (**409** `conflict`);
+an approval when the Coordinator's approvals in the last 24 h are at the
+**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is
+no cap) is
+**409** `{detail:'daily_cap', cap}` and the ask stays for the user —
+declines are never capped; a **spawn** approval into a target box that is
+`offline` (no socket and no wake possible) is **409**
+`{detail:'target_offline'}` — an `asleep` box is woken exactly as a tap
+would. Every refusal leaves the ask as it was.
+
+**What an answer does** is exactly what the tap does — one code path
+(`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`
+and this route: the row flips, the consent item closes, the invite is
+pumped or the spawn orchestration starts off-cycle with wake-before-spawn,
+and a chat decline reaches the requester as the usual `refused`. On top of
+that, a Coordinator decision:
+
+- stamps the row `answered_by: 'coordinator'` + `answer_reason`
+  (`convo_agents`, `agent_spawn_requests`), and writes one row to
+  `consent_decisions` (the cap's counter and the audit record);
+- closes the consent item with "Approved by the Coordinator — <reason>. …"
+  or "Declined by the Coordinator — <reason>.", attributed to the
+  Coordinator's device as an agent, not to the user;
+- puts `decided_by: 'coordinator'` and `reason` on the spawn's
+  `spawn_outcome` event and `{kind:'spawn', event:'outcome'}` frame, and
+  `approved_by: 'coordinator'` on the `{kind:'invite', event:'request'\|'join_request'}`
+  frame relayed to the target — so both bridges can say who decided. The
+  requester's `answer` frame for a declined chat is unchanged (a requester
+  never learns who said no);
+- appends a **client-only** `consent_decision` event on the card's
+  conversation (the parent conversation for a spawn, the room for a chat):
+  `{kind, request_id | room_id + target_device_id, decision, by:'coordinator',
+  convo_id, reason}` — never fanned to an agent, never replayed to one,
+  never a push — which is what an app renders as the "approved by the
+  Coordinator" badge with its one-tap Stop session / Mute room.
+
+**Nudge.** When an ask parks and it is *not* the Coordinator's own (its
+conversation, or for a join its box), and the switch is on, the journal
+sends the Coordinator's box one ephemeral frame,
+`{kind:'consent', event:'pending', ask:{…}}` with the same row shape as
+`/consent/pending`, after the card and the item have been journaled — the
+user is never second to the Coordinator. A Coordinator box that is asleep
+learns about the ask from `/consent/pending` at its next sweep instead.
+
+**Off switch.** `user_settings.coordinator_consent` (`PUT /coordinator
+{consent:false}`, clients only; default on). Off, both routes answer
+`consent_disabled` and no nudge is sent; the cards and taps work as ever.
+
+### Alertmanager webhook (`POST /alerts/alertmanager`)
+
+(`src/alerts-http.js`, formatting in `src/alerts.js`.) Prometheus
+Alertmanager's `webhook_configs` receiver posts here and the alert arrives
+as a turn in one user's Coordinator session, so a disk alert reaches the
+agent that looks after the boxes without anyone forwarding an email.
+
+| Env | |
+|---|---|
+| `MATRON_ALERT_WEBHOOK_TOKEN` | Shared secret, sent as `Authorization: Bearer <token>`. Unset or shorter than 32 chars: the route is off. |
+| `MATRON_ALERT_WEBHOOK_USER` | Username (`users.name`) whose Coordinator receives the alerts. Unset or no such user: the route is off (a warning is logged at boot when the token is set but the user is missing). |
+
+Off, the handler declines and the request meets the rest of the chain
+exactly as an unknown path would (401 without a device token, 404 with
+one). On, it is mounted **ahead of** the device Bearer auth:
+
+- missing/wrong token → **401** `unauthenticated` (compared in constant
+  time on sha256 digests). Wrong tokens are charged to the same per-IP
+  limiter as `/login` (5/min); once an IP's budget is spent every request
+  from it is **429** `rate_limited`, the right token included. A right token
+  never spends the budget.
+- body: JSON object ≤ 256 KiB (**413** over) with an `alerts` array (the
+  Alertmanager webhook v4 shape); anything else **400** `bad_request`.
+- otherwise always **202** — Alertmanager retries only on 5xx:
+  `{delivered:false, reason:'no_coordinator'}` when the user has no
+  Coordinator or its conversation has no box; `{delivered:false,
+  reason:'busy'}` when 4 deliveries are already in flight in this journal
+  process; else `{accepted:true}`. The delivery then runs off the request:
+  the Coordinator's box is woken if asleep and waited for
+  (`MATRON_SPAWN_WAKE_WAIT_MS`), and a journal-originated RPC is issued to
+  it (`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
+
+```json
+{ "method": "session_control",
+  "params": { "convo_id": "<the Coordinator conversation>", "action": "alert",
+              "message": "<≤ 2000 chars, one or more lines>", "from_name": "Alertmanager" } }
+```
+
+The bridge answers `{ok:true, result:{applied:'now'|'deferred'}}` or
+`{ok:false, error:{code, detail?}}`; the outcome is logged (one line), never
+returned. `alert` is **not** a `session_control` op action: only this route
+builds it, so no agent can forge an alert through its own op (which still
+answers `bad_request` / `bad action`).
+
+The message: a header `🔔 Alertmanager: FIRING|RESOLVED <alertname>
+[<severity>] (<n> alert(s))` (severity only when common to the group), one
+line per alert (at most 10, each ≤ 300 chars) `- <status> <where>:
+<summary or description>` where `<where>` is `guest` (else `instance`),
+then `mountpoint`, then `on <hostname>` when it differs, `+N more` when
+lines were dropped, and — for a firing alert whose name matches
+`/Disk|Zpool/` — a closing line telling the Coordinator to check the box's
+disk and start a safe clean-up below 20% free. Every payload field is
+peer-text sanitised on its own, so nothing in a label can add a line.
 
 ## Missions & milestones
 
@@ -1818,41 +2223,67 @@ mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
 — rather than minting one implicitly. `mission_start` (`POST /missions`)
 is the only way in.
 
-A conversation gains a mission in exactly four ways: `POST /missions`
-(which attaches its origin unless `attach: false`), `POST /missions/:id/join`,
-a spawn that named the mission (`spawn_request` `mission_num`, see
-*Agent-spawned sessions*), and **inheritance**
-— a spawned conversation takes its parent's mission at creation, and never
-afterwards (like `parent_convo_id`, it is immutable once the row exists).
-Inheritance is a way *into* a mission, so `join`'s gates apply to it
-identically: the parent's mission must be `open`, it must hold fewer than
-200 conversations (the raw count — never the sieved one the creator can
-see), and it must be **visible to the creating device** under the rule in
-*Visibility* below. That last gate refuses two shapes an ordinary
-(non-private) agent could otherwise be attached through: a **private-owned
-parent**, and a *public* parent the user has joined to a **private-origin**
-mission — the second is invisible from the parent row alone, and either
-one would hand the child a `mission_id` it can never read, join or post a
-milestone to. A child that fails any gate simply starts with no mission;
-its agent can `mission_start` its own.
+A conversation may be linked to **many** missions (spec
+2026-09-30 projects & mission links §3). The `mission_conversations` table
+holds one row per (mission, conversation): `how` it was made (`origin |
+joined | spawned | inherited | backfill`), `joined_at`, and `ended_at`
+(`null` = active). Exactly one active link is **current**, or none;
+`conversations.mission_id` is the pointer to it (invariant: a non-null
+pointer always has an active link), and it is where `POST /milestones` and
+new items go by default. The pointer changes only through create (origin),
+join, leave, spawn and inheritance.
 
-A mission is **unassigned** while it is `open` and has no conversations
-(`conversations: 0` on the list and detail rows) — typically one the
-Coordinator created with `attach: false`. Clients derive it; there is no
-column.
+A conversation gains a link by `POST /missions` (its origin, unless
+`attach: false`), `POST /missions/:id/join`, a spawn that named the mission
+(`spawn_request` `mission_num`; `how: spawned`), and **inheritance** — a
+sub-chat takes its parent's *current* mission at creation (`how:
+inherited`), and never afterwards. Inheritance is a way into a mission, so
+two of join's gates apply: the mission must be `open`, and **visible to the
+creating device** under *Visibility* (a private-owned parent, or a public
+parent joined to a private-origin mission, is refused for an ordinary
+agent). There is no cap gate: **sub-chats never count toward the 200**. A
+child that fails a gate starts with no mission.
+
+**Cap.** `CONVOS_MAX = 200` counts a mission's *active* links from
+*top-level* conversations (`parent_convo_id IS NULL`). Ended links and
+sub-chats never count.
+
+**Backfill.** On the first start after this change, while the link table
+is empty, the journal writes one active link per current pointer (`origin`
+when the mission was born there, `inherited` for a sub-chat, else `joined`;
+`joined_at` from the conversation's earliest `created`/`joined` marker for
+that mission, else the later of the two creation times), then one ended
+`backfill` link for every other (mission, conversation) pair a milestone or
+an item records, from its first to its last trace (items filed by the
+Coordinator conversation are skipped: filing an item into a mission never
+links it). Pairs that left no trace
+cannot be recovered. It never runs again once any link exists. A separate
+heal pass runs on every start: any conversation whose current pointer has
+no active link (written by older code, e.g. after a rollback) gets one back
+— a new `backfill` link, or its ended link reactivated with its `how` kept.
+
+A mission is **unassigned** while it is `open` and its `conversations`
+count (active top-level links) is `0` — typically one the Coordinator
+created with `attach: false`. That count is **not** the length of `GET
+/missions/:id`'s `conversations[]` array (see below): a mission can read
+`conversations: 0` while its detail still lists a sub-chat or a history
+row, so `conversations: 0` must not be read as "the array is empty" —
+check the array itself. Clients derive "unassigned"; there is no column.
 
 ### Routes (Bearer, either device kind)
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
-| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
-| `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
-| `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
-| `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
-| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
-| `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
-| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
+| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. Optional `project` (id, `#n` or `n`) files the new mission: 404 for a project the caller cannot see, 409 `{blocked_by:'project_closed'}`, 400 on a non-string/non-number; ignored on the `existing: true` answer. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. Rows also carry `project_id`, `project_num`, `activity` and `last_activity_at` (see *Activity*). `conversations` is the number of **active top-level** links. `?scope=shared` rows carry `project_id: null, project_num: null`. |
+| `GET /missions/:id` | `?subchats=1`, `?history=1` | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id, title, box, state, parent_convo_id, current, how, joined_at, ended_at, subchat_count, other_missions, status?}]}`. By default only **active** links, ordered by `joined_at`; `?history=1` appends the ended links after them (each with its `ended_at`); the two orderings never interleave. A sub-chat whose parent (or nearest linked ancestor) is also linked is **folded**: counted in that ancestor's `subchat_count` and left out of the list — `?subchats=1` lists them too (folding runs separately within the active group and the history group, so an ended sub-chat never folds into an active row); the two flags combine. A sub-chat whose parent is not linked stands as its own row. **This array can be longer than the mission's `conversations` count**: that count is active top-level links only, while the array also lists an unfolded sub-chat whose parent isn't linked, and — with `?subchats=1` / `?history=1` — folded sub-chats and history rows too; never assume `conversations === conversations[].length`. `parent_convo_id` is `null` when the caller cannot see the parent (an ordinary agent and a private-owned parent) — for that caller, `null` means "no parent, or parent hidden", not "no parent" (see *Visibility → Links*). `other_missions` is `[{id, num, title, current, active, joined_at, ended_at}]`: the listed conversation's links to *other* missions (for "also on #N" / "moved to #N"), current first, then active, then ended newest first, at most 5; for an ordinary agent a private-origin mission is left out. `status` is the session header (own-user view only). |
+| `GET /missions/:id` (shared) | `?subchats=1` (honoured; `?history=1` is ignored — a colleague has no members table to reconcile) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility*; mission detail with `owner`; the conversation rows' `conversations` count (active top-level links) can likewise be less than `conversations[].length` once `?subchats=1` unfolds sub-chats, and `parent_convo_id` is `null` when the viewing colleague cannot read the parent under the shared rule; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
+| `PATCH /missions/:id` | `{title?, body?, status?: string\|null, project?: id\|"#n"\|n\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}`. `project` files or (`null`) unfiles the mission — same 404/409 `project_closed`/400 as on create — and is the one change a **closed** mission still accepts (any other field on a closed mission is 409 `closed`). The `updated` marker carries `project_changed: true` when the project changed. |
+| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`. Adds a link — or reactivates an ended one, keeping its original `how` unless that was `backfill` (or `joined`, when the reactivation is a spawn: it becomes `spawned`) — stamps `joined_at`, and makes it **current**. The previous current mission stays active ("also on"): there is **no 409 `other_mission`** any more (an old bridge simply sees 200). Re-joining the current mission is a no-op 200 with no marker. 409 `{blocked_by:'closed'}`; 400 `{error:'bad_request'}` when the mission already has 200 active top-level links (a sub-chat is never refused by the cap). Repoints the conversation's unassigned items. Marker: `joined` for a new or reactivated link, `current_changed` for an already-active one. |
+| `POST /missions/:id/leave` | `{convo_id}` | 200 `{mission, current_mission}`. Ends the link (`ended_at`), keeping it as history. Leaving the current one moves current to the most recently joined remaining active link **on an open mission**, else to none (`current_mission: null`). Leaving an already-ended link is a 200 no-op; **404** when the conversation was never linked, or the conversation fails join's gate. Items stay where they are. Markers: `left`, and `current_changed` (for the new current mission) when current moved. |
+| `GET /conversations/:id/missions` | | `{missions:[…]}` — every mission the conversation is or was linked to: current first, then other active links newest-joined first, then ended links newest-ended first. Each is a full mission row plus `current`, `active`, `how`, `joined_at`, `ended_at`. Own conversations only; 404 for another user's, an unknown one, or (ordinary agent) a private-owned one. |
+| `POST /missions/:id/close` | `{summary, convo_id?}` | 200 `{mission}`, or 409 as in *Closing*, below. `convo_id` (agents only; a client's is ignored) names the closing conversation: **404** unless this device owns it, **403** `{error:'forbidden', detail:'not_coordinator'}` when it is neither on the mission nor the user's Coordinator — see *Closing*. |
+| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?, mission?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`. `mission` (id, `#n` or `n`; `null`/absent = current) may name any mission this conversation has an **active** link to; anything else — unknown, invisible to the caller, never linked, or ended — is 409 `{blocked_by:'not_linked'}` (one answer, so it is never an existence oracle), and a non-string/non-number is 400. With no `mission`: 409 `{blocked_by:'no_mission'}` if the conversation has no current mission (or its mission is invisible to the caller), 409 `{blocked_by:'closed'}` if the target mission is closed; 502 `{error:'marker_append_failed'}` as before. |
 | `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
 | `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
 
@@ -1864,11 +2295,77 @@ fails.
 Row shapes: a mission is `{id, user_id, num, state, title, body,
 close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
-closed_at}` plus the counts listed against `GET /missions` above; a
-milestone is `{id, mission_id, user_id, num, kind, title, body, convo_id,
-seq, device_id, created_by, created_at}`. `idem_key` is an internal column
-on both and is never returned — the same stance items take, and the only
-key either shape strips.
+closed_at, status, status_by, status_convo_id, status_updated_at,
+closed_convo_id, project_id, project_num, activity, last_activity_at}` plus
+the counts listed against `GET /missions` above
+(`closed_convo_id` is null when no conversation was named and, for an
+ordinary agent, when the closing conversation is private-owned — the same
+sieve `status_convo_id` gets); a milestone is `{id,
+mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
+created_at}`. Stored columns stripped from the wire: `idem_key` (both
+shapes), `status_device_id` (mission — the device that wrote the status,
+used only by the privacy sieve) and `user_id` (milestone — always the
+caller's own id, so no route reads it back). Query-computed columns such as
+`sieved_last_milestone_at` and `status_hidden` (the sort key and the
+per-caller status sieve verdict, both internal to `countsSql`/
+`sharedCountsSql`) are never returned either. `running_convos`,
+`waiting_convos` and `convo_activity_at` (activity inputs computed by
+`countsSql`) are never returned.
+
+### Status
+
+Spec: `docs/superpowers/specs/2026-09-28-missions-dashboard-design.md` §1.
+
+A mission carries one **status**: a short markdown paragraph saying where
+the work is, what's next and what is blocked — the headline on its card in
+the apps. It is overwritten, never appended; there is no history.
+
+- `PATCH /missions/:id {status: "…"}` sets it. The text is trimmed (CRLF
+  folded to LF first) and must then be 1–600 UTF-16 code units with no
+  control characters other than `\n` and `\t`, and no U+2028/U+2029 —
+  else 400 `bad_request` and nothing is written. It combines with `title`
+  / `body` in one PATCH. `status` on `POST /missions` is ignored.
+- `{status: null}` clears it.
+- The four fields are always written together: `status`, `status_by`
+  (`'user'` for a client, `'agent'` for an agent), `status_convo_id`,
+  `status_updated_at` (ms; the same instant as the new `updated_at`; null
+  when cleared).
+- `status_convo_id` comes from an optional `convo_id` in the same body. It
+  is recorded only when the caller is an agent, the conversation belongs to
+  the caller's user, and — for an ordinary agent — it is not private-owned.
+  Anything else (a client, another user's or an unknown conversation, a
+  non-string) records null: it is attribution, never a gate, never a 400.
+- A closed mission is 409 `{blocked_by:'closed'}` and a mission the caller
+  cannot see is 404 — the rules of every PATCH. An ordinary agent may set
+  the status of any mission it can see (the Coordinator refreshes missions
+  it is not on).
+- Like every PATCH it bumps `updated_at` (so `GET /missions?since=` sees
+  it) and appends the `updated` mission marker to the origin conversation,
+  carrying `status_changed: true` (see *Marker events*).
+
+Every mission row — `GET /missions`, `GET /missions/:id`, and the `mission`
+object in every other response — carries the four fields, null when unset
+or withheld (see *Visibility*).
+
+### Activity
+
+Every mission row carries `activity` and `last_activity_at`, computed per
+caller (spec 2026-09-30 §2):
+
+- `closed` — the mission is closed;
+- `running` — any actively linked conversation's `session_state` is `running`;
+- `waiting` — any actively linked conversation is `waiting`, or `needs_you > 0`;
+- `quiet` — `now − last_activity_at ≥ 7 days`;
+- `idle` — none of the above.
+
+`last_activity_at` is the latest of the mission's `created_at`, its last
+milestone, its `status_updated_at`, and — for each **active** link — the
+link's `joined_at` and the conversation's newest message event (the
+`MESSAGE_TYPES` rule `/snapshot` uses for `last_ts`; `session_status` and
+marker events are not activity). There is no stored activity column.
+Every input goes through the caller's sieve: for an ordinary agent a
+private-owned conversation's state and messages, a withheld status and a
+hidden milestone never count.
 
 ### Idempotency
 
@@ -1899,6 +2396,28 @@ so the response never names a private item or its title. Closing an
 already-closed mission is `409 {"blocked_by":"closed"}` regardless of
 caller kind.
 
+**Who may close (`convo_id`).** Without `convo_id` any agent of the user
+closes by id, as before. An agent that names its conversation (every
+current bridge does) is held to a rule: the conversation must be one this
+device owns (else **404**, same stance as `join`'s `convo_id`), and either
+**on the mission** — any conversation with an *active* link to it, current
+or also-on — or the user's **Coordinator**
+(`user_settings.coordinator_convo_id`), which may close any mission the
+user owns: the one mission route the role gates (spec: matron-bridge
+2026-09-29 coordinator session control, "Coordinator mission close"). Any
+other conversation is **403** `{error:'forbidden', detail:'not_coordinator'}`
+and nothing is written. The Coordinator is held to the same two item tiers
+as any agent — it resolves or moves the open items first — so a mission
+never closes over an item that is awaiting the user. The row records the
+closing conversation as `closed_convo_id` (null for a client close and for
+a bridge that predates the field) and the `closed` marker carries it as
+`by_convo_id`, which is how an app can say "closed by the Coordinator"
+(compare it with the Coordinator setting) rather than only "by agent".
+Both stay behind the privacy boundary: an ordinary agent reads
+`closed_convo_id` as null when the closing conversation is private-owned,
+and the marker omits `by_convo_id` when the closing conversation is
+private-owned and the origin is not (the same rule as the marker's title).
+
 ### Marker events
 
 Two new event types, written only by the journal from these routes.
@@ -1918,18 +2437,30 @@ INSERT, so if the append fails, nothing (not even the number) survives.
 ```json
 { "type": "mission",
   "payload": { "mission_id": "ms_…", "num": 61, "title": "…",
-               "action": "created" | "joined" | "updated" | "closed",
+               "action": "created" | "joined" | "updated" | "closed" | "left" | "current_changed",
                "by": "user" | "agent",
-               "open_item_nums": [64, 70] } }        // only on a user-forced close
+               "open_item_nums": [64, 70],          // only on a user-forced close
+               "status_changed": true,              // only on an `updated` that wrote the status
+               "project_changed": true } }           // only on an `updated` that moved the mission between projects
 ```
-Appended to the conversation that performed the action (`created`/`joined`
-on that conversation; `updated`/`closed` on the origin conversation).
+Appended to the conversation concerned: `created`, `joined`, `left` and
+`current_changed` on that conversation (`current_changed` names the mission
+that became current; `left` the one it left); `updated`/`closed` on the
+origin conversation. A merge (see *Projects*) writes one `updated` with
+`project_changed` per moved mission.
 Written **after** the mission's own transaction has committed, not inside
 it — a broadcast can never advertise a write that then rolls back, and a
 marker append that itself fails (e.g. the origin conversation vanished
 underneath it) is logged and swallowed; the mission write stands. Apps use
 it only as an invalidation signal; it renders as a small inline notice
-("🏁 Mission #61 closed").
+("🏁 Mission #61 closed", "🏁 Left mission #N", "🏁 Now on mission #N").
+
+`status_changed: true` is present on an `updated` marker whenever that
+PATCH carried `status` — set, re-set to the same text (its
+`status_updated_at` still moves) or cleared — and absent otherwise. It is a
+flag only: the marker never carries the status text, because the origin
+conversation's agents replay it verbatim. Clients may ignore it; the marker
+is already the refetch signal.
 
 `title` on the `mission` payload and `mission_title` on the `milestone`
 payload are **omitted** when the marker is written into a conversation that
@@ -2011,6 +2542,193 @@ event, and a missing event would be its own signal. Markers written into
 the origin conversation, or into another private-owned conversation, are
 unchanged: nothing crossed.
 
+**Status.** A status written from a private-owned conversation — or by a
+private device, whichever conversation it named, or none — reads as
+`status`, `status_by`, `status_convo_id` and `status_updated_at` all null
+for an ordinary agent: on the list, the detail, and every response carrying
+the mission, that agent's own PATCH responses included. The rest of the row
+is unchanged. Client devices and private agents always see it. The verdict
+is taken at read time against the device's current private flag, like every
+other sieve here. For a colleague (*Shared visibility*) the status shows
+only when it names a conversation that colleague can read under the shared
+rule, or when it was written by the owner's client with no conversation at
+all (a client write — shared like the title and body); an agent write that
+names no conversation is hidden from that colleague even when it isn't
+private, because a status is a synthesis across the mission's conversations,
+which may include ones the colleague can't read, so an unattributed agent
+write fails closed rather than being taken on faith. Otherwise the four
+fields are null.
+
+**Links.** Every link read is sieved the same way: `GET
+/conversations/:id/missions` omits a private-origin mission for an ordinary
+agent (the user may have joined a public conversation to one), `/snapshot`'s
+`mission_id` reads null and `mission_count` excludes it, a mission's
+`conversations` rows and `subchat_count` exclude private-owned
+conversations, each row's `other_missions` omits private-origin missions, and `activity` ignores them. `POST /milestones {mission}`
+answers `not_linked` for a mission the caller cannot see. A `conversations`
+row's `parent_convo_id` is withheld the same way: `null` when the caller
+can't see the parent — a private-owned parent for an ordinary agent's own
+view, or (the shared view) a parent the colleague can't read under *Shared
+visibility* — so for those callers `null` means "no parent, or parent
+hidden," never a reliable "top-level."
+
+## Projects
+
+Spec: matron-apple `docs/superpowers/specs/2026-09-30-projects-and-mission-links-design.md` §4.
+
+A project (`projects`, id `pj_…`) groups missions. A mission belongs to at
+most one (`missions.project_id`). Projects share the per-user `#num`
+counter, so `/lookup` resolves them (`kind: 'project'`). Mounted in
+`src/projects-http.js`; `:id` accepts `pj_…` or a number.
+
+| Route | Body / query | Returns |
+|---|---|---|
+| `POST /projects` | `{title, body?, convo_id?}` + optional `Idempotency-Key` | 201 `{project}`; replay 200. Any device may create. `convo_id` is optional provenance and must pass the same gate as `POST /missions` (404 otherwise). No marker. |
+| `GET /projects` | `?state=open\|closed` (omit = both) | `{projects:[…]}`, newest `last_activity_at` first. Each row adds `missions: {running, waiting, idle, quiet, closed}` (its missions' *Activity*), `needs_you` and `open_items` (sums of its missions' counts), and `last_activity_at` (the latest of the project's `created_at`, its `status_updated_at` and its missions' `last_activity_at`). |
+| `GET /projects/:id` | | `{project, missions:[mission rows], needs_you:[open items awaiting the user, each with mission_id and mission_num], recent_milestones:[the 5 newest across its missions, each with mission_num], sessions_by_box:{box name: n}}` — `sessions_by_box` counts distinct top-level conversations actively linked to its **open** missions. For a **merged** project: the detail of the project it was merged into (following up to 16 merges) plus `merged_from: {id, num}` of the one asked for. |
+| `PATCH /projects/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{project}`. Title/body/status rules and status attribution are exactly the mission ones (see *Missions & milestones → Status*). 409 `{blocked_by:'closed'}` on a closed (or merged) project. No marker. |
+| `POST /projects/:id/close` | `{summary, convo_id?}` — `convo_id` is required when the caller is an agent (it must name the Coordinator's own conversation); a client never needs it | 200 `{project}`. A client always may, over open missions: `closed_over_open_missions` records the count and the missions stay open and filed. An agent must be the **Coordinator** and prove it by naming its conversation (owned by this device, else 404); any other agent — or one naming none — is **403** `{error:'forbidden', detail:'not_coordinator'}`. The Coordinator is blocked by open missions: 409 `{blocked_by:'open_missions', missions:[{num,title}]}` (listed through its sieve; a hidden one still blocks). 409 `closed` if already closed. |
+| `POST /projects/:id/merge` | `{into, convo_id?}` — same `convo_id` rule as close | 200 `{project: into, merged: this}`. Same who-may rule as close. Moves **every** mission of this project (any state) to `into`, closes this one with `close_summary: "Merged into #N"`, `merged_into` and `merged_into_num`, and writes one `updated` mission marker with `project_changed: true` per moved mission on its origin conversation. 400 when `into` is this project or not a string/number; 404 for an `into` the caller cannot see; 409 `{blocked_by:'closed'}` if this one is closed, `{blocked_by:'into_closed'}` if `into` is. |
+| `POST /missions`, `PATCH /missions/:id` | `project` | see *Missions & milestones* |
+
+Row shape: `{id, user_id, num, state, title, body, status, status_by,
+status_convo_id, status_updated_at, close_summary, closed_by,
+closed_over_open_missions, closed_at, merged_into, merged_into_num,
+origin_convo_id, origin_device_id, created_by, created_at, updated_at}`,
+plus the rollup fields on every route that returns one. `idem_key` and
+`status_device_id` are never returned.
+
+There is no project marker: the apps refresh `GET /projects` on any
+`mission` marker and while the Projects tab is open.
+
+**Visibility.** Same rules as missions. An ordinary agent never sees a
+project whose origin conversation is private-owned or that a private device
+created (404, absent from lists, not resolvable by `/lookup`); a status
+written from/by a private device reads as four nulls; rollups, needs-you
+items, milestones and session counts are computed from that agent's own
+sieved mission rows. `project_id` / `project_num` on a mission row it *can*
+see still travel as bare handles (the same "numbers, never words" exception
+as `mission_num` on items). Projects are never shared with colleagues:
+shared mission rows carry `project_id: null`.
+
+## Read state (seen, unseen)
+
+Spec: `docs/superpowers/specs/2026-09-30-read-state-design.md`. This is what the user
+has actually **seen**, as reported by their client apps. It is separate from
+`read_marker` / `unread_count`: nothing here touches unread, the badge, the
+snippet or push.
+
+**Client ops (WebSocket, client connections only; an agent gets `forbidden`):**
+
+- `{op:'seen', convo_id, ranges:[[from_seq,to_seq],...]}` reports message
+  events that were on screen: at least half the row visible for 1 s, with the
+  app in the foreground.
+  - `ranges` holds at most 64 ranges, each `1 <= from <= to`. Ranges past the
+    conversation's head are clipped.
+  - Stored ranges are coalesced. Two ranges merge when the seqs between them
+    hold no content event of that conversation from anyone but the user,
+    because seqs are per user, not per conversation.
+  - Not journaled, no reply. A malformed op gets `bad_request`, and a missing
+    or foreign conversation gets `forbidden`.
+  - An empty `ranges` is valid. It registers the device as a range reporter
+    (see the legacy fallback below) without marking anything.
+- `{op:'item_seen', item_id, through_comment_at?}` reports that an item's
+  detail was on screen: the item, and its comments up to `through_comment_at`
+  (the newest comment rendered, in ms; `0` or absent means none). Monotonic.
+
+**Legacy fallback.** A **client** `read_marker` counts as "seen up to that
+seq", covering `[1, up_to_seq]`, until the device sends its first `seen`.
+This covers apps that don't report ranges yet. A bridge's `read_marker` never
+counts.
+
+**Routes (agent connections only; a client gets 403):**
+
+- `GET /unseen?convo_id=<the Coordinator's conversation>` → `{entries,
+  truncated}`. Coordinator only.
+  - The gate runs in order: 400 on a bad `convo_id`, 404 when the
+    conversation isn't this device's own top-level conversation, then 403
+    `not_coordinator`.
+  - Query params:
+    - `older_than_ms` (default 30 min)
+    - `since_ms` (default 3 d, max 30 d)
+    - `importance` (`important`, the default, or `all`)
+    - `in_convo_id`
+    - `mission` (number)
+    - `include_flagged=1`
+    - `limit` (1–200, default 50)
+  - An ordinary Coordinator never sees conversations owned by a private
+    device, or items that came from one.
+- `GET /unseen?mine=1&convo_id=<a conversation this agent may write to, or a room it has joined>` → the
+  same shape, restricted to messages whose sender is the caller, in that
+  conversation. No items. Defaults are `importance=all` and
+  `older_than_ms` 10 min. A conversation the caller may not write to gets 404.
+- `POST /unseen/flags {convo_id, refs[1..100]}` → `{flagged}`. Records that
+  entries were raised with the user, so they are not listed again. The
+  Coordinator may flag any ref; any other agent only refs to its own messages
+  in `convo_id` (else 403). An ordinary Coordinator gets 404 for a ref in a
+  private device's conversation. Flags are pruned after 30 days.
+
+**Entries.** Each entry has these fields:
+
+- `ref`: `msg:<convo_id>:<seq>` or `item:<item_id>:<ms of newest agent content>`.
+  An item's ref changes when an agent adds to it, so new content can be
+  raised again.
+- `kind`: `message` or `item`.
+- `convo_id`, `convo_title`, `session_state`, `mission_num`, `is_room`, `ts`,
+  `snippet`, `reasons[]`, `important`.
+- Messages also have `seq`, `sender` and `type`. Items also have `item_id`,
+  `item_num` and `item_kind`.
+
+Entries are sorted important first, then newest first. A message is a
+`text`, `prompt`, `permission_request`, `file`, `image` or `spawn_outcome`
+event, not sent by the user and not covered by a seen range. It is left out
+when any of these is true:
+
+- the conversation is archived or a child conversation;
+- it is the Coordinator's own conversation (except with `mine=1`);
+- it is an item's fallback text or a consent card;
+- it is a prompt or permission request the user has written or answered
+  (`prompt_reply`) after.
+
+An open, non-consent item is unseen while it has agent content (its creation,
+or an agent comment) newer than what `item_seen` covers, and the user hasn't
+commented since.
+
+**Reasons.** An entry with at least one reason is `important`.
+
+| reason | meaning |
+| --- | --- |
+| `awaiting_user` | an item awaiting the user |
+| `question` | an item of kind question |
+| `prompt` | an unanswered prompt |
+| `permission` | an unanswered permission request |
+| `final` | the last non-user message of a conversation that is now `waiting` or `done` |
+| `failure` | a failed `spawn_outcome` |
+
+A message in an agent-to-agent room never has a reason: the room's prompts
+and last messages are addressed to the other agent, and whatever there needs
+the user becomes a tracker item, which is raised as `awaiting_user`. (Until
+2026-10-01 the user's name in a room was a reason, `mentions_user`; a name
+that is also a box name and in every "approved by …" made it noise.) The
+`final` reason
+ignores item fallback texts and consent cards. A scan reads at most 20 000
+candidate messages; hitting that sets `truncated`.
+
+**Nudge.** Every 10 minutes the journal checks each user who has a
+Coordinator. When all of the following hold, it sends one ephemeral frame to
+the Coordinator's bridge:
+
+- UK time is between 07:00 and 22:00;
+- the last nudge was at least an hour ago;
+- the Coordinator's bridge is connected;
+- there are important, unflagged entries unseen for 2 h or more that no
+  earlier nudge named (the journal remembers each nudged ref for 30 days).
+
+The frame is `{kind:'unseen', event:'pending', convo_id, count,
+entries:[up to 5 of {ref, kind, convo_id, convo_title, item_num?, ts,
+reasons, snippet}]}`. Each entry is nudged about once. Set
+`MATRON_UNSEEN_NUDGE=0` to turn it off.
+
 ## Shared visibility (GitHub-verified, per repo)
 
 Spec: `docs/superpowers/specs/2026-09-23-tracker-web-teams-and-item-links-design.md`.
@@ -2063,7 +2781,7 @@ no secret to pair with),
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
-| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, owner:{user_id,name}}`; 404 unknown or invisible. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
 own pages name the OAuth App, never the journal user — so the person who
@@ -2571,8 +3289,10 @@ typing text commands into the control conversation.
 
 **Journal-originated requests.** The journal itself can be the RPC caller —
 not just the relay between a client and an agent. Spawn approval's `start`
-call and spawn-target discovery's `recent_folders` call (see "Agent-spawned
-sessions" above) are both issued by the journal directly, over the same
+call, spawn-target discovery's `recent_folders` call (see "Agent-spawned
+sessions" above) and the Coordinator's `session_control` relay (see
+"Session control" under "Coordinator") are all issued by the journal
+directly, over the same
 single-consumer delivery path a client-relayed `agent_request` uses. These
 requests carry `from_device_id: 0` — a reserved value no real device row can
 ever have (SQLite `AUTOINCREMENT` starts at 1) — signalling that the journal,
@@ -2600,6 +3320,12 @@ dependencies). Disabled unless all four are set:
 
 Missing any of them logs one warn line at boot and the push pipeline is an
 inert no-op — everything else on the server works as normal.
+
+An alert payload carries the conversation as `aps.thread-id`. It also carries
+a top-level `seq`, the event the alert shows, so a tapped notification can
+report that one message as seen (read state, op `seen`). The push relay
+(`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
+`seq`. A client must treat a missing `seq` as "no tap receipt".
 
 After a journal event fans out to a user's connections, the push pipeline
 considers each of that user's *client* devices with a registered token

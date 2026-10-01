@@ -1,0 +1,88 @@
+{
+  "name": "mission links & projects: a conversation joins a second mission (200), lists both, names one on a milestone, leaves the current; a project files a mission and rolls it up",
+  "description": "Exercises POST /missions/:id/join on a conversation that already has a mission (200 — it was 409 other_mission), GET /conversations/:id/missions (current first), POST /milestones {mission}, POST /missions/:id/leave (current falls back), POST /projects, PATCH /missions/:id {project} and GET /projects rollups, then the mission markers c1 holds: created, joined, milestone, left, current_changed and updated with project_changed. Numbers are shared: missions #1 and #2, milestone #3, project #4.",
+  "server": { "tmpDb": true },
+  "seed": {
+    "users": [ { "as": "dan", "name": "dan", "password": "fixture-pw-17" } ],
+    "agents": [ { "as": "bridge", "user": "dan", "name": "dev-2" } ],
+    "conversations": [
+      { "id": "c1", "owner": "dan", "title": "Long session", "sessionState": "running", "agent": "bridge" },
+      { "id": "c2", "owner": "dan", "title": "Other", "sessionState": "running", "agent": "bridge" }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/missions", "token": { "$ref": "bridge.token" },
+      "body": { "title": "A", "convo_id": "c1" },
+      "expect": { "status": 201, "body": { "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "POST", "path": "/missions", "token": { "$ref": "bridge.token" },
+      "body": { "title": "B", "convo_id": "c2" },
+      "expect": { "status": 201, "body": { "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "POST", "path": "/missions/2/join", "token": { "$ref": "bridge.token" },
+      "body": { "convo_id": "c1" },
+      "expect": { "status": 200, "body": { "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "GET", "path": "/conversations/c1/missions", "token": { "$ref": "bridge.token" },
+      "expect": { "status": 200, "body": { "missions": [
+        { "id": { "$bind": "b_id" }, "user_id": { "$ref": "dan.user_id" }, "num": 2, "state": "open", "title": "B", "body": "",
+          "close_summary": null, "closed_by": null, "closed_over_open_items": 0, "origin_convo_id": "c2",
+          "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "last_milestone_at": null, "closed_at": null,
+          "status": null, "status_by": null, "status_convo_id": null, "status_updated_at": null, "closed_convo_id": null,
+          "project_id": null, "project_num": null,
+          "open_items": 0, "needs_you": 0, "conversations": 2, "milestones": 0, "last_milestone": null,
+          "activity": "running", "last_activity_at": { "$type": "integer" },
+          "current": true, "active": true, "how": "joined", "joined_at": { "$type": "integer" }, "ended_at": null },
+        { "id": { "$bind": "a_id" }, "user_id": { "$ref": "dan.user_id" }, "num": 1, "state": "open", "title": "A", "body": "",
+          "close_summary": null, "closed_by": null, "closed_over_open_items": 0, "origin_convo_id": "c1",
+          "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "last_milestone_at": null, "closed_at": null,
+          "status": null, "status_by": null, "status_convo_id": null, "status_updated_at": null, "closed_convo_id": null,
+          "project_id": null, "project_num": null,
+          "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 0, "last_milestone": null,
+          "activity": "running", "last_activity_at": { "$type": "integer" },
+          "current": false, "active": true, "how": "origin", "joined_at": { "$type": "integer" }, "ended_at": null }
+      ] } } },
+    { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
+      "body": { "convo_id": "c1", "kind": "progress", "title": "Work on A", "mission": "#1" },
+      "expect": { "status": 201, "body": {
+        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "a_id" }, "num": 3, "kind": "progress",
+          "title": "Work on A", "body": "", "convo_id": "c1", "seq": { "$bind": "anchor_seq" },
+          "device_id": { "$ref": "bridge.device_id" }, "created_by": "agent", "created_at": { "$type": "integer" } },
+        "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "POST", "path": "/missions/2/leave", "token": { "$ref": "bridge.token" },
+      "body": { "convo_id": "c1" },
+      "expect": { "status": 200, "body": { "mission": { "$ignore": true }, "current_mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "POST", "path": "/projects", "token": { "$ref": "bridge.token" },
+      "body": { "title": "Promo launch" },
+      "expect": { "status": 201, "body": { "project": { "$ignore": true } } } },
+    { "kind": "http", "method": "PATCH", "path": "/missions/1", "token": { "$ref": "bridge.token" },
+      "body": { "project": "#4" },
+      "expect": { "status": 200, "body": { "mission": { "$ignore": true } } } },
+    { "kind": "http", "method": "GET", "path": "/projects", "token": { "$ref": "bridge.token" },
+      "expect": { "status": 200, "body": { "projects": [
+        { "id": { "$type": "string" }, "user_id": { "$ref": "dan.user_id" }, "num": 4, "state": "open", "title": "Promo launch", "body": "",
+          "status": null, "status_by": null, "status_convo_id": null, "status_updated_at": null,
+          "close_summary": null, "closed_by": null, "closed_over_open_missions": 0, "closed_at": null,
+          "merged_into": null, "merged_into_num": null, "origin_convo_id": null,
+          "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" },
+          "missions": { "running": 1, "waiting": 0, "idle": 0, "quiet": 0, "closed": 0 },
+          "needs_you": 0, "open_items": 0, "last_activity_at": { "$type": "integer" } }
+      ] } } },
+    { "kind": "http", "method": "GET", "path": "/convo/c1/messages?limit=20", "token": { "$ref": "bridge.token" },
+      "expect": { "status": 200, "body": { "events": [
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "a_id" }, "num": 1, "title": "A", "action": "created", "by": "agent" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "b_id" }, "num": 2, "title": "B", "action": "joined", "by": "agent" } },
+        { "seq": { "$ref": "anchor_seq" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "milestone",
+          "payload": { "milestone_id": { "$ref": "milestone_id" }, "num": 3, "kind": "progress", "title": "Work on A", "body": "",
+            "mission_id": { "$ref": "a_id" }, "mission_num": 1, "mission_title": "A", "by": "agent" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "b_id" }, "num": 2, "title": "B", "action": "left", "by": "agent" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "a_id" }, "num": 1, "title": "A", "action": "current_changed", "by": "agent" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
+          "payload": { "mission_id": { "$ref": "a_id" }, "num": 1, "title": "A", "action": "updated", "by": "agent", "project_changed": true } }
+      ] } } }
+  ]
+}

@@ -1,6 +1,7 @@
 // Resolves a shareable link's (user, num) to a row (spec 2026-09-23 tracker
 // web/teams, "Item links and the lookup URL"). One per-user counter numbers
-// items, missions and milestones alike, so a single lookup covers all three.
+// items, missions, milestones and projects alike, so a single lookup covers
+// all four.
 // Visibility is exactly the read rule: the caller's own rows, or a
 // colleague's under the shared predicate. Unknown user, unknown number and
 // invisible row are one 404. Own-row checks reuse the same helpers the
@@ -10,6 +11,7 @@ import { json } from './http-body.js'
 import { badRequest, notFound } from './http-who.js'
 import { getItem, getSharedItem, isConsentMirror } from './items.js'
 import { getMission, getSharedMission } from './missions.js'
+import { resolveProject } from './projects.js'
 import { canReadConvo } from './visibility.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
@@ -39,6 +41,15 @@ function resolve(db, who, ownerName, num) {
     const ok = own ? !(filteredAgent(db, who) && privateOwnedConvo(db, ms.convo_id)) : canReadConvo(db, who.userId, ms.convo_id)
     return ok ? { kind: 'milestone', id: ms.id, owner } : null
   }
+  // Projects (spec 2026-09-30 §4.1) share the number space. Never shared
+  // with colleagues (§9), so a foreign number is the same 404. A merged
+  // project resolves to the one that survived it, like GET /projects/:id.
+  const project = db.prepare('SELECT id FROM projects WHERE user_id=? AND num=?').get(owner.id, num)
+  if (project) {
+    if (!own) return null
+    const r = resolveProject(db, who.userId, project.id, { excludePrivateOwned: filteredAgent(db, who) })
+    return r ? { kind: 'project', id: r.project.id, owner, mergedFrom: r.mergedFrom?.id ?? null } : null
+  }
   return null
 }
 
@@ -58,6 +69,10 @@ export function handleLookupRoute(ctx, req, res, url, who) {
   if (!Number.isInteger(num) || num < 1) return badRequest(res)
   const hit = resolve(db, who, user, num)
   if (!hit) return notFound(res)
-  json(res, 200, { kind: hit.kind, id: hit.id, owner: { user_id: hit.owner.id, name: hit.owner.name } })
+  json(res, 200, {
+    kind: hit.kind, id: hit.id,
+    ...(hit.mergedFrom ? { merged_from: hit.mergedFrom } : {}),
+    owner: { user_id: hit.owner.id, name: hit.owner.name },
+  })
   return true
 }

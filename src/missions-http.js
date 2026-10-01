@@ -10,16 +10,19 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
-  updateMission, joinMission, closeMission, createMilestone, listMilestones, milestoneRow,
-  listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones,
+  updateMission, joinMission, leaveMission, closeMission, createMilestone, listMilestones, milestoneRow,
+  listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones, conversationMissions,
 } from './missions.js'
+import { getProject } from './projects.js'
+import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
+import { getCoordinatorConvoId } from './coordinator.js'
 import { canReadConvo } from './visibility.js'
 
 const STATES = ['open', 'closed']
 
-const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
+export const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure. Exported
@@ -37,7 +40,7 @@ export const visibleMission = (db, who, idOrNum) =>
 
 // The conversation gate for the two routes that target a conversation
 // rather than an already-visible mission (create, milestone, join).
-function writableConvo(db, who, convoId) {
+export function writableConvo(db, who, convoId) {
   if (typeof convoId !== 'string' || !convoId) return false
   const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId) return false
@@ -55,9 +58,9 @@ function writableConvo(db, who, convoId) {
 // always target the origin conversation, so the predicate is a no-op for
 // them; it is applied uniformly anyway rather than per-action, so a future
 // action written elsewhere is covered by construction.
-function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null }) {
+export function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false, byConvoId = null, projectChanged = false }) {
   const payload = missionMarkerPayload({
-    mission, action, by: byOf(who), openItemNums,
+    mission, action, by: byOf(who), openItemNums, statusChanged, byConvoId, projectChanged,
     withTitle: markerTitleAllowed(db, mission.origin_convo_id, convoId),
   })
   try {
@@ -65,6 +68,44 @@ function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openIte
   } catch (err) {
     console.error('missions: marker append failed (mission write already committed)', err)
   }
+}
+
+// `project` on POST /missions and PATCH /missions/:id (spec 2026-09-30
+// §4.2): id, "#n" or n — or null (take it out). Resolved through the
+// caller's own sieve, so a project it cannot read is the same 404 as one
+// that does not exist. Filing INTO a closed project is refused.
+export function projectRefOf(db, who, ref) {
+  if (ref === null) return { projectId: null }
+  if (typeof ref !== 'string' && typeof ref !== 'number') return { status: 400 }
+  const p = getProject(db, who.userId, ref, { excludePrivateOwned: filteredAgent(db, who) })
+  if (!p) return { status: 404 }
+  if (p.state === 'closed') return { status: 409 }
+  return { projectId: p.id }
+}
+
+// The one mapping every caller of projectRefOf uses. Returns true when it
+// answered (the caller returns), false when the reference resolved.
+function refusedProjectRef(res, ref) {
+  if (ref.status === 400) return badRequest(res)
+  if (ref.status === 404) return notFound(res)
+  if (ref.status === 409) return conflict(res, { blocked_by: 'project_closed' })
+  return false
+}
+
+// Controller ruling D5: `project` is validated only on the path that
+// actually INSERTs a new mission. Mirrors createMission's own two
+// short-circuits (an idem_key replay, or — under attach — a conversation
+// that already has a current mission) so `POST /missions {project}` on an
+// `existing: true` reply ignores `project` outright: no 404, no 409, even
+// for a bogus or closed one. Tolerates the same TOCTOU as writableConvo
+// above — createMission re-reads both under its own transaction.
+function createsNewMission(db, userId, { convoId, idemKey, attach }) {
+  if (idemKey && db.prepare('SELECT 1 FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)) return false
+  if (attach) {
+    const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    if (convo && convo.mission_id) return false
+  }
+  return true
 }
 
 async function handleCreate(ctx, req, res, who) {
@@ -78,12 +119,19 @@ async function handleCreate(ctx, req, res, who) {
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
+  const attach = body.attach !== false
+  let projectId = null
+  if (body.project != null && createsNewMission(db, who.userId, { convoId: body.convo_id, idemKey, attach })) {
+    const ref = projectRefOf(db, who, body.project)
+    if (refusedProjectRef(res, ref)) return true
+    projectId = ref.projectId
+  }
   let out
   try {
     out = createMission(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-      title: v.value.title, body: v.value.body ?? '', idemKey, attach: body.attach !== false,
-      excludePrivateOwned: filteredAgent(db, who),
+      title: v.value.title, body: v.value.body ?? '', idemKey, attach,
+      excludePrivateOwned: filteredAgent(db, who), projectId,
     })
   } catch (err) {
     // TOCTOU: writableConvo just confirmed the convo, but it can vanish
@@ -126,17 +174,45 @@ function handleList(ctx, res, url, who) {
   return true
 }
 
+// Spec 2026-09-28 missions dashboard §1: `convo_id` on a status PATCH is
+// attribution — the writing agent's conversation — never a gate. Honoured
+// only for an agent, only for a conversation of the caller's own user, and
+// for an ordinary agent never a private-owned one (that would file its own
+// status behind the sieve, and confirm the id exists). Anything else —
+// a client, a foreign or unknown id, a non-string — records null; never a 400.
+export function statusConvoOf(db, who, convoId) {
+  if (who.kind !== 'agent' || typeof convoId !== 'string' || !convoId) return null
+  const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+  if (!convo || convo.owner_user_id !== who.userId) return null
+  if (filteredAgent(db, who) && privateOwnedConvo(db, convoId)) return null
+  return convoId
+}
+
 async function handlePatch(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   const v = validateMissionFields(body, { partial: true })
-  if (!v.ok || Object.keys(v.value).length === 0) return badRequest(res)
+  if (!v.ok) return badRequest(res)
+  const fields = { ...v.value }
+  if (body.project !== undefined) {
+    const ref = projectRefOf(db, who, body.project)
+    if (refusedProjectRef(res, ref)) return true
+    fields.projectId = ref.projectId
+  }
+  if (Object.keys(fields).length === 0) return badRequest(res)
+  const statusWriter = typeof fields.status === 'string'
+    ? { by: byOf(who), convoId: statusConvoOf(db, who, body.convo_id), deviceId: who.deviceId }
+    : null
   let updated
   try {
-    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value, excludePrivateOwned: filteredAgent(db, who) })
+    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields, statusWriter, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
   if (!updated) return notFound(res)
-  emitMissionMarker(ctx, who, { mission: updated, action: 'updated', convoId: updated.origin_convo_id })
+  emitMissionMarker(ctx, who, {
+    mission: updated, action: 'updated', convoId: updated.origin_convo_id,
+    statusChanged: fields.status !== undefined,
+    projectChanged: fields.projectId !== undefined && fields.projectId !== mission.project_id,
+  })
   json(res, 200, { mission: updated })
   return true
 }
@@ -145,12 +221,11 @@ async function handleJoin(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
-  const already = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(body.convo_id)?.mission_id
-  let joined
+  let out
   try {
-    joined = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned: filteredAgent(db, who) })
+    out = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) {
-    if (err.message === 'closed' || err.message === 'other_mission') return conflict(res, { blocked_by: err.message })
+    if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' })
     if (err.message === 'too_many_convos') return badRequest(res)
     // TOCTOU: the mission/convo were confirmed a moment ago (visibleMission,
     // writableConvo) but either can vanish before this write.
@@ -158,19 +233,88 @@ async function handleJoin(ctx, req, res, who, mission) {
     throw err
   }
   // Only reachable if the mission vanished inside its own transaction.
-  if (!joined) return notFound(res)
-  if (already !== joined.id) emitMissionMarker(ctx, who, { mission: joined, action: 'joined', convoId: body.convo_id })
-  json(res, 200, { mission: joined })
+  if (!out.mission) return notFound(res)
+  // Spec 2026-09-30 §3: no more 409 other_mission — an old bridge simply sees
+  // its join succeed. The marker says what happened to this conversation.
+  if (out.action) emitMissionMarker(ctx, who, { mission: out.mission, action: out.action, convoId: body.convo_id })
+  json(res, 200, { mission: out.mission })
   return true
+}
+
+// Spec 2026-09-30 §3: ends this conversation's link to the mission. Same
+// conversation gate as join. Markers go to the conversation concerned:
+// `left` for this mission and, when current moved to another mission,
+// `current_changed` for that one. Both are built from the unsieved row —
+// markerTitleAllowed (inside emitMissionMarker) is what drops a private
+// title — while the response is sieved like every other mission read.
+async function handleLeave(ctx, req, res, who, mission) {
+  const { db } = ctx
+  const body = await readBody(req)
+  if (!writableConvo(db, who, body.convo_id)) return notFound(res)
+  const excludePrivateOwned = filteredAgent(db, who)
+  let out
+  try {
+    out = leaveMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned })
+  } catch (err) {
+    if (['no_link', 'no_mission', 'no_convo'].includes(err.message)) return notFound(res)
+    throw err
+  }
+  if (out.left) {
+    emitMissionMarker(ctx, who, { mission: getMission(db, who.userId, mission.id), action: 'left', convoId: body.convo_id })
+    if (out.currentChanged) {
+      emitMissionMarker(ctx, who, { mission: getMission(db, who.userId, out.currentMissionId), action: 'current_changed', convoId: body.convo_id })
+    }
+  }
+  const current = out.currentMissionId ? getMission(db, who.userId, out.currentMissionId, { excludePrivateOwned }) : null
+  json(res, 200, { mission: out.mission, current_mission: current })
+  return true
+}
+
+// A close summary: a non-blank string of at most BODY_MAX UTF-8 bytes.
+// Shared with the project close route.
+export const validCloseSummary = (summary) =>
+  typeof summary === 'string' && !!summary.trim() && Buffer.byteLength(summary, 'utf8') <= BODY_MAX
+
+// The conversation an agent close names (spec 2026-09-29 coordinator session
+// control, "Coordinator mission close"). Absent → the pre-field contract (any
+// agent of the user closes by id) — unless `required`, as for project close
+// and merge (spec 2026-09-30 §4.2), where an agent naming none is 403.
+// Present → it must be a conversation this device owns (404 otherwise, same
+// stance as writableConvo), and either ON the target (`isOn(convoId)`: a
+// mission's own close, a child of the origin included) or the user's
+// Coordinator, which may close anything the user owns. Anyone else: 403
+// not_coordinator, and nothing about the target is learned beyond what the
+// caller's sieved lookup already answered. A client never names one; the
+// apps' close is the user's own override.
+export function closingConvo(db, who, convoId, { isOn = () => false, required = false } = {}) {
+  if (who.kind !== 'agent') return { convoId: null }
+  if (convoId === undefined) return required ? { status: 403 } : { convoId: null }
+  if (typeof convoId !== 'string' || !convoId) return { status: 400 }
+  const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
+  if (!convo || convo.owner_user_id !== who.userId || convo.agent_device_id !== who.deviceId) return { status: 404 }
+  if (isOn(convoId)) return { convoId }
+  if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403 }
+  return { convoId }
+}
+
+// The one mapping every closingConvo caller uses. True when it answered.
+export function refusedCloser(res, closer) {
+  if (closer.status === 400) return badRequest(res)
+  if (closer.status === 404) return notFound(res)
+  if (closer.status === 403) { json(res, 403, { error: 'forbidden', detail: 'not_coordinator' }); return true }
+  return false
 }
 
 async function handleClose(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
-  if (typeof body.summary !== 'string' || !body.summary.trim() || Buffer.byteLength(body.summary, 'utf8') > BODY_MAX) return badRequest(res)
+  if (!validCloseSummary(body.summary)) return badRequest(res)
+  // "On the mission" = an ACTIVE link (spec 2026-09-30 §3): current or also-on.
+  const closer = closingConvo(db, who, body.convo_id, { isOn: (convoId) => hasActiveLink(db, mission.id, convoId) })
+  if (refusedCloser(res, closer)) return true
   let out
   try {
-    out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, excludePrivateOwned: filteredAgent(db, who) })
+    out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, closedConvoId: closer.convoId, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) {
     if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' })
     if (err.message === 'user_items' || err.message === 'agent_items') return conflict(res, { blocked_by: err.message, items: err.items })
@@ -181,6 +325,10 @@ async function handleClose(ctx, req, res, who, mission) {
   emitMissionMarker(ctx, who, {
     mission: out.mission, action: 'closed', convoId: out.mission.origin_convo_id,
     openItemNums: who.kind === 'agent' ? null : out.openItemNums,
+    // Across the privacy boundary the marker carries no conversation id
+    // either: a private Coordinator closing a mission with a public origin
+    // must not hand its own id to every ordinary agent replaying the origin.
+    byConvoId: closer.convoId && markerTitleAllowed(db, closer.convoId, out.mission.origin_convo_id) ? closer.convoId : null,
   })
   json(res, 200, { mission: out.mission })
   return true
@@ -192,6 +340,8 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   if (!MILESTONE_KINDS.includes(body.kind)) return badRequest(res)
   if (typeof body.title !== 'string' || !body.title.trim() || body.title.trim().length > TITLE_MAX) return badRequest(res)
   if (body.body !== undefined && (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX)) return badRequest(res)
+  // Optional mission name (spec 2026-09-30 §3): id, "#n" or n; null/absent = current.
+  if (body.mission != null && typeof body.mission !== 'string' && typeof body.mission !== 'number') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
@@ -202,9 +352,11 @@ async function handleMilestoneCreate(ctx, req, res, who) {
     out = createMilestone(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
       kind: body.kind, title: body.title.trim(), body: body.body ?? '', idemKey, excludePrivateOwned,
+      missionRef: body.mission ?? null,
       appendMarker: (payload) => append(db, { userId: who.userId, convoId: body.convo_id, sender, type: MILESTONE_EVENT_TYPE, payload }),
     })
   } catch (err) {
+    if (err.message === 'not_linked') return conflict(res, { blocked_by: 'not_linked' })
     if (err.message === 'no_mission' || err.message === 'closed') return conflict(res, { blocked_by: err.message })
     // Unreachable through this route (MILESTONE_KINDS is checked above) —
     // kept mapped rather than dropped so the module's own guard, which other
@@ -276,6 +428,21 @@ function handleMilestoneList(ctx, res, url, who) {
 export async function handleMissionsRoute(ctx, req, res, url, who) {
   const { db } = ctx
   const path = url.pathname
+  // The conversation header's list (spec 2026-09-30 §3). Own conversations
+  // only; an ordinary agent never reads a private-owned one — same 404 as
+  // missing, like GET /milestones?convo=.
+  const cm = path.match(/^\/conversations\/([^/]+)\/missions$/)
+  if (cm) {
+    if (req.method !== 'GET') return false
+    let convoId
+    try { convoId = decodeURIComponent(cm[1]) } catch { return badRequest(res) }
+    const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+    if (!convo || convo.owner_user_id !== who.userId) return notFound(res)
+    const excludePrivateOwned = filteredAgent(db, who)
+    if (excludePrivateOwned && privateOwnedConvo(db, convoId)) return notFound(res)
+    json(res, 200, { missions: conversationMissions(db, who.userId, convoId, { excludePrivateOwned }) })
+    return true
+  }
   if (path === '/milestones') {
     if (req.method === 'POST') return handleMilestoneCreate(ctx, req, res, who)
     if (req.method === 'GET') return handleMilestoneList(ctx, res, url, who)
@@ -294,7 +461,7 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     return false
   }
   // Nested sub segment on purpose (see items-http.js): /missions/:id/junk must not match.
-  const m = path.match(/^\/missions\/([^/]+)(?:\/(join|close))?$/)
+  const m = path.match(/^\/missions\/([^/]+)(?:\/(join|leave|close))?$/)
   if (!m) return false
   let idOrNum
   try { idOrNum = decodeURIComponent(m[1]) } catch { return badRequest(res) }
@@ -303,7 +470,7 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   if (!mission) {
     const shared = getSharedMission(db, who.userId, idOrNum)
     if (!shared) return notFound(res)
-    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared)); return true }
+    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared, { subchats: url.searchParams.get('subchats') === '1' })); return true }
     json(res, 403, { error: 'forbidden' })
     return true
   }
@@ -311,7 +478,13 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') {
       // Only null if the mission vanished between the gate above and this
       // re-read — 404 like any other missing mission, never `200 null`.
-      const detail = missionDetail(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) })
+      // Sub-chats fold into their parent's row unless ?subchats=1; ended
+      // links (history) appear only with ?history=1 (spec §7: old apps).
+      const detail = missionDetail(db, who.userId, mission.id, {
+        excludePrivateOwned: filteredAgent(db, who),
+        subchats: url.searchParams.get('subchats') === '1',
+        history: url.searchParams.get('history') === '1',
+      })
       if (!detail) return notFound(res)
       json(res, 200, detail); return true
     }
@@ -320,5 +493,6 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   }
   if (req.method !== 'POST') return false
   if (sub === 'join') return handleJoin(ctx, req, res, who, mission)
+  if (sub === 'leave') return handleLeave(ctx, req, res, who, mission)
   return handleClose(ctx, req, res, who, mission)
 }

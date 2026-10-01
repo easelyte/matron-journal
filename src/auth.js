@@ -189,5 +189,13 @@ export function makeRateLimiter({ max = 5, windowMs = 60000 } = {}) {
       hits.set(key, list)
       return true
     },
+    // Peek without recording a hit: for a route that charges only its
+    // FAILED attempts (the Alertmanager webhook's bad tokens) but must
+    // refuse everything — the right token included — once the budget is
+    // spent, or a correct guess would still stand out from the 429s.
+    blocked(key) {
+      const now = Date.now()
+      return (hits.get(key) || []).filter((t) => now - t < windowMs).length >= max
+    },
   }
 }

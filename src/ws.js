@@ -5,14 +5,18 @@ import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
-import { participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
+import { nudgeCoordinator, chatAskId } from './consent.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
+import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -55,6 +59,9 @@ const ACTIVITY_DETAIL_MAX_CHARS = 200
 // lib/session-status.js) but size-capped — it's held in server memory, so an
 // unbounded status would be an unbounded hold.
 const STATUS_MAX_BYTES = 4096
+// session_control ops in flight per connection (each holds a wake waiter
+// and a broker entry) before `conflict`.
+const SESSION_CONTROL_MAX_INFLIGHT = 8
 const STATUS_CACHE_MAX = 2048
 
 // host_vitals op (host-global machine sample — cpu/ram/sampled_at_ms): a
@@ -310,7 +317,7 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
   perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
@@ -659,7 +666,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -715,7 +722,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, waker = null, log = console.log }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -826,11 +833,30 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // append/broadcast must log and move on, not surface as {code:'internal'}
   // (the caller would retry an op that already happened) or strand the peer
   // notifications that follow it.
+  // The requester's own asking conversation on agent_invite / agent_join
+  // (spec: agent chat request naming; 2026-10-01 for agent_join). Optional —
+  // absent resolves to {title:''} — but when present it is authorisation,
+  // not a hint: a top-level conversation of this user that THIS connection's
+  // device owns, else not_found (never confirm a conversation the caller
+  // cannot see). The title is shown to the user as the asker's identity, and
+  // the id is persisted as the row's initiator_convo_id, which places the
+  // room under that session's missions (participantConvoIds).
+  const resolveFromConvo = () => {
+    if (msg.from_convo_id == null) return { title: '' }
+    if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return { err: ['bad_request', 'bad from_convo_id'] }
+    const fromConvo = db.prepare(
+      'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
+    ).get(msg.from_convo_id)
+    if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+      || fromConvo.agent_device_id !== conn.deviceId
+      || fromConvo.parent_convo_id != null) return { err: ['not_found'] }
+    return { title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS) }
+  }
   const fanParticipants = (roomId) => {
     try {
       appendAndBroadcast(db, hub, {
         userId: conn.userId, convoId: roomId, sender: 'journal',
-        type: 'convo_meta', payload: { participants: participantIds(db, roomId) },
+        type: 'convo_meta', payload: { participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) },
       })
     } catch (err) {
       console.error('participants meta fan failed (the membership change itself already committed)', err)
@@ -1200,6 +1226,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
+        // Then the Coordinator's bridge (spec: 2026-09-29 coordinator
+        // consent) — after the card, so the user is never second to it.
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.
@@ -1375,17 +1404,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // borrowing someone else's name to be trusted by. Optional — a
         // bridge that predates this field sends none and the card simply
         // says less.
-        let fromConvoTitle = ''
-        if (msg.from_convo_id != null) {
-          if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return fail('bad_request', 'bad from_convo_id')
-          const fromConvo = db.prepare(
-            'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
-          ).get(msg.from_convo_id)
-          if (!fromConvo || fromConvo.owner_user_id !== conn.userId
-            || fromConvo.agent_device_id !== conn.deviceId
-            || fromConvo.parent_convo_id != null) return fail('not_found')
-          fromConvoTitle = sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS)
-        }
+        const from = resolveFromConvo()
+        if (from.err) return fail(...from.err)
+        const fromConvoTitle = from.title
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
@@ -1439,6 +1460,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // The card's mirror in the tracker (spec: 2026-09-22 consent-items),
         // best-effort — its failure never costs the ask.
         fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: msg.target_device_id, card: inviteCard })
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, msg.target_device_id) }, { askerConvoId: msg.from_convo_id ?? null, askerDeviceId: conn.deviceId })
         // Same ack as a relayed request: to the bridge, delivered means
         // "accepted into the system" — its tool copy already says pending is
         // normal and the answer arrives as a later turn. A distinct 'parked'
@@ -1460,6 +1482,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // catches a literally empty string, not whitespace/control chars
         // that sanitise down to ''.
         if (!justification) return fail('bad_request', 'bad justification')
+        // The joiner's own session, same rules as agent_invite's from_convo_id.
+        const from = resolveFromConvo()
+        if (from.err) return fail(...from.err)
         // Room ownership was established above, so this row exists; `?.name`
         // only guards the device being deleted between the two statements,
         // in which case the card degrades to a nameless owner rather than
@@ -1473,7 +1498,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // The recipient of a join is the room's owner box; start it if asleep
         // (same stance as agent_invite above).
@@ -1496,8 +1521,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // does NOT follow target_device_id: that field names the row to
             // answer (the joiner, self-targeted), whereas the user needs to
             // read who is being asked to let them in — the room's owner.
-            from_convo_id: '',
-            from_convo_title: '',
+            from_convo_id: msg.from_convo_id ?? '',
+            from_convo_title: from.title,
             to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
             to_convo_id: '',
             to_convo_title: '',
@@ -1506,6 +1531,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Mirror in the tracker, keyed on the joiner like the row (spec:
         // 2026-09-22 consent-items); best-effort.
         fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: conn.deviceId, card: joinCard })
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, conn.deviceId) }, { askerConvoId: msg.from_convo_id ?? null, askerDeviceId: conn.deviceId })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }
@@ -1676,6 +1702,48 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sender, type: 'read_marker',
           payload: { convo_id: msg.convo_id, up_to_seq: r.upToSeq },
         }))
+        // Read state's legacy fallback (spec 2026-09-30 read state §3): a
+        // client that doesn't report seen ranges yet has "seen" what it
+        // marked read. A bridge's marker never counts — it mirrors the
+        // user's own message, it doesn't mean the user looked.
+        if (conn.kind === 'client') legacyReadAsSeen(db, conn.userId, msg.convo_id, conn.deviceId, r.upToSeq)
+        break
+      }
+      case 'seen': {
+        // What the user actually had on screen (spec 2026-09-30 read state):
+        // client connections only, the owner's own conversations only. Not
+        // journaled — seen state is not conversation content and must not
+        // bump unread, the snippet or push. No reply. An empty `ranges`
+        // registers the device as a range reporter (ending its legacy
+        // read_marker fallback) without marking anything.
+        if (conn.kind !== 'client') return fail('forbidden')
+        if (typeof msg.convo_id !== 'string' || !msg.convo_id || msg.convo_id.length > CONVO_ID_MAX_CHARS) return fail('bad_request')
+        const ranges = validRanges(msg.ranges)
+        if (!ranges) return fail('bad_request')
+        markDeviceUsesRanges(db, conn.deviceId)
+        if (ranges.length === 0) break
+        try {
+          addSeenRanges(db, conn.userId, msg.convo_id, ranges)
+        } catch (err) {
+          if (err.message === 'not_found') return fail('forbidden')
+          throw err
+        }
+        break
+      }
+      case 'item_seen': {
+        // An item's detail was on screen: its body and its comments up to
+        // `through_comment_at` (the newest rendered; 0 = none). Same rules as
+        // `seen`.
+        if (conn.kind !== 'client') return fail('forbidden')
+        if (typeof msg.item_id !== 'string' || !msg.item_id || msg.item_id.length > 128) return fail('bad_request')
+        const through = msg.through_comment_at ?? 0
+        if (!Number.isInteger(through) || through < 0) return fail('bad_request')
+        try {
+          markItemSeen(db, conn.userId, msg.item_id, through)
+        } catch (err) {
+          if (err.message === 'not_found') return fail('forbidden')
+          throw err
+        }
         break
       }
       case 'convo_upsert': {
@@ -2073,6 +2141,49 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
         break
       }
+      case 'session_control': {
+        // Coordinator session control (src/session-control.js): validate,
+        // prove the caller is the Coordinator, resolve the target's box,
+        // ack, then — off this socket's message loop, because a wake can
+        // take minutes — wake, issue the journal-originated RPC and relay
+        // the reply to every socket of the caller's device. Not a room op,
+        // not counted against the pending-ask cap: nothing awaits the user.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const v = validateSessionControl(msg)
+        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}) }))
+        if (!v.ok) return failRpc(v.code, v.detail)
+        const auth = authorizeSessionControl(db, conn, msg)
+        if (auth.code) return failRpc(auth.code, auth.detail)
+        const { target } = auth
+        // Each op parks a wake waiter (minutes) and a broker entry; bound
+        // them per connection so a looping Coordinator cannot stack them.
+        if ((conn._sessionControlInflight || 0) >= SESSION_CONTROL_MAX_INFLIGHT) return failRpc('conflict', 'too many session_control requests in flight')
+        const online = hub.connsOf(conn.userId).some((c) => c.deviceId === target.device_id && c.ws.readyState === 1)
+        const waking = !online && wakeIfOffline(target.device_id)
+        if (!online && !waking) return failRpc('agent_unreachable')
+        conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
+        const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
+        const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
+        const rid = v.rid
+        conn._sessionControlInflight = (conn._sessionControlInflight || 0) + 1
+        void (async () => {
+          let frame
+          try {
+            if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
+            const r = await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+            frame = sessionControlResultFrame(rid, r)
+          } catch (err) {
+            console.error(`session_control: ${err?.message || err}`)
+            frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
+          } finally {
+            conn._sessionControlInflight = Math.max(0, (conn._sessionControlInflight || 1) - 1)
+          }
+          hub.sendToDevice(conn.userId, conn.deviceId, frame)
+        })()
+        break
+      }
       case 'status': {
         // Same ownership stance and delivery path as `activity`, with one
         // difference: the last status per convo is cached (bounded, memory
@@ -2088,6 +2199,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         try { encoded = JSON.stringify(msg.status) } catch { return fail('bad_request') }
         if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'status too large')
         statusCache.set(conn.userId, msg.convo_id, msg.status)
+        // Persist the roster subset (spec 2026-09-29 coordinator session
+        // control §1, src/convo-status.js). Best effort and never fatal to
+        // the op: the conversation can vanish between the ownership check
+        // and this write (FK), and a failed persist must not cost the live
+        // header fan-out below.
+        const reportedAt = Date.now()
+        const persisted = sanitizeConvoStatus(msg.status, reportedAt)
+        if (persisted) {
+          try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
+          catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
+        }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         }, () => agentTargetsFor(db, msg.convo_id))

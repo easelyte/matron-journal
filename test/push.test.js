@@ -278,6 +278,7 @@ test('alert body: title falls back to convo id, body is the event snippet, badge
   assert.equal(call.payload.aps.alert.title, 'no-title-convo')
   assert.equal(call.payload.aps.alert.body, 'hello there, this is the body')
   assert.equal(call.payload.aps['thread-id'], 'no-title-convo')
+  assert.equal(call.payload.seq, r.seq) // read state: a tap reports this message as seen
   // both convos now have unread_count 1 (both messages from an agent sender)
   assert.equal(call.payload.aps.badge, 2)
 })

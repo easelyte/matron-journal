@@ -5,6 +5,8 @@
 // http.js's outer catch pairs with, the non-object guard), and two
 // hand-synced copies of that is exactly the kind of drift that turns into a
 // hole. One copy, both callers.
+import { StringDecoder } from 'node:string_decoder'
+
 export const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
   res.writeHead(status, { 'content-type': 'application/json' })
@@ -13,30 +15,45 @@ export const json = (res, status, obj) => {
 
 // The raw text of a request body, with the same 1 MB cap and socket
 // handling as readBody. For the one non-JSON POST the journal accepts (the
-// browser form on the GitHub confirm page).
-export const readRawBody = (req) => new Promise((resolve, reject) => {
+// browser form on the GitHub confirm page). `maxBytes` lets a route cap
+// tighter than the 1 MB default (the Alertmanager webhook takes 256 KiB);
+// the overflow path is the same 413 either way.
+//
+// The cap counts bytes off the wire, not decoded characters: with
+// setEncoding('utf8') a string's .length is UTF-16 code units, so a body
+// of 3-byte characters (€) got three times the cap through (CodeRabbit,
+// PR #104). Raw Buffer chunks are counted, then decoded with a
+// StringDecoder, which carries a multibyte character split across two
+// chunks over to the next write instead of mangling it. For an ASCII body
+// (every JSON body the apps and bridges send in practice) bytes and
+// characters are the same number, so the default cap is unchanged there.
+export const readRawBody = (req, { maxBytes = 1e6 } = {}) => new Promise((resolve, reject) => {
+  const decoder = new StringDecoder('utf8')
   let data = ''
+  let bytes = 0
   let settled = false
   const fail = (err) => { if (!settled) { settled = true; reject(err) } }
-  req.setEncoding('utf8')
   req.on('data', (c) => {
-    data += c
-    if (data.length > 1e6) {
+    const chunk = typeof c === 'string' ? Buffer.from(c) : c
+    bytes += chunk.length
+    if (bytes > maxBytes) {
       req.removeAllListeners('data')
       req.pause()
       fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
+      return
     }
+    data += decoder.write(chunk)
   })
   req.on('end', () => {
     if (settled) return
     settled = true
-    resolve(data)
+    resolve(data + decoder.end())
   })
   req.on('close', () => fail(new Error('connection closed')))
   req.on('error', fail)
 })
 
-export const readBody = (req) => readRawBody(req).then((data) => new Promise((resolve, reject) => {
+export const readBody = (req, opts) => readRawBody(req, opts).then((data) => new Promise((resolve, reject) => {
     if (!data) { resolve({}); return }
     let parsed
     try {

@@ -7,18 +7,30 @@ import { json, readBody } from './http-body.js'
 import { senderOf, badRequest, notFound } from './http-who.js'
 import { filteredAgent } from './privacy.js'
 import { COORDINATOR_EVENT_TYPE, coordinatorFor, setCoordinatorConvoId } from './coordinator.js'
+import { getConsentEnabled, setConsentEnabled } from './consent.js'
+import { seedRoutines } from './routines.js'
 
 export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/coordinator') return false
   const { db, hub } = ctx
+  // `consent` (spec: 2026-09-29 coordinator consent): whether the
+  // Coordinator may answer chat and spawn asks on the user's behalf. Read by
+  // both kinds; set by a client alone, with or without a convo_id change.
+  const view = () => ({ convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }), consent: getConsentEnabled(db, who.userId) })
   if (req.method === 'GET') {
-    json(res, 200, { convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }) })
+    json(res, 200, view())
     return true
   }
   if (req.method !== 'PUT') return false
   if (who.kind !== 'client') { json(res, 403, { error: 'forbidden' }); return true }
   const body = await readBody(req)
-  if (!('convo_id' in body)) return badRequest(res)
+  if (!('convo_id' in body) && !('consent' in body)) return badRequest(res)
+  if ('consent' in body && typeof body.consent !== 'boolean') return badRequest(res)
+  if (!('convo_id' in body)) {
+    setConsentEnabled(db, who.userId, body.consent, Date.now())
+    json(res, 200, view())
+    return true
+  }
   const convoId = body.convo_id
   if (convoId !== null && (typeof convoId !== 'string' || !convoId || convoId.length > CONVO_ID_MAX_CHARS)) return badRequest(res)
   const sender = senderOf(db, who)
@@ -50,6 +62,14 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
       console.error('coordinator: role event broadcast failed (already committed)', err)
     }
   }
-  json(res, 200, { convo_id: out.current })
+  // Coordinator routines (spec 2026-10-01): the starter set is seeded the
+  // first time a user gets a Coordinator — once ever, per user; a later
+  // re-assignment, or an emptied list, never re-seeds. Off the role
+  // transaction: a seeding failure must not undo the assignment.
+  if (out.current) {
+    try { seedRoutines(db, who.userId, Date.now()) } catch (err) { console.error('coordinator: routine seeding failed (the role stands)', err) }
+  }
+  if ('consent' in body) setConsentEnabled(db, who.userId, body.consent, Date.now())
+  json(res, 200, { convo_id: out.current, consent: getConsentEnabled(db, who.userId) })
   return true
 }

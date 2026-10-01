@@ -1,10 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import Database from 'better-sqlite3'
 import { openDb, pinDevicePrivate } from '../src/db.js'
 import { createUser, createAgent, revokeDevice } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import {
-  validateMemoryFields, validName, upsertMemory, getMemory, listMemories, deleteMemory, privateOrigin, MEMORIES_MAX,
+  validateMemoryFields, validName, validScope, upsertMemory, getMemory, listMemories, deleteMemory, privateOrigin, MEMORIES_MAX,
 } from '../src/memories.js'
 
 async function seed() {
@@ -25,7 +29,37 @@ const save = (db, userId, over = {}) => upsertMemory(db, {
 test('schema: memories table has the spec columns', async () => {
   const { db } = await seed()
   const cols = db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name)
-  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'origin_private', 'created_by', 'updated_by', 'created_at', 'updated_at'])
+  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'origin_private', 'created_by', 'updated_by', 'created_at', 'updated_at', 'scope'])
+})
+
+test('schema: a pre-scope memories table is migrated in place and every existing row is global', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-memory-scope-'))
+  const dbPath = path.join(dir, 'pre-scope.db')
+  const raw = new Database(dbPath)
+  raw.exec(`CREATE TABLE memories(
+    id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('user','feedback','project','reference')),
+    description TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+    origin_convo_id TEXT, origin_device_id INTEGER, origin_private INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL CHECK(created_by IN ('user','agent')), updated_by TEXT NOT NULL CHECK(updated_by IN ('user','agent')),
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id, name))`)
+  raw.prepare("INSERT INTO memories(id, user_id, name, type, description, created_by, updated_by, created_at, updated_at) VALUES('me_old',1,'old-rule','feedback','Keep it.','user','user',1,1)").run()
+  raw.close()
+  const db = openDb(dbPath)
+  try {
+    assert.ok(db.prepare('PRAGMA table_info(memories)').all().some((c) => c.name === 'scope'))
+    assert.equal(getMemory(db, 1, 'old-rule').scope, 'global')
+    assert.equal(db.prepare("SELECT scope FROM memories WHERE id='me_old'").get().scope, 'global')
+  } finally {
+    db.close()
+  }
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('validScope: global, coordinator, or repo:<name> with the canonical repo-name characters', () => {
+  for (const ok of ['global', 'coordinator', 'repo:yearbook-app', 'repo:Matron_Journal.v2', `repo:${'a'.repeat(123)}`]) assert.equal(validScope(ok), true, ok)
+  for (const bad of ['', 'repo:', 'repo', 'repo:a/b', 'repo:a b', 'Global', 'coordinator:x', 'team:ops', `repo:${'a'.repeat(124)}`, 42, null, undefined]) assert.equal(validScope(bad), false, String(bad))
 })
 
 test('validName: kebab slugs only', () => {
@@ -35,12 +69,15 @@ test('validName: kebab slugs only', () => {
 
 test('validateMemoryFields: description trimmed one-liner ≤200, body ≤8192 bytes (cleared when omitted), type enum', () => {
   const ok = validateMemoryFields({ description: '  Never use eric.  ', body: 'why', type: 'user' })
-  assert.deepEqual(ok, { ok: true, value: { description: 'Never use eric.', body: 'why', type: 'user' } })
-  assert.deepEqual(validateMemoryFields({ description: 'x' }), { ok: true, value: { description: 'x', body: '', type: undefined } })
+  assert.deepEqual(ok, { ok: true, value: { description: 'Never use eric.', body: 'why', type: 'user', scope: undefined } })
+  assert.deepEqual(validateMemoryFields({ description: 'x' }), { ok: true, value: { description: 'x', body: '', type: undefined, scope: undefined } })
+  assert.equal(validateMemoryFields({ description: 'x', scope: 'repo:yearbook-app' }).value.scope, 'repo:yearbook-app')
+  assert.equal(validateMemoryFields({ description: 'x', scope: 'coordinator' }).value.scope, 'coordinator')
   assert.equal(validateMemoryFields({ description: 'x', body: 'é'.repeat(4096) }).ok, true)
   assert.equal(validateMemoryFields({ description: 'x', body: 'é'.repeat(4096) + 'a' }).ok, false)
   for (const bad of [{}, null, [], { description: '' }, { description: '   ' }, { description: 'a'.repeat(201) }, { description: 'a\nb' }, { description: 'a\u2028b' },
-    { description: 'x', body: 42 }, { description: 'x', type: 'rule' }, { description: 'x', type: '' }, { description: 42 }]) {
+    { description: 'x', body: 42 }, { description: 'x', type: 'rule' }, { description: 'x', type: '' }, { description: 42 },
+    { description: 'x', scope: '' }, { description: 'x', scope: 'team' }, { description: 'x', scope: 'repo:' }, { description: 'x', scope: null }]) {
     assert.equal(validateMemoryFields(bad).ok, false, JSON.stringify(bad))
   }
 })
@@ -60,6 +97,17 @@ test('upsertMemory: create then update by name; origin and created_* fixed, upda
   assert.equal(u.memory.created_at, 1000); assert.equal(u.memory.updated_at, 2000)
   assert.equal(save(db, dan.id, {}).memory.type, 'user')
   assert.equal(save(db, dan.id, { name: 'fresh' }).memory.type, 'feedback')
+})
+
+test('upsertMemory: scope is global on a create that names none, set when given, kept when omitted on an update', async () => {
+  const { db, dan } = await seed()
+  assert.equal(save(db, dan.id).memory.scope, 'global')
+  const c = save(db, dan.id, { name: 'merge-train', scope: 'repo:yearbook-app' })
+  assert.equal(c.created, true); assert.equal(c.memory.scope, 'repo:yearbook-app')
+  assert.equal(save(db, dan.id, { name: 'merge-train', description: 'still the train' }).memory.scope, 'repo:yearbook-app')
+  assert.equal(save(db, dan.id, { name: 'merge-train', scope: 'coordinator' }).memory.scope, 'coordinator')
+  assert.equal(save(db, dan.id, { name: 'merge-train', scope: 'global' }).memory.scope, 'global')
+  assert.deepEqual(listMemories(db, dan.id).map((m) => [m.name, m.scope]), [['avoid-eric', 'global'], ['merge-train', 'global']])
 })
 
 test('upsertMemory: the same name is a different row per user', async () => {

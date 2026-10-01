@@ -68,6 +68,9 @@ export function classify(type, payload, sender, prevState) {
   }
   // Missions and milestones are navigation, never a push (spec: Marker events).
   if (type === 'milestone' || type === 'mission') return null
+  // A Coordinator consent decision is a badge on a card the user already
+  // saw, not new attention.
+  if (type === 'consent_decision') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }
@@ -238,7 +241,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({
-        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id } },
+        // seq (read state): the message this alert shows, so a tapped
+        // notification can report that one message as seen.
+        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
         priority: cls.priority,
         pushType: 'alert',
         collapseId: event.convo_id,

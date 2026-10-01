@@ -8,20 +8,18 @@ import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEven
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
-import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
+import { listAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
-import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
-import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
 import { makeDurableIdemStore } from './file-idem.js'
 import { makeFileAudit } from './file-audit.js'
-import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
+import { handleProjectsRoute } from './projects-http.js'
 import { createWorkView, handleWorkRoute, parseOwnerUserId } from './work-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
@@ -29,8 +27,14 @@ import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
+import { handleRoutinesRoute } from './routines-http.js'
+import { handleSeenRoute } from './seen-http.js'
+import { handleConsentRoute } from './consent-http.js'
+import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
+import { convoStatuses } from './convo-status.js'
+import { makeAlertsHandler } from './alerts-http.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -122,7 +126,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -147,6 +151,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     ? (Number.isSafeInteger(fileOwnerUserId) && fileOwnerUserId > 0 ? fileOwnerUserId : null)
     : parseOwnerUserId(fileOwnerUserId)
   const filesLive = !!fileReadRoots || !!(fileWriteCtx.fileEnableWrites && fileWriteCtx.fileWriteRoots && fileWriteCtx.audit)
+  // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
+  // bound is per process. Off (declines every request) without config.
+  const handleAlerts = makeAlertsHandler({
+    db, hub, broker, waker, rateLimiter, wakeWaitMs: spawnWakeWaitMs, timeoutMs: sessionControlTimeoutMs,
+    token: alertWebhook?.token ?? null, username: alertWebhook?.username ?? null,
+  })
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -309,6 +319,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
       if (await handleGithubCallback({ db, github, tokenBox: tokenBox || undefined }, req, res, url)) return
+      // Its own shared-secret Bearer, not a device token — so ahead of `who`.
+      // Disabled, it declines and the request meets the chain below exactly
+      // as an unknown path would.
+      if (await handleAlerts(req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // --- File Explorer read API (spec: matron-file-explorer §5) -----------
@@ -571,7 +585,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleWorkRoute(workView, req, res, url, who)) return
+      if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
+      if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
+      if (await handleSeenRoute({ db }, req, res, url, who)) return
       if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
@@ -584,6 +601,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         })
       }
       if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
+      // Coordinator consent approval (src/consent-http.js): the same answer
+      // path the two client routes below use, gated on the Coordinator.
+      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
@@ -706,7 +726,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // comparator as /snapshot (byLastMessageThenId, see journal.js); sorting
         // in JS avoids re-evaluating the correlated last_ts subquery in a SQL
         // ORDER BY.
-        const conversations = db.prepare(
+        const rows = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    AND e.type IN (${MESSAGE_TYPES_SQL})
@@ -716,7 +736,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
                     SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
              : ''}`
         ).all(who.userId)
-        conversations.sort(byLastMessageThenId)
+        rows.sort(byLastMessageThenId)
+        // Persisted session header (spec 2026-09-29 coordinator session
+        // control §1): model, context gauge, stall and meters from the
+        // bridge's last status op. Omitted (never null) for a conversation
+        // that has not reported. Rides the already-filtered rows, so privacy
+        // needs no second check.
+        const headers = convoStatuses(db, who.userId)
+        const conversations = rows.map((c) => (headers.has(c.id) ? { ...c, status: headers.get(c.id) } : c))
         return json(res, 200, { agents, conversations })
       }
       if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {
@@ -750,46 +777,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // that believes it granted standing consent which does not exist is
         // worse off than one told plainly that the field is not accepted.
         if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
-        const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
-        // Unknown room and a room owned by someone else are indistinguishable
-        // (404, never 403) — same anti-enumeration stance as
-        // GET /convo/:id/messages.
-        if (!room || room.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
-        const row = getParticipant(db, room_id, target_device_id)
-        if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
-        if (decision === 'deny') {
-          answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
-          // The tracker mirror (spec: 2026-09-22 consent-items), best-effort.
-          closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'denied', answeredByDeviceId: who.deviceId })
-          // Indistinguishable from a peer refusal — reason 'refused', never
-          // 'denied' (a requester must never learn the human said no).
-          hub.sendToDevice(who.userId, row.initiator_device_id, {
-            kind: 'invite', event: 'answer', room_id, peer_device_id: target_device_id, accept: false, reason: 'refused',
-          })
-          return json(res, 200, { ok: true })
-        }
-        answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
-        closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'approved', answeredByDeviceId: who.deviceId })
-        // Join requests self-target (row.initiator_device_id ===
-        // target_device_id, the joiner) — the recipient of THIS row's relay
-        // (and, below, the directed-pair target) is the room owner, not the
-        // joiner itself.
-        const isJoin = row.initiator_device_id === target_device_id
-        // Scoped to this row's own recipient: the unscoped pump sweeps every
-        // undelivered row system-wide, so an unrelated row's successful
-        // delivery could otherwise make `sent > 0` true while THIS row's
-        // target is still offline. Even scoped, `sent` could reflect a
-        // different row addressed to the same recipient device — so the
-        // response flag is read back off the answered row itself, which is
-        // exact.
-        deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
-        const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
-        // Undelivered means the recipient has no live socket — most often a
-        // box the host idle-stopped since the ask was parked. Wake it: the
-        // approved row is pumped again the moment its bridge says hello
-        // (deliverPendingInvites on register), so nothing is lost meanwhile.
-        if (!delivered) wakeIfOffline({ db, hub, waker }, who.userId, isJoin ? room.agent_device_id : target_device_id)
-        return json(res, 200, { ok: true, delivered })
+        // The answer itself lives in src/consent-answer.js, shared with the
+        // Coordinator's route: a tap and a Coordinator decision do exactly
+        // the same thing, with the deny masked as a peer refusal either way.
+        const r = answerChatAsk({ db, hub, waker }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        return json(res, r.status, r.body)
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
         // Client-gated: an agent must never answer a consent ask, including
@@ -804,34 +796,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // the field rather than ignore it, exactly as /agent-chat/answer
         // does: a caller that believes it granted something must be told.
         if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
-        const row = getSpawn(db, request_id)
-        // Unknown id and another user's row are indistinguishable.
-        if (!row || row.user_id !== who.userId) return json(res, 404, { error: 'not_found' })
-        if (decision === 'deny') {
-          if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
-          // Reported plainly (spec: no peer to hide behind) — 'declined',
-          // never a fabricated box-side failure.
-          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined', answeredByDeviceId: who.deviceId })
-          return json(res, 200, { ok: true })
-        }
-        // The tap CLAIMS the row; a zero row-count means another tap already
-        // won — 409, and nothing expensive has started (spec failure table:
-        // two approve taps spawn once).
-        if (!claimApprove(db, request_id)) return json(res, 409, { error: 'conflict' })
-        // Everything after the claim is expensive and externally visible;
-        // it runs off the request cycle — the app needs its 200 now, the
-        // outcome reaches the parent as a turn. Errors are contained: the
-        // broker timeout guarantees approveSpawn itself always settles.
-        // wake-before-spawn: a target that went to sleep between the card and
-        // the tap is woken and waited for (up to spawnWakeWaitMs) before the
-        // start RPC, instead of failing the user's approval on the spot.
-        approveSpawn({
-          db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId,
-          wakeWaitMs: spawnWakeWaitMs,
-          wakeTarget: () => wakeIfOffline({ db, hub, waker }, who.userId, row.target_device_id),
-        }, getSpawn(db, request_id))
-          .catch((err) => console.error('agent-spawn approve orchestration failed', err))
-        return json(res, 200, { ok: true })
+        // Shared with the Coordinator's route (src/consent-answer.js): the
+        // claim, the off-cycle orchestration and the wake-before-spawn are
+        // one code path whoever answered.
+        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        return json(res, r.status, r.body)
       }
       if (req.method === 'GET' && url.pathname === '/search') {
         // User-scoped full-text search (spec: agent journal search). Open to

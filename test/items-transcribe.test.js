@@ -1,10 +1,13 @@
 import test from 'node:test'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { listComments, listPendingTranscripts } from '../src/items.js'
-import { makeTranscriber, cleanWhisperText } from '../src/transcribe.js'
+import { makeTranscriber, cleanWhisperText, resolveWhisperPrompt, withDeviceNames, promptLooksTruncated, DEFAULT_WHISPER_PROMPT } from '../src/transcribe.js'
 
 // A transcriber whose jobs the test releases by hand, so "pending" is a state
 // the assertions can actually observe rather than a race.
@@ -162,6 +165,101 @@ test('makeTranscriber: off without a model, off (loudly) when the model path is 
   assert.equal(makeTranscriber({ modelPath: '/nope/models/ggml-base.bin', log: { error: (m) => errs.push(m) } }), null)
   assert.equal(errs.length, 1)
   assert.equal(cleanWhisperText(' [BLANK_AUDIO]\n Use option A.\n'), 'Use option A.')
+})
+
+test('makeTranscriber: whisper-cli gets the vocabulary prompt as --prompt, and none when it is off', async (t) => {
+  // Model and cli only have to exist for the boot check; the injected exec
+  // never runs them.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  const calls = []
+  const exec = async (cmd, args) => { calls.push({ cmd, args }); return { stdout: cmd === cliPath ? 'Dan-mac can get the sudo password.' : '' } }
+
+  const withPrompt = makeTranscriber({ modelPath, cliPath, prompt: 'Matron, dan-mac, sudo.', exec })
+  assert.equal(await withPrompt.transcribeFile('/blob'), 'Dan-mac can get the sudo password.')
+  const w = calls.find((c) => c.cmd === cliPath)
+  assert.deepEqual(w.args.slice(w.args.indexOf('--prompt')), ['--prompt', 'Matron, dan-mac, sudo.'])
+
+  calls.length = 0
+  const without = makeTranscriber({ modelPath, cliPath, prompt: '', exec })
+  await without.transcribeFile('/blob')
+  assert.ok(!calls.find((c) => c.cmd === cliPath).args.includes('--prompt'))
+
+  // With a device lookup, the user's box names ride on the end of the prompt.
+  calls.length = 0
+  const seen = []
+  const named = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', deviceNames: (uid) => { seen.push(uid); return ['pat', 'dan-mac', 'pat'] }, exec })
+  await named.transcribeFile('/blob', { userId: 7 })
+  assert.deepEqual(seen, [7])
+  const n = calls.find((c) => c.cmd === cliPath)
+  assert.equal(n.args[n.args.indexOf('--prompt') + 1], 'Matron. dan-mac, pat.')
+})
+
+test('prompt guard: an implausibly short prompted transcript is rerun without the prompt, keeping the fuller one', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  const words = (n) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ')
+  const calls = []
+  // ffmpeg's stand-in writes a WAV whose size says "124 seconds".
+  const exec = async (cmd, args) => {
+    calls.push({ cmd, args })
+    if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } }
+    return { stdout: args.includes('--prompt') ? words(16) : words(300) }
+  }
+  const tr = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec })
+  const text = await tr.transcribeFile('/blob')
+  const whisper = calls.filter((c) => c.cmd === cliPath)
+  assert.equal(whisper.length, 2)
+  assert.ok(whisper[0].args.includes('--prompt'))
+  assert.ok(!whisper[1].args.includes('--prompt'))
+  assert.equal(text.split(' ').length, 300)
+
+  // A rerun that fails keeps the prompted transcript; an abort still propagates.
+  calls.length = 0
+  const flaky = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { calls.push({ cmd, args }); if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } } if (args.includes('--prompt')) return { stdout: words(16) }; throw new Error('timed out') } })
+  assert.equal((await flaky.transcribeFile('/blob')).split(' ').length, 16)
+  assert.equal(calls.filter((c) => c.cmd === cliPath).length, 2)
+  const ac = new AbortController()
+  const aborting = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } } if (args.includes('--prompt')) return { stdout: words(16) }; ac.abort(); throw Object.assign(new Error('aborted'), { name: 'AbortError' }) } })
+  await assert.rejects(aborting.transcribeFile('/blob', { signal: ac.signal }), { name: 'AbortError' })
+
+  // A plausible transcript is never rerun.
+  calls.length = 0
+  const fine = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { calls.push({ cmd, args }); if (cmd === 'ffmpeg') fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 60)); return { stdout: cmd === cliPath ? words(150) : '' } } })
+  await fine.transcribeFile('/blob')
+  assert.equal(calls.filter((c) => c.cmd === cliPath).length, 1)
+
+  assert.equal(promptLooksTruncated(words(16), 124), true)
+  assert.equal(promptLooksTruncated(words(300), 124), false)
+  assert.equal(promptLooksTruncated('', 7), false)
+})
+
+test('withDeviceNames: dedupes and sorts, drops names that are not hostname-shaped, survives a failing lookup', () => {
+  assert.equal(withDeviceNames('Matron.', () => ['greg', 'bev', 'greg', 'evil --prompt x', '', 42], 1), 'Matron. bev, greg.')
+  assert.equal(withDeviceNames('Matron.', () => [], 1), 'Matron.')
+  assert.equal(withDeviceNames('Matron.', () => { throw new Error('db') }, 1), 'Matron.')
+  assert.equal(withDeviceNames('Matron.', null, 1), 'Matron.')
+  assert.equal(withDeviceNames('Matron.', () => ['pat'], null), 'Matron.')
+})
+
+test('resolveWhisperPrompt: unset -> built-in vocabulary, empty -> off, set -> trimmed value', () => {
+  // An explicit undefined still triggers the default parameter, which reads
+  // the real environment, so the test's own env is isolated here.
+  const saved = process.env.MATRON_WHISPER_PROMPT
+  delete process.env.MATRON_WHISPER_PROMPT
+  try {
+    assert.equal(resolveWhisperPrompt(), DEFAULT_WHISPER_PROMPT)
+  } finally {
+    if (saved !== undefined) process.env.MATRON_WHISPER_PROMPT = saved
+  }
+  assert.ok(DEFAULT_WHISPER_PROMPT.length > 0)
+  assert.equal(resolveWhisperPrompt(''), '')
+  assert.equal(resolveWhisperPrompt('  '), '')
+  assert.equal(resolveWhisperPrompt(' Acme, widget-2. '), 'Acme, widget-2.')
 })
 
 test('the same blob attached twice is one whisper run and settles both attachments', async (t) => {
