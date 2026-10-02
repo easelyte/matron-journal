@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Canonical source: son-of-anton/docs/contracts/work-view.schema.json. Vendored consumer copies must not be edited directly.",
+  "$comment": "Canonical source: the producer repository's docs/contracts/work-view.schema.json. Vendored consumer copies must not be edited directly.",
   "title": "WorkViewEnvelope",
   "type": "object",
   "additionalProperties": false,
