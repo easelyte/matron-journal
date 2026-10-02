@@ -781,7 +781,7 @@ test('reap pass runs at boot when a user is over quota', async (t) => {
   assert.equal(JSON.parse(row.payload).expired, true)
 })
 
-// --- Orphan-blob reaper (loop #780) ---------------------------------------
+// --- Orphan-blob reaper ---------------------------------------
 // runReapMedia joins through events, so a blob nothing references (an upload
 // whose send never happened, an item attachment abandoned mid-compose) was
 // never a candidate for anything and lived forever. runReapOrphanBlobs is the

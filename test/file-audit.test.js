@@ -1,4 +1,4 @@
-// Phase-2 T-1.3: the append-only JSONL write audit. The security contract is
+// Phase 2: the append-only JSONL write audit. The security contract is
 // narrow and absolute — one line per attempt, one write() syscall per line,
 // never file content, never a field the allowlist does not name, and a failed
 // append is a REFUSAL (fail-closed), never a silently-unlogged mutation.
@@ -29,7 +29,7 @@ test('appendAudit: one JSONL line per attempt, append-only, allowlisted fields o
   assert.equal(lines(dir).length, 3)
 })
 
-test('appendAudit: content and unknown fields are dropped, never serialized (R500)', () => {
+test('appendAudit: content and unknown fields are dropped, never serialized', () => {
   const dir = tmpDir()
   appendAudit(dir, {
     ts: 1, deviceId: 7, op: 'write', path: '/w/a.env', result: 'denied', reason: 'sensitive',
@@ -170,7 +170,7 @@ test('auditPathFor / makeFileAudit: the log sits beside the DB, and the maker bi
   assert.equal(makeFileAudit(null), null)
 })
 
-test('appendAudit: creating the log fsyncs its parent directory, not just the file (F7)', (t) => {
+test('appendAudit: creating the log fsyncs its parent directory, not just the file', (t) => {
   const dir = tmpDir()
   const synced = []
   const realFsync = fs.fsyncSync
@@ -195,7 +195,7 @@ test('appendAudit: creating the log fsyncs its parent directory, not just the fi
   assert.deepEqual(synced, ['file'])
 })
 
-test('R3-F4: the short-write rollback refuses to truncate over a concurrent append', (t) => {
+test('the short-write rollback refuses to truncate over a concurrent append', (t) => {
   const dir = tmpDir()
   appendAudit(dir, { ts: 1, deviceId: 1, op: 'write', path: '/w/a', result: 'ok' })
 
@@ -219,7 +219,7 @@ test('R3-F4: the short-write rollback refuses to truncate over a concurrent appe
   assert.throws(() => appendAudit(dir, { ts: 3, deviceId: 1, op: 'write', path: '/w/c', result: 'ok' }), /refusing to append/)
 })
 
-test('R3-F5: a log left with a partial tail by a dead process is refused, not appended to', () => {
+test('a log left with a partial tail by a dead process is refused, not appended to', () => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   // Exactly what a process killed between write() and rollback leaves behind.
@@ -239,7 +239,7 @@ test('R3-F5: a log left with a partial tail by a dead process is refused, not ap
   assert.equal(lines(clean).length, 2)
 })
 
-test('R4: the audit sink refuses a symlinked or non-regular log', () => {
+test('the audit sink refuses a symlinked or non-regular log', () => {
   const dir = tmpDir()
   const elsewhere = tmpDir()
   const victim = path.join(elsewhere, 'some-other-state.json')
@@ -260,7 +260,7 @@ test('R4: the audit sink refuses a symlinked or non-regular log', () => {
   )
 })
 
-test('R6: a FIFO audit target fails closed instead of blocking the process', () => {
+test('a FIFO audit target fails closed instead of blocking the process', () => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   const made = spawnSync('mkfifo', [target])
@@ -277,7 +277,7 @@ test('R6: a FIFO audit target fails closed instead of blocking the process', () 
   assert.ok(Date.now() - started < 2000, 'the refusal is immediate, not a block')
 })
 
-test('R7: the tail check reads the very inode the line lands on, not the pathname', (t) => {
+test('the tail check reads the very inode the line lands on, not the pathname', (t) => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   // The log on disk ends in a FRAGMENT — a previous process died mid-append.
@@ -315,10 +315,10 @@ test('R7: the tail check reads the very inode the line lands on, not the pathnam
   assert.equal(fs.readFileSync(target, 'utf8'), `${'x'.repeat(fragment.length - 1)}\n`)
 })
 
-test('R7-F1: a record that lands in a rotated-away inode refuses the operation', (t) => {
+test('a record that lands in a rotated-away inode refuses the operation', (t) => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
-  // Unlike R7 above, the original log is WELL FORMED — the tail check passes,
+  // Unlike the tail-check test above, the original log is WELL FORMED — the tail check passes,
   // the line is written and fsynced. The defect is where it ends up.
   fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
   const rotatedIn = path.join(dir, 'rotated-in.jsonl')
@@ -351,7 +351,7 @@ test('R7-F1: a record that lands in a rotated-away inode refuses the operation',
   assert.deepEqual(lines(dir).map((r) => r.ts), [3])
 })
 
-test('R7-F1: an audit log unlinked mid-append refuses the operation', (t) => {
+test('an audit log unlinked mid-append refuses the operation', (t) => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
@@ -375,7 +375,7 @@ test('R7-F1: an audit log unlinked mid-append refuses the operation', (t) => {
   assert.ok(removed)
 })
 
-test('R7-R2-F1: a copytruncate rotation of the same inode refuses the operation', (t) => {
+test('a copytruncate rotation of the same inode refuses the operation', (t) => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
   fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)

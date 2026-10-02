@@ -1,12 +1,12 @@
-// Append-only JSONL audit for the File Explorer write API (spec §5.3, plan
-// T-1.3). Every write ATTEMPT lands here — allowed, denied, or errored — and
+// Append-only JSONL audit for the File Explorer write API.
+// Every write ATTEMPT lands here — allowed, denied, or errored — and
 // for a destructive op the "attempt" line is written (and fsynced) BEFORE the
 // first irreversible filesystem call, so there is no such thing as an
 // unlogged destructive change outside a process crash.
 //
 // Two hard contracts:
 //
-//  1. R500 — the record is built from an ALLOWLIST. File content, request
+//  1. The record is built from an ALLOWLIST. File content, request
 //     bodies, headers, tokens: none of them have a field here, and an extra
 //     key on the caller's object is dropped rather than serialized. The only
 //     client-controlled strings that reach disk are paths, which the guard
@@ -29,8 +29,8 @@
 //     refuses to truncate A's bytes but cannot revoke A's gate. Nothing here
 //     takes an interprocess lock, so a second writer is not a thing to be
 //     careful about — it is unsupported. Adding one means putting
-//     fstat -> tail -> write/rollback -> fsync under a real file lock first
-//     (Codex R7-F2). Log ROTATION from another process is supported, subject
+//     fstat -> tail -> write/rollback -> fsync under a real file lock first.
+//     Log ROTATION from another process is supported, subject
 //     to contract 4.
 //
 //  4. Rotation is rename/create, never copytruncate. Renaming the log away and
@@ -46,7 +46,7 @@
 //     truncate between the check and the caller's mutation still leaves an
 //     authorized write with its intent in neither file. Closing that needs a
 //     lock held across the append AND the mutation, shared with the rotator —
-//     which contract 3 deliberately does not take (Codex R7-R2-F1, R7-R3-F1).
+//     which contract 3 deliberately does not take.
 //     So: configure rename/create rotation. Under copytruncate this sink is
 //     best-effort, and no amount of checking here makes it otherwise.
 //
@@ -80,13 +80,13 @@ const poisoned = new Set()
 // A log whose last byte is not a newline ends in a fragment — a previous
 // process died between its write() and the rollback. Appending onto it would
 // weld the next intent record to that fragment and make BOTH unparsable, so the
-// tail is checked before this process appends (Codex R3-F5).
+// tail is checked before this process appends.
 //
 // The check runs on EVERY append, through the descriptor the line is about to
 // land on — never a memo keyed by pathname. A memo is a statement about the
 // file that WAS at that name: one rotation, restore or inode reuse later it is
 // a statement about nothing, and the append proceeds on a fragment it never
-// looked at (Codex R7). The cost of being right is a one-byte pread per audit
+// looked at. The cost of being right is a one-byte pread per audit
 // record. The tradeoff taken deliberately: a fragment another writer is
 // mid-rollback on now refuses this append instead of being welded onto, which
 // is the fail-closed side of a module that exists to refuse.
@@ -106,7 +106,7 @@ function assertIntactTail(fd, target, size) {
 // inode nothing can reach any more (close() releases the last link), while the
 // LIVE log holds no write-ahead entry for the mutation the caller is about to
 // make. Durability in an orphan is not evidence, so the name is re-resolved
-// after fsync and a mismatch REFUSES the append (Codex R7-F1).
+// after fsync and a mismatch REFUSES the append.
 //
 // Not poison: rotation is a legitimate operator action, and the next call opens
 // the new file and succeeds normally. This attempt simply does not get to
@@ -225,12 +225,12 @@ export function appendAudit(dir, entry) {
       // O_NOFOLLOW: `file-audit.jsonl` left as a symlink by a bad rotation or
       // restore would otherwise make the first authenticated write append this
       // server's JSON into whatever the link points at — and fsync it — while
-      // the audit gate reported success (Codex R4).
+      // the audit gate reported success.
       //
       // O_NONBLOCK: the type check below cannot run until open() returns, and
       // opening a FIFO for writing BLOCKS until a reader appears. On Node's
       // single thread that is not a failed write, it is a wedged server — so
-      // refuse to block at all. A no-op on a regular file (Codex R6).
+      // refuse to block at all. A no-op on a regular file.
       //
       // O_RDWR rather than O_WRONLY: the tail check has to READ the same inode
       // this descriptor appends to. Re-opening the pathname to read it gave a
@@ -238,7 +238,7 @@ export function appendAudit(dir, entry) {
       // under the name — the check then passed on the replacement while the
       // line landed on the original's fragment, and the audit gate reported
       // success. One descriptor for fstat, tail, write and fsync is what makes
-      // check and act share guard scope (Codex R7).
+      // check and act share guard scope.
       fd = fs.openSync(
         target,
         fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
@@ -270,8 +270,8 @@ export function appendAudit(dir, entry) {
       try {
         // Truncating a SHARED log is only safe if nothing else appended in the
         // meantime — otherwise the rollback would delete another writer's
-        // complete intent record and let its mutation proceed unlogged (Codex
-        // R3-F4). If the file is not exactly our fragment past the snapshot,
+        // complete intent record and let its mutation proceed unlogged).
+        // If the file is not exactly our fragment past the snapshot,
         // refuse to truncate and poison instead.
         const current = fs.fstatSync(fd).size
         if (current === sizeBefore + written) {

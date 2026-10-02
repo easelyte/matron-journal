@@ -27,7 +27,7 @@ export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_LIST_ENTRIES = 2000;
 
 // Basename patterns applied to EVERY path segment (a sensitively-named
-// directory denies its contents). Bridge PR #54 set, hardened (review F2) to
+// directory denies its contents). The bridge's set, hardened to
 // cover the credential/config dirs + files that live under a broad `/root`
 // read-root — a compromised journal session must never be able to fetch e.g.
 // /root/.codex/auth.json or /root/.config/**.
@@ -108,10 +108,10 @@ export function isSensitivePath(filePath) {
 
 // The service user's home directory is where dotfiles and dot-directories keep
 // credentials the name patterns cannot enumerate (~/.acme.sh/account.conf,
-// ~/.anton/approval_grant_secret, ~/.bashrc exports, tool caches). When a
+// ~/.agent/approval_grant_secret, ~/.bashrc exports, tool caches). When a
 // read-root is $HOME or an ancestor of it, every top-level dot entry under
 // $HOME is denied — unless a configured root itself lives inside that dot
-// entry (an operator who roots ~/.openclaw/workspace explicitly opted in to
+// entry (an operator who roots ~/.devtool/workspace explicitly opted in to
 // that subtree, and only that subtree).
 function isHomeDotPath(realPath, homeDir, pinnedRoots) {
   if (!homeDir || !contains(homeDir, realPath) || realPath === homeDir) return false;
@@ -174,7 +174,7 @@ export class FileLinkDenied extends Error {
 // is ENAMETOOLONG at mkdir/open time — which, on a recursive mkdir, can happen
 // AFTER earlier components were already created. Rejecting it up front keeps
 // dry-run and live in agreement and keeps a client-controlled path from
-// leaving half a directory tree behind (Codex R3-F2).
+// leaving half a directory tree behind.
 export const MAX_NAME_BYTES = 255;
 
 // The wire body for a denial. Every reason answers `denied` — except the one
@@ -203,7 +203,7 @@ export function denialToStatus(reason) {
   // choosing differently (pick another name, pass overwrite/confirm, empty the
   // directory, retry a changed source) — a 409, never the 502 fallback, which
   // would read as "the server is broken" for an ordinary user-resolvable
-  // conflict (plan T-2.0 / Claude B3 / Codex F6).
+  // conflict.
   if (reason === 'dest-exists'
       || reason === 'dir-not-empty'
       || reason === 'overwrite-conflict'
@@ -381,7 +381,7 @@ function assertNotProtected(canonicalTarget, protectedPaths) {
 // workdir form. An unresolved root-string array is rejected outright. An empty
 // bare `[]` stays legacy (no-roots -> workdir fallback) for the ported bridge
 // tests; the FILE API never reaches here with an empty pinned object (server
-// treats no/empty roots as "disabled", F1/F4), and the guards below fail CLOSED
+// treats no/empty roots as "disabled"), and the guards below fail CLOSED
 // on a zero-root pinned object as defense-in-depth.
 function pinnedRootsOf(allowedRoots) {
   const isPinnedApi = allowedRoots?.[PINNED_ROOTS] === true;
@@ -622,7 +622,7 @@ function writeAllSync(fd, bytes) {
 // rename/link that made the change visible). The change has already happened,
 // so a failure here cannot be "returned as an error" without lying: the caller
 // would retry an operation that already succeeded and get a 404 on a source
-// that is legitimately gone (Codex F4). Report success, and make the lost
+// that is legitimately gone. Report success, and make the lost
 // durability loud in the server log instead.
 function postCommitFsync(fd, what) {
   try {
@@ -653,7 +653,7 @@ function fixedBytes(value) {
 }
 
 // `overwrite` defaults to FALSE: replacing an existing file is a destructive
-// act, so the caller has to say so explicitly (plan T-2.4's server-enforced
+// act, so the caller has to say so explicitly (a server-enforced
 // confirm). When it is allowed, the previous content is copied into the
 // write-root's .matron-trash/ and fsynced BEFORE the replacement lands, so an
 // overwrite is always recoverable.
@@ -709,7 +709,7 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     );
     // open(2)'s mode is masked by the process umask — the service runs with
     // UMask=0077, so a 0644 file replaced through here would come back 0600 and
-    // silently cut off every other reader. fchmod is not masked (Codex R4).
+    // silently cut off every other reader. fchmod is not masked.
     fs.fchmodSync(tmpFd, intendedMode);
     if (prepared.targetStat) {
       // A REPLACEMENT inherits the process identity unless it is told
@@ -767,7 +767,7 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
       // linkNoReplace succeeded, so the caller's file EXISTS and this write is
       // committed. Removing the temp name is housekeeping: failing the request
       // on it would report a 500 for a file that is there, and the retry would
-      // then hit overwrite-conflict (Codex R3-F3).
+      // then hit overwrite-conflict.
       try {
         fs.unlinkSync(tmpPath);
       } catch (err) {
@@ -810,7 +810,7 @@ export async function mkdirGuarded(targetPath, { writeRoots, dryRun = false } = 
     // mkdir -p, one component at a time, fsyncing each parent after its child
     // lands. A single fsync of the deepest PRE-EXISTING ancestor would leave
     // the intermediate entries undurable, so a crash could lose part of a tree
-    // the API (and the audit log) already called created (Codex R4).
+    // the API (and the audit log) already called created.
     const opened = [];
     try {
       let parentFd = prepared.parentFd;
@@ -962,7 +962,7 @@ function copyRegularFileForMove(
       writeAllSync(tmpFd, buffer.subarray(0, read));
       position += read;
     }
-    // F3: the copy loop read exactly the byte count fstat reported when the
+    // The copy loop read exactly the byte count fstat reported when the
     // source was opened. A writer that appended (or rewrote) the file while we
     // were copying would have those bytes silently dropped by the unlink that
     // follows, so re-read the identity through the SAME fd and refuse rather
@@ -973,7 +973,7 @@ function copyRegularFileForMove(
         || afterCopyStat.ctimeMs !== sourceStat.ctimeMs) {
       throw new FileLinkDenied('source-changed');
     }
-    // F2: a move must not quietly rewrite the file's metadata. The same-device
+    // A move must not quietly rewrite the file's metadata. The same-device
     // path preserves everything because it keeps the inode; the cross-device
     // copy has to restore it by hand. Ownership needs privilege we may not
     // have (and is already correct whenever the copy runs as the owner), so it
@@ -1219,7 +1219,7 @@ function trashName(sourcePath) {
 // Preserves the file about to be replaced by linking its INODE into the trash.
 // Not a byte copy: a copy is a photograph taken at one instant, and a writer
 // touching the file between the snapshot and the replacement would have those
-// bytes destroyed with only the stale copy left behind (Codex R3-F6). A link
+// bytes destroyed with only the stale copy left behind. A link
 // has no such window — the backup IS the file.
 //
 // When the link cannot be made (a write root spanning a bind mount -> EXDEV, a
@@ -1261,7 +1261,7 @@ function preserveFileForOverwrite(prepared) {
     // The link exists the moment linkNoReplace returns. If anything after it
     // fails, the overwrite does NOT happen — so the trash must not keep a
     // "previous version" of a replacement that never occurred, and retries must
-    // not pile up links (Codex R4).
+    // not pile up links.
     if (!linked && backupPath && installedStat) {
       try {
         const current = lstatIfPresent(backupPath);
@@ -1429,7 +1429,7 @@ export async function validateAndOpen(filePath, { workdir, allowedRoots, maxByte
     if (!path.isAbsolute(String(filePath))) throw new FileLinkDenied('relative-path');
     const { pinnedRoots, isPinnedApi } = pinnedRootsOf(allowedRoots);
     // File API with zero roots -> fail CLOSED, never fall through to the
-    // no-containment path (review F4).
+    // no-containment path.
     if (isPinnedApi && pinnedRoots.length === 0) throw new FileLinkDenied('outside-scope');
     try {
       fd = await fsp.open(
@@ -1486,7 +1486,7 @@ export async function validateAndOpen(filePath, { workdir, allowedRoots, maxByte
   }
 }
 
-// Streaming serve-time boundary for CONTENT (review F3). Runs the SAME
+// Streaming serve-time boundary for CONTENT. Runs the SAME
 // TOCTOU-safe validation as validateAndOpen (fd-pin via O_NOFOLLOW,
 // /proc/self/fd realpath re-check, root-identity + containment + sensitivity),
 // but reads NO bytes and returns the OPEN FileHandle so the caller can stream

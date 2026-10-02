@@ -29,7 +29,7 @@ const SENSITIVE = [
   '/w/secret/note.txt', '/w/credentials/token.dat',
   '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
   '/w/app.key/nested/file.txt',
-  // review F2 — credential/config material reachable under a broad /root root
+  // credential/config material reachable under a broad /root root
   '/root/.codex/auth.json', '/root/.codex', '/root/auth.json',
   '/root/.config/gh/hosts.yml', '/root/.config', '/root/.claude/settings.json',
   '/root/.claude', '/root/.claude.json', '/root/.git-credentials', '/root/.pgpass',
@@ -312,7 +312,7 @@ test('MAX_VIEW_BYTES is the 5MB default cap', () => {
   assert.equal(MAX_VIEW_BYTES, 5 * 1024 * 1024)
 })
 
-// --- openGuarded (streaming validate, review F3) -----------------------------
+// --- openGuarded (streaming validate) -----------------------------
 test('openGuarded returns an OPEN fd + size + realPath without reading bytes', async () => {
   const roots = await pinAllowedRoots([dir])
   const { fd, size, realPath } = await openGuarded(path.join(dir, 'ok.txt'), { allowedRoots: roots })
@@ -344,7 +344,7 @@ test('openGuarded denials mirror validateAndOpen and never leak an fd', async ()
   assert.equal(await openDenied('relative.txt'), 'relative-path')
 })
 
-// --- empty pinned root set must FAIL CLOSED (review F4) ----------------------
+// --- empty pinned root set must FAIL CLOSED ----------------------
 test('a zero-root pinned set is refused (outside-scope) by every file-API guard', async () => {
   const empty = pinAllowedRootsSync([])
   const guardDenied = async (fn) => {
@@ -970,7 +970,7 @@ test('moveGuarded cross-device file fallback succeeds and rolls back the destina
   }
 })
 
-// F4: the post-unlink fsync is a durability barrier AFTER the move committed.
+// The post-unlink fsync is a durability barrier AFTER the move committed.
 // It used to reject, which left the caller with an error describing a move
 // that had in fact happened — and a retry would 404 on the vanished source.
 // The contract now: report success, keep the destination, log the lost
@@ -1218,7 +1218,7 @@ test('an interleaved same-basename delete survives and delete-missing is idempot
   }
 })
 
-// --- Carried Codex findings F2/F3/F4 ----------------------------------------
+// --- Carried hardening findings ------------------------------------------------
 // The same-device path is an inode-preserving link()+unlink(), so metadata,
 // concurrent appends, and post-commit durability are only at risk on the
 // cross-device (EXDEV) copy fallback and the crash-window fsyncs around a
@@ -1238,7 +1238,7 @@ const forceExdev = (t, predicate) => {
   })
 }
 
-test('F2: the cross-device move fallback preserves mode and mtime', async (t) => {
+test('the cross-device move fallback preserves mode and mtime', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'payload.bin')
@@ -1265,7 +1265,7 @@ test('F2: the cross-device move fallback preserves mode and mtime', async (t) =>
   }
 })
 
-test('F3: a concurrent append during the cross-device copy aborts instead of losing bytes', async (t) => {
+test('a concurrent append during the cross-device copy aborts instead of losing bytes', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'growing.log')
@@ -1297,7 +1297,7 @@ test('F3: a concurrent append during the cross-device copy aborts instead of los
   }
 })
 
-test('F4: a post-commit fsync failure reports success rather than a lying error', async (t) => {
+test('a post-commit fsync failure reports success rather than a lying error', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'committed.txt')
@@ -1327,7 +1327,7 @@ test('F4: a post-commit fsync failure reports success rather than a lying error'
   }
 })
 
-test('F4: a post-commit fsync failure does not un-commit a trashed file', async (t) => {
+test('a post-commit fsync failure does not un-commit a trashed file', async (t) => {
   const f = makeWriteFixture()
   try {
     const doomed = path.join(f.root, 'doomed.txt')
@@ -1354,7 +1354,7 @@ test('F4: a post-commit fsync failure does not un-commit a trashed file', async 
   }
 })
 
-test('F4: a post-commit fsync failure does not un-commit an atomic write', async (t) => {
+test('a post-commit fsync failure does not un-commit an atomic write', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'note.txt')
@@ -1439,9 +1439,9 @@ test('writeFileAtomic rejects a create-only write whose target appears mid-strea
   }
 })
 
-// --- Codex round-1 findings F2/F4/F5 ----------------------------------------
+// --- Hardening findings ------------------------------------------------------
 
-test('F2: server-owned state inside a write-root is refused by every write primitive', async () => {
+test('server-owned state inside a write-root is refused by every write primitive', async () => {
   const f = makeWriteFixture()
   try {
     const dbPath = path.join(f.root, 'matron.db')
@@ -1483,7 +1483,7 @@ test('F2: server-owned state inside a write-root is refused by every write primi
   }
 })
 
-test('F4: a create-only write installs no-replace and never clobbers a race winner', async (t) => {
+test('a create-only write installs no-replace and never clobbers a race winner', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'raced.txt')
@@ -1512,7 +1512,7 @@ test('F4: a create-only write installs no-replace and never clobbers a race winn
   }
 })
 
-test('F5: an overwrite backup preserves the original inode rather than a copy of it', async () => {
+test('an overwrite backup preserves the original inode rather than a copy of it', async () => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'doc.txt')
@@ -1533,7 +1533,7 @@ test('F5: an overwrite backup preserves the original inode rather than a copy of
   }
 })
 
-test('F5/R3-F6: an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
+test('an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'doc.txt')
@@ -1562,7 +1562,7 @@ test('F5/R3-F6: an overwrite whose backup cannot preserve the inode is refused, 
   }
 })
 
-test('F5: a cross-device move re-checks the source immediately before destroying it', async (t) => {
+test('a cross-device move re-checks the source immediately before destroying it', async (t) => {
   const f = makeWriteFixture()
   try {
     const source = path.join(f.root, 'payload.txt')
@@ -1604,7 +1604,7 @@ test('F5: a cross-device move re-checks the source immediately before destroying
   }
 })
 
-test('R4: modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
+test('modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
   const previousUmask = process.umask(0o077)   // the deployed service's UMask
   const f = makeWriteFixture()
   try {
@@ -1631,7 +1631,7 @@ test('R4: modes survive an overwrite and a cross-device move under a restrictive
   }
 })
 
-test('R4: a failed overwrite leaves no orphan backup link in the trash', async (t) => {
+test('a failed overwrite leaves no orphan backup link in the trash', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'doc.txt')
@@ -1662,7 +1662,7 @@ test('R4: a failed overwrite leaves no orphan backup link in the trash', async (
   }
 })
 
-test('R4: a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
+test('a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
   const f = makeWriteFixture()
   try {
     const realFsync = fs.fsyncSync
@@ -1691,7 +1691,7 @@ test('R4: a recursive mkdir fsyncs every directory it creates, not just the firs
   }
 })
 
-test('R5: an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
+test('an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'foreign.txt')

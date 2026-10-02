@@ -135,8 +135,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
     audit: makeFileAudit(fileAuditDir),
     // Durable, not a Map: a reservation has to outlive the process that made
-    // it, or a retry crossing a restart re-executes its move/delete/upload
-    // (loop #644). Built here for the same reason the audit is — at the
+    // it, or a retry crossing a restart re-executes its move/delete/upload.
+    // Built here for the same reason the audit is — at the
     // trusted boundary, once, bound to the server's own database.
     idem: makeDurableIdemStore({ db }),
   }
@@ -329,7 +329,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // Opt-in: the routes exist only when read-roots were configured at boot
       // (fileReadRoots is a non-empty pinned set); otherwise `/files/*` falls
       // through to the final 404, so an un-configured/disabled deploy serves
-      // everything else normally (review F1). Client devices only (operator
+      // everything else normally. Client devices only (operator
       // devices browse; agents do not). Every path is parsed/validated at the
       // boundary and jailed server-side to the pinned read-roots + always-on
       // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
@@ -402,7 +402,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           }
           return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
         })
-        // Breadcrumb jail (frontend F4): expose the containing read-root so the
+        // Breadcrumb jail: expose the containing read-root so the
         // client builds breadcrumbs from `root` down, and clamp `parent` so it
         // NEVER points above the jail. `path ∈ root` was already enforced by
         // the guard, so dirname(path) stays within/at `root`; when `path` IS a
@@ -470,7 +470,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // filled once the handle is validated; `streaming` gates whether an
         // abort should close the fd directly (pre-stream) or tear the stream
         // down and let its 'close' close the fd (mid-stream — closing the fd
-        // under an active read would error it) (review round-2 F1).
+        // under an active read would error it).
         let fd = null
         let fdClosed = false
         let streaming = false
@@ -483,7 +483,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           try {
             // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
             // sensitivity checks as the buffering path but returns the OPEN fd
-            // WITHOUT reading — we STREAM it with backpressure (P21), never
+            // WITHOUT reading — we STREAM it with backpressure, never
             // buffering the whole file. Never readBody (JSON/1MB).
             opened = await openGuarded(p, { allowedRoots: fileReadRoots })
           } catch (e) {

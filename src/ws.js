@@ -31,10 +31,10 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
-// peer_message is DELIBERATELY NOT here (T-2.2/T-2.3): its attribution is
+// peer_message is DELIBERATELY NOT here: its attribution is
 // server-authoritative (bridge-stamped from_convo/from_name/from_kind), so it is
-// mintable ONLY via the dedicated agent-gated op:peer_message (T-2.4), never a
-// bare publish. Adding it here would let an agent forge attribution — an R501
+// mintable ONLY via the dedicated agent-gated op:peer_message, never a
+// bare publish. Adding it here would let an agent forge attribution — a
 // non-mintability violation. It IS in journal.js MESSAGE_TYPES (snippet/last_seq
 // only), which is a distinct storage/snippet concern, not a publish gate.
 const AGENT_PUBLISH_TYPES = new Set([
@@ -230,7 +230,7 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
 // cache slot (last writer wins) and clients could not tell them apart. Our
 // deployment is single-VPS / single-bridge per user, so this does not bite.
 // True multi-bridge / multi-VPS per-host telemetry (device-keyed cache +
-// client host-selection UX) is deferred to matron loop #542 (the
+// client host-selection UX) is deferred (the
 // multi-account / multi-VPS dashboard). Do NOT add device-keying here now.
 export function makeVitalsCache(max = VITALS_CACHE_MAX) {
   const map = new Map()
@@ -959,16 +959,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Read-only sub-chat guard (see isReadOnlyChild above).
         if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
         const replyPayload = { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null }
-        // #538: stamp queued_release provenance onto the reply, resolved from
+        // stamp queued_release provenance onto the reply, resolved from
         // the stored target prompt's own kind. A tap on a queued_release card
         // is a control action, not a chat message, so clients suppress its raw
         // "send"/"cancel:N" echo. Clients can only derive that from the card
         // being in their loaded page; when it has paginated out of view the
-        // echo leaks into the thread until the card scrolls back in (#538).
+        // echo leaks into the thread until the card scrolls back in.
         // This makes the marker authoritative and page-independent. Keyed on
         // the target prompt's kind, NEVER the reply's value shape — so a
         // genuine answer that merely reads like a control token is never
-        // suppressed (the #493b regression that value-shape matching caused).
+        // suppressed (a regression that value-shape matching once caused).
         // Scoped to conn.userId: append() stores every convo event under the
         // owner's user_id, so this resolves the same prompt append() will
         // authorize the reply against, and can't read another user's rows.
@@ -1325,7 +1325,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // Sanitised like every other client-bound device name (roster,
             // consent cards) — the recipient here is an agent, not a client, so
             // this is cheap insurance rather than closing a real hole.
-            // Tag the caller's own box so the picker can label it (loop #690).
+            // Tag the caller's own box so the picker can label it.
             // The base name is capped short enough that the suffix keeps the
             // whole string within PEER_NAME_CAP; `self:true` lets a client
             // detect the same-box entry without string-matching the tag.
@@ -1897,7 +1897,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               agent_kind: convo.agent_kind ?? null,
               // summary rides convo_meta so the operator's pinned-summary
               // surface refreshes live instead of only at /snapshot (spec:
-              // pinned-summary surface, loop #554). Read back from the stored
+              // pinned-summary surface). Read back from the stored
               // row like agent_kind, so the event can never disagree with the
               // snapshot — this event also fires for a title-only change, and
               // then it simply restates the summary already stored.
@@ -2019,8 +2019,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        // T-2.3 (round-1 F1 non-mintability): peer_message is server-authoritative
-        // — mintable ONLY via op:peer_message (T-2.4), which stamps from_convo/
+        // Non-mintability: peer_message is server-authoritative
+        // — mintable ONLY via op:peer_message, which stamps from_convo/
         // from_name/from_kind from the trusted bridge. A bare publish would let an
         // agent forge that attribution, so reject it explicitly here (defense in
         // depth: it is also absent from AGENT_PUBLISH_TYPES below).

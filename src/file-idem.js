@@ -1,4 +1,4 @@
-// Durable idempotency for the file WRITE API (loop #644), replacing the
+// Durable idempotency for the file WRITE API, replacing the
 // in-memory Map that files-write-http.js shipped with.
 //
 // WHY THIS EXISTS. The Phase-2 store kept reservations in process memory,

@@ -270,7 +270,7 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
   return { reaped, bytesFreed }
 }
 
-// Orphan-blob reaper (fourth retention pass, loop #780). runReapMedia joins
+// Orphan-blob reaper (fourth retention pass). runReapMedia joins
 // through events, so a blob NOTHING references was never a candidate for any
 // pass and lived forever: an upload whose ws send never happened, an item
 // attachment abandoned mid-compose, the blob half of a crashed offload. Blob

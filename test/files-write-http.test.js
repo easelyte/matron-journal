@@ -1,7 +1,7 @@
-// Real-server harness for the File Explorer WRITE API (plan Phase 2,
-// T-2.0..T-2.6). Same shape as files-http.test.js: startTestServer + a real
-// fixture tree, asserted end-to-end over HTTP. The sweep at the bottom is
-// T-2.6 — the cross-endpoint invariants no single endpoint owns.
+// Real-server harness for the File Explorer WRITE API (Phase 2).
+// Same shape as files-http.test.js: startTestServer + a real
+// fixture tree, asserted end-to-end over HTTP. The sweep at the bottom covers
+// the cross-endpoint invariants no single endpoint owns.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -96,9 +96,9 @@ const WRITE_ROUTES = (writeRoot) => [
   ['DELETE', `/files?path=${encodeURIComponent(path.join(writeRoot, 'existing.txt'))}&confirm=1`, undefined, undefined],
 ]
 
-// --- T-2.0: the shared wiring ----------------------------------------------
+// --- the shared wiring ----------------------------------------------
 
-test('T-2.0: every write route is 404 while the kill switch is off', async (t) => {
+test('every write route is 404 while the kill switch is off', async (t) => {
   const f = makeFixture()
   const s = await startTestServer({ fileReadRoots: [f.root], fileWriteRoots: [f.writeRoot], fileAuditDir: f.auditDir })
   t.after(() => s.close())
@@ -116,7 +116,7 @@ test('T-2.0: every write route is 404 while the kill switch is off', async (t) =
   assert.equal(list.writable, false)
 })
 
-test('T-2.0: writes stay disabled when there is nowhere to keep the audit log', async (t) => {
+test('writes stay disabled when there is nowhere to keep the audit log', async (t) => {
   const f = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   // dbPath ':memory:' has no data directory, and an unaudited write is not a
@@ -132,7 +132,7 @@ test('T-2.0: writes stay disabled when there is nowhere to keep the audit log', 
   assert.equal(fs.existsSync(path.join(f.writeRoot, 'nope')), false)
 })
 
-test('T-2.0: an agent device is forbidden from every write route', async (t) => {
+test('an agent device is forbidden from every write route', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -148,7 +148,7 @@ test('T-2.0: an agent device is forbidden from every write route', async (t) => 
   assert.deepEqual(auditLines(f), [])
 })
 
-test('T-2.0: dry-run validates and audits the intent, changes nothing, and answers dry_run', async (t) => {
+test('dry-run validates and audits the intent, changes nothing, and answers dry_run', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f, { fileWritesDryRun: true })
   t.after(() => s.close())
@@ -170,7 +170,7 @@ test('T-2.0: dry-run validates and audits the intent, changes nothing, and answe
   assert.equal(list.writable, false)
 })
 
-test('T-2.0: a dry-run upload drains its body, so the keep-alive socket survives', async (t) => {
+test('a dry-run upload drains its body, so the keep-alive socket survives', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f, { fileWritesDryRun: true })
   t.after(() => s.close())
@@ -209,7 +209,7 @@ test('T-2.0: a dry-run upload drains its body, so the keep-alive socket survives
   assert.equal(fs.existsSync(path.join(f.writeRoot, 'streamed.bin')), false)
 })
 
-test('T-2.0: an audit append failure refuses with 507 and zero filesystem change', async (t) => {
+test('an audit append failure refuses with 507 and zero filesystem change', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -229,7 +229,7 @@ test('T-2.0: an audit append failure refuses with 507 and zero filesystem change
   assert.ok(error.mock.calls.length > 0, 'the refusal is loud server-side')
 })
 
-test('T-2.0: two concurrent retries of one Idempotency-Key perform one mutation', async (t) => {
+test('two concurrent retries of one Idempotency-Key perform one mutation', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -255,7 +255,7 @@ test('T-2.0: two concurrent retries of one Idempotency-Key perform one mutation'
   assert.deepEqual(trashEntries(f.writeRoot), [])
 })
 
-test('T-2.0: an Idempotency-Key reused for a DIFFERENT request is rejected, not replayed', async (t) => {
+test('an Idempotency-Key reused for a DIFFERENT request is rejected, not replayed', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -280,9 +280,9 @@ test('T-2.0: an Idempotency-Key reused for a DIFFERENT request is rejected, not 
   assert.equal(fs.existsSync(path.join(f.writeRoot, 'c.txt')), false)
 })
 
-// --- T-2.1: upload ---------------------------------------------------------
+// --- upload ---------------------------------------------------------
 
-test('T-2.1: a denied upload target lands zero bytes on disk', async (t) => {
+test('a denied upload target lands zero bytes on disk', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -304,7 +304,7 @@ test('T-2.1: a denied upload target lands zero bytes on disk', async (t) => {
   assert.equal(auditLines(f).filter((r) => r.result === 'denied').length, cases.length)
 })
 
-test('T-2.1: streams a binary body into the write-root and sanitizes the basename', async (t) => {
+test('streams a binary body into the write-root and sanitizes the basename', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -328,7 +328,7 @@ test('T-2.1: streams a binary body into the write-root and sanitizes the basenam
   assert.equal(sanitizeBasename('/a/b/keeps spaces-and.dots'), 'keeps spaces-and.dots')
 })
 
-test('T-2.1: an over-cap upload is 413 and leaves nothing behind', async (t) => {
+test('an over-cap upload is 413 and leaves nothing behind', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f, { fileWriteMaxBytes: 1024 })
   t.after(() => s.close())
@@ -347,7 +347,7 @@ test('T-2.1: an over-cap upload is 413 and leaves nothing behind', async (t) => 
   assert.equal(fs.statSync(target).size, 512)
 })
 
-test('T-2.4: an oversized JSON write body is 413, not a 500', async (t) => {
+test('an oversized JSON write body is 413, not a 500', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -359,7 +359,7 @@ test('T-2.4: an oversized JSON write body is 413, not a 500', async (t) => {
   assert.equal(fs.existsSync(target), false)
 })
 
-test('T-2.1: uploading over an existing file needs an explicit overwrite', async (t) => {
+test('uploading over an existing file needs an explicit overwrite', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -379,9 +379,9 @@ test('T-2.1: uploading over an existing file needs an explicit overwrite', async
   assert.equal(fs.readFileSync(path.join(f.writeRoot, TRASH, trashed[0]), 'utf8'), 'original\n')
 })
 
-// --- T-2.2: mkdir ----------------------------------------------------------
+// --- mkdir ----------------------------------------------------------
 
-test('T-2.2: mkdir creates nested directories, is idempotent, and refuses outside the write-root', async (t) => {
+test('mkdir creates nested directories, is idempotent, and refuses outside the write-root', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -411,9 +411,9 @@ test('T-2.2: mkdir creates nested directories, is idempotent, and refuses outsid
   assert.ok(auditLines(f).some((a) => a.op === 'mkdir' && a.result === 'ok' && a.path === target))
 })
 
-// --- T-2.3: move -----------------------------------------------------------
+// --- move -----------------------------------------------------------
 
-test('T-2.3: move renames inside the write-root and refuses to clobber or escape', async (t) => {
+test('move renames inside the write-root and refuses to clobber or escape', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -447,9 +447,9 @@ test('T-2.3: move renames inside the write-root and refuses to clobber or escape
   assert.equal(fs.readFileSync(to, 'utf8'), 'original\n')
 })
 
-// --- T-2.4: write ----------------------------------------------------------
+// --- write ----------------------------------------------------------
 
-test('T-2.4: write creates, refuses a bare overwrite, and keeps the prior version recoverable', async (t) => {
+test('write creates, refuses a bare overwrite, and keeps the prior version recoverable', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -472,7 +472,7 @@ test('T-2.4: write creates, refuses a bare overwrite, and keeps the prior versio
   assert.equal(trashed.length, 1)
   assert.equal(fs.readFileSync(path.join(f.writeRoot, TRASH, trashed[0]), 'utf8'), '# notes\n')
 
-  // R500: the log records the byte COUNT, never the bytes.
+  // The log records the byte COUNT, never the bytes.
   const raw = fs.readFileSync(path.join(f.auditDir, FILE_AUDIT_BASENAME), 'utf8')
   assert.ok(!raw.includes('# notes'))
   assert.ok(!raw.includes('replaced'))
@@ -490,9 +490,9 @@ test('T-2.4: write creates, refuses a bare overwrite, and keeps the prior versio
   }
 })
 
-// --- T-2.5: delete ---------------------------------------------------------
+// --- delete ---------------------------------------------------------
 
-test('T-2.5: delete moves into the trash, demands confirm, and guards non-empty directories', async (t) => {
+test('delete moves into the trash, demands confirm, and guards non-empty directories', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -531,7 +531,7 @@ test('T-2.5: delete moves into the trash, demands confirm, and guards non-empty 
   assert.equal(fs.readFileSync(path.join((await recursive.json()).trashed ?? '', 'nested.txt'), 'utf8'), 'nested\n')
 })
 
-test('T-2.5: an Idempotency-Key deduplicates DELETE — replayed body, and every fingerprinted field (path/recursive/confirm) conflicts on reuse', async (t) => {
+test('an Idempotency-Key deduplicates DELETE — replayed body, and every fingerprinted field (path/recursive/confirm) conflicts on reuse', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -614,7 +614,7 @@ test('T-2.5: an Idempotency-Key deduplicates DELETE — replayed body, and every
   assert.ok(fs.existsSync(survivor), 'a rejected header performs no mutation')
 })
 
-test('T-2.5: the trash itself is not deletable, and it stays out of ordinary listings', async (t) => {
+test('the trash itself is not deletable, and it stays out of ordinary listings', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -640,9 +640,9 @@ test('T-2.5: the trash itself is not deletable, and it stays out of ordinary lis
   assert.ok(!listed.entries.some((e) => e.name === TRASH))
 })
 
-// --- T-2.6: the cross-endpoint sweep ---------------------------------------
+// --- the cross-endpoint sweep ---------------------------------------
 
-test('T-2.6: `writable` is true only inside a write-root, and never in the trash', async (t) => {
+test('`writable` is true only inside a write-root, and never in the trash', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -659,7 +659,7 @@ test('T-2.6: `writable` is true only inside a write-root, and never in the trash
   assert.equal(await writableOf(path.join(f.writeRoot, TRASH)), false)
 })
 
-test('T-2.6: no write route answers 502 — every denial comes from denialToStatus', async (t) => {
+test('no write route answers 502 — every denial comes from denialToStatus', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -682,7 +682,7 @@ test('T-2.6: no write route answers 502 — every denial comes from denialToStat
   }
 })
 
-test('T-2.6: every attempt is audited, and no destructive 2xx exists without one', async (t) => {
+test('every attempt is audited, and no destructive 2xx exists without one', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -707,9 +707,9 @@ test('T-2.6: every attempt is audited, and no destructive 2xx exists without one
   assert.ok(deleteIntent >= 0 && deleteIntent < deleteOutcome)
 })
 
-// --- Codex round-1 findings F2/F3/F6 ---------------------------------------
+// --- Hardening findings -----------------------------------------------------
 
-test('F2: a write-root that overlaps server-owned state is refused at boot', async () => {
+test('a write-root that overlaps server-owned state is refused at boot', async () => {
   const f = makeFixture()
   const dataDir = fs.realpathSync(makeTmpDir('matron-w-data-'))
   const dbPath = path.join(dataDir, 'matron.db')
@@ -739,7 +739,7 @@ test('F2: a write-root that overlaps server-owned state is refused at boot', asy
   )
 })
 
-test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not replayed', async (t) => {
+test('an idempotent upload replay carrying DIFFERENT bytes is rejected, not replayed', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
   t.after(() => s.close())
@@ -768,9 +768,9 @@ test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not 
   assert.equal(auditLines(f).filter((a) => a.op === 'upload' && a.result === 'attempt').length, 1)
 })
 
-// --- Codex round-2 findings ------------------------------------------------
+// --- Hardening findings, second pass ------------------------------------------------
 
-test('R2-F1: a state path reached through a symlinked ancestor is still protected', async () => {
+test('a state path reached through a symlinked ancestor is still protected', async () => {
   const f = makeFixture()
   const elsewhere = fs.realpathSync(makeTmpDir('matron-w-link-'))
   // `link` points INTO the write root, and the final component does not exist
@@ -790,7 +790,7 @@ test('R2-F1: a state path reached through a symlinked ancestor is still protecte
   )
 })
 
-test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) => {
+test('dry-run rejects exactly what the live request rejects', async (t) => {
   const f = makeFixture()
   const dry = await startWrites(f, { fileWritesDryRun: true, fileWriteMaxBytes: 1024 })
   const live = await startWrites(f, { fileWriteMaxBytes: 1024 })
@@ -822,9 +822,9 @@ test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) =
   assert.deepEqual(treeOf(f.root), before, 'neither server mutated anything')
 })
 
-// --- Codex round-3 findings ------------------------------------------------
+// --- Hardening findings, third pass -------------------------------------------------
 
-test('R3-F1: enabling writes on a multi-user journal warns that the roots are global', async (t) => {
+test('enabling writes on a multi-user journal warns that the roots are global', async (t) => {
   const f = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   const dbPath = path.join(makeTmpDir('matron-w-db-'), 'matron.db')
@@ -849,7 +849,7 @@ test('R3-F1: enabling writes on a multi-user journal warns that the roots are gl
   assert.ok(warn.mock.calls.some((c) => /file writes are enabled on a journal with 2 users/.test(c.arguments[0])))
 })
 
-test('R3-F2: an over-long path component is rejected before any directory is created', async (t) => {
+test('an over-long path component is rejected before any directory is created', async (t) => {
   const f = makeFixture()
   const dry = await startWrites(f, { fileWritesDryRun: true })
   const live = await startWrites(f)

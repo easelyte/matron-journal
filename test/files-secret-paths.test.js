@@ -20,17 +20,17 @@ import { makeTmpDir } from './tmp-dir.js'
 
 const SECRET_PATHS = [
   '/root/.secrets', '/root/.secrets/req-abc.txt', '/home/u/.secret',
-  '/root/.anton/approval_grant_secret', '/w/client.secret',
-  '/root/.supabase/access-token', '/etc/matron/agent-token', '/w/agent_token.json',
-  '/opt/matron/journal/data/bridge-agent-token.txt', '/opt/matron/journal/data/bridge-agent-creds.txt',
+  '/root/.agent/approval_grant_secret', '/w/client.secret',
+  '/root/.vendor-cli/access-token', '/etc/matron/agent-token', '/w/agent_token.json',
+  '/srv/journal/data/bridge-agent-token.txt', '/srv/journal/data/bridge-agent-creds.txt',
   '/w/creds', '/w/deploy.creds.json',
   '/root/.claude-matrix-sessions.json', '/root/.claude-matrix-announced.json', '/root/.claude-matrix-bridge/x',
   '/root/.matron-bridge-secrets.json', '/root/.matron-bridge-timers.json', '/root/.matron-bridge-inflight.json',
   '/root/.claude-queued-release-outbox.json', '/root/.claude-run-state-outbox.json',
   '/root/.claude-subagent-running.json',
-  '/opt/matron/bridge-journal/run-state-outbox.json', '/opt/matron/bridge-journal/journal-cursor.json',
+  '/srv/bridge/run-state-outbox.json', '/srv/bridge/journal-cursor.json',
   '/root/.bash_history', '/root/.python_history', '/root/.zsh_history',
-  '/opt/matron/bridge-journal/.env.bak-2026-09-19',
+  '/srv/bridge/.env.bak-2026-01-01',
 ]
 const STILL_ALLOWED = [
   '/w/lib/secret-requests.js', '/w/secretary/notes.txt', '/w/tokenizer.js', '/w/docs/agent-token.md',
@@ -48,10 +48,10 @@ function makeHome() {
   fs.writeFileSync(path.join(home, '.bashrc'), 'export TOKEN=abc\n')
   fs.mkdirSync(path.join(home, '.acme.sh'))
   fs.writeFileSync(path.join(home, '.acme.sh', 'account.conf'), 'CF_Key=abc\n')
-  fs.mkdirSync(path.join(home, '.openclaw', 'workspace', 'src'), { recursive: true })
-  fs.writeFileSync(path.join(home, '.openclaw', 'workspace', 'src', 'a.js'), 'ok\n')
-  fs.mkdirSync(path.join(home, '.openclaw', 'backups'))
-  fs.writeFileSync(path.join(home, '.openclaw', 'backups', 'dump.sql'), 'secret rows\n')
+  fs.mkdirSync(path.join(home, '.devtool', 'workspace', 'src'), { recursive: true })
+  fs.writeFileSync(path.join(home, '.devtool', 'workspace', 'src', 'a.js'), 'ok\n')
+  fs.mkdirSync(path.join(home, '.devtool', 'backups'))
+  fs.writeFileSync(path.join(home, '.devtool', 'backups', 'dump.sql'), 'secret rows\n')
   fs.mkdirSync(path.join(home, 'proj'))
   fs.writeFileSync(path.join(home, 'proj', '.eslintrc'), '{}\n') // a dotfile NOT at the top of $HOME
   return home
@@ -63,7 +63,7 @@ test('withReadPolicy refuses a read-root of /', () => {
 
 test('home dot-entry rule: $HOME root denies top-level dot entries unless a root lives inside one', async () => {
   const home = makeHome()
-  const ws = path.join(home, '.openclaw', 'workspace')
+  const ws = path.join(home, '.devtool', 'workspace')
   const homeOnly = withReadPolicy(pinAllowedRootsSync([home]), { homeDir: home })
   assert.equal(isDeniedPath(path.join(home, '.bashrc'), homeOnly), true)
   assert.equal(isDeniedPath(path.join(home, '.acme.sh', 'account.conf'), homeOnly), true)
@@ -74,8 +74,8 @@ test('home dot-entry rule: $HOME root denies top-level dot entries unless a root
 
   const withWs = withReadPolicy(pinAllowedRootsSync([home, ws]), { homeDir: home })
   assert.equal(isDeniedPath(path.join(ws, 'src', 'a.js'), withWs), false)
-  assert.equal(isDeniedPath(path.join(home, '.openclaw', 'backups', 'dump.sql'), withWs), true)
-  assert.equal(isDeniedPath(path.join(home, '.openclaw'), withWs), true)
+  assert.equal(isDeniedPath(path.join(home, '.devtool', 'backups', 'dump.sql'), withWs), true)
+  assert.equal(isDeniedPath(path.join(home, '.devtool'), withWs), true)
   assert.equal(isDeniedPath(path.join(home, '.bashrc'), withWs), true)
 
   await assert.rejects(validateAndOpen(path.join(home, '.bashrc'), { allowedRoots: withWs }),
@@ -130,7 +130,7 @@ test('server: $HOME root hides ~/.secrets and dotfiles; an explicit workspace ro
   const home = makeHome()
   fs.mkdirSync(path.join(home, '.secrets'))
   fs.writeFileSync(path.join(home, '.secrets', 'req-1.txt'), 'hunter2\n')
-  const ws = path.join(home, '.openclaw', 'workspace')
+  const ws = path.join(home, '.devtool', 'workspace')
   const s = await startTestServer({ fileReadRoots: [home, ws], fileHomeDir: home })
   t.after(() => s.close())
   const token = await clientToken(s)
@@ -149,10 +149,10 @@ test('server: $HOME root hides ~/.secrets and dotfiles; an explicit workspace ro
 // The production shape: $HOME and a workspace inside one of its (denied) dot entries are both read
 // roots, and the workspace is the write root. The path-less default opens the workspace, and its
 // breadcrumb root is the workspace itself (the DEEPEST containing root), so no crumb or parent
-// points into the denied ~/.openclaw.
+// points into the denied ~/.devtool.
 test('server: path-less list opens the workspace write root with a navigable breadcrumb', async (t) => {
   const home = makeHome()
-  const ws = path.join(home, '.openclaw', 'workspace')
+  const ws = path.join(home, '.devtool', 'workspace')
   const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
   const s = await startTestServer({
     fileReadRoots: [home, ws], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,
@@ -175,7 +175,7 @@ test('server: path-less list opens the workspace write root with a navigable bre
 // is skipped: the default falls through to the first read root instead of answering 403.
 test('server: path-less list skips a write root the read policy denies', async (t) => {
   const home = makeHome()
-  const ws = path.join(home, '.openclaw', 'workspace')
+  const ws = path.join(home, '.devtool', 'workspace')
   const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
   const s = await startTestServer({
     fileReadRoots: [home], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,

@@ -48,7 +48,7 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
 // File Explorer read API (spec: matron-file-explorer §5.4). OPT-IN: there is
-// no host-specific default read-root (review F1) — the feature is OFF unless
+// no host-specific default read-root — the feature is OFF unless
 // MATRON_FILE_READ_ROOTS is set at deploy (or fileReadRoots is passed). When
 // enabled, reads are broad by operator preference; the always-on secret
 // denylist (isDeniedPath: name patterns, the server's own state, and every
@@ -220,7 +220,7 @@ function resolveToolLogTtlHours(override) {
 
 export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 168
 
-// Grace window for the orphan-blob reaper (runReapOrphanBlobs, loop #780):
+// Grace window for the orphan-blob reaper (runReapOrphanBlobs):
 // how old an unreferenced blob must be before it is deleted. `override` is
 // startServer's `orphanBlobGraceHours` opt and beats MATRON_ORPHAN_BLOB_GRACE_HOURS,
 // mirroring the other retention resolvers: unset means ENABLED at 7 days
@@ -508,16 +508,16 @@ export function startServer({
   // File Explorer read API config (spec §5.4). OPT-IN + fail-safe by design:
   //  - No roots configured (fileReadRoots opt absent AND MATRON_FILE_READ_ROOTS
   //    unset) -> feature DISABLED; handler gets null; /files/* -> 404; the rest
-  //    of the server starts normally (review F1). A deploy enables it via env.
+  //    of the server starts normally. A deploy enables it via env.
   //  - Configured but EMPTY (opt [] or MATRON_FILE_READ_ROOTS="") -> DISABLED
-  //    too (an empty root set must never fail open — review F4).
+  //    too (an empty root set must never fail open).
   //  - Configured & non-empty but /proc/self/fd unavailable (non-Linux) ->
   //    DISABLED: the fd-identity re-check needs procfs; refuse the racy
-  //    realpath fallback rather than serve with a TOCTOU hole (review F6).
+  //    realpath fallback rather than serve with a TOCTOU hole.
   //  - Configured & non-empty & procfs OK -> pin the roots ONCE, on the trusted
   //    server side. pinAllowedRootsSync fails VISIBLE (throws, restart-loud) on
   //    an unreadable/missing configured root: that is an explicit operator
-  //    misconfiguration, not a reason to silently disable (review F1).
+  //    misconfiguration, not a reason to silently disable.
   const fileRootsConfigured = fileReadRoots !== undefined
     ? fileReadRoots
     : (process.env.MATRON_FILE_READ_ROOTS !== undefined
@@ -536,7 +536,7 @@ export function startServer({
   } else if (Array.isArray(fileRootsConfigured)) {
     console.warn('file API: disabled — configured read-root list is empty')
   }
-  // File Explorer write config (Phase 2, plan T-1.1). Write roots are a
+  // File Explorer write config (Phase 2). Write roots are a
   // separate, narrower, server-owned pin. They are resolved even while the
   // kill switch is off so a bad deployment fails visibly at boot instead of
   // becoming a latent escape that appears only when the switch is flipped.
@@ -594,7 +594,7 @@ export function startServer({
     // future root-resolution change cannot quietly reopen the hole.
     resolvedFileWriteRoots = withProtectedPaths(withReadPolicy(resolvedFileWriteRoots, readPolicy), serverStatePaths)
   }
-  // The write audit (plan T-1.3) is a PRECONDITION for writes, not a
+  // The write audit is a PRECONDITION for writes, not a
   // decoration: every destructive op writes its intent line before the first
   // irreversible fs call and refuses if that append fails. So a deploy with
   // nowhere to put the log (an in-memory DB has no data directory) must not

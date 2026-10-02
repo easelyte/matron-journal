@@ -9,7 +9,7 @@ import { toEventShape, upsertConversation } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
 
 // Canonical producer-owned contract. Bridge and web vendor this file verbatim;
-// their cross-repo byte-parity gate is intentionally owned by T-6.4.
+// their cross-repo byte-parity gate is intentionally owned elsewhere.
 const fixturePath = fileURLToPath(new URL('./fixtures/peer_message.fixture.json', import.meta.url))
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'))
 
