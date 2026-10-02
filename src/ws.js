@@ -31,9 +31,9 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
-// peer_message is DELIBERATELY NOT here (T-2.2/T-2.3): its attribution is
+// peer_message is DELIBERATELY NOT here: its attribution is
 // server-authoritative (bridge-stamped from_convo/from_name/from_kind), so it is
-// mintable ONLY via the dedicated agent-gated op:peer_message (T-2.4), never a
+// mintable ONLY via the dedicated agent-gated op:peer_message, never a
 // bare publish. Adding it here would let an agent forge attribution — a
 // non-mintability violation. It IS in journal.js MESSAGE_TYPES (snippet/last_seq
 // only), which is a distinct storage/snippet concern, not a publish gate.
@@ -2019,8 +2019,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
       }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        // T-2.3 (non-mintability): peer_message is server-authoritative
-        // — mintable ONLY via op:peer_message (T-2.4), which stamps from_convo/
+        // Non-mintability: peer_message is server-authoritative
+        // — mintable ONLY via op:peer_message, which stamps from_convo/
         // from_name/from_kind from the trusted bridge. A bare publish would let an
         // agent forge that attribution, so reject it explicitly here (defense in
         // depth: it is also absent from AGENT_PUBLISH_TYPES below).

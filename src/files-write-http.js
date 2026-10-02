@@ -266,7 +266,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
   const uploadMax = ctx.fileWriteMaxBytes ?? MAX_UPLOAD_BYTES
   const opts = { bodyBearing: req.method !== 'DELETE' }
 
-  // --- T-2.1: POST /files/upload?path=<abs-target-file> ---------------------
+  // --- POST /files/upload?path=<abs-target-file> ---------------------
   if (is('POST', '/files/upload')) {
     const requested = url.searchParams.get('path')
     if (!absolutePath(requested)) return badRequest(res)
@@ -306,7 +306,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       { op: 'upload', path: target })
   }
 
-  // --- T-2.2: POST /files/mkdir {path} -------------------------------------
+  // --- POST /files/mkdir {path} -------------------------------------
   if (is('POST', '/files/mkdir')) {
     const body = await readBody(req)
     const target = body.path
@@ -324,7 +324,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       { op: 'mkdir', path: target }), opts)
   }
 
-  // --- T-2.3: POST /files/move {from,to} -----------------------------------
+  // --- POST /files/move {from,to} -----------------------------------
   if (is('POST', '/files/move')) {
     const body = await readBody(req)
     const { from, to } = body
@@ -340,7 +340,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       { op: 'move', path: from, to }), opts)
   }
 
-  // --- T-2.4: POST /files/write {path, content, overwrite?} ----------------
+  // --- POST /files/write {path, content, overwrite?} ----------------
   if (is('POST', '/files/write')) {
     const body = await readBody(req)
     const target = body.path
@@ -368,7 +368,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     }, run, { op: 'write', path: target }), opts)
   }
 
-  // --- T-2.5: DELETE /files?path=&recursive=0|1&confirm=1 ------------------
+  // --- DELETE /files?path=&recursive=0|1&confirm=1 ------------------
   const requested = url.searchParams.get('path')
   if (!absolutePath(requested)) return badRequest(res)
   const recursive = url.searchParams.get('recursive') === '1'

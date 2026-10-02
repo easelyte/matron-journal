@@ -165,9 +165,9 @@ test('send type whitelist and ack validation', async (t) => {
   c.close()
 })
 
-// T-2.3 (non-mintability): peer_message is NOT agent-publishable. A
+// Non-mintability: peer_message is NOT agent-publishable. A
 // bare publish carrying forged from_convo/from_name/from_kind must be rejected
-// and never reach storage — attribution is stamped only by op:peer_message (T-2.4).
+// and never reach storage — attribution is stamped only by op:peer_message.
 test('a bare publish of peer_message with forged attribution is rejected, nothing persisted', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
@@ -186,7 +186,7 @@ test('a bare publish of peer_message with forged attribution is rejected, nothin
   agent.close()
 })
 
-// T-2.4: the agent-gated op:peer_message handler — server-authoritative
+// The agent-gated op:peer_message handler — server-authoritative
 // attribution, dual ownership, same/cross-account, fail-loud validation.
 function peerPayload(db, convo = 'target') {
   const row = db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='peer_message' ORDER BY seq DESC LIMIT 1").get(convo)

@@ -483,7 +483,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           try {
             // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
             // sensitivity checks as the buffering path but returns the OPEN fd
-            // WITHOUT reading — we STREAM it with backpressure (P21), never
+            // WITHOUT reading — we STREAM it with backpressure, never
             // buffering the whole file. Never readBody (JSON/1MB).
             opened = await openGuarded(p, { allowedRoots: fileReadRoots })
           } catch (e) {

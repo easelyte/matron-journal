@@ -601,7 +601,7 @@ test('openDb collapses duplicate APNs tokens, keeping the newest device row', ()
 // handed its id straight to the next insert, and a replacement then inherited
 // the revoked device's idempotency namespace (idemKeyOf embeds who.deviceId).
 // AUTOINCREMENT makes the id monotonic and never-reused, closing the hole at
-// the source. This is the A1 scope: the downstream workarounds
+// the source. By design, the downstream workarounds
 // (file_idem trigger/gen/SET NULL, agent_idem incarnation-binding) are LEFT in
 // place as belt-and-braces and removed in a follow-up.
 

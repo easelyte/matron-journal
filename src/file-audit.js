@@ -1,5 +1,5 @@
-// Append-only JSONL audit for the File Explorer write API (spec §5.3, plan
-// T-1.3). Every write ATTEMPT lands here — allowed, denied, or errored — and
+// Append-only JSONL audit for the File Explorer write API.
+// Every write ATTEMPT lands here — allowed, denied, or errored — and
 // for a destructive op the "attempt" line is written (and fsynced) BEFORE the
 // first irreversible filesystem call, so there is no such thing as an
 // unlogged destructive change outside a process crash.

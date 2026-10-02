@@ -738,7 +738,7 @@ export function openDb(path) {
         //      idem_key column (items/missions/milestones/item_comments) sits in
         //      a row that also carries an integer *_device_id, already covered
         //      by (1); a detached file_idem key (device_id NULL) is left to
-        //      file_idem's own colliding-key refusal + 120s TTL (A1-retained).
+        //      file_idem's own colliding-key refusal + 120s TTL (retained).
         // Quote an identifier from the schema by doubling embedded quotes — the
         // names come from sqlite_master/PRAGMA, not user input, but a table or
         // column legally containing a `"` would otherwise generate invalid SQL

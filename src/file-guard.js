@@ -653,7 +653,7 @@ function fixedBytes(value) {
 }
 
 // `overwrite` defaults to FALSE: replacing an existing file is a destructive
-// act, so the caller has to say so explicitly (plan T-2.4's server-enforced
+// act, so the caller has to say so explicitly (a server-enforced
 // confirm). When it is allowed, the previous content is copied into the
 // write-root's .matron-trash/ and fsynced BEFORE the replacement lands, so an
 // overwrite is always recoverable.
@@ -962,7 +962,7 @@ function copyRegularFileForMove(
       writeAllSync(tmpFd, buffer.subarray(0, read));
       position += read;
     }
-    // F3: the copy loop read exactly the byte count fstat reported when the
+    // The copy loop read exactly the byte count fstat reported when the
     // source was opened. A writer that appended (or rewrote) the file while we
     // were copying would have those bytes silently dropped by the unlink that
     // follows, so re-read the identity through the SAME fd and refuse rather
@@ -973,7 +973,7 @@ function copyRegularFileForMove(
         || afterCopyStat.ctimeMs !== sourceStat.ctimeMs) {
       throw new FileLinkDenied('source-changed');
     }
-    // F2: a move must not quietly rewrite the file's metadata. The same-device
+    // A move must not quietly rewrite the file's metadata. The same-device
     // path preserves everything because it keeps the inode; the cross-device
     // copy has to restore it by hand. Ownership needs privilege we may not
     // have (and is already correct whenever the copy runs as the owner), so it

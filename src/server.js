@@ -536,7 +536,7 @@ export function startServer({
   } else if (Array.isArray(fileRootsConfigured)) {
     console.warn('file API: disabled — configured read-root list is empty')
   }
-  // File Explorer write config (Phase 2, plan T-1.1). Write roots are a
+  // File Explorer write config (Phase 2). Write roots are a
   // separate, narrower, server-owned pin. They are resolved even while the
   // kill switch is off so a bad deployment fails visibly at boot instead of
   // becoming a latent escape that appears only when the switch is flipped.
@@ -594,7 +594,7 @@ export function startServer({
     // future root-resolution change cannot quietly reopen the hole.
     resolvedFileWriteRoots = withProtectedPaths(withReadPolicy(resolvedFileWriteRoots, readPolicy), serverStatePaths)
   }
-  // The write audit (plan T-1.3) is a PRECONDITION for writes, not a
+  // The write audit is a PRECONDITION for writes, not a
   // decoration: every destructive op writes its intent line before the first
   // irreversible fs call and refuses if that append fails. So a deploy with
   // nowhere to put the log (an in-memory DB has no data directory) must not

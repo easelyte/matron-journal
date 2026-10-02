@@ -226,7 +226,7 @@ test('snippetOf shows a captioned attachment as what the user said, not [image]'
   assert.equal(snippetOf('image', { caption: 'x'.repeat(200) }).length, 120)
 })
 
-// T-2.2: a peer_message snippet renders the sanitized BODY (💬-prefixed), never
+// A peer_message snippet renders the sanitized BODY (💬-prefixed), never
 // the literal [peer_message] placeholder — the operator sees the coordination
 // line in the convo list.
 test('snippetOf renders a peer_message as its sanitized body, never [peer_message]', () => {

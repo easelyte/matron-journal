@@ -56,7 +56,7 @@ function makeFixture() {
   return { root, outside, binBytes }
 }
 
-// F2 credential entries: (segment-relative path, secret substring that must
+// Credential entries: (segment-relative path, secret substring that must
 // never appear in any response body).
 const F2_SENSITIVE = [
   ['.codex/auth.json', 'sk-x'],
@@ -381,14 +381,14 @@ test('File API is client-only (agent -> 403) and requires auth (-> 401)', async 
   }
 })
 
-// --- F2: credential/config material is never listed or served ---------------
-test('F2: sensitive credential entries are dropped from listings and 403 on meta/content', async (t) => {
+// --- credential/config material is never listed or served ---------------
+test('sensitive credential entries are dropped from listings and 403 on meta/content', async (t) => {
   const { root } = makeFixture()
   const s = await startTestServer({ fileReadRoots: [root] })
   t.after(() => s.close())
   const token = await clientToken(s)
 
-  // Listing must never surface any F2 entry, in either display mode.
+  // Listing must never surface any credential entry, in either display mode.
   for (const mode of ['', '&all=1']) {
     const body = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}${mode}`, token)).json()
     const names = body.entries.map((e) => e.name)
@@ -407,8 +407,8 @@ test('F2: sensitive credential entries are dropped from listings and 403 on meta
   }
 })
 
-// --- F3: content streams; a Range reads only the requested slice ------------
-test('F3: a large-file Range returns only the slice (streamed, not whole-file buffered)', async (t) => {
+// --- content streams; a Range reads only the requested slice ------------
+test('a large-file Range returns only the slice (streamed, not whole-file buffered)', async (t) => {
   const { root } = makeFixture()
   // 40MB file — over inline cap, well under the 100MB attachment cap.
   const big = path.join(root, 'huge.bin')
@@ -479,8 +479,8 @@ test('a client abort during /files/content open closes the fd (no leak) and sett
   assert.equal(closeCalled, true)
 })
 
-// --- F1/F4/F6: opt-in + fail-safe disabling ---------------------------------
-test('F1: with no roots configured, the server starts and /files/* is 404 (feature off)', async (t) => {
+// --- opt-in + fail-safe disabling ---------------------------------
+test('with no roots configured, the server starts and /files/* is 404 (feature off)', async (t) => {
   const s = await startTestServer() // no fileReadRoots, env unset
   t.after(() => s.close())
   const token = await clientToken(s)
@@ -493,14 +493,14 @@ test('F1: with no roots configured, the server starts and /files/* is 404 (featu
   }
 })
 
-test('F1: startServer fails visible on an unreadable configured read-root', async () => {
+test('startServer fails visible on an unreadable configured read-root', async () => {
   await assert.rejects(
     startTestServer({ fileReadRoots: [path.join(os.tmpdir(), 'matron-does-not-exist-' + crypto.randomBytes(6).toString('hex'))] }),
     (e) => e && e.reason === 'bad-workdir',
   )
 })
 
-test('F4: an empty configured root set disables the API (never fails open)', async (t) => {
+test('an empty configured root set disables the API (never fails open)', async (t) => {
   const s = await startTestServer({ fileReadRoots: [] })
   t.after(() => s.close())
   const token = await clientToken(s)
@@ -510,7 +510,7 @@ test('F4: an empty configured root set disables the API (never fails open)', asy
   assert.equal((await authGet(s, '/files/list?path=/etc', token)).status, 404)
 })
 
-test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', async (t) => {
+test('file API disabled (fail closed) when /proc/self/fd is unavailable', async (t) => {
   const { root } = makeFixture()
   // Roots ARE configured, but the fd-identity re-check platform is absent.
   const s = await startTestServer({ fileReadRoots: [root], procSelfFdAvailable: false })
@@ -521,8 +521,8 @@ test('F6: file API disabled (fail closed) when /proc/self/fd is unavailable', as
   assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
 })
 
-// --- Phase 2 T-1.1: server-owned write configuration -----------------------
-test('T-1.1: writes are off by default even with a valid pinned write-root', async (t) => {
+// --- Phase 2: server-owned write configuration -----------------------
+test('writes are off by default even with a valid pinned write-root', async (t) => {
   const { root } = makeFixture()
   const writeRoot = path.join(root, 'src')
   const capture = captureHttpHandlerOptions()
@@ -536,7 +536,7 @@ test('T-1.1: writes are off by default even with a valid pinned write-root', asy
   assert.equal(capture.options.fileWritesDryRun, false)
 })
 
-test('T-1.1: ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
+test('ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
   const { root } = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   const capture = captureHttpHandlerOptions()
@@ -550,7 +550,7 @@ test('T-1.1: ENABLE_WRITES=1 without write-roots fails closed and logs why', asy
   assert.equal(capture.options.fileEnableWrites, false)
 })
 
-test('T-1.1: ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
+test('ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
   const { root } = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   const capture = captureHttpHandlerOptions()
@@ -565,7 +565,7 @@ test('T-1.1: ENABLE_WRITES=1 with an empty write-root list also fails closed', a
   assert.equal(capture.options.fileEnableWrites, false)
 })
 
-test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
+test('write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
   const { root } = makeFixture()
   const envNames = ['MATRON_FILE_WRITE_ROOTS', 'MATRON_FILE_ENABLE_WRITES', 'MATRON_FILE_WRITES_DRYRUN']
   const previous = new Map(envNames.map((name) => [name, process.env[name]]))
@@ -594,7 +594,7 @@ test('T-1.1: write-root, enable, and dry-run env config accepts colon-separated 
   assert.equal(capture.options.fileWritesDryRun, true)
 })
 
-test('T-1.1: broad write-root identities reject synthetic bind-mount aliases', () => {
+test('broad write-root identities reject synthetic bind-mount aliases', () => {
   const { root, outside } = makeFixture()
   const broadRoots = [root, path.join(root, 'src'), path.join(root, 'node_modules')]
   const missingRoot = path.join(root, 'host-path-not-present')
@@ -615,7 +615,7 @@ test('T-1.1: broad write-root identities reject synthetic bind-mount aliases', (
   }
 })
 
-test('T-1.1: a write-root outside all read-roots fails visibly at boot', async () => {
+test('a write-root outside all read-roots fails visibly at boot', async () => {
   const { root, outside } = makeFixture()
   await assert.rejects(
     startTestServer({ fileReadRoots: [root], fileWriteRoots: [outside] }),
@@ -623,7 +623,7 @@ test('T-1.1: a write-root outside all read-roots fails visibly at boot', async (
   )
 })
 
-test('T-1.1: an unreadable configured write-root fails visibly while pinning', async () => {
+test('an unreadable configured write-root fails visibly while pinning', async () => {
   const { root } = makeFixture()
   await assert.rejects(
     startTestServer({
