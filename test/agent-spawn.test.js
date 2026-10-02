@@ -227,7 +227,7 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   // self IS listed (the user may want the session on this very machine),
   // flagged so a caller can tell it apart, and not flagged on anyone else
   const me = reply.boxes.find((b) => b.self === true)
-  assert.equal(me.name, 'dev-6 (this box)') // easelyte fork: self tagged (loop #690)
+  assert.equal(me.name, 'dev-6 (this box)') // self is tagged
   assert.equal(me.self, true)
   assert.equal(me.online, true)
   assert.equal('self' in eric, false)
@@ -298,7 +298,7 @@ test('spawn_targets: valid capacity blocks pass through; a malformed block is dr
     })
   })
   // self (the caller) is online too and now listed — answer its folder RPC so
-  // the fan-out doesn't wait out the full folders timeout (loop #690)
+  // the fan-out doesn't wait out the full folders timeout
   parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
     parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
   })
@@ -876,7 +876,7 @@ test('spawn_targets is single-flight per connection: a concurrent second ask is 
   assert.ok(third)
 })
 
-// --- Loop #690: same-box spawn -------------------------------------------
+// --- same-box spawn -------------------------------------------
 // Fork divergence from upstream's deliberate self-spawn exclusion. A session
 // may spawn ANOTHER session on its OWN box, seeded with a task — the
 // copy-paste elimination the loop was filed for. Every same-box spawn STILL

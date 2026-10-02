@@ -218,7 +218,7 @@ test('admin CLI: device revoke clears room membership, and a replacement gets a 
   assert.equal(getParticipant(db, 'room1', doomed.deviceId), null, 'the membership row goes with the device')
 
   const fresh = createAgent(db, dan.id, 'replacement-agent')
-  // devices.id is AUTOINCREMENT (#755): the revoked id is never handed back, so
+  // devices.id is AUTOINCREMENT: the revoked id is never handed back, so
   // a replacement can no longer even be confused with the device it replaced.
   // The cascade above still clears the membership row (retained belt-and-braces
   // per the A1 scope), so the replacement starts from nothing either way.

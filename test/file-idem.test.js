@@ -1,4 +1,4 @@
-// Durable idempotency for the file WRITE API (loop #644).
+// Durable idempotency for the file WRITE API.
 //
 // The property under test is the one the in-memory store could not hold: a
 // reservation OUTLIVES the process that made it. So every test here that says

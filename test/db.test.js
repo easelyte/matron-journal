@@ -191,7 +191,7 @@ test('openDb adds agent_kind to legacy conversations and codex upserts round-tri
   }
 })
 
-// Migration guard for the pinned-summary surface (spec: loop #554). Two
+// Migration guard for the pinned-summary surface (spec). Two
 // distinct failure modes are being excluded: a cold start on a FRESH database
 // (where the base CREATE TABLE has no such column, so the ALTER must run and
 // must not fail) and a restart on a database that already carries it (where
@@ -596,12 +596,12 @@ test('openDb collapses duplicate APNs tokens, keeping the newest device row', ()
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-// --- devices.id AUTOINCREMENT (loop #755) --------------------------------
+// --- devices.id AUTOINCREMENT --------------------------------
 // devices.id was a plain reusable rowid: deleting the highest-numbered device
 // handed its id straight to the next insert, and a replacement then inherited
 // the revoked device's idempotency namespace (idemKeyOf embeds who.deviceId).
 // AUTOINCREMENT makes the id monotonic and never-reused, closing the hole at
-// the source. This is the A1 scope of #755: the downstream workarounds
+// the source. This is the A1 scope: the downstream workarounds
 // (file_idem trigger/gen/SET NULL, agent_idem incarnation-binding) are LEFT in
 // place as belt-and-braces and removed in a follow-up.
 
@@ -743,7 +743,7 @@ test('devices rebuild preserves inbound FK children and the file_idem revoke tri
   db.close()
 })
 
-// F1 regression (loop #755 Codex round 1): the seed must clear the HIGH-WATER
+// Regression: the seed must clear the HIGH-WATER
 // mark across every durable device-id reference, not just live device rows.
 // conversations.agent_device_id is the dangerous one — it is not a foreign key
 // (a revoke leaves it dangling) and authorizeAgentWrite treats it as ownership,
@@ -784,7 +784,7 @@ test('devices rebuild seeds the sequence above a dangling conversation owner, no
   db.close()
 })
 
-// F2 regression (loop #755 Codex round 1): the FK audit runs INSIDE the
+// Regression: the FK audit runs INSIDE the
 // transaction, so a devices-parent orphan rolls the whole rebuild back and the
 // AUTOINCREMENT DDL never lands. A restart therefore re-attempts and re-fails
 // rather than skipping the (never-completed) migration and booting with the
@@ -823,7 +823,7 @@ test('a devices-parent FK violation rolls the rebuild back and re-fails on resta
   assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'restart does not skip the never-completed migration')
 })
 
-// F1 round-2 (loop #755): the high-water scan must be schema-complete, not a
+// The high-water scan must be schema-complete, not a
 // hand-list. A revoked id surviving ONLY in items.origin_device_id (an integer
 // column reached by the dynamic *_device_id scan) or ONLY in events.idem_key
 // (the one persistent integer-less namespace, `client:<id>:` / `agent:<id>:`)
@@ -891,7 +891,7 @@ test('devices rebuild seeds above a dangling id found only in events.idem_key', 
   db.close()
 })
 
-// F1/F2 round-3 hardening (loop #755): defensive against data our own code
+// Hardening: defensive against data our own code
 // never writes but externally-repaired/legacy DBs might.
 test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID exhaustion)', (t) => {
   const dir = makeTmpDir('matron-devices-ai-malformed-')

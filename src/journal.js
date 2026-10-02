@@ -177,7 +177,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     if (title != null && title !== existing.title) metaChanged = true
     // A summary change is metadata a live client must learn mid-conversation,
-    // not just roster-read material (spec: pinned-summary surface, loop #554).
+    // not just roster-read material (spec: pinned-summary surface).
     // The operator's pinned digest would otherwise only refresh at /snapshot,
     // i.e. show the first five messages of a six-hour session. It rides the
     // existing convo_meta event rather than a new type — see docs/protocol.md.

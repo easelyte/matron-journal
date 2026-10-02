@@ -341,7 +341,7 @@ test('summary: set via upsert, kept when omitted, returned by snapshot', async (
   assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
 })
 
-// The load-bearing guarantee of the pinned-summary surface (spec: loop #554).
+// The load-bearing guarantee of the pinned-summary surface (spec).
 // The stamp feeds an "updated Nm ago" label; if a re-sent identical summary
 // moved it, a bridge backfilling its saved digests on reconnect would stamp
 // every old digest as fresh — the surface would confidently report the exact
@@ -412,7 +412,7 @@ test('summary_updated_at: stamped at creation when the insert carries a summary,
   assert.equal(bare.summary_updated_at, 0)
 })
 
-// Regression (Codex adversarial F2): a conversation minted by a summary-only
+// Regression: a conversation minted by a summary-only
 // upsert — no title, no parent, no state — used to append no event at all, so
 // live clients could not learn the conversation OR its digest existed until
 // their next /snapshot. "The bridge always sends a title first" is a property

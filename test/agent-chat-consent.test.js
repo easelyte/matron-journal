@@ -780,7 +780,7 @@ test('revoking a device clears its room membership, and a fresh-id replacement i
 
   assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
 
-  // devices.id is AUTOINCREMENT (#755): the replacement gets a fresh id, never
+  // devices.id is AUTOINCREMENT: the replacement gets a fresh id, never
   // the revoked one — and the cascade above already cleared the membership, so
   // it starts from nothing under either its own or the old id.
   const fresh = createAgent(s.db, dan.id, 'dev-replacement')

@@ -472,7 +472,7 @@ test('T-2.4: write creates, refuses a bare overwrite, and keeps the prior versio
   assert.equal(trashed.length, 1)
   assert.equal(fs.readFileSync(path.join(f.writeRoot, TRASH, trashed[0]), 'utf8'), '# notes\n')
 
-  // R500: the log records the byte COUNT, never the bytes.
+  // The log records the byte COUNT, never the bytes.
   const raw = fs.readFileSync(path.join(f.auditDir, FILE_AUDIT_BASENAME), 'utf8')
   assert.ok(!raw.includes('# notes'))
   assert.ok(!raw.includes('replaced'))
@@ -707,7 +707,7 @@ test('T-2.6: every attempt is audited, and no destructive 2xx exists without one
   assert.ok(deleteIntent >= 0 && deleteIntent < deleteOutcome)
 })
 
-// --- Codex round-1 findings F2/F3/F6 ---------------------------------------
+// --- Hardening findings F2/F3/F6 ---------------------------------------------
 
 test('F2: a write-root that overlaps server-owned state is refused at boot', async () => {
   const f = makeFixture()
@@ -768,9 +768,9 @@ test('F3: an idempotent upload replay carrying DIFFERENT bytes is rejected, not 
   assert.equal(auditLines(f).filter((a) => a.op === 'upload' && a.result === 'attempt').length, 1)
 })
 
-// --- Codex round-2 findings ------------------------------------------------
+// --- Hardening findings, second pass ------------------------------------------------
 
-test('R2-F1: a state path reached through a symlinked ancestor is still protected', async () => {
+test('a state path reached through a symlinked ancestor is still protected', async () => {
   const f = makeFixture()
   const elsewhere = fs.realpathSync(makeTmpDir('matron-w-link-'))
   // `link` points INTO the write root, and the final component does not exist
@@ -790,7 +790,7 @@ test('R2-F1: a state path reached through a symlinked ancestor is still protecte
   )
 })
 
-test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) => {
+test('dry-run rejects exactly what the live request rejects', async (t) => {
   const f = makeFixture()
   const dry = await startWrites(f, { fileWritesDryRun: true, fileWriteMaxBytes: 1024 })
   const live = await startWrites(f, { fileWriteMaxBytes: 1024 })
@@ -822,9 +822,9 @@ test('R2-F3: dry-run rejects exactly what the live request rejects', async (t) =
   assert.deepEqual(treeOf(f.root), before, 'neither server mutated anything')
 })
 
-// --- Codex round-3 findings ------------------------------------------------
+// --- Hardening findings, third pass -------------------------------------------------
 
-test('R3-F1: enabling writes on a multi-user journal warns that the roots are global', async (t) => {
+test('enabling writes on a multi-user journal warns that the roots are global', async (t) => {
   const f = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   const dbPath = path.join(makeTmpDir('matron-w-db-'), 'matron.db')
@@ -849,7 +849,7 @@ test('R3-F1: enabling writes on a multi-user journal warns that the roots are gl
   assert.ok(warn.mock.calls.some((c) => /file writes are enabled on a journal with 2 users/.test(c.arguments[0])))
 })
 
-test('R3-F2: an over-long path component is rejected before any directory is created', async (t) => {
+test('an over-long path component is rejected before any directory is created', async (t) => {
   const f = makeFixture()
   const dry = await startWrites(f, { fileWritesDryRun: true })
   const live = await startWrites(f)

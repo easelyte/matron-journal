@@ -530,7 +530,7 @@ test('GET /roster: agent token gets agent devices + top-level conversation metad
   const top = r.json.conversations.find((c) => c.id === 'top')
   assert.equal(top.summary, 'fixing CI')
   assert.equal(top.agent_device_id, agA.deviceId)
-  assert.equal(top.agent_kind, 'codex') // #619 T-1.3: /roster forwards per-convo agent_kind (claude|codex|null)
+  assert.equal(top.agent_kind, 'codex') // /roster forwards per-convo agent_kind (claude|codex|null)
 })
 
 test('GET /roster works for client tokens too and requires auth', async (t) => {

@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS users(
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices(
-  -- AUTOINCREMENT, not a plain rowid (loop #755): a plain INTEGER PRIMARY KEY
+  -- AUTOINCREMENT, not a plain rowid: a plain INTEGER PRIMARY KEY
   -- hands a deleted device's number straight to the next insert, so a
   -- replacement inherits the revoked device's identity — and with it the
   -- revoked device's idempotency namespace, since idemKeyOf embeds who.deviceId
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS agent_idem(
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
--- Durable idempotency for the file WRITE API (loop #644). Separate from
+-- Durable idempotency for the file WRITE API. Separate from
 -- agent_idem because the unit of replay is an HTTP OUTCOME (status + body),
 -- not an appended event seq, and because a row has to survive the process that
 -- created it: the in-memory store this replaces lost every reservation on
@@ -660,7 +660,7 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'tag_char')) {
     db.exec('ALTER TABLE devices ADD COLUMN tag_char TEXT')
   }
-  // Retrofit AUTOINCREMENT onto a devices table that predates it (loop #755).
+  // Retrofit AUTOINCREMENT onto a devices table that predates it.
   // SQLite has no ALTER to add AUTOINCREMENT, so the table is rebuilt — and
   // devices is a PARENT (agent_idem, file_idem and convo_agents all reference
   // devices(id)), so unlike the child-table rebuilds above this one must run
@@ -794,7 +794,7 @@ export function openDb(path) {
           throw new Error(`devices AUTOINCREMENT migration orphaned a child reference: ${JSON.stringify(violations)}`)
         }
       })()
-      console.log('devices: rebuilt with AUTOINCREMENT so revoked ids are never reused (loop #755)')
+      console.log('devices: rebuilt with AUTOINCREMENT so revoked ids are never reused')
     } finally {
       // Always restore enforcement, even if the transaction rolled back — a
       // failed migration must not leave this connection running with foreign

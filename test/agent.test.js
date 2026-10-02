@@ -249,7 +249,7 @@ test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it;
   agent.close(); client.close()
 })
 
-// Pinned-summary live push (spec: loop #554). The surface's whole value is
+// Pinned-summary live push (spec). The surface's whole value is
 // that it refreshes mid-conversation; before this, a summary change stored
 // silently and a client learned it only at its next /snapshot.
 test('convo_upsert: a summary change fans convo_meta with summary + summary_updated_at; an identical re-send fans nothing', async (t) => {
@@ -301,7 +301,7 @@ test('convo_upsert: a summary change fans convo_meta with summary + summary_upda
   assert.equal(bare.payload.summary, '')
   assert.equal(bare.payload.summary_updated_at, 0)
 
-  // Regression (Codex adversarial F2): a conversation created by a
+  // Regression: a conversation created by a
   // summary-only frame — no title, no parent, no state — must still announce
   // itself, or a live client cannot learn it or its digest exists at all
   // until its next /snapshot.

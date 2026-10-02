@@ -165,7 +165,7 @@ test('send type whitelist and ack validation', async (t) => {
   c.close()
 })
 
-// T-2.3 (round-1 F1 non-mintability): peer_message is NOT agent-publishable. A
+// T-2.3 (non-mintability): peer_message is NOT agent-publishable. A
 // bare publish carrying forged from_convo/from_name/from_kind must be rejected
 // and never reach storage — attribution is stamped only by op:peer_message (T-2.4).
 test('a bare publish of peer_message with forged attribution is rejected, nothing persisted', async (t) => {
@@ -327,7 +327,7 @@ test('op:peer_message rejects ownerless and dangling targets as not found before
   agent.close()
 })
 
-test('op:peer_message forbidden when sender device does not own from_convo (device parity, F1)', async (t) => {
+test('op:peer_message forbidden when sender device does not own from_convo (device parity)', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
@@ -516,7 +516,7 @@ test('prompt_reply requires an integer target_seq (the ref it answers)', async (
   c.close()
 })
 
-test('prompt_reply to a queued_release card is stamped kind=queued_release; other targets are not (#538)', async (t) => {
+test('prompt_reply to a queued_release card is stamped kind=queued_release; other targets are not', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
@@ -545,7 +545,7 @@ test('prompt_reply to a queued_release card is stamped kind=queued_release; othe
 
   // A genuine answer to an ordinary prompt whose value shape looks like a
   // control token is NOT stamped — provenance is the target prompt's kind,
-  // never the reply's value shape (guards against the #493b regression).
+  // never the reply's value shape (guards against a value-shape regression).
   c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: ordinary.seq, choice: 'send' })
   const answer = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > tap.seq)
   assert.equal(answer.payload.kind, undefined)

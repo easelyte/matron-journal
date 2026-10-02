@@ -34,7 +34,7 @@ function makeFixture() {
   const binBytes = Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x81]), crypto.randomBytes(2048)])
   fs.writeFileSync(path.join(root, 'blob.bin'), binBytes)
 
-  // Credential/config material reachable under a broad /root-style root (F2).
+  // Credential/config material reachable under a broad /root-style root.
   // Each must be dropped from listings (even ?all=1) and 403 on content/meta.
   fs.mkdirSync(path.join(root, '.codex'))
   fs.writeFileSync(path.join(root, '.codex', 'auth.json'), '{"OPENAI_API_KEY":"sk-x"}\n')
@@ -134,7 +134,7 @@ test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?
   }
 })
 
-test('GET /files/list: breadcrumb jail — root exposed, parent never above the read-root (F4)', async (t) => {
+test('GET /files/list: breadcrumb jail — root exposed, parent never above the read-root', async (t) => {
   const { root } = makeFixture()
   // nested subtree inside the read-root
   const deep = path.join(root, 'src', 'nested')
@@ -440,8 +440,8 @@ test('F3: a large-file Range returns only the slice (streamed, not whole-file bu
   assert.equal(buf.subarray(size - 6).toString(), 'MARKER')
 })
 
-// --- round-2 F1: an aborted content request must close the validated fd -----
-test('round-2 F1: a client abort during /files/content open closes the fd (no leak) and settles', async (t) => {
+// --- an aborted content request must close the validated fd -----
+test('a client abort during /files/content open closes the fd (no leak) and settles', async (t) => {
   const { root } = makeFixture()
   const s = await startTestServer({ fileReadRoots: [root] })
   t.after(() => s.close())

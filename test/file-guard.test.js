@@ -29,7 +29,7 @@ const SENSITIVE = [
   '/w/secret/note.txt', '/w/credentials/token.dat',
   '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
   '/w/app.key/nested/file.txt',
-  // review F2 — credential/config material reachable under a broad /root root
+  // credential/config material reachable under a broad /root root
   '/root/.codex/auth.json', '/root/.codex', '/root/auth.json',
   '/root/.config/gh/hosts.yml', '/root/.config', '/root/.claude/settings.json',
   '/root/.claude', '/root/.claude.json', '/root/.git-credentials', '/root/.pgpass',
@@ -312,7 +312,7 @@ test('MAX_VIEW_BYTES is the 5MB default cap', () => {
   assert.equal(MAX_VIEW_BYTES, 5 * 1024 * 1024)
 })
 
-// --- openGuarded (streaming validate, review F3) -----------------------------
+// --- openGuarded (streaming validate) -----------------------------
 test('openGuarded returns an OPEN fd + size + realPath without reading bytes', async () => {
   const roots = await pinAllowedRoots([dir])
   const { fd, size, realPath } = await openGuarded(path.join(dir, 'ok.txt'), { allowedRoots: roots })
@@ -344,7 +344,7 @@ test('openGuarded denials mirror validateAndOpen and never leak an fd', async ()
   assert.equal(await openDenied('relative.txt'), 'relative-path')
 })
 
-// --- empty pinned root set must FAIL CLOSED (review F4) ----------------------
+// --- empty pinned root set must FAIL CLOSED ----------------------
 test('a zero-root pinned set is refused (outside-scope) by every file-API guard', async () => {
   const empty = pinAllowedRootsSync([])
   const guardDenied = async (fn) => {
@@ -1218,7 +1218,7 @@ test('an interleaved same-basename delete survives and delete-missing is idempot
   }
 })
 
-// --- Carried Codex findings F2/F3/F4 ----------------------------------------
+// --- Carried hardening findings F2/F3/F4 ----------------------------------------
 // The same-device path is an inode-preserving link()+unlink(), so metadata,
 // concurrent appends, and post-commit durability are only at risk on the
 // cross-device (EXDEV) copy fallback and the crash-window fsyncs around a
@@ -1439,7 +1439,7 @@ test('writeFileAtomic rejects a create-only write whose target appears mid-strea
   }
 })
 
-// --- Codex round-1 findings F2/F4/F5 ----------------------------------------
+// --- Hardening findings F2/F4/F5 ----------------------------------------------
 
 test('F2: server-owned state inside a write-root is refused by every write primitive', async () => {
   const f = makeWriteFixture()
@@ -1533,7 +1533,7 @@ test('F5: an overwrite backup preserves the original inode rather than a copy of
   }
 })
 
-test('F5/R3-F6: an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
+test('an overwrite whose backup cannot preserve the inode is refused, not copied', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'doc.txt')
@@ -1604,7 +1604,7 @@ test('F5: a cross-device move re-checks the source immediately before destroying
   }
 })
 
-test('R4: modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
+test('modes survive an overwrite and a cross-device move under a restrictive umask', async (t) => {
   const previousUmask = process.umask(0o077)   // the deployed service's UMask
   const f = makeWriteFixture()
   try {
@@ -1631,7 +1631,7 @@ test('R4: modes survive an overwrite and a cross-device move under a restrictive
   }
 })
 
-test('R4: a failed overwrite leaves no orphan backup link in the trash', async (t) => {
+test('a failed overwrite leaves no orphan backup link in the trash', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'doc.txt')
@@ -1662,7 +1662,7 @@ test('R4: a failed overwrite leaves no orphan backup link in the trash', async (
   }
 })
 
-test('R4: a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
+test('a recursive mkdir fsyncs every directory it creates, not just the first parent', async (t) => {
   const f = makeWriteFixture()
   try {
     const realFsync = fs.fsyncSync
@@ -1691,7 +1691,7 @@ test('R4: a recursive mkdir fsyncs every directory it creates, not just the firs
   }
 })
 
-test('R5: an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
+test('an overwrite that cannot preserve ownership refuses instead of re-homing the file', async (t) => {
   const f = makeWriteFixture()
   try {
     const target = path.join(f.root, 'foreign.txt')

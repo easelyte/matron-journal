@@ -140,7 +140,7 @@ async function audited(ctx, who, intent, run) {
 
   // The outcome line is best-effort BY DESIGN: the intent line is already
   // durable, so a failure here still leaves a record of the attempt, and
-  // rejecting a completed mutation would be the lie Codex F4 is about.
+  // rejecting a completed mutation would be a lie.
   const record = (result, extra) => {
     try {
       ctx.audit({ ...base, ...extra, result })
@@ -375,7 +375,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
   const confirmed = url.searchParams.get('confirm') === '1'
 
   const run = () => audited(ctx, who, { op: 'delete', path: requested }, async () => {
-    // Server-enforced explicit confirm (R102's spirit): destructive, so the
+    // Server-enforced explicit confirm: destructive, so the
     // caller must say so. Checked inside the funnel so the refusal is audited
     // like every other denial.
     if (!confirmed) throw new FileLinkDenied('confirm-required')

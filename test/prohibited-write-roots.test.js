@@ -1,5 +1,5 @@
 // The service user's home is a prohibited file write-root, the same way /root is.
-// Loop #778 moves the runtime off root; as root the prohibited set must be unchanged.
+// When the runtime runs as root, the prohibited set must be unchanged.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync } from 'node:fs'
@@ -23,7 +23,7 @@ test('as root the prohibited write-roots equal the legacy set', () => {
 })
 
 test('a non-root service user adds its home to the prohibited write-roots', () => {
-  assert.deepEqual(prohibitedFileWriteRoots('/home/anton'), new Set([...LEGACY_ROOTS, '/home/anton']))
+  assert.deepEqual(prohibitedFileWriteRoots('/home/user'), new Set([...LEGACY_ROOTS, '/home/user']))
 })
 
 test('an empty or relative home adds nothing', () => {
