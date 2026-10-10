@@ -65,6 +65,7 @@ export function classify(type, payload, sender, prevState) {
   if (type === 'convo_meta') return null
   // TOC summary events are derived metadata, not new activity — journal-sync only.
   if (type === 'summary') return null
+  if (type === 'peer_message') return { priority: 5, coalesce: true, kind: 'activity' }
   // Tracker markers (spec: task-decision-tracker ~:207-210). Only "the
   // agent needs you" pushes: an agent-authored create, comment, or reopen
   // that leaves the item awaiting the user. The `by === 'agent'` guard

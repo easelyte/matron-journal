@@ -326,7 +326,7 @@ test('wire: convo_upsert, mission create/join/leave and rename fan convo_meta wi
   const { s, box, client, agent, metas, waitMeta } = await wired(t)
   agent.send({ op: 'convo_upsert', convo_id: 'c1', title: '[ab] Fix it', session_state: 'running' })
   const first = await waitMeta('c1', '[ab] Fix it')
-  assert.deepEqual(first.payload, { title: '[ab] Fix it', auto_title: '[ab] Fix it', parent_convo_id: null, agent_device_id: box.deviceId, repo: null })
+  assert.deepEqual(first.payload, { title: '[ab] Fix it', auto_title: '[ab] Fix it', parent_convo_id: null, agent_device_id: box.deviceId, agent_kind: null, summary: "", summary_updated_at: 0, repo: null })
 
   const created = await s.http('/missions', { method: 'POST', token: box.token, body: { convo_id: 'c1', title: 'Mission one', name: '  M1 ' } })
   assert.equal(created.status, 201)

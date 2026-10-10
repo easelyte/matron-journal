@@ -77,7 +77,10 @@ the machine-checkable version of this page.
   or not — gets `snippet` omitted from every row (it can carry `tool_output`
   text, a credential surface); an ordinary (non-private) agent additionally
   has private-owned conversations excluded entirely — see "Device privacy"
-  below.
+  below. Conversations are ordered by last message time, exactly as `/roster`
+  documents below: `COALESCE(last_ts, created_at) DESC, id DESC`, so non-message
+  activity (`session_status`/`convo_meta`/`read_marker`) never resurfaces an
+  idle conversation.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -244,6 +247,12 @@ the machine-checkable version of this page.
   `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
   render an "expired" attachment; clients that already hold the event learn
   from the 404 on `GET /media/:id`.
+  Separately from quota pressure, a scheduled orphan-blob reaper deletes any
+  blob that nothing references (no `events.blob_ref`, no `blob_ref` anywhere
+  inside an event payload, no item or item-comment attachment) once it is older
+  than `MATRON_ORPHAN_BLOB_GRACE_HOURS` (default 168 = 7 days, long enough for a
+  client outbox to resend a pending attachment after a long offline spell;
+  `0`/invalid disables).
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
   hand-maintained digest of this API surface (`src/help.js`), aimed at agent
   callers that arrive with a token and no repo checkout — it names the
@@ -298,7 +307,7 @@ the machine-checkable version of this page.
   caller's own user's devices only; `is_self` marks the requesting device.
   `status` (agent devices, omitted until the box has reported) is the box's
   last capacity report — `{reported_at, activity?, limits?, disk?,
-  account?}`, see "Box status" under the spawn section — so a client sees a
+  account?, vitals?}`, see "Box status" under the spawn section — so a client sees a
   box's usage and allowances without ever having talked to it, and while it
   is asleep; `reported_at` says how old the numbers are.
   `defaults` (agent devices only, always present for them) is the box's
@@ -329,16 +338,22 @@ the machine-checkable version of this page.
   `[{id, title, session_state, last_seq, summary, agent_device_id,
   created_at, last_ts, mission_num, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
-  chat targets), ordered by `last_seq DESC`; `last_ts` is the newest
-  event's timestamp (`null` for an event-less conversation), same
-  derivation as `/snapshot`; `status` is the session's persisted header
-  `{reported_at, model?, context?, stall?, limits?}` (see the agent
+  chat targets), ordered by last message time —
+  `COALESCE(last_ts, created_at) DESC, id DESC` (most recent message first,
+  falling back to the conversation's own `created_at` when it has no message
+  events, with the immutable `id` as a stable tie-break). Deliberately NOT
+  `last_seq DESC`: a `session_status`/`convo_meta`/`read_marker` event advances
+  `last_seq` without being a message, so a `last_seq` order resurfaced an idle
+  conversation to the top on non-message activity. `last_ts` is the newest
+  **message** event's timestamp (`null` for a conversation with no message
+  events), same derivation as `/snapshot`; `status` is the session's persisted
+  header `{reported_at, model?, context?, stall?, limits?}` (see the agent
   `status` op), present only once the session has reported one;
   `mission_num` is the number of the session's current mission, `null`
   when it has none (or, for an ordinary agent, when that mission was born
-  on a private box). Scoped to
-  the caller's own user like every other read. See "Agent chat rooms" below
-  for what a room and `summary` are.
+  on a private box). Scoped to the
+  caller's own user like every other read. See "Agent chat rooms" below for
+  what a room and `summary` are.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
@@ -595,6 +610,14 @@ Rows from before the stamp carry neither, and don't count.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
+  `hello` may carry an optional `max_replay` (non-negative integer) that
+  **lowers** the valve for that connection only: the server trips
+  `snapshot_required` when the gap exceeds `min(MATRON_MAX_REPLAY,
+  max_replay)`. It can never raise the server's limit, and any other value
+  (negative, fractional, non-number) is ignored rather than rejected, so an
+  older client that omits it is unaffected. The web client sends 500: it
+  applies replayed rows one at a time, and past a few hundred rows a
+  snapshot is far cheaper than the replay.
   Client ops: send (type text, or file/image with a top-level blob_ref from a
   prior POST /media — payload mirrors the agent-publish media shape),
   prompt_reply, read_marker, ack, viewing.
@@ -615,7 +638,8 @@ Rows from before the stamp carry neither, and don't count.
     captioned frame with no batch keys. The agent gets the typed text, then
     the transcript, then the attachments, as one turn.
   Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
-  finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
+  finalize, activity (ephemeral), status (ephemeral, cached), host_vitals
+  (ephemeral, cached, host-global — no convo_id). `read_marker`
   is available to both kinds:
   an agent (bridge) connection may advance its user's read marker too —
   e.g. after mirroring the user's own message into the journal, so that
@@ -660,15 +684,21 @@ Rows from before the stamp carry neither, and don't count.
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, auto_title, parent_convo_id, agent_device_id, repo}`, sender = the agent device, e.g.
+  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, summary,
+  summary_updated_at, repo}`, sender = the agent device, e.g.
   `agent:box-2`) whenever it changes an existing conversation's title or
   `auto_title` (see *Mission-named conversations*), sets
-  a non-empty title at creation, or creates a child (`parent_convo_id` set,
+  a non-empty title at creation, changes the stored `summary` (see
+  "`convo_upsert` accepts an optional `summary`" below), or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
   list the child as a normal conversation until its next `/snapshot`) — so
-  other devices learn renames and child linkage live instead of only via
-  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
-  upserts on existing conversations). `agent_device_id` is the upserting
+  other devices learn renames, summary refreshes and child linkage live
+  instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title AND
+  unchanged/omitted summary, state-only
+  upserts on existing conversations) — in particular, a bridge that
+  re-sends the summary it already stored appends nothing, so a reconnect
+  backfill is not an event storm. `agent_device_id` is the upserting
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
@@ -734,9 +764,59 @@ Rows from before the stamp carry neither, and don't count.
   "Agent chat rooms" below). Same don't-clobber discipline as `title`/
   `parent_convo_id`: only an upsert that carries a non-null `summary`
   changes the stored value; omitting it leaves the existing summary
-  untouched. Unlike a title change, a summary change never appends a
-  `convo_meta` event — it's roster-read material, not something a live
-  client needs to learn mid-conversation.
+  untouched. A summary change sets the same meta-changed condition a title
+  change does, and therefore appends a `convo_meta` event carrying
+  `payload.summary` and `payload.summary_updated_at` (see below). This
+  reverses an earlier rule that a summary change never appended one: the
+  summary stopped being roster-read-only material when it became the source
+  for a client's pinned-summary surface, and a digest that only refreshes at
+  `/snapshot` shows the first few messages of an hours-long session in a bar
+  labelled "Summary" above a live timeline. A stale digest presented as
+  current is worse than none, so the refresh rides the event that already
+  means "conversation metadata changed" rather than a new event type.
+- `summary_updated_at` (integer, epoch-ms; `0` = never) accompanies the
+  summary on each `convo_upsert`-generated `convo_meta` payload and on every
+  `/snapshot` conversation row. It advances **only when the stored summary actually changes** —
+  never on an upsert that omits the summary, and never on one that re-sends
+  a byte-identical value. That guarantee is the point of the field: a bridge
+  republishing its saved digests — which it does on every reconnect — must
+  not restamp them, or an age label ("updated 2m ago") would lie about
+  exactly the staleness it exists to disclose. Conversations that never had
+  a summary, and every row predating the column, read `0`.
+- **What the stamp measures, precisely: when this server first observed this
+  text — not when the producer generated it.** The two coincide in steady
+  state, because a bridge publishes a digest as soon as it makes one. They
+  diverge on the *first* delivery of text the producer has been holding: a
+  backfill of already-generated digests onto a server that has none (the
+  rollout case), or a restore onto a server whose stored copy is older.
+  There the stamp reads "now" for text that may be considerably older. The
+  divergence is one-shot per conversation and self-correcting — every later
+  change is one this server genuinely witnessed — so consumers should treat
+  the value as a *lower* bound on the digest's age. Closing the gap properly
+  means the producer owning its generation time and sending it
+  (canonical-source); this server does not accept such a field yet,
+  deliberately, since it would be inert until a bridge supplies one.
+- Both fields are **additive, and always present on a `convo_upsert`-generated
+  `convo_meta`** — like `title`/`agent_kind` on that same event, and unlike
+  `session_status`'s omitted-when-absent `session_outcome`. Always-present
+  *there* is what lets a bridge CLEAR a summary (upsert `summary: ""`) and
+  have the clear reach live clients, instead of being indistinguishable from
+  an event that carries no summary news.
+  **The guarantee is scoped to that producer, not to the event type.** The
+  server-authored `convo_meta` variants deliberately carry only what changed
+  — a membership fan sends `{participants}` alone, a spawn-room creation
+  sends `{title, parent_convo_id, participants}` — and neither gains these
+  keys. That follows the standing rule for this event, stated above: clients
+  treat every `convo_meta` key independently, and an absent key means "no
+  news", never "cleared". A client must therefore **not** read the absence of
+  `summary` on an arbitrary `convo_meta` as "this server lacks the feature":
+  do feature detection on the `/snapshot` conversation row, where both fields
+  are unconditional. (There is no capability negotiation to use instead —
+  `/snapshot` advertises no `capabilities` array.)
+- A client that does not know the keys ignores them, exactly as it already
+  ignores any unknown `convo_meta` key; a client that does know them degrades
+  cleanly against a server that never sends them (no summary → no surface,
+  no `summary_updated_at` → no age label).
 - Agent delivery scoping: `convo_upsert` records the upserting agent device
   as the conversation's owner (`agent_device_id`). Ownership is
   last-writer-wins **except** for a guest: a device that has ever appeared
@@ -901,6 +981,23 @@ Rows from before the stamp carry neither, and don't count.
   row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
   conversation's `status`, so a session's model and context gauge are readable for a sleeping
   box and across a journal restart.
+- Agent `host_vitals {vitals}` publishes a host-global machine sample
+  (`vitals` = `{cpu, ram, sampled_at_ms}`, shape owned opaquely by the
+  bridge). Unlike every other agent op it carries **no `convo_id`** and has
+  **no ownership check** — vitals belong to the machine, not a conversation.
+  Agent connections only (a client gets `forbidden`); `vitals` validated only
+  as a non-null object whose JSON encoding is ≤ 4096 bytes (else
+  `bad_request`). Delivered as `{kind:'ephemeral', host_vitals:{...}}` to
+  **all** of the user's client connections regardless of what (if anything)
+  they are `viewing` — the one ephemeral that bypasses the viewing filter.
+  Never journaled. The server caches the last sample per user (in-memory,
+  bounded) and replays it to a client immediately on connect (after
+  `hello_ok`), so a fresh client paints its vitals gauge without waiting for
+  the next sample. Rate-limited server-side to one accepted frame per second
+  per agent connection (excess dropped silently); a backed-up client is
+  skipped for a sample rather than queued (latest-wins telemetry). Keyed by
+  user, so it assumes one host per user — see `makeVitalsCache` in
+  `src/ws.js` (multi-host is deferred).
 - Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
   live tool output (never journaled). `message_ref` is the tool_use_id;
   `offset` is the UTF-8 byte position of `chunk` in the command's output.
@@ -1464,11 +1561,11 @@ Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_w
 }
 ```
 
-Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, wakeable?, folders: [{path, last_used}], activity?, limits?, defaults?}]}`. `defaults` is `{agent, model, effort}` a new session on the box starts with when the ask names none: the bridge's own effective block (the live `recent_folders` reply's `defaults`, else its last `box_status` one), else the journal's stored box defaults; omitted when neither says anything (see *Box defaults*). Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Nor can a name check tell a Mac called `alice-mac` from a dev VM, so the journal also remembers the wake command's own verdict: when it exits 2 ("not a box I can start") the device row is marked (`devices.wake_refused_at`, matched by name, persistent), and from then on the box is listed without `wakeable`, `wakeIfOffline` skips it and a spawn to it fails `agent_unreachable` at once. The mark stands for a day (`WAKE_REFUSAL_TTL_MS`), after which the box is tried again and re-marked if refused again, so a dev VM refused by mistake recovers on its own; a later exit 0 for that name, or renaming the device, clears it at once. The first wake to a box never refused before is still attempted, so that one spawn parks until the refusal comes back (`isWakeableDevice` in `src/wake.js`). Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, self?, online, wakeable?, folders: [{path, last_used}], activity?, limits?, defaults?}]}`. `defaults` is `{agent, model, effort}` a new session on the box starts with when the ask names none: the bridge's own effective block (the live `recent_folders` reply's `defaults`, else its last `box_status` one), else the journal's stored box defaults; omitted when neither says anything (see *Box defaults*). Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Nor can a name check tell a Mac called `alice-mac` from a dev VM, so the journal also remembers the wake command's own verdict: when it exits 2 ("not a box I can start") the device row is marked (`devices.wake_refused_at`, matched by name, persistent), and from then on the box is listed without `wakeable`, `wakeIfOffline` skips it and a spawn to it fails `agent_unreachable` at once. The mark stands for a day (`WAKE_REFUSAL_TTL_MS`), after which the box is tried again and re-marked if refused again, so a dev VM refused by mistake recovers on its own; a later exit 0 for that name, or renaming the device, clears it at once. The first wake to a box never refused before is still attempted, so that one spawn parks until the refusal comes back (`isWakeableDevice` in `src/wake.js`). Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
 
 Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
 
-**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, vitals?: {cpu_pct, ram_pct, sampled_at_ms}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). `vitals` is the box's host-global CPU/RAM sample: `cpu_pct` and `ram_pct` finite numbers in 0..100, `sampled_at_ms` a positive integer epoch-ms no greater than 8.64e15; all-or-nothing like the other blocks (a wrong type or out-of-range value drops the block, extra keys are not copied). It is distinct from the ephemeral `host_vitals` op (`{cpu, ram, sampled_at_ms}`, unpersisted, opaque): `box_status.vitals` is persisted with the rest of the report so a sleeping box still shows its last known load. A journal predating the block ignores it. Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its `activity`/`limits`/`disk` blocks plus `reported_at`; `account` and `vitals` are served on `/devices` and `/roster` only), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
 
 **Defaults block (optional).** `defaults` is what a new session on the box starts with as the bridge resolves it — the journal's box defaults, else its own `MATRON_DEFAULT_*` env — with `source` saying which (e.g. `journal`, `env`). `agent` is required (`claude` | `codex`); `model` is null or a plain token (≤64 chars, `[A-Za-z0-9._[\]-]`); `effort` null or a short lowercase word (≤16; Codex has levels Claude lacks); `source` optional, `[a-z_]`, ≤32. All-or-nothing like the other blocks (`sanitizeBoxDefaults` in `src/spawns.js`); a report carrying only this block is valid. A `recent_folders` reply may carry it too.
 

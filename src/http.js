@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
+import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, isDeniedPath, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { pipeline } from 'node:stream/promises'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript } from './blob-transcripts.js'
@@ -14,7 +16,10 @@ import { searchMessages, searchChats, searchRecent, indexableBody } from './sear
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { parseCitation, verifySaid } from './said.js'
 import { serveHelp } from './help.js'
-import { wakeIfOffline, isWakeableDevice } from './wake.js'
+import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
+import { makeDurableIdemStore } from './file-idem.js'
+import { makeFileAudit } from './file-audit.js'
+import { wakeIfOffline, isWakeableBoxName, isWakeableDevice } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
@@ -22,6 +27,7 @@ import { handleSharingRoute } from './sharing-http.js'
 import { handlePersonRoomRoute } from './person-rooms-http.js'
 import { sessionsSharedWith } from './person-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
+import { createWorkView, handleWorkRoute, parseOwnerUserId } from './work-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
@@ -70,7 +76,14 @@ const DEVICE_NAME_MAX = 40
 const graphemes = new Intl.Segmenter()
 const TAG_CODEPOINT_MAX = 16
 const tagChar = (raw) => {
-  const clean = deviceName(raw)
+  // Owner-set (authenticated), NOT untrusted peer text — so it may legitimately
+  // carry a ZWJ compound emoji (👩‍💻). Sanitize C0 controls + collapse
+  // whitespace here, but do NOT apply deviceName/sanitizePeerText's \p{Cf} sieve
+  // (our fork's peer-forgery hardening), which would split the ZWJ cluster into
+  // its first code point (👩) before segmentation. The grapheme + format-only
+  // checks below still enforce "one visible grapheme" and reject an invisible tag.
+  if (raw == null) return null
+  const clean = String(raw).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, PEER_NAME_CAP)
   if (!clean) return null
   let first = null
   for (const g of graphemes.segment(clean)) { first = g.segment; break }
@@ -103,10 +116,56 @@ function preapproveKeyMatches(expected, given) {
 // request's parse, same concern as readBody's existing 413 handling below.
 const rejectEarly = (req, res, status, obj) => {
   res.on('finish', () => req.destroy())
+  // Never cacheable. Both callers are transient states -- 401 (no/!valid
+  // credential) and 429 (throttled) -- so a cached copy would be served back
+  // to a caller whose credential or throttle window has since changed. It also
+  // keeps the guarantee uniform for routes that promise no-store on every
+  // response (see /work), whose own handler never runs when the shared auth
+  // gate rejects first.
+  res.setHeader('Cache-Control', 'private, no-store')
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
+// Default-hidden listing entries (dev noise). Hiding is a DISPLAY filter layered
+// on top of the always-on sensitive DROP in listDirGuarded — a `?all=1` toggle
+// reveals these, but never a sensitive entry (those are gone before this runs).
+// '.matron-trash' is a dotfile and so already default-hidden by the rule
+// below; it is named explicitly because that is a CONTRACT (the Phase-2 trash
+// must not appear in an ordinary listing), not an accident of its spelling.
+const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__', '.matron-trash'])
+const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
+// Strip anything that could break a Content-Disposition header (quotes, CR/LF).
+// The whole File Explorer namespace: `/files` itself (DELETE) and every
+// `/files/*` route. One predicate, so the owner gate and the static-hosting
+// exclusion can never disagree about which paths are the file API's.
+const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
+const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
+
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
+  // Server-owned, built once at the trusted boundary rather than per request:
+  // the audit binds its directory here (a handler carries a function, never a
+  // path it could be talked into changing), and the idempotency reservations
+  // have to outlive a single request to be reservations at all.
+  const fileWriteCtx = {
+    fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
+    audit: makeFileAudit(fileAuditDir),
+    // Durable, not a Map: a reservation has to outlive the process that made
+    // it, or a retry crossing a restart re-executes its move/delete/upload.
+    // Built here for the same reason the audit is — at the
+    // trusted boundary, once, bound to the server's own database.
+    idem: makeDurableIdemStore({ db }),
+  }
+  // Bound once at server startup: explicit producer-root validation happens
+  // before the listener is returned, and no request can supply or replace the
+  // owner/root configuration.
+  const workView = createWorkView({ ...workViewOptions, db })
+  // File Explorer owner (see the gate in the handler). Accepts the parsed
+  // number from startServer or a raw string; anything else is null, and null
+  // refuses every /files request.
+  const fileOwnerId = typeof fileOwnerUserId === 'number'
+    ? (Number.isSafeInteger(fileOwnerUserId) && fileOwnerUserId > 0 ? fileOwnerUserId : null)
+    : parseOwnerUserId(fileOwnerUserId)
+  const filesLive = !!fileReadRoots || !!(fileWriteCtx.fileEnableWrites && fileWriteCtx.fileWriteRoots && fileWriteCtx.audit)
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -117,7 +176,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
-      if (await handleStatic(req, res, url)) return
+      // /files is the File Explorer's namespace and is owner-authorized below;
+      // static hosting (which runs before auth) must never answer for it.
+      if (!isFilesPath(url.pathname) && await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
         // (the tunnel is the only route in, so this header is trustworthy here).
@@ -279,6 +340,260 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleAlerts(req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // --- File Explorer read API (spec: matron-file-explorer §5) -----------
+      // Opt-in: the routes exist only when read-roots were configured at boot
+      // (fileReadRoots is a non-empty pinned set); otherwise `/files/*` falls
+      // through to the final 404, so an un-configured/disabled deploy serves
+      // everything else normally. Client devices only (operator
+      // devices browse; agents do not). Every path is parsed/validated at the
+      // boundary and jailed server-side to the pinned read-roots + always-on
+      // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
+      // rejection reasons uniform.
+      // Owner gate (same shape as GET /work): the File Explorer exposes the
+      // server's own disk, which belongs to the journal's operator, not to
+      // whichever user a client device happens to be signed in as. A second
+      // user (including an admin one) must never inherit read access to the
+      // read-roots or write access to the write-roots. Checked ONCE, here,
+      // for every /files and /files/* path before any route-specific work —
+      // so no audit line, idempotency reservation, or fs call happens for a
+      // caller who is not the owner. Only while the feature is live: a
+      // disabled deploy keeps its fall-through 404 (feature-off parity).
+      // Fails closed: an absent or unparseable owner id serves nothing.
+      if (filesLive && isFilesPath(url.pathname)) {
+        // rejectEarly, not json: an upload/write body is still unread here,
+        // and those bytes must not be left on a keep-alive socket.
+        if (who.kind !== 'client') return rejectEarly(req, res, 403, { error: 'forbidden' })
+        if (fileOwnerId === null) {
+          console.error('file API: MATRON_FILE_OWNER_USER_ID is absent or is not a positive integer; refusing /files requests')
+          return rejectEarly(req, res, 500, { error: 'internal' })
+        }
+        if (who.userId !== fileOwnerId) return rejectEarly(req, res, 403, { error: 'forbidden' })
+      }
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        // No `path` => the server's default folder, so a client never has to
+        // hardcode a host path: the first write root that accepts writes right
+        // now (where the operator works, even nested below a read root), else
+        // the first read root. Each candidate goes through the same read guard
+        // as an explicit path. Only a read-POLICY refusal skips a write root;
+        // an operational failure (unreadable, gone) is answered as-is so a
+        // broken working folder fails visible instead of silently opening the
+        // read root. An explicit but empty/relative `path` is still a 400.
+        const explicit = url.searchParams.has('path')
+        const candidates = explicit
+          ? [url.searchParams.get('path')]
+          : [
+              ...(fileWriteCtx.fileWriteRoots?.roots ?? [])
+                .filter((w) => listingIsWritable(fileWriteCtx, w.realPath))
+                .map((w) => w.realPath),
+              fileReadRoots.roots[0]?.realPath,
+            ]
+        if (explicit && (typeof candidates[0] !== 'string' || !path.isAbsolute(candidates[0]))) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        let listed
+        let denied = null
+        for (const p of candidates) {
+          if (typeof p !== 'string') continue
+          try {
+            listed = listDirGuarded(p, { allowedRoots: fileReadRoots, maxEntries: fileListMax })
+            break
+          } catch (e) {
+            if (!(e instanceof FileLinkDenied)) throw e
+            denied = e
+            if (e.reason !== 'sensitive' && e.reason !== 'outside-scope') break
+          }
+        }
+        if (!listed) return json(res, denied ? denialToStatus(denied.reason) : 404, { error: denied ? 'denied' : 'not_found' })
+        const showAll = url.searchParams.get('all') === '1'
+        // Sensitive entries are already dropped by the guard; this is only the
+        // dev-noise/dotfile display filter, toggled off by ?all=1.
+        const visible = showAll ? listed.entries : listed.entries.filter((e) => !isHiddenListEntry(e.name))
+        // Dirs first, then case-insensitive name.
+        visible.sort((a, b) => {
+          if (a.kind !== b.kind) {
+            if (a.kind === 'dir') return -1
+            if (b.kind === 'dir') return 1
+          }
+          return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+        })
+        // Breadcrumb jail: expose the containing read-root so the
+        // client builds breadcrumbs from `root` down, and clamp `parent` so it
+        // NEVER points above the jail. `path ∈ root` was already enforced by
+        // the guard, so dirname(path) stays within/at `root`; when `path` IS a
+        // read-root, `parent` is null (top boundary).
+        // With overlapping roots, the SHALLOWEST containing root whose
+        // breadcrumb is navigable: every directory between it and this one
+        // passes the read policy. /work + /work/project keeps browsing up to
+        // /work; $HOME + a workspace inside a denied dot entry stops at the
+        // workspace, so no crumb or parent points at a refused directory.
+        const containingRoots = fileReadRoots.roots
+          .map((r) => r.realPath)
+          .filter((r) => contains(r, listed.realDir))
+          .sort((a, b) => a.length - b.length)
+        const navigableFrom = (root) => {
+          for (let d = path.dirname(listed.realDir); d !== root && contains(root, d); d = path.dirname(d)) {
+            if (isDeniedPath(d, fileReadRoots)) return false
+          }
+          return true
+        }
+        const containingRoot = containingRoots.find(navigableFrom) ?? containingRoots.at(-1) ?? null
+        const parent = (containingRoot === null || listed.realDir === containingRoot)
+          ? null
+          : path.dirname(listed.realDir)
+        // `writable` (Phase-2 wire contract): the UI renders write affordances
+        // only when the server says this directory accepts writes right now.
+        // Absent or false => a strictly read-only browser.
+        return json(res, 200, {
+          path: listed.realDir,
+          root: containingRoot,
+          parent,
+          entries: visible,
+          truncated: listed.truncated,
+          writable: listingIsWritable(fileWriteCtx, listed.realDir),
+        })
+      }
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        let meta
+        try {
+          meta = await metaGuarded(p, { allowedRoots: fileReadRoots })
+        } catch (e) {
+          if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+          return json(res, 404, { error: 'not_found' })
+        }
+        return json(res, 200, {
+          path: meta.realPath,
+          kind: meta.kind,
+          size: meta.size,
+          mtime: meta.mtime,
+          mime: meta.mime,
+          is_text: meta.is_text,
+        })
+      }
+      if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/content') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const p = url.searchParams.get('path')
+        if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
+        const attachment = url.searchParams.get('disposition') === 'attachment'
+        const maxBytes = attachment ? MAX_DOWNLOAD_BYTES : MAX_VIEW_BYTES
+        // Single idempotent fd-close covering EVERY terminal path (denial,
+        // cap/416 rejects, empty body, stream end/error, AND a client abort at
+        // any point — including while openGuarded() is still awaiting). `fd` is
+        // filled once the handle is validated; `streaming` gates whether an
+        // abort should close the fd directly (pre-stream) or tear the stream
+        // down and let its 'close' close the fd (mid-stream — closing the fd
+        // under an active read would error it).
+        let fd = null
+        let fdClosed = false
+        let streaming = false
+        let aborted = false
+        const closeFd = () => { if (fdClosed || !fd) return; fdClosed = true; fd.close().catch(() => {}) }
+        const onEarlyAbort = () => { aborted = true; if (!streaming) closeFd() }
+        res.on('close', onEarlyAbort)
+        try {
+          let opened
+          try {
+            // openGuarded runs the SAME fd-pinned, symlink-proof, containment +
+            // sensitivity checks as the buffering path but returns the OPEN fd
+            // WITHOUT reading — we STREAM it with backpressure, never
+            // buffering the whole file. Never readBody (JSON/1MB).
+            opened = await openGuarded(p, { allowedRoots: fileReadRoots })
+          } catch (e) {
+            res.removeListener('close', onEarlyAbort)
+            // Guard contract: map ANY throw to a denial (404 default), not just
+            // FileLinkDenied — an unexpected fs error must not leak/500.
+            if (e instanceof FileLinkDenied) return json(res, denialToStatus(e.reason), { error: 'denied' })
+            return json(res, 404, { error: 'not_found' })
+          }
+          fd = opened.fd
+          const { size, realPath } = opened
+          // The client may have disconnected WHILE openGuarded was awaiting —
+          // onEarlyAbort ran with fd still null (no close), so close the now-
+          // validated fd and bail before writing anything.
+          if (aborted || res.destroyed) { res.removeListener('close', onEarlyAbort); closeFd(); return }
+          // Cap on the FULL file size, decided from fstat BEFORE any byte is
+          // read (so an oversized download never allocates or streams).
+          if (size > maxBytes) { res.removeListener('close', onEarlyAbort); closeFd(); return json(res, 413, { error: 'too_large' }) }
+          const { type, inlineSafe } = contentTypeFor(realPath)
+          // Force download for a non-inline-safe type even if inline was asked
+          // (nothing script-capable renders inline on this origin).
+          const disposition = attachment || !inlineSafe ? 'attachment' : 'inline'
+          const headers = {
+            'content-type': type,
+            'cache-control': 'private',
+            'x-content-type-options': 'nosniff',
+            'accept-ranges': 'bytes',
+            'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+          }
+          // Compute the Range window from `size` BEFORE reading — only the
+          // selected interval is streamed (createReadStream end is inclusive).
+          let statusCode = 200
+          let start = 0
+          let end = size > 0 ? size - 1 : 0
+          const range = req.headers.range
+          if (range) {
+            const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+            if (!m || (m[1] === '' && m[2] === '')) {
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            let s = m[1] === '' ? null : Number(m[1])
+            let e = m[2] === '' ? null : Number(m[2])
+            if (s === null) {
+              // suffix range: last `e` bytes
+              s = Math.max(0, size - e)
+              e = size - 1
+            } else if (e === null || e >= size) {
+              e = size - 1
+            }
+            if (!Number.isInteger(s) || s > e || s >= size || s < 0) {
+              res.removeListener('close', onEarlyAbort)
+              closeFd()
+              res.writeHead(416, { 'content-range': `bytes */${size}` })
+              return res.end()
+            }
+            statusCode = 206
+            start = s
+            end = e
+            headers['content-range'] = `bytes ${start}-${end}/${size}`
+          }
+          const length = size === 0 ? 0 : (end - start + 1)
+          res.writeHead(statusCode, { ...headers, 'content-length': String(length) })
+          if (length === 0) { res.removeListener('close', onEarlyAbort); closeFd(); return res.end() }
+          await new Promise((resolve) => {
+            // Hand off from the pre-stream abort listener to stream teardown:
+            // once streaming, an abort must destroy the stream (its 'close'
+            // then closes the fd) rather than close the fd out from under it.
+            res.removeListener('close', onEarlyAbort)
+            streaming = true
+            const stream = fd.createReadStream({ start, end, autoClose: false })
+            let settled = false
+            const finish = () => { if (settled) return; settled = true; closeFd(); resolve() }
+            stream.on('error', () => { res.destroy(); finish() })
+            stream.on('close', finish)
+            res.on('close', () => stream.destroy())
+            // Race guard: the socket may already have closed between the check
+            // above and attaching the listener — tear down immediately if so.
+            if (res.destroyed) stream.destroy()
+            stream.pipe(res)
+          })
+          return
+        } catch (e) {
+          res.removeListener('close', onEarlyAbort)
+          closeFd()
+          throw e
+        }
+      }
+      // Phase-2 writes (src/files-write-http.js). Mounted with the read routes
+      // and inside the outer try/catch, so readBody's 400/413 map like every
+      // other route's; returns false when the kill switch is off, and the
+      // request falls through to the final 404.
+      if (await handleFilesWriteRoute(fileWriteCtx, req, res, url, who)) return
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
@@ -287,6 +602,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleSharingRoute({ db, hub, pushPipeline }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleWorkRoute(workView, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
@@ -459,8 +775,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           // Stored defaults for new sessions, as GET /devices.
           defaults: boxDefaults.get(d.device_id),
         }))
+        // Ordered by last message time then id — same rule and same JS
+        // comparator as /snapshot (byLastMessageThenId, see journal.js); sorting
+        // in JS avoids re-evaluating the correlated last_ts subquery in a SQL
+        // ORDER BY.
         const rows = db.prepare(
-          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT m.num FROM missions m WHERE m.id = conversations.mission_id${filtered ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    AND e.type IN (${MESSAGE_TYPES_SQL})
@@ -469,9 +789,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
              AND NOT EXISTS(SELECT 1 FROM person_rooms pr WHERE pr.guest_room_id = conversations.id)${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
                     SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
-             : ''}
-           ORDER BY last_seq DESC`
+             : ''}`
         ).all(who.userId)
+        rows.sort(byLastMessageThenId)
         // mission_num: the session's CURRENT mission (null when none) —
         // the number its mission-named title (src/convo-title.js) stands
         // for. A filtered caller never learns a private-origin mission's

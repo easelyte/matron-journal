@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
+import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
@@ -40,6 +41,12 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
+// peer_message is DELIBERATELY NOT here: its attribution is
+// server-authoritative (bridge-stamped from_convo/from_name/from_kind), so it is
+// mintable ONLY via the dedicated agent-gated op:peer_message, never a
+// bare publish. Adding it here would let an agent forge attribution — a
+// non-mintability violation. It IS in journal.js MESSAGE_TYPES (snippet/last_seq
+// only), which is a distinct storage/snippet concern, not a publish gate.
 // Attachment rows must name their blob in the indexed events.blob_ref COLUMN,
 // not only inside the payload: the quota-pressure reaper (retention.js
 // runReapMedia) joins on the column. Client `send` validates a top-level
@@ -85,6 +92,19 @@ const STATUS_MAX_BYTES = 4096
 const SESSION_CONTROL_MAX_INFLIGHT = 8
 const STATUS_CACHE_MAX = 2048
 
+// host_vitals op (host-global machine sample — cpu/ram/sampled_at_ms): a
+// pure ephemeral like status, but NOT convo-scoped. The bridge emits it
+// without a convo_id at a slow cadence (~5s); the server relays it to every
+// one of the user's clients and caches the LAST sample per user so a fresh
+// client paints immediately on connect. Size-capped (same ceiling as status)
+// because it's held in server memory. Never journaled.
+const VITALS_CACHE_MAX = 2048
+// Server-side floor between accepted host_vitals frames from one agent
+// connection. Our bridge samples at ~5s so this never trips in normal
+// operation — it's a defense against a runaway/buggy agent flooding the op;
+// excess frames are dropped silently (telemetry, not a protocol error).
+const VITALS_MIN_INTERVAL_MS = 1000
+
 // Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
 // request/response relay, never journaled. Whole-frame byte cap — larger
 // payloads belong in POST /media with a blob_ref inside params.
@@ -114,6 +134,11 @@ function parseViewingConvoIds(value) {
 // (today 'completed' | 'interrupted' | 'failed'), and the journal deliberately
 // does not enumerate it — see the session_outcome column comment in db.js.
 const SESSION_OUTCOME_MAX_CHARS = 32
+// Cap for an agent_kind sent by a bridge. Shape-only, same discipline as
+// session_outcome: the backend vocabulary belongs to the writing bridge (today
+// 'claude' | 'codex') and the journal does not enumerate it — see the
+// agent_kind column comment in db.js.
+const AGENT_KIND_MAX_CHARS = 16
 
 // Invite lifecycle (spec: agent chat phase 2). Topic is a title fragment;
 // justification/reason are one-paragraph human text — capped so a row/frame
@@ -140,6 +165,27 @@ const SPAWN_EFFORT_MAX_CHARS = 16
 // sanitising; the cap is tighter than a topic's because these are rendered
 // as identity on one line, not as body copy.
 const CARD_TITLE_MAX_CHARS = 120
+const PEER_IDEM_KEY_MAX_CHARS = 128
+
+function logPeerMessageDecision(log, {
+  decision, reason = null, correlationId, convoId, seq,
+}) {
+  const entry = {
+    type: 'peer_message_decision',
+    ts: new Date().toISOString(),
+    decision,
+    reason,
+    correlation_id: correlationId,
+    convo_id: convoId,
+  }
+  if (seq != null) entry.seq = seq
+  try {
+    log(JSON.stringify(entry))
+  } catch (err) {
+    // Observability must not turn a committed append into a protocol failure.
+    console.error('peer_message decision log failed', err)
+  }
+}
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
 // the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
@@ -213,7 +259,57 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
   }
 }
 
+// Last host_vitals per user. In-memory only and bounded (oldest-written
+// evicted first): host-global, so a single value per user, not per convo. A
+// lost entry just means a reconnecting client waits up to one sample interval
+// for the next tick. Exported for direct unit testing.
+//
+// KNOWN LIMITATION (single-host): keyed by userId alone, so if one user ran
+// TWO bridges on different machines their samples would collapse onto one
+// cache slot (last writer wins) and clients could not tell them apart. Our
+// deployment is single-VPS / single-bridge per user, so this does not bite.
+// True multi-bridge / multi-VPS per-host telemetry (device-keyed cache +
+// client host-selection UX) is deferred (the
+// multi-account / multi-VPS dashboard). Do NOT add device-keying here now.
+export function makeVitalsCache(max = VITALS_CACHE_MAX) {
+  const map = new Map()
+  return {
+    set(userId, vitals) {
+      if (map.has(userId)) map.delete(userId)
+      map.set(userId, vitals)
+      if (map.size > max) map.delete(map.keys().next().value)
+    },
+    get(userId) {
+      return map.get(userId)
+    },
+  }
+}
+
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
+
+// permessage-deflate (RFC 7692), negotiated per connection: a client that
+// does not offer the extension gets plain frames exactly as before, so this is
+// wire-compatible with every existing client. Only frames of >= 1 KiB are
+// compressed (tool_output / diff rows; short text and control frames are not
+// worth the zlib call). No context takeover on either side, so no per-socket
+// zlib window outlives a message — flat memory per connection at the cost of
+// some ratio. Measured over a day of the live journal's frames: 29.5 MB ->
+// 12.5 MB (2.4x) for ~1 s of deflate CPU per connected client.
+// Memory: ws keeps a socket's (reset) zlib stream allocated until the socket
+// closes, so each socket that has received a large frame retains one deflate
+// state; memLevel 7 makes that ~192 KiB instead of zlib's default ~256 KiB.
+// Deliberately NO serverMaxWindowBits / clientMaxWindowBits: with either set,
+// ws REJECTS (HTTP 400, no plain fallback) a valid offer that does not carry
+// the matching parameter or asks for a smaller window — e.g. Firefox's bare
+// `permessage-deflate` offer. Negotiation must only ever add compression,
+// never cost a client its connection.
+export const WS_DEFLATE_OPTIONS = Object.freeze({
+  threshold: 1024,
+  zlibDeflateOptions: { level: 6, memLevel: 7 },
+  serverNoContextTakeover: true,
+  clientNoContextTakeover: true,
+  concurrencyLimit: 10,
+})
 
 // Between replay batches, a slow/paused reader must not let the server
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
@@ -261,13 +357,18 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
+  perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
   // since wake-before-spawn, the wake wait that may precede it.
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
-  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  const wss = new WebSocketServer({
+    server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES,
+    perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
+  })
   const statusCache = makeStatusCache()
+  const vitalsCache = makeVitalsCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
@@ -527,7 +628,14 @@ export function attachWs({
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
             // with the fresh cursor instead. Close 4009 right after; the socket
             // is never registered (no live traffic for this abandoned attempt).
-            if (headSeq - msg.cursor > maxReplay) {
+            // A client may LOWER the valve for its own connection with an optional
+            // hello `max_replay` (non-negative integer; anything else is ignored,
+            // not rejected — it is an additive field). A client that applies rows
+            // one by one knows its own replay cost; the web client asks for a
+            // snapshot past a few hundred rows instead of receiving tens of
+            // thousands of frames. It can never raise the server's limit.
+            const clientMax = Number.isInteger(msg.max_replay) && msg.max_replay >= 0 ? msg.max_replay : Infinity
+            if (headSeq - msg.cursor > Math.min(maxReplay, clientMax)) {
               ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
               ws.close(4009)
               return
@@ -607,6 +715,17 @@ export function attachWs({
           if (conn.closed) return
           hub.register(conn)
           conn.registered = true
+          // Host-vitals paint-on-connect: a fresh client gets the last host
+          // sample immediately. host_vitals is host-global and never
+          // journaled, so it is not part of the cursor replay above — without
+          // this a reconnecting client would show a blank vitals gauge until
+          // the bridge's next ~5s tick.
+          if (conn.kind === 'client') {
+            const cachedVitals = vitalsCache.get(conn.userId)
+            if (cachedVitals) {
+              ws.send(JSON.stringify({ kind: 'ephemeral', host_vitals: cachedVitals }))
+            }
+          }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
           // Catch-up delivery for THIS device only (spec: single pump, three
           // callers) — an invite approved while this agent was offline sits
@@ -631,7 +750,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -687,7 +806,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -946,10 +1065,32 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!Number.isInteger(msg.target_seq)) return fail('bad_request')
         // Read-only sub-chat guard (see isReadOnlyChild above).
         if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
+        const replyPayload = { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null }
+        // stamp queued_release provenance onto the reply, resolved from
+        // the stored target prompt's own kind. A tap on a queued_release card
+        // is a control action, not a chat message, so clients suppress its raw
+        // "send"/"cancel:N" echo. Clients can only derive that from the card
+        // being in their loaded page; when it has paginated out of view the
+        // echo leaks into the thread until the card scrolls back in.
+        // This makes the marker authoritative and page-independent. Keyed on
+        // the target prompt's kind, NEVER the reply's value shape — so a
+        // genuine answer that merely reads like a control token is never
+        // suppressed (a regression that value-shape matching once caused).
+        // Scoped to conn.userId: append() stores every convo event under the
+        // owner's user_id, so this resolves the same prompt append() will
+        // authorize the reply against, and can't read another user's rows.
+        const targetPrompt = db.prepare(
+          'SELECT type, payload FROM events WHERE user_id=? AND convo_id=? AND seq=?'
+        ).get(conn.userId, msg.convo_id, msg.target_seq)
+        if (targetPrompt && targetPrompt.type === 'prompt') {
+          let targetKind
+          try { targetKind = JSON.parse(targetPrompt.payload)?.kind } catch { targetKind = undefined }
+          if (targetKind === 'queued_release') replyPayload.kind = 'queued_release'
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type: 'prompt_reply',
-          payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
+          payload: replyPayload,
         })
         wakeConvoAgent(msg.convo_id)
         break
@@ -1821,6 +1962,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         )) {
           return fail('bad_request', 'bad session_outcome')
         }
+        // agent_kind is optional and shape-only, like session_outcome — an
+        // omitted kind leaves any previously recorded one untouched (COALESCE in
+        // upsertConversation).
+        if (msg.agent_kind != null && (
+          typeof msg.agent_kind !== 'string'
+          || msg.agent_kind.length === 0
+          || msg.agent_kind.length > AGENT_KIND_MAX_CHARS
+        )) {
+          return fail('bad_request', 'bad agent_kind')
+        }
         if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
           return fail('bad_request', 'bad summary')
         }
@@ -1877,6 +2028,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           parentConvoId: msg.parent_convo_id ?? null,
           sessionOutcome: msg.session_outcome ?? null,
           summary: msg.summary ?? null,
+          agentKind: msg.agent_kind ?? null,
           repo: msg.repo,
         })
         // A spawned child's first published title carries the session short
@@ -1944,14 +2096,142 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               auto_title: convo.auto_title ?? null,
               parent_convo_id: convo.parent_convo_id ?? null,
               agent_device_id: conn.deviceId,
+              // agent_kind rides the meta event so a live client marks a new
+              // codex/claude conversation the moment it appears, without waiting
+              // for the next /snapshot. Read back from the stored row (like
+              // session_outcome on session_status) so it agrees with the
+              // snapshot; omitted-null when the bridge sent no kind.
+              agent_kind: convo.agent_kind ?? null,
+              // summary rides convo_meta so the operator's pinned-summary
+              // surface refreshes live instead of only at /snapshot (spec:
+              // pinned-summary surface). Read back from the stored
+              // row like agent_kind, so the event can never disagree with the
+              // snapshot — this event also fires for a title-only change, and
+              // then it simply restates the summary already stored.
+              //
+              // Always present (like title/agent_kind, unlike session_status's
+              // omitted-when-absent session_outcome) for two reasons: it makes
+              // the payload self-describing for field-presence feature
+              // detection — the only mechanism available, since /snapshot
+              // advertises no capabilities array — and it lets a bridge CLEAR
+              // a summary (upsert `summary: ""`) and have the clear actually
+              // reach live clients instead of being indistinguishable from
+              // "this event carries no summary news".
+              summary: convo.summary ?? '',
+              summary_updated_at: convo.summary_updated_at ?? 0,
               repo: convo.repo ?? null,
             },
           })
         }
         break
       }
+      case 'peer_message': {
+        const validIdemKey = typeof msg.idem_key === 'string' && msg.idem_key
+          && msg.idem_key.length <= PEER_IDEM_KEY_MAX_CHARS
+        const correlationId = Number.isInteger(conn.deviceId) && validIdemKey
+          ? `agent:${conn.deviceId}:${msg.idem_key}` : null
+        const convoId = typeof msg.target_convo === 'string' && msg.target_convo
+          && msg.target_convo.length <= CONVO_ID_MAX_CHARS
+          ? msg.target_convo : null
+        const reject = (reason, detail, seq) => {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason, correlationId, convoId, seq,
+          })
+          return fail(reason, detail)
+        }
+
+        if (conn.kind !== 'agent') return reject('forbidden')
+        if (typeof msg.target_convo !== 'string' || !msg.target_convo
+          || typeof msg.from_convo !== 'string' || !msg.from_convo
+          || msg.target_convo === msg.from_convo) {
+          return reject('bad_request')
+        }
+        if (!validIdemKey) return reject('bad_request')
+        const body = sanitizePeerText(msg.body)
+        if (!body) return reject('bad_request')
+
+        // Attribution comes only from the conversation row. Requiring both
+        // account and managing-device ownership prevents one same-account
+        // agent from borrowing another session's title or kind.
+        const fromConvo = db.prepare(
+          'SELECT owner_user_id, agent_device_id, title, agent_kind FROM conversations WHERE id=?'
+        ).get(msg.from_convo)
+        if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+          || fromConvo.agent_device_id !== conn.deviceId) {
+          return reject('forbidden')
+        }
+
+        // A peer message is targeted at a live agent-owned conversation.
+        // Ownerless legacy rows and dangling/revoked owners must take the
+        // same path as a missing target; otherwise fanOut's legacy null-owner
+        // behavior would broadcast targeted coordination text to every agent.
+        const targetConvo = db.prepare(`
+          SELECT c.owner_user_id, c.agent_device_id
+            FROM conversations c
+            JOIN devices d ON d.id=c.agent_device_id
+                          AND d.user_id=c.owner_user_id
+                          AND d.kind='agent'
+           WHERE c.id=?
+        `).get(msg.target_convo)
+        if (!targetConvo) return reject('not_found')
+        if (targetConvo.owner_user_id !== conn.userId) {
+          return reject('forbidden', 'cross-user peer messaging not enabled yet')
+        }
+        // Same private-owner visibility rule as read_marker/loadRoom. A
+        // private caller or an ordinary caller with known standing in the
+        // target may write; every other ordinary agent sees byte-identical
+        // not_found behavior for private and nonexistent targets.
+        if (isPrivateDevice(db, targetConvo.agent_device_id)
+          && !isPrivateDevice(db, conn.deviceId)
+          && !isKnownParticipant(db, msg.target_convo, conn.deviceId)) {
+          return reject('not_found')
+        }
+
+        const appendArgs = {
+          userId: conn.userId, convoId: msg.target_convo,
+          sender: `agent:${conn.name}`, type: 'peer_message',
+          payload: {
+            from_convo: msg.from_convo,
+            from_name: sanitizePeerText(fromConvo.title, PEER_NAME_CAP),
+            from_kind: fromConvo.agent_kind,
+            body,
+            // Server-authoritative reconstruction: only the fields listed here reach the
+            // stored/broadcast payload. Include `priority` ONLY when the sender set it true,
+            // so a normal peer message keeps its 4-key payload (matching the byte-identical
+            // cross-repo fixture) and clients that read event.payload.priority defensively
+            // see the flag exactly when it was sent.
+            ...(msg.priority === true ? { priority: true } : {}),
+          },
+        }
+        const result = appendAgentIdempotent(db, {
+          deviceId: conn.deviceId,
+          key: correlationId,
+          appendArgs,
+        })
+        if (result.duplicate) {
+          logPeerMessageDecision(log, {
+            decision: 'reject', reason: 'duplicate', correlationId, convoId,
+            seq: result.seq,
+          })
+          return result
+        }
+        logPeerMessageDecision(log, {
+          decision: 'accept', correlationId, convoId, seq: result.seq,
+        })
+        fanOut(journalFrame({
+          seq: result.seq, convo_id: appendArgs.convoId, ts: result.ts,
+          sender: appendArgs.sender, type: appendArgs.type, payload: appendArgs.payload,
+        }))
+        return result
+      }
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // Non-mintability: peer_message is server-authoritative
+        // — mintable ONLY via op:peer_message, which stamps from_convo/
+        // from_name/from_kind from the trusted bridge. A bare publish would let an
+        // agent forge that attribution, so reject it explicitly here (defense in
+        // depth: it is also absent from AGENT_PUBLISH_TYPES below).
+        if (msg.type === 'peer_message') return fail('bad_request', 'peer_message is not agent-publishable')
         if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         // The agent_chat consent card is minted only by the server's own
         // agent_invite/agent_join park path, which sanitises from_name/
@@ -2144,6 +2424,33 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         }, () => agentTargetsFor(db, msg.convo_id))
+        break
+      }
+      case 'host_vitals': {
+        // Host-global machine vitals (cpu/ram/sampled_at_ms) sampled by the
+        // bridge and relayed to EVERY one of the user's clients. Same
+        // agent-only stance as status, but deliberately NOT convo-scoped: the
+        // frame carries no convo_id, there is no authorize() ownership check
+        // (host vitals belong to the machine, not a conversation), and the
+        // broadcast bypasses the viewingConvoIds filter that sendEphemeral
+        // applies. Never journaled — pure ephemeral, so no appendAndFan. The
+        // last sample is cached per user and replayed on client connect.
+        // Payload is opaque to the server, validated only as a size-capped
+        // non-null object so the bridge can evolve the shape without a deploy.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.vitals !== 'object' || msg.vitals === null) return fail('bad_request')
+        let encoded
+        try { encoded = JSON.stringify(msg.vitals) } catch { return fail('bad_request') }
+        if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'vitals too large')
+        // Min-interval throttle: drop (silently) frames arriving faster than
+        // the floor from this connection. Checked AFTER validation so a
+        // rejected frame never consumes the interval, and BEFORE the cache
+        // write/broadcast so a flood can neither churn the cache nor fan out.
+        const nowMs = Date.now()
+        if (conn._lastVitalsMs != null && nowMs - conn._lastVitalsMs < VITALS_MIN_INTERVAL_MS) break
+        conn._lastVitalsMs = nowMs
+        vitalsCache.set(conn.userId, msg.vitals)
+        hub.broadcastVitals(conn.userId, { kind: 'ephemeral', host_vitals: msg.vitals })
         break
       }
       case 'finalize': {

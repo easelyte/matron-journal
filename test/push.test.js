@@ -9,6 +9,12 @@ import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
+// Peer_message is a routine coalesced activity push (priority 5), not an
+// attention alert and never silent — asserted explicitly, not via fallthrough.
+test('classify(peer_message) deep-equals a coalesced activity push', () => {
+  assert.deepEqual(classify('peer_message'), { priority: 5, coalesce: true, kind: 'activity' })
+})
+
 // A stub apnsClient recording every send() call. `respond` maps a call to a
 // {status, reason} result (default: 200 success); tests override it to
 // simulate 410/400/etc. Never throws, matching the real client's contract.

@@ -1,14 +1,14 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import http2 from 'node:http2'
+import { makeTmpDir } from './tmp-dir.js'
 
 // Never reads a real .p8: generates a throwaway EC P-256 key pair and writes
 // it out as PKCS8 PEM, the same shape as Apple's .p8 file.
 export function makeTestKey() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' })
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-apns-key-'))
+  const dir = makeTmpDir('matron-apns-key-')
   const keyFile = path.join(dir, 'AuthKey_TEST123.p8')
   fs.writeFileSync(keyFile, privateKey.export({ type: 'pkcs8', format: 'pem' }))
   return { keyFile, publicKey }

@@ -1,6 +1,6 @@
 {
-  "name": "snapshot: conversations carry title/session_state/unread_count/snippet, ordered by last_seq desc",
-  "description": "Two conversations, one advanced by an agent (bumps unread + snippet), one advanced by the user's own send (does not bump unread). GET /snapshot's seq is the user's journal head; conversations are ordered most-recently-active first.",
+  "name": "snapshot: conversations carry title/session_state/unread_count/snippet, ordered by last message time desc",
+  "description": "Two conversations, one advanced by an agent (bumps unread + snippet), one advanced by the user's own send (does not bump unread). GET /snapshot's seq is the user's journal head; conversations are ordered by last message time (COALESCE(last_ts, created_at) DESC, id DESC), so the most recently messaged conversation is first.",
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-2" }],
     "conversations": [
@@ -26,13 +26,13 @@
           {
             "id": "c2", "title": "Notes", "auto_title": "Notes", "session_state": "done", "session_outcome": null,
             "last_seq": 2, "unread_count": 0, "snippet": "a note to self",
-            "parent_convo_id": null, "summary": "", "repo": null, "agent_device_id": null, "mission_id": null, "mission_count": 0,
+            "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "mission_id": null, "mission_count": 0,
             "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           },
           {
             "id": "c1", "title": "Fix login bug", "auto_title": "Fix login bug", "session_state": "running", "session_outcome": null,
             "last_seq": 1, "unread_count": 1, "snippet": "starting work",
-            "parent_convo_id": null, "summary": "", "repo": null, "agent_device_id": null, "mission_id": null, "mission_count": 0,
+            "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "mission_id": null, "mission_count": 0,
             "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           }
         ]

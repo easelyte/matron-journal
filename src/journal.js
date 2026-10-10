@@ -12,6 +12,18 @@ import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
+// Conversation-list order: newest last-MESSAGE time first (last_ts, falling
+// back to created_at for a conversation with no message events), tie-broken by
+// the immutable id DESC. Done in JS by snapshot() and the /roster handler over
+// the already-fetched rows — NOT a SQL ORDER BY, which would re-evaluate the
+// correlated last_ts subquery a second time per row. Byte-for-byte the same
+// comparator the web client uses (matron-web database.ts) so the two agree.
+export function byLastMessageThenId(a, b) {
+  const activity = (b.last_ts ?? b.created_at) - (a.last_ts ?? a.created_at)
+  if (activity) return activity
+  return a.id > b.id ? -1 : a.id < b.id ? 1 : 0
+}
+
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
 // capping the bridge-returned `start` rpc's convo_id — same 128-char id
@@ -76,6 +88,7 @@ export function snippetOf(type, payload) {
   }
   if (type === PEOPLE_EVENT_TYPE) return `👥 ${String(p.summary || 'Contacts updated')}`.slice(0, 120)
   if (type === 'text') return String(p.body || '').slice(0, 120)
+  if (type === 'peer_message') return `💬 ${sanitizePeerText(p.body)}`.slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
   // A captioned attachment reads better in the chat list as what the user
@@ -170,7 +183,7 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, repo }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, agentKind, repo }) {
   // repo: undefined = unchanged, null = clear, string = canonical host/org/name.
   let repoCols = null // { repo, scope } to write, or null to leave alone
   if (repo === null) repoCols = { repo: null, scope: null }
@@ -188,6 +201,19 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // agent's to title, adopt or re-state.
     if (existing.system != null) throw new Error('not authorized: system conversation')
     if (title != null && title !== existing.auto_title) metaChanged = true
+    // A summary change is metadata a live client must learn mid-conversation,
+    // not just roster-read material (spec: pinned-summary surface).
+    // The operator's pinned digest would otherwise only refresh at /snapshot,
+    // i.e. show the first five messages of a six-hour session. It rides the
+    // existing convo_meta event rather than a new type — see docs/protocol.md.
+    //
+    // Compared against the STORED value, not merely against null: the bridge
+    // republishes its digest on reconnect and on every pass that did not grow
+    // a bullet, and an unchanged value is not a change. This guard is what
+    // keeps summary_updated_at honest and keeps convo_meta off the wire when
+    // nothing happened.
+    const summaryChanged = summary != null && summary !== existing.summary
+    if (summaryChanged) metaChanged = true
     if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
@@ -214,9 +240,12 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && existing.agent_device_id !== agentDeviceId
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
+    // summary_updated_at binds null — i.e. COALESCE keeps the stored stamp —
+    // on every upsert that did not actually change the summary, including an
+    // identical re-send. Only a real change moves it.
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
     if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
     if (title != null) {
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
@@ -233,16 +262,27 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     const createdAt = Date.now()
     // The row and its inherited link are one write: the invariant "a
     // non-null mission_id has an active link" must hold from birth.
+    // A creation that carries a summary stamps it now; one that doesn't gets
+    // 0 ("never"), the same value every pre-existing row has.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt)
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, agentKind ?? null, inheritedMission, createdAt)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
       if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
       recomputeConvoTitle(db, id)
     })()
-    if (initialTitle || parentConvoId) metaChanged = true
+    // A non-empty creation summary counts, for the same reason a creation
+    // title does: without it, a conversation minted by a summary-only upsert
+    // (no title, no parent, no state) appends NO event at all, so live clients
+    // would not learn the conversation — let alone its digest — exists until
+    // their next /snapshot. "The bridge always sends a title first" is true of
+    // today's producer, but it is a property of the caller, not a guarantee of
+    // this contract, and relying on it reintroduces exactly the snapshot-only
+    // staleness this change exists to remove. An empty summary is not a
+    // change and stays silent.
+    if (initialTitle || parentConvoId || summary) metaChanged = true
     if (repoCols && repoCols.repo) {
       db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
       metaChanged = true
@@ -403,6 +443,20 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // has no message events (just created, or history pruned by retention) —
   // clients fall back to created_at. The (convo_id, seq) index keeps the
   // subquery a backwards seek to the first message row.
+  // Ordering is by that last-message time (COALESCE(last_ts, created_at)), not
+  // raw last_seq — every meta/status/read_marker event advances last_seq, so a
+  // last_seq ordering resurfaced a stale conversation to the top on non-message
+  // activity. The tie-break is the immutable `id`, NOT last_seq: a last_seq
+  // tie-break would reintroduce the exact bug on a same-millisecond last_ts
+  // collision (the non-message event still advanced last_seq), and id also
+  // gives message-less rows sharing a created_at a total, flicker-free order.
+  // The ordering is done in JS, not a SQL ORDER BY: referencing the correlated
+  // last_ts subquery in ORDER BY makes SQLite evaluate it a SECOND time per row
+  // (re-walking each conversation's non-message suffix — measured ~2x on a
+  // pathological history), and better-sqlite3 runs synchronously, so that would
+  // block the event loop. Sorting the already-fetched rows costs nothing at
+  // per-user conversation counts, and uses the exact comparator the web client
+  // applies (database.ts), keeping server and client order identical.
   // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
   // a fetch — the current mission and how many missions this conversation
   // ever touched; a filtered caller never counts or names a private-origin
@@ -410,7 +464,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, auto_title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, repo, created_at, agent_device_id, system,
+            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, agent_kind, system,
             ${excludePrivateOwned
               ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,
@@ -422,9 +476,9 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
-       : ''}
-     ORDER BY last_seq DESC`
+       : ''}`
   ).all(userId)
+  conversations.sort(byLastMessageThenId)
   // Room membership, so a client can chip every participating box, not just
   // the recorded owner (spec: multi-agent room tags), and place a room under
   // its participants' missions (spec: 2026-10-01 rooms under missions).

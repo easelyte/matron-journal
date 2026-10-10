@@ -1,0 +1,17 @@
+{
+  "fixtureVersion": "sha256:88804244220f6443a9935b066fe0b31dab7ad27ea67badb47ecf7bf0faa78cbf",
+  "event": {
+    "seq": 42,
+    "convo_id": "peer-target-convo",
+    "ts": 1786939200000,
+    "sender": "agent:sender-device",
+    "type": "peer_message",
+    "payload": {
+      "from_convo": "peer-source-convo",
+      "from_name": "Sender Session",
+      "from_kind": "codex",
+      "body": "Coordinate on the release checklist.",
+      "priority": true
+    }
+  }
+}

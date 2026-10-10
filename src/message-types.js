@@ -4,7 +4,7 @@
 // missions.js can use it without importing journal.js (which imports
 // missions.js).
 export const MESSAGE_TYPES = [
-  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
+  'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
 ]
 
 // SQL literal of MESSAGE_TYPES for correlated last-message subqueries

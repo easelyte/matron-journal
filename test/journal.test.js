@@ -226,6 +226,18 @@ test('snippetOf shows a captioned attachment as what the user said, not [image]'
   assert.equal(snippetOf('image', { caption: 'x'.repeat(200) }).length, 120)
 })
 
+// A peer_message snippet renders the sanitized BODY (💬-prefixed), never
+// the literal [peer_message] placeholder — the operator sees the coordination
+// line in the convo list.
+test('snippetOf renders a peer_message as its sanitized body, never [peer_message]', () => {
+  assert.equal(snippetOf('peer_message', { body: 'ship the invoice fix' }), '💬 ship the invoice fix')
+  assert.notEqual(snippetOf('peer_message', { body: 'x' }), '[peer_message]')
+  // newline/control flattened by sanitizePeerText before prefixing
+  assert.equal(snippetOf('peer_message', { body: 'a\nb' }), '💬 a b')
+  // capped like every other snippet
+  assert.ok(snippetOf('peer_message', { body: 'y'.repeat(300) }).length <= 120)
+})
+
 test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
   for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
     assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)
@@ -327,6 +339,100 @@ test('summary: set via upsert, kept when omitted, returned by snapshot', async (
   upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: 'fixed CI, now on tests' })
   const snap = snapshot(db, alice.id)
   assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
+})
+
+// The load-bearing guarantee of the pinned-summary surface (spec).
+// The stamp feeds an "updated Nm ago" label; if a re-sent identical summary
+// moved it, a bridge backfilling its saved digests on reconnect would stamp
+// every old digest as fresh — the surface would confidently report the exact
+// staleness the field exists to disclose. Date.now is pinned per call so the
+// assertions test the guard, not the clock's millisecond resolution.
+test('summary_updated_at: advances only on a real content change', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+  const realNow = Date.now
+  const at = (ms, fn) => { Date.now = () => ms; try { return fn() } finally { Date.now = realNow } }
+  const stamp = () => db.prepare('SELECT summary_updated_at FROM conversations WHERE id=?').get('s1').summary_updated_at
+
+  // Creation with no summary: never-set sentinel, not "now".
+  at(1000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't', sessionState: 'running', agentDeviceId: ag.deviceId }))
+  assert.equal(stamp(), 0, 'a summary-less creation must read "never"')
+
+  // First real summary stamps.
+  const first = at(2000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a' }))
+  assert.equal(stamp(), 2000)
+  assert.equal(first.metaChanged, true, 'a summary change must fan a convo_meta')
+
+  // Byte-identical re-send: no move, no event. This is the requirement.
+  const resend = at(3000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a' }))
+  assert.equal(stamp(), 2000, 're-sending the same summary must not move the stamp')
+  assert.equal(resend.metaChanged, false, 're-sending the same summary must not fan an event')
+
+  // Summary-omitting upsert (a title change, a state-only housekeeping
+  // upsert): don't-clobber applies to the stamp as well as the text.
+  const titleOnly = at(4000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't2', agentDeviceId: ag.deviceId }))
+  assert.equal(stamp(), 2000, 'an upsert that omits the summary must not move the stamp')
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, '• a')
+  assert.equal(titleOnly.metaChanged, true, 'the title still changed')
+
+  // A genuine change moves it.
+  at(5000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a\n• b' }))
+  assert.equal(stamp(), 5000)
+
+  // Clearing is a change too — otherwise a cleared surface would keep an
+  // age label describing text that is gone.
+  const cleared = at(6000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' }))
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, '')
+  assert.equal(stamp(), 6000)
+  assert.equal(cleared.metaChanged, true)
+
+  // ...and clearing an already-empty summary is not.
+  at(7000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' }))
+  assert.equal(stamp(), 6000)
+
+  assert.equal(Date.now, realNow, 'clock must be restored')
+})
+
+test('summary_updated_at: stamped at creation when the insert carries a summary, and exposed by snapshot', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+  const before = Date.now()
+  upsertConversation(db, { id: 'born', ownerUserId: dan.id, title: 't', agentDeviceId: ag.deviceId, summary: '• born with one' })
+  upsertConversation(db, { id: 'bare', ownerUserId: dan.id, title: 't', agentDeviceId: ag.deviceId })
+  const rows = snapshot(db, dan.id).conversations
+  const born = rows.find((c) => c.id === 'born')
+  const bare = rows.find((c) => c.id === 'bare')
+  assert.ok(born.summary_updated_at >= before, 'a summary-carrying insert stamps now')
+  assert.equal(born.summary, '• born with one')
+  // A conversation that never had a summary reads ''/0 — the same values
+  // every row predating the column reads, so the web surface renders nothing.
+  assert.equal(bare.summary, '')
+  assert.equal(bare.summary_updated_at, 0)
+})
+
+// Regression: a conversation minted by a summary-only
+// upsert — no title, no parent, no state — used to append no event at all, so
+// live clients could not learn the conversation OR its digest existed until
+// their next /snapshot. "The bridge always sends a title first" is a property
+// of today's producer, not of this contract.
+test('summary_updated_at: a titleless summary-only creation still counts as meta-changed', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+
+  const born = upsertConversation(db, { id: 'quiet', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• minted by a digest' })
+  assert.equal(born.metaChanged, true, 'a summary-only creation must fan a convo_meta')
+  assert.equal(born.title, '')
+  assert.ok(born.summary_updated_at > 0)
+
+  // An EMPTY summary is not news, so a bare creation stays silent exactly as
+  // it did before — the only way to create without an event.
+  const silent = upsertConversation(db, { id: 'silent', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' })
+  assert.equal(silent.metaChanged, false)
+  const alsoSilent = upsertConversation(db, { id: 'silent2', ownerUserId: dan.id, agentDeviceId: ag.deviceId })
+  assert.equal(alsoSilent.metaChanged, false)
 })
 
 test('agent_chat permission_request is client-only; everything else is not', () => {

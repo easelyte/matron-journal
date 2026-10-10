@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs, upsertDeviceStatus, deviceStatuses } from '../src/db.js'
 import { createUser } from '../src/auth.js'
+import { upsertConversation } from '../src/journal.js'
+import { makeTmpDir } from './tmp-dir.js'
 import { participantConvoIds } from '../src/participants.js'
 
 test('openDb creates schema idempotently', () => {
@@ -31,7 +32,7 @@ test('events PK is (user_id, seq)', () => {
 })
 
 test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade path)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-migration-'))
+  const dir = makeTmpDir('matron-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -68,7 +69,7 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
 })
 
 test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-parent-migration-'))
+  const dir = makeTmpDir('matron-parent-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -106,7 +107,7 @@ test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations 
 })
 
 test('openDb adds session_outcome to a pre-existing conversations table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-outcome-migration-'))
+  const dir = makeTmpDir('matron-outcome-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -149,6 +150,113 @@ test('openDb adds session_outcome to a pre-existing conversations table in place
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('openDb adds agent_kind to legacy conversations and codex upserts round-trip', () => {
+  const dir = makeTmpDir('matron-agent-kind-migration-')
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('legacy',1,'pre-stamp',0)"
+  ).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  try {
+    const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.ok(cols.includes('agent_kind'), 'agent_kind column missing after migration')
+
+    const legacy = db.prepare("SELECT agent_kind FROM conversations WHERE id='legacy'").get()
+    assert.equal(legacy.agent_kind, null)
+    assert.ok(['claude', 'codex', null].includes(legacy.agent_kind))
+
+    upsertConversation(db, { id: 'codex', ownerUserId: 1, title: 'review', agentKind: 'codex' })
+    const codex = db.prepare("SELECT agent_kind FROM conversations WHERE id='codex'").get()
+    assert.equal(codex.agent_kind, 'codex')
+    assert.ok(['claude', 'codex', null].includes(codex.agent_kind))
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Migration guard for the pinned-summary surface (spec). Two
+// distinct failure modes are being excluded: a cold start on a FRESH database
+// (where the base CREATE TABLE has no such column, so the ALTER must run and
+// must not fail) and a restart on a database that already carries it (where
+// re-running the ALTER would throw "duplicate column name" and take the
+// process down at boot). The live journal DB is the second case on every
+// restart after the first, so re-runnability is not academic.
+test('openDb adds summary_updated_at to legacy conversations, is re-runnable, and cold-starts fresh', () => {
+  const dir = makeTmpDir('matron-summary-stamp-migration-')
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('legacy',1,'pre-stamp',0)"
+  ).run()
+  raw.close()
+
+  let db = openDb(dbPath)
+  try {
+    const cols = db.prepare('PRAGMA table_info(conversations)').all()
+    const col = cols.find((c) => c.name === 'summary_updated_at')
+    assert.ok(col, 'summary_updated_at column missing after migration')
+    assert.equal(col.notnull, 1, 'must be NOT NULL so no row ever reads null')
+    assert.equal(col.dflt_value, '0')
+    assert.equal(cols.filter((c) => c.name === 'summary_updated_at').length, 1, 'added exactly once')
+
+    // The backfilled value for a row that predates the column is the same
+    // "never" sentinel a summary-less new row gets — so an old conversation
+    // renders no age label rather than claiming to be fresh.
+    assert.equal(db.prepare("SELECT summary_updated_at FROM conversations WHERE id='legacy'").get().summary_updated_at, 0)
+    assert.equal(db.prepare("SELECT summary FROM conversations WHERE id='legacy'").get().summary, '')
+  } finally {
+    db.close()
+  }
+
+  // Re-open the SAME file: the migration block runs again against a database
+  // that already has the column. Idempotent or the server cannot restart.
+  try {
+    db = openDb(dbPath)
+    const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.equal(cols.filter((c) => c === 'summary_updated_at').length, 1, 're-open must not re-add the column')
+    db.close()
+
+    // Fresh/empty database: the column must exist after a cold start too,
+    // since the base CREATE TABLE does not declare it.
+    const fresh = openDb(':memory:')
+    const freshCols = fresh.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+    assert.ok(freshCols.includes('summary_updated_at'), 'cold start must create the column')
+    fresh.close()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // WAL mitigation, openDb half (docs/wal-checkpoint-profile.md): the WAL file
 // truncates back to <=4MiB on reset for every opener, but the inline
 // auto-checkpoint must stay at SQLite's stock default here — only the server
@@ -157,7 +265,7 @@ test('openDb adds session_outcome to a pre-existing conversations table in place
 // long one-shot runs. Asserted on a file-backed DB because :memory:
 // databases silently ignore WAL mode.
 test('openDb bounds the WAL file but keeps the stock auto-checkpoint', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walpragma-'))
+  const dir = makeTmpDir('matron-walpragma-')
   const db = openDb(path.join(dir, 'm.db'))
   try {
     assert.equal(db.pragma('journal_mode', { simple: true }), 'wal')
@@ -248,7 +356,7 @@ test('convo_agents accepts the consent states and columns', () => {
 })
 
 test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-migration-'))
+  const dir = makeTmpDir('matron-convo-agents-migration-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -304,7 +412,7 @@ test('convo_agents: an unknown agent_device_id is rejected outright', () => {
 })
 
 test('convo_agents migration adds the cascade and drops rows the old revoke path stranded', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-fk-'))
+  const dir = makeTmpDir('matron-convo-agents-fk-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-fk.db')
 
@@ -347,7 +455,7 @@ test('openDb: agent_chat_allowances is gone from a fresh database', () => {
 })
 
 test('openDb: an existing agent_chat_allowances table is dropped on migrate', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-allow-'))
+  const dir = makeTmpDir('matron-allow-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'm.db')
   const raw = new Database(dbPath)
@@ -454,7 +562,7 @@ test('unregistering clears only the calling device row', async () => {
 // The live box-2 DB already carries 18 rows sharing one token; the fix above
 // only stops NEW duplicates, so openDb collapses the existing ones on start.
 test('openDb collapses duplicate APNs tokens, keeping the newest device row', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-apns-dedupe-'))
+  const dir = makeTmpDir('matron-apns-dedupe-')
   const dbPath = path.join(dir, 'dupes.db')
 
   // Seeded through a raw handle, because openDb is exactly what refuses to
@@ -491,11 +599,370 @@ test('openDb collapses duplicate APNs tokens, keeping the newest device row', ()
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+// --- devices.id AUTOINCREMENT --------------------------------
+// devices.id was a plain reusable rowid: deleting the highest-numbered device
+// handed its id straight to the next insert, and a replacement then inherited
+// the revoked device's idempotency namespace (idemKeyOf embeds who.deviceId).
+// AUTOINCREMENT makes the id monotonic and never-reused, closing the hole at
+// the source. By design, the downstream workarounds
+// (file_idem trigger/gen/SET NULL, agent_idem incarnation-binding) are LEFT in
+// place as belt-and-braces and removed in a follow-up.
+
+test('fresh DB: devices.id is AUTOINCREMENT and a revoked id is never reused', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const mk = (hash) => db.prepare(
+    "INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'agent','box',?,0)"
+  ).run(dan.id, hash).lastInsertRowid
+
+  // The DDL itself carries the guarantee.
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql
+  assert.match(sql, /AUTOINCREMENT/, 'fresh devices table must be AUTOINCREMENT')
+
+  const a = mk('h-a')
+  const b = mk('h-b')
+  assert.equal(b, a + 1)
+  // Delete the HIGHEST id, then insert again: a plain rowid would hand `b`
+  // back; AUTOINCREMENT must skip past it.
+  db.prepare('DELETE FROM devices WHERE id=?').run(b)
+  const c = mk('h-c')
+  assert.equal(c, b + 1, 'the revoked id must not be reused')
+  db.close()
+})
+
+test('openDb rebuilds a pre-AUTOINCREMENT devices table in place, preserving rows and ids', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  // A live-shaped devices table (base columns + every ALTER-added column) with
+  // NO AUTOINCREMENT — what every database written before this migration has.
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE users(
+      id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE TABLE devices(
+      id INTEGER PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      apns_token TEXT,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER,
+      apns_env TEXT,
+      push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0,
+      private_pinned INTEGER NOT NULL DEFAULT 0,
+      tag_char TEXT
+    );
+  `)
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  const ins = raw.prepare(
+    "INSERT INTO devices(id, user_id, kind, name, token_hash, cursor, private, private_pinned, tag_char, created_at, last_seen_at) VALUES(?,1,'agent',?,?,7,1,1,?,?,?)"
+  )
+  ins.run(1, 'box-1', 'h1', 'A', 100, 200)
+  ins.run(2, 'box-2', 'h2', 'B', 101, 201)
+  ins.run(3, 'box-3', 'h3', 'C', 102, 202)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql
+  assert.match(sql, /AUTOINCREMENT/, 'migration must convert devices to AUTOINCREMENT')
+
+  // Every row + every column survives with its exact id.
+  const rows = db.prepare('SELECT * FROM devices ORDER BY id').all()
+  assert.deepEqual(rows.map((r) => r.id), [1, 2, 3])
+  const two = rows[1]
+  assert.deepEqual(
+    [two.name, two.token_hash, two.cursor, two.private, two.private_pinned, two.tag_char, two.created_at, two.last_seen_at],
+    ['box-2', 'h2', 7, 1, 1, 'B', 101, 201])
+
+  // sqlite_sequence is seeded to the max live id, so a NEW device after the
+  // migration is 4 — and deleting the top then re-inserting never reuses.
+  const four = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','box-4','h4',0)").run().lastInsertRowid
+  assert.equal(four, 4)
+  db.prepare('DELETE FROM devices WHERE id=4').run()
+  const five = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','box-5','h5',0)").run().lastInsertRowid
+  assert.equal(five, 5, 'a post-migration revoke must not reuse the id')
+
+  // Whole-DB FK integrity is intact after the parent-table rebuild.
+  assert.equal(db.pragma('foreign_key_check').length, 0)
+  db.close()
+
+  // Idempotent: re-opening an already-AUTOINCREMENT DB is a no-op.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+})
+
+test('devices rebuild preserves inbound FK children and the file_idem revoke trigger', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-fk-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  // Stand the DB up on the CURRENT schema, then downgrade ONLY devices back to
+  // a non-AUTOINCREMENT shape (keeping its rows), so the child tables + trigger
+  // are real and must survive the parent rebuild.
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at)
+      VALUES(5,1,'agent','box-5','h5',0),(6,1,'agent','box-6','h6',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // A joined membership (cascades) and two file_idem reservations for device 6.
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  raw.exec("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room',6,5,'joined',0)")
+  raw.exec(`INSERT INTO file_idem(key, device_id, gen, fingerprint, boot_id, state, created_at, expires_at)
+            VALUES('6:done', 6, 'g1', 'fp', 'boot', 'done', 0, 9e18),
+                  ('6:pending', 6, 'g2', 'fp', 'boot', 'pending', 0, 9e18)`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql, /AUTOINCREMENT/)
+  // Children carried across the parent rebuild.
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=6").get().n, 1)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM file_idem').get().n, 2)
+  assert.equal(db.pragma('foreign_key_check').length, 0)
+
+  // The BEFORE DELETE trigger was dropped with the old table and must be back:
+  // revoking device 6 drops its SETTLED file_idem row and detaches the PENDING
+  // one, and cascades its membership.
+  db.prepare('DELETE FROM devices WHERE id=6').run()
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM file_idem WHERE key='6:done'").get().n, 0, 'settled row dropped by trigger')
+  const pending = db.prepare("SELECT device_id FROM file_idem WHERE key='6:pending'").get()
+  assert.equal(pending.device_id, null, 'pending row detached to a tombstone, not deleted')
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=6").get().n, 0, 'membership cascaded')
+  db.close()
+})
+
+// Regression: the seed must clear the HIGH-WATER
+// mark across every durable device-id reference, not just live device rows.
+// conversations.agent_device_id is the dangerous one — it is not a foreign key
+// (a revoke leaves it dangling) and authorizeAgentWrite treats it as ownership,
+// so if the highest id ever issued was revoked but still owns a conversation,
+// reissuing it would hand the replacement that conversation's write access.
+test('devices rebuild seeds the sequence above a dangling conversation owner, not just live rows', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-hw-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  // Downgrade devices to a non-AUTOINCREMENT table holding ONLY device 1 —
+  // device 2 was the highest ever issued but has since been revoked.
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // The revoked device 2 still owns a conversation — the dangling reference the
+  // live-max seed would miss.
+  raw.exec("INSERT INTO conversations(id, owner_user_id, agent_device_id, created_at) VALUES('room',1,2,0)")
+  raw.close()
+
+  const db = openDb(dbPath)
+  assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql, /AUTOINCREMENT/)
+  // Next issuance must skip PAST the dangling id 2 — id 3, never 2.
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','replacement','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 3, 'a revoked-but-still-referenced id must not be reissued')
+  assert.notEqual(next, 2)
+  db.close()
+})
+
+// Regression: the FK audit runs INSIDE the
+// transaction, so a devices-parent orphan rolls the whole rebuild back and the
+// AUTOINCREMENT DDL never lands. A restart therefore re-attempts and re-fails
+// rather than skipping the (never-completed) migration and booting with the
+// broken FK state silently accepted.
+test('a devices-parent FK violation rolls the rebuild back and re-fails on restart', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-fkfail-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // A convo_agents row pointing at a device (99) that is NOT in devices: a
+  // devices-parent orphan the rebuild's scoped audit must catch.
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  raw.exec("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room',99,1,'joined',0)")
+  raw.close()
+
+  assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'the audit fails the migration')
+  // Rolled back: devices is still the non-AUTOINCREMENT table.
+  const check = new Database(dbPath)
+  assert.doesNotMatch(check.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql, /AUTOINCREMENT/)
+  check.close()
+  // Restart re-attempts and re-fails rather than silently accepting the state.
+  assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'restart does not skip the never-completed migration')
+})
+
+// The high-water scan must be schema-complete, not a
+// hand-list. A revoked id surviving ONLY in items.origin_device_id (an integer
+// column reached by the dynamic *_device_id scan) or ONLY in events.idem_key
+// (the one persistent integer-less namespace, `client:<id>:` / `agent:<id>:`)
+// must still lift the sequence past it — otherwise a reissued id inherits the
+// old item's idempotency key (replay) or the old device's message dedup.
+test('devices rebuild seeds above a dangling id found only in items.origin_device_id', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-item-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // Revoked device 40 persists only as an item's author.
+  raw.exec(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
+            VALUES('it1',1,1,'task','open',1.0,'t','room',40,'agent','40:ckey',0,0)`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 41, 'the dynamic *_device_id scan must reach items.origin_device_id')
+  db.close()
+})
+
+test('devices rebuild seeds above a dangling id found only in events.idem_key', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-events-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // Revoked client 50 persists only as a message idempotency key; agent 30 too.
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  raw.exec(`INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key)
+            VALUES(1,1,'room',0,'user:dan','text','{}','client:50:local-1'),
+                  (1,2,'room',0,'agent:a','text','{}','agent:30:some-key')`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'client','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 51, 'the events.idem_key scan must reach the 2nd colon segment')
+  db.close()
+})
+
+// Hardening: defensive against data our own code
+// never writes but externally-repaired/legacy DBs might.
+test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID exhaustion)', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-malformed-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
+  // A numeric-prefix-with-junk key (CAST would yield a giant int) and a real one.
+  raw.exec(`INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key)
+            VALUES(1,1,'room',0,'user:dan','text','{}','client:9223372036854775807junk:x'),
+                  (1,2,'room',0,'user:dan','text','{}','client:7:ok')`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  // The malformed key is excluded; the real id 7 wins → next is 8, NOT a giant.
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'client','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 8, 'malformed prefixes must not inflate the sequence')
+  db.close()
+})
+
+test('devices rebuild scans a table whose name contains a double-quote', (t) => {
+  const dir = makeTmpDir('matron-devices-ai-quote-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-ai.db')
+
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
+  raw.exec(`
+    CREATE TABLE devices_old(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
+      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
+      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
+    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP TABLE devices;
+    ALTER TABLE devices_old RENAME TO devices;
+  `)
+  // A table with a literal double-quote in its name, holding a dangling id 60.
+  raw.exec('CREATE TABLE "weird""tbl" (x_device_id INTEGER); INSERT INTO "weird""tbl" VALUES(60);')
+  raw.close()
+
+  const db = openDb(dbPath)
+  const next = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(1,'agent','r','h-new',0)").run().lastInsertRowid
+  assert.equal(next, 61, 'the quoted-identifier scan must reach the oddly-named table without throwing')
+  db.close()
+})
+
 // Rows parked before the `link` column existed were asked under the
 // always-linked contract, so the column's DEFAULT keeps them linked; only
 // rows written by the new code carry an explicit 0.
 test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing rows', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-spawn-link-migration-'))
+  const dir = makeTmpDir('matron-spawn-link-migration-')
   const dbPath = path.join(dir, 'pre-migration.db')
   const raw = new Database(dbPath)
   raw.exec(`
@@ -537,7 +1004,7 @@ test('device_status: the row goes with its device on revoke, and a reused id sta
 })
 
 test('old-schema device_status (no cascade) is rebuilt in place: live rows kept, orphans dropped', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-status-migration-'))
+  const dir = makeTmpDir('matron-device-status-migration-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -583,7 +1050,7 @@ test('schema: repo columns and github tables exist', () => {
 })
 
 test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing populated database in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-repo-migration-'))
+  const dir = makeTmpDir('matron-repo-migration-')
   const dbPath = path.join(dir, 'pre-repo.db')
 
   // A conversations table shaped like the one before the tracker
@@ -631,7 +1098,7 @@ test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing p
 })
 
 test('openDb adds users.unlisted (default 0) to a pre-existing users table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-unlisted-migration-'))
+  const dir = makeTmpDir('matron-unlisted-migration-')
   const dbPath = path.join(dir, 'pre-unlisted.db')
   const raw = new Database(dbPath)
   raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0)')
@@ -645,7 +1112,7 @@ test('openDb adds users.unlisted (default 0) to a pre-existing users table in pl
 })
 
 test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-migration-'))
+  const dir = makeTmpDir('matron-admin-migration-')
   const dbPath = path.join(dir, 'pre-admin.db')
   const raw = new Database(dbPath)
   raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)')
@@ -665,7 +1132,7 @@ test('openDb adds users.is_admin (default 0) to a pre-existing users table in pl
 // showed, so no live room's list changes at deploy — and a room with no
 // joined row (dissolved) must not get its old owner sessions back.
 test('room_owner_convos + spawn_id backfill reproduce the pre-migration participant_convos', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-owner-convos-migration-'))
+  const dir = makeTmpDir('matron-owner-convos-migration-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -696,7 +1163,7 @@ test('room_owner_convos + spawn_id backfill reproduce the pre-migration particip
 // a blob the column does not. Idempotent, cheap (idx_events_media narrows
 // the scan to attachment rows), and never touches tombstones or other types.
 test('openDb backfills events.blob_ref for image/file rows that only carry payload.blob_ref', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-blobref-backfill-'))
+  const dir = makeTmpDir('matron-blobref-backfill-')
   const dbPath = path.join(dir, 'm.db')
   let db = openDb(dbPath)
   const ins = db.prepare('INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref) VALUES(1,?,?,?,?,?,?,?)')

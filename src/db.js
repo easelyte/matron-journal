@@ -13,7 +13,17 @@ CREATE TABLE IF NOT EXISTS users(
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices(
-  id INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT, not a plain rowid: a plain INTEGER PRIMARY KEY
+  -- hands a deleted device's number straight to the next insert, so a
+  -- replacement inherits the revoked device's identity — and with it the
+  -- revoked device's idempotency namespace, since idemKeyOf embeds who.deviceId
+  -- (\`<deviceId>:<key>\`). AUTOINCREMENT makes the id monotonic and never
+  -- reused, closing that at the source. The downstream workarounds that were
+  -- built while this id was reusable (file_idem's revoke trigger + gen + SET
+  -- NULL detach, agent_idem's incarnation-binding migration, the convo_agents
+  -- cascade) are LEFT in place here as belt-and-braces and removed in a
+  -- follow-up — this change only re-bases the invariant they defend.
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id),
   kind TEXT NOT NULL CHECK(kind IN ('client','agent')),
   name TEXT NOT NULL,
@@ -51,6 +61,66 @@ CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_media ON events(convo_id, seq) WHERE type IN ('image', 'file');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS agent_idem(
+  key TEXT PRIMARY KEY,
+  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_idem_expires ON agent_idem(expires_at);
+-- Durable idempotency for the file WRITE API. Separate from
+-- agent_idem because the unit of replay is an HTTP OUTCOME (status + body),
+-- not an appended event seq, and because a row has to survive the process that
+-- created it: the in-memory store this replaces lost every reservation on
+-- restart, so a client retry crossing one re-executed its move/delete/upload.
+-- The key column already carries the calling device (idemKeyOf prefixes it
+-- with the device id), so there is no device column here: the 120s TTL, not a
+-- revocation cascade, is what bounds this table.
+CREATE TABLE IF NOT EXISTS file_idem(
+  key TEXT PRIMARY KEY,
+  -- The device INCARNATION that reserved this row, not just the id encoded in
+  -- the key. devices.id is a reusable rowid, so without this a revoked device's
+  -- rows are inherited by whichever replacement is handed the same number.
+  --
+  -- Revocation splits by state, because the two states fail in opposite
+  -- directions. A SETTLED row is a cached response: inherited, it answers a
+  -- replacement with the previous incarnation's result, so the trigger below
+  -- deletes it. A PENDING row is a live exclusion record, and its work may
+  -- still be running — cascading it away would let a retry execute a second
+  -- time, which for an upload or a move destroys data. So it is detached
+  -- (device_id → NULL) and kept as a tombstone: unowned, charged to no one's
+  -- quota, swept at the orphan retention bound, and refusing its key until
+  -- then. A replacement colliding on that key is refused rather than served or
+  -- joined — the safe direction, and the collision needs both id reuse and the
+  -- same client-chosen key.
+  device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+  -- Identifies THIS reservation, not just its key. The key is chosen by the
+  -- client and the device id it embeds is reusable, so after a revoke the same
+  -- key can legitimately belong to a different reservation. Bookkeeping that
+  -- addressed rows by key alone could then let an in-flight operation from the
+  -- revoked incarnation settle, or delete, the replacement's row.
+  gen TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  -- Which server process reserved this row. A 'pending' row whose boot_id is
+  -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
+  boot_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','done')),
+  -- JSON {op, path, to?, contentHash?}: what the row was reserved to do, so a
+  -- crossed-restart retry can ask the filesystem whether it happened.
+  intent TEXT,
+  status INTEGER,
+  body TEXT,
+  content_hash TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
+CREATE INDEX IF NOT EXISTS idx_file_idem_device ON file_idem(device_id);
+-- Fires before the FK's SET NULL detaches the rest, so only reservations that
+-- have already answered are discarded with the device.
+CREATE TRIGGER IF NOT EXISTS file_idem_drop_settled_on_revoke BEFORE DELETE ON devices BEGIN
+  DELETE FROM file_idem WHERE device_id=OLD.id AND state='done';
+END;
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL
@@ -629,12 +699,52 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
-  // The unstemmed search mirror is populated by trigger from here on; a
-  // database that predates it has rows to index. 'rebuild' reads the
-  // content table (seconds for a few hundred thousand prose rows).
-  const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
-  db.exec(SCHEMA)
-  if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
+  // BEFORE the schema exec, and it has to be: SCHEMA builds
+  // idx_file_idem_device, and creating that index over a table that predates
+  // the column raises `no such column: device_id` — which does not just skip
+  // the repair below, it throws out of openDb and wedges every opener, server
+  // and admin CLI alike, against exactly the database this is meant to fix.
+  //
+  // A drop is the whole migration: file_idem is introduced by the same
+  // unreleased change that added device_id, so there are no production rows to
+  // preserve. A column-less table can only exist in a dev checkout that ran an
+  // earlier commit of this branch, and SCHEMA recreates it on the next line.
+  // The SHAPE of the table, not just its column names. This branch revised
+  // file_idem three times — device_id, then gen, then the cascade becoming a
+  // detach — so a dev database can hold any of those intermediate forms, and
+  // `CREATE TABLE IF NOT EXISTS` repairs none of them. Checking column names
+  // alone would accept the revision whose foreign key still says CASCADE,
+  // which quietly restores the bug that revision removed: a revoke would
+  // delete a PENDING reservation whose work is still running, and a reused
+  // device id with the same key would then execute it a second time.
+  //
+  // Inspect, drop and create in ONE immediate transaction. Both the server and
+  // the admin CLI open this database, and split across three statements two
+  // concurrent openers can each see the stale table — the second then either
+  // fails on a table that is no longer there or drops the correct one the
+  // first just built. The write lock serialises them, and the loser re-reads
+  // under it and finds nothing to do.
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(file_idem)').all()
+    const fk = db.prepare('PRAGMA foreign_key_list(file_idem)').all().find((r) => r.from === 'device_id')
+    const deviceCol = cols.find((c) => c.name === 'device_id')
+    const stale = cols.length && !(
+      deviceCol && deviceCol.notnull === 0
+      && cols.some((c) => c.name === 'gen')
+      && fk && fk.table === 'devices'
+      && String(fk.on_delete).toUpperCase() === 'SET NULL'
+    )
+    if (stale) {
+      db.exec('DROP TABLE file_idem')
+      console.log('file_idem: dropped a pre-release dev table whose shape predates this revision; recreating')
+    }
+    // The unstemmed search mirror is populated by trigger from here on; a
+    // database that predates it has rows to index. 'rebuild' reads the
+    // content table (seconds for a few hundred thousand prose rows).
+    const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
+    db.exec(SCHEMA)
+    if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
+  }).immediate()
   // Older live DBs predate apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.
@@ -667,6 +777,52 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
+  // Bind peer-message idempotency rows to the device incarnation that wrote
+  // them. devices.id is a reusable rowid, so retaining a dedupe row after
+  // revocation could otherwise suppress a replacement device's first send.
+  // Existing rows predate the explicit device_id column; their keys are
+  // server-generated as `agent:<device id>:<bridge key>`, so preserve only
+  // rows whose encoded device existed when the row was written (expires_at
+  // minus the fixed 120s TTL). That timestamp check also rejects a stale row
+  // if its numeric id was already reused before this migration. Rows for
+  // revoked/replacement devices are intentionally discarded because the new
+  // cascade would have removed them.
+  const agentIdemCols = db.prepare('PRAGMA table_info(agent_idem)').all()
+  const agentIdemFks = db.prepare('PRAGMA foreign_key_list(agent_idem)').all()
+  const agentIdemHasDevice = agentIdemCols.some((c) => c.name === 'device_id')
+  const agentIdemHasCascade = agentIdemFks.some((fk) => (
+    fk.from === 'device_id' && fk.table === 'devices' && fk.to === 'id'
+    && String(fk.on_delete).toUpperCase() === 'CASCADE'
+  ))
+  if (!agentIdemHasDevice || !agentIdemHasCascade) {
+    const before = db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n
+    const copy = agentIdemHasDevice
+      ? `SELECT ai.key, ai.device_id, ai.seq, ai.expires_at
+           FROM agent_idem ai JOIN devices d ON d.id=ai.device_id
+          WHERE d.created_at <= ai.expires_at - 120000`
+      : `SELECT ai.key, d.id, ai.seq, ai.expires_at
+           FROM agent_idem ai JOIN devices d
+             ON ai.key LIKE 'agent:' || d.id || ':%'
+          WHERE d.created_at <= ai.expires_at - 120000`
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE agent_idem_fk(
+          key TEXT PRIMARY KEY,
+          device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        INSERT INTO agent_idem_fk(key, device_id, seq, expires_at) ${copy};
+        DROP TABLE agent_idem;
+        ALTER TABLE agent_idem_fk RENAME TO agent_idem;
+        CREATE INDEX idx_agent_idem_expires ON agent_idem(expires_at);
+      `)
+    })()
+    const dropped = before - db.prepare('SELECT COUNT(*) AS n FROM agent_idem').get().n
+    if (dropped > 0) {
+      console.log(`agent_idem: dropped ${dropped} row(s) whose device was already revoked`)
+    }
+  }
   // User-chosen roster tag character (spec: box tag characters). ONE grapheme,
   // NULL = automatic (clients derive a letter from the name). Journal-held so
   // the same letter shows on every device — it used to live in each app's
@@ -686,6 +842,155 @@ export function openDb(path) {
   // consent); no bridge can assert or clear it.
   if (!deviceCols.some((c) => c.name === 'consent_user_only')) {
     db.exec('ALTER TABLE devices ADD COLUMN consent_user_only INTEGER NOT NULL DEFAULT 0')
+  }
+  // Retrofit AUTOINCREMENT onto a devices table that predates it.
+  // SQLite has no ALTER to add AUTOINCREMENT, so the table is rebuilt — and
+  // devices is a PARENT (agent_idem, file_idem and convo_agents all reference
+  // devices(id)), so unlike the child-table rebuilds above this one must run
+  // with foreign_keys OFF: with it ON, DROP TABLE devices would fire every
+  // child's ON DELETE action and wipe/detach their rows. Placed AFTER every
+  // devices ADD COLUMN so the rebuilt shape is the full, stable column set, and
+  // BEFORE the apns dedupe + unique index below so that index lands on the new
+  // table for free. The BEFORE DELETE trigger is dropped with the old table and
+  // recreated by re-running SCHEMA (IF NOT EXISTS makes every other object a
+  // no-op) — sourcing it from the canonical text rather than a hand-copy that
+  // could drift.
+  //
+  // The explicit-id copy alone seeds sqlite_sequence only to MAX(live device
+  // id) — which is NOT enough. A device deleted before the migration can still
+  // be REFERENCED by a durable, non-cascading integer column, above all
+  // `conversations.agent_device_id`, which authorizeAgentWrite treats as
+  // conversation ownership (it is deliberately not a foreign key, so a revoke
+  // leaves it dangling). If such a dangling id is the highest ever issued, the
+  // live-max seed would hand it straight back to the next device, which would
+  // then inherit write access to the revoked agent's conversation. The retained
+  // idempotency/convo_agents workarounds do not cover that column. So the
+  // sequence is seeded to the high-water mark across EVERY durable device-id
+  // reference, guaranteeing no id that was ever issued — live or dangling — is
+  // reissued from here on.
+  const devicesSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get()
+  if (devicesSql && !/AUTOINCREMENT/i.test(devicesSql.sql)) {
+    db.pragma('foreign_keys = OFF')
+    try {
+      db.transaction(() => {
+        // Columns added after the base shape (wake_refused_at, consent_user_only,
+        // push_level, box defaults ...) ride along when the old table has them,
+        // so the rebuild never drops data an earlier migration step added.
+        const baseCols = ['id', 'user_id', 'kind', 'name', 'token_hash', 'cursor', 'apns_token',
+          'created_at', 'last_seen_at', 'apns_env', 'push_prefs', 'private', 'private_pinned', 'tag_char']
+        const extraCols = db.prepare('PRAGMA table_info(devices)').all()
+          .filter((c) => !baseCols.includes(c.name) && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.name))
+        const extraDdl = extraCols.map((c) =>
+          `, ${c.name} ${/^[A-Za-z ]*$/.test(c.type) ? c.type : 'TEXT'}${c.notnull && c.dflt_value != null ? ` NOT NULL DEFAULT ${c.dflt_value}` : ''}`).join('')
+        const copyCols = baseCols.concat(extraCols.map((c) => c.name)).join(', ')
+        db.exec(`
+          CREATE TABLE devices_ai(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL CHECK(kind IN ('client','agent')),
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            cursor INTEGER NOT NULL DEFAULT 0,
+            apns_token TEXT,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER,
+            apns_env TEXT,
+            push_prefs TEXT,
+            private INTEGER NOT NULL DEFAULT 0,
+            private_pinned INTEGER NOT NULL DEFAULT 0,
+            tag_char TEXT${extraDdl}
+          );
+          INSERT INTO devices_ai(${copyCols})
+            SELECT ${copyCols} FROM devices;
+          DROP TABLE devices;
+          ALTER TABLE devices_ai RENAME TO devices;
+        `)
+        // Recreate the trigger dropped with the old table, from the canonical
+        // SCHEMA (every other CREATE ... IF NOT EXISTS is a no-op here).
+        db.exec(SCHEMA)
+        // Lift the sequence above every surviving device-id reference, not just
+        // the live device rows, so a revoked-but-still-referenced id (e.g. a
+        // dangling conversation owner, an item's origin_device_id, or a
+        // milestone's device_id) is never reissued and cannot inherit that
+        // reference's meaning (ownership, idempotency replay, attribution).
+        //
+        // The reference set is DISCOVERED from the schema, not hand-listed — a
+        // hand-list silently diverges as columns are added (P2 canonical
+        // source). Two kinds of reference:
+        //   1. Integer columns: devices.id plus every column named `device_id`
+        //      or `*_device_id` in any table. This auto-covers items, missions,
+        //      milestones, item_comments, conversations, convo_agents,
+        //      agent_spawn_requests, file_idem and agent_idem — and any future
+        //      column that follows the same naming convention.
+        //   2. `events.idem_key`, the ONLY persistent namespace that encodes a
+        //      device id with no sibling integer column (`client:<id>:<local>`
+        //      / `agent:<id>:<key>`, id as the 2nd colon segment). Every other
+        //      idem_key column (items/missions/milestones/item_comments) sits in
+        //      a row that also carries an integer *_device_id, already covered
+        //      by (1); a detached file_idem key (device_id NULL) is left to
+        //      file_idem's own colliding-key refusal + 120s TTL (retained).
+        // Quote an identifier from the schema by doubling embedded quotes — the
+        // names come from sqlite_master/PRAGMA, not user input, but a table or
+        // column legally containing a `"` would otherwise generate invalid SQL
+        // and wedge the migration on every restart.
+        const qid = (id) => `"${String(id).replace(/"/g, '""')}"`
+        let highWater = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM devices').get().m
+        for (const t of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+          for (const c of db.prepare(`PRAGMA table_info(${qid(t.name)})`).all()) {
+            if (c.name === 'device_id' || /_device_id$/.test(c.name)) {
+              const v = db.prepare(`SELECT MAX(${qid(c.name)}) AS m FROM ${qid(t.name)}`).get().m
+              if (v != null && v > highWater) highWater = v
+            }
+          }
+        }
+        const eventsExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
+        if (eventsExists) {
+          // 2nd colon segment of `<scheme>:<id>:<rest>`. Only a canonical, in-
+          // range decimal counts: SQLite's CAST accepts a numeric PREFIX, so
+          // `client:<huge>junk:x` would otherwise cast to a giant value and seed
+          // the sequence to it (SQLITE_FULL on the next insert). The GLOB filter
+          // requires all-digits and length ≤ 18 (< 10^18, safely inside int64),
+          // so any suffix, sign, whitespace, scientific notation or overflow
+          // width is excluded rather than truncated to a huge integer.
+          const ev = db.prepare(`
+            SELECT COALESCE(MAX(CAST(seg AS INTEGER)), 0) AS m
+              FROM (SELECT substr(rest, 1, instr(rest || ':', ':') - 1) AS seg
+                      FROM (SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest
+                              FROM events
+                             WHERE idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%'))
+             WHERE length(seg) BETWEEN 1 AND 18 AND seg NOT GLOB '*[^0-9]*'
+          `).get().m
+          if (ev > highWater) highWater = ev
+        }
+        const seqRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name='devices'").get()
+        if (seqRow) {
+          if (highWater > seqRow.seq) {
+            db.prepare("UPDATE sqlite_sequence SET seq=? WHERE name='devices'").run(highWater)
+          }
+        } else if (highWater > 0) {
+          db.prepare("INSERT INTO sqlite_sequence(name, seq) VALUES('devices', ?)").run(highWater)
+        }
+        // Validate BEFORE commit, scoped to children that reference devices
+        // (parent==='devices'): those are the only violations THIS rebuild could
+        // introduce (a device row the copy dropped while a child still points at
+        // it). Throwing here rolls the whole rebuild back, so a failed audit
+        // cannot be silently "completed" by the AUTOINCREMENT DDL landing and the
+        // guard above skipping the migration on the next restart. Scoped rather
+        // than whole-DB so a pre-existing unrelated orphan (e.g. a device whose
+        // user_id no longer resolves) does not wedge every opener against a
+        // condition this migration neither caused nor fixes.
+        const violations = db.pragma('foreign_key_check').filter((v) => v.parent === 'devices')
+        if (violations.length) {
+          throw new Error(`devices AUTOINCREMENT migration orphaned a child reference: ${JSON.stringify(violations)}`)
+        }
+      })()
+      console.log('devices: rebuilt with AUTOINCREMENT so revoked ids are never reused')
+    } finally {
+      // Always restore enforcement, even if the transaction rolled back — a
+      // failed migration must not leave this connection running with foreign
+      // keys off for the rest of the process.
+      db.pragma('foreign_keys = ON')
+    }
   }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
@@ -739,12 +1044,43 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'session_outcome')) {
     db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
   }
+  // Which KIND of agent backs this conversation — e.g. 'claude' or 'codex' —
+  // recorded by convo_upsert (spec: codex forwarder icon). Distinct from
+  // agent_device_id: one agent device (a bridge) hosts BOTH claude and codex
+  // sessions and stamps the same agent_device_id on every conversation it owns,
+  // so the owning device cannot distinguish the backend — the kind is a
+  // per-conversation fact. NULL for every normal conversation and every row
+  // predating this column, which clients render as "no agent-kind marker".
+  //
+  // Deliberately NOT a CHECK constraint, mirroring session_outcome: the
+  // vocabulary is the writing bridge's, not the journal's. A bridge that grows
+  // a third backend must not start failing writes against an older server.
+  // Shape is validated at the ws boundary (non-empty bounded string) and
+  // clients render an unrecognised value as no marker, so an unknown kind
+  // degrades instead of breaking. Mutable last-write-wins (COALESCE) like
+  // session_outcome — a conversation can switch backend (a claude<->codex
+  // agent switch) and an upsert that omits it leaves the recorded kind alone.
+  if (!convoCols.some((c) => c.name === 'agent_kind')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN agent_kind TEXT')
+  }
   // Rolling 2-3 sentence conversation summary, maintained by the owning
   // bridge's title pass (spec: agent chat phase 2) — roster targeting
   // metadata. Same don't-clobber discipline as title: only an upsert that
   // carries it changes it.
   if (!convoCols.some((c) => c.name === 'summary')) {
     db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+  }
+  // Epoch-ms of the last summary CHANGE (0 = never, including every row that
+  // predates this column). The operator's pinned-summary surface needs
+  // freshness: the bridge's digest lags the conversation by up to five
+  // messages, and a stale digest rendered in a bar labelled "Summary" above a
+  // live timeline reads as current when it isn't. Written ONLY when the
+  // summary actually changes (see upsertConversation), never on an upsert
+  // that merely re-sends the value it already stored — a bridge backfilling
+  // its saved digests on reconnect must not stamp months-old text as fresh,
+  // which is the precise lie this column exists to prevent.
+  if (!convoCols.some((c) => c.name === 'summary_updated_at')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN summary_updated_at INTEGER NOT NULL DEFAULT 0')
   }
   // Displayed pixel size of an image blob (spec: 2026-10-01 item thread
   // layout shift), read from the file's own header by image-size.js. NULL =

@@ -2,7 +2,11 @@ import WebSocket from 'ws'
 import { startServer } from '../src/server.js'
 
 export async function startTestServer(opts = {}) {
-  const s = await startServer({ dbPath: ':memory:', port: 0, ...opts })
+  // fileOwnerUserId: 1 is the first user a test creates in a fresh :memory:
+  // DB — the File Explorer owner gate fails closed without one, so suites that
+  // exercise /files as "the operator" get it by default. Owner-gate tests
+  // override it (a different id, or null for the unconfigured case).
+  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,
@@ -24,14 +28,14 @@ export async function startTestServer(opts = {}) {
   }
 }
 
-export function makeWsClient(base, { token, cursor }) {
+export function makeWsClient(base, { token, cursor, ...helloExtra }) {
   const ws = new WebSocket(base.replace('http', 'ws') + '/ws')
   const frames = []
   ws.on('message', (d) => frames.push(JSON.parse(d)))
   return new Promise((resolve, reject) => {
     ws.on('error', reject)
     ws.on('open', () => {
-      ws.send(JSON.stringify({ op: 'hello', token, cursor }))
+      ws.send(JSON.stringify({ op: 'hello', token, cursor, ...helloExtra }))
       resolve({
         ws,
         frames,

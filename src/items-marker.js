@@ -32,6 +32,13 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
     by,
     awaiting: item.awaiting ?? null,
     resolution: item.resolution ?? null,
+    // Origin conversation, so a client rendering the marker can label the
+    // item's provenance relative to the session receiving it (this session /
+    // another session). origin_convo_id is a base column; origin_convo_title
+    // rides on the decorated item shape (getItem/DECORATE) — null when the
+    // origin conversation row is gone or the item was passed undecorated.
+    origin_convo_id: item.origin_convo_id ?? null,
+    origin_convo_title: item.origin_convo_title ?? null,
     // Action buttons (2026-09-24 item-actions contract): every marker carries
     // the item's current offer and the user's latest tap, so a connected app
     // — and a hello replay — renders the buttons without refetching.

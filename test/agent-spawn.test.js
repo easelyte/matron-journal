@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getSpawn, createSpawnRequest, claimApprove, approveSpawn, discardSpawnRequest } from '../src/spawns.js'
+import { participantIds } from '../src/participants.js'
 
 // Fleet: one user, a parent agent (box-6), a target agent (opal), a client.
 // Parent owns 'parent-convo' — the conversation the consent card lands in.
@@ -246,6 +247,9 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
     target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/alice/app', last_used: 5 }] } })
   })
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   parent.send({ op: 'spawn_targets', request_id: 'q1' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
   assert.equal(reply.request_id, 'q1')
@@ -255,7 +259,8 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   assert.deepEqual(opal.folders, [{ path: '/home/alice/app', last_used: 5 }])
   // self IS listed (the user may want the session on this very machine),
   // flagged so a caller can tell it apart, and not flagged on anyone else
-  const me = reply.boxes.find((b) => b.name === 'box-6')
+  const me = reply.boxes.find((b) => b.self === true)
+  assert.equal(me.name, 'box-6')
   assert.equal(me.self, true)
   assert.equal(me.online, true)
   assert.equal('self' in opal, false)
@@ -325,6 +330,11 @@ test('spawn_targets: valid capacity blocks pass through; a malformed block is dr
       result: { folders: [], activity: { live_sessions: -5, last_hour: [] }, disk: { free_bytes: 9, total_bytes: 4 } },
     })
   })
+  // self (the caller) is online too and now listed — answer its folder RPC so
+  // the fan-out doesn't wait out the full folders timeout
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   parent.send({ op: 'spawn_targets', request_id: 'q1' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
   const opal = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
@@ -362,6 +372,10 @@ test('spawn_targets is agent-only and hides private boxes from ordinary agents',
   const priv = createAgent(s.db, alice.id, 'secret-box')
   s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
   parent.frames.length = 0
+  // self (ordinary caller) is online and now listed — answer its folder RPC
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   parent.send({ op: 'spawn_targets', request_id: 'q2' })
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
   assert.equal(reply.boxes.some((b) => b.name === 'secret-box'), false)
@@ -894,6 +908,23 @@ test('spawn_targets is single-flight per connection: a concurrent second ask is 
   parent.send({ op: 'spawn_targets', request_id: 'sf-3' })
   const third = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets' && f.request_id === 'sf-3', 5000)
   assert.ok(third)
+})
+
+// --- fork-only: recursion guard on a self-targeted spawn ---
+test('recursion guard intact: a spawned CHILD (parent_convo_id set) still cannot spawn, even on its own box', async (t) => {
+  const { s, parentDev, parent } = await spawnFleet(t)
+  // A child conversation, as a spawned session's transcript would be recorded.
+  parent.send({ op: 'convo_upsert', convo_id: 'child-convo', title: 'child session', session_state: 'running', parent_convo_id: 'parent-convo' })
+  await new Promise((r) => setTimeout(r, 50))
+  // Attempt to spawn (same box) FROM the child convo — the recursion guard must
+  // still reject it as an indistinguishable not_found: no card, no row.
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'child-convo',
+    target_device_id: parentDev.deviceId, workdir: '/w', task: 'grandchild',
+  })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'not_found')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
 })
 
 test('approve relays the asked effort to the target start; no effort, no key', async (t) => {

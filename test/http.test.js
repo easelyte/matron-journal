@@ -514,7 +514,7 @@ test('GET /roster: agent token gets agent devices + top-level conversation metad
   const agB = createAgent(s.db, alice.id, 'dev-b')
   createAgent(s.db, eve.id, 'dev-eve')
   await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
-  upsertConversation(s.db, { id: 'top', ownerUserId: alice.id, title: 'work', sessionState: 'running', agentDeviceId: agA.deviceId, summary: 'fixing CI' })
+  upsertConversation(s.db, { id: 'top', ownerUserId: alice.id, title: 'work', sessionState: 'running', agentDeviceId: agA.deviceId, summary: 'fixing CI', agentKind: 'codex' })
   upsertConversation(s.db, { id: 'child', ownerUserId: alice.id, title: 'sub', sessionState: 'running', agentDeviceId: agA.deviceId, parentConvoId: 'top' })
   upsertConversation(s.db, { id: 'evetop', ownerUserId: eve.id, title: 'secret', sessionState: 'running' })
 
@@ -530,6 +530,7 @@ test('GET /roster: agent token gets agent devices + top-level conversation metad
   const top = r.json.conversations.find((c) => c.id === 'top')
   assert.equal(top.summary, 'fixing CI')
   assert.equal(top.agent_device_id, agA.deviceId)
+  assert.equal(top.agent_kind, 'codex') // /roster forwards per-convo agent_kind (claude|codex|null)
 })
 
 test('GET /roster works for client tokens too and requires auth', async (t) => {
