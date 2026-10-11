@@ -181,3 +181,91 @@ test('box_status: a vitals block persists, fans live, and shows on /devices and 
   assert.equal('vitals' in second, false)
   assert.deepEqual(second.disk, DISK)
 })
+
+// Planned-restart state: a bridge publishes where a restart stands so a
+// fleet watcher sees it from the journal. Capped on the way in, and kept
+// across later reports that do not mention it (box_status otherwise
+// replaces the whole row).
+const RESTART = {
+  id: 'r-20261010-1',
+  state: 'pending',
+  requests: [{ conversation: 'abc', reason: 'deploy', sha: 'deadbee' }],
+  pending_since: 1760000000000,
+  waiting_on: { busy: ['s1', 's2'], code: 'dirty tree' },
+  expected_sha: 'deadbeefcafe',
+}
+
+test('box_status.restart is stored and relayed; a frame without it keeps the stored one', async (t) => {
+  const { s, alice, agDev, clientToken, agent, client } = await fleet(t)
+  // A report carrying only the restart block is valid.
+  agent.send({ op: 'box_status', restart: RESTART })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.restart, RESTART)
+  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart, RESTART)
+
+  // A later usage refresh with no restart: replaces the other blocks, keeps restart.
+  client.frames.length = 0
+  agent.send({ op: 'box_status', limits: LIMITS, disk: DISK })
+  const second = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(second.limits, LIMITS)
+  assert.deepEqual(second.restart, RESTART)
+  const stored = deviceStatuses(s.db, alice.id).get(agDev.deviceId)
+  assert.deepEqual(stored.restart, RESTART)
+  assert.deepEqual(stored.limits, LIMITS)
+  const devs = await s.http('/devices', { token: clientToken })
+  assert.deepEqual(devs.json.devices.find((d) => d.device_id === agDev.deviceId).status.restart, RESTART)
+
+  // A later frame with a new restart state replaces it; the kept one moves on.
+  client.frames.length = 0
+  const back = { ...RESTART, state: 'back', results: { resumed: ['s1'], failed: [], possibly_delivered: ['s2'], no_note: [], code_mismatch: false } }
+  agent.send({ op: 'box_status', limits: LIMITS, restart: back })
+  const third = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(third.restart, back)
+  // Other blocks still replace: a frame without limits drops limits, not restart.
+  client.frames.length = 0
+  agent.send({ op: 'box_status', disk: DISK })
+  const fourth = await client.waitFor((f) => f.kind === 'box_status')
+  assert.equal('limits' in fourth, false)
+  assert.deepEqual(fourth.restart, back)
+})
+
+test('box_status.restart is capped and sanitised; a malformed block is dropped and the old one kept', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  const big = {
+    id: 'r1',
+    state: 'pending',
+    requests: Array.from({ length: 100 }, (_, i) => ({ conversation: `c${i}`, note: 'x'.repeat(500), nested: { a: 1 }, 'bad key': 1 })),
+    pending_since: 1760000000000,
+    waiting_on: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, i % 2 ? 'y'.repeat(500) : Array.from({ length: 200 }, (_, j) => `s${j}`)])),
+    expected_sha: 'not a sha',
+    results: { resumed: Array.from({ length: 500 }, (_, i) => `s${i}`), failed: 'nope', no_note: ['a\nb'], code_mismatch: true, extra: 1 },
+    extra: 'dropped',
+  }
+  agent.send({ op: 'box_status', restart: big })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  const r = live.restart
+  assert.equal(r.requests.length, 32)
+  assert.deepEqual(Object.keys(r.requests[0]), ['conversation', 'note'])
+  assert.equal(r.requests[0].note.length, 200)
+  assert.equal(Object.keys(r.waiting_on).length, 16)
+  for (const v of Object.values(r.waiting_on)) assert.ok(Array.isArray(v) ? v.length === 64 : v.length === 200)
+  assert.equal('expected_sha' in r, false)
+  assert.equal(r.results.resumed.length, 64)
+  assert.equal('failed' in r.results, false)
+  assert.deepEqual(r.results.no_note, ['a b'])
+  assert.equal(r.results.code_mismatch, true)
+  assert.equal('extra' in r, false)
+  assert.equal('extra' in r.results, false)
+
+  // Bad state: the block is dropped, the stored one stays, other blocks land.
+  client.frames.length = 0
+  agent.send({ op: 'box_status', disk: DISK, restart: { id: 'r2', state: 'sideways' } })
+  const next = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(next.disk, DISK)
+  assert.equal(next.restart.id, 'r1')
+  // A frame whose only block is a bad restart is rejected, as an empty one is.
+  agent.send({ op: 'box_status', restart: { id: '', state: 'back' } })
+  const err = await agent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+  assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart.id, 'r1')
+})

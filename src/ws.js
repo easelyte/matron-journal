@@ -2366,6 +2366,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (conn.kind !== 'agent') return fail('forbidden')
         const status = sanitizeBoxStatus(msg)
         if (!status) return fail('bad_request', 'no valid status block')
+        // box_status is a full replacement, except `restart`: a restart's
+        // state is kept until the next one, so a report that does not
+        // mention it (usage refresh, shutdown flush) must not erase it.
+        if (!status.restart) {
+          const kept = getDeviceStatus(db, conn.userId, conn.deviceId)?.restart
+          if (kept) status.restart = kept
+        }
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
         hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })

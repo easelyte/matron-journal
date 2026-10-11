@@ -626,7 +626,8 @@ export function sanitizeBoxStatus(raw) {
     const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
     if (email) account = { email }
   }
-  if (!activity && !limits && !disk && !account && !vitals && !defaults) return null
+  const restart = sanitizeBoxRestart(raw.restart)
+  if (!activity && !limits && !disk && !account && !vitals && !defaults && !restart) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
@@ -634,7 +635,102 @@ export function sanitizeBoxStatus(raw) {
     ...(account ? { account } : {}),
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(restart ? { restart } : {}),
   }
+}
+
+// Planned-restart block: the state of a restart a bridge has been asked to
+// perform, so a fleet watcher can see a restart that is pending, under way
+// or finished, what it is waiting on, and how the sessions fared. Shape:
+//   { id, state: pending|restarting|back, requests[], pending_since,
+//     waiting_on, expected_sha, results?: { resumed, failed,
+//     possibly_delivered, no_note: [ids], code_mismatch: bool } }
+// All-or-nothing on the parts that identify it (id, state); the free-form
+// parts are capped and flattened instead, so a chatty bridge cannot grow a
+// stored row without bound. Unknown keys are dropped.
+const RESTART_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
+const RESTART_STATES = new Set(['pending', 'restarting', 'back'])
+const RESTART_REQUESTS_MAX = 32
+const RESTART_REQUEST_KEYS_MAX = 8
+const RESTART_TEXT_CAP = 200
+const RESTART_KEY_RE = /^[A-Za-z0-9_]{1,32}$/
+const RESTART_WAITING_KEYS_MAX = 16
+const RESTART_IDS_MAX = 64
+const RESTART_ID_LIST_ITEM_CAP = 128
+const RESTART_SHA_RE = /^[0-9a-fA-F]{7,64}$/
+
+function restartScalar(v) {
+  if (typeof v === 'string') return sanitizePeerText(v, RESTART_TEXT_CAP)
+  if (typeof v === 'boolean') return v
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  return undefined
+}
+
+function restartIdList(raw) {
+  if (!Array.isArray(raw)) return null
+  const out = []
+  for (const v of raw.slice(0, RESTART_IDS_MAX)) {
+    if (typeof v !== 'string' && !Number.isSafeInteger(v)) continue
+    const t = sanitizePeerText(v, RESTART_ID_LIST_ITEM_CAP)
+    if (t) out.push(t)
+  }
+  return out
+}
+
+export function sanitizeBoxRestart(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (typeof raw.id !== 'string' || !RESTART_ID_RE.test(raw.id)) return null
+  if (!RESTART_STATES.has(raw.state)) return null
+  const out = { id: raw.id, state: raw.state }
+  if (Array.isArray(raw.requests)) {
+    const requests = []
+    for (const r of raw.requests.slice(0, RESTART_REQUESTS_MAX)) {
+      if (r && typeof r === 'object' && !Array.isArray(r)) {
+        const item = {}
+        for (const [k, v] of Object.entries(r).slice(0, RESTART_REQUEST_KEYS_MAX)) {
+          if (!RESTART_KEY_RE.test(k)) continue
+          const sv = restartScalar(v)
+          if (sv !== undefined && sv !== '') item[k] = sv
+        }
+        if (Object.keys(item).length) requests.push(item)
+      } else {
+        const sv = restartScalar(r)
+        if (typeof sv === 'string' && sv) requests.push(sv)
+      }
+    }
+    out.requests = requests
+  }
+  if (Number.isSafeInteger(raw.pending_since) && raw.pending_since >= 0 && raw.pending_since <= AS_OF_MAX_MS) {
+    out.pending_since = raw.pending_since
+  } else if (typeof raw.pending_since === 'string' && raw.pending_since.length <= 40) {
+    const t = sanitizePeerText(raw.pending_since, 40)
+    if (t) out.pending_since = t
+  }
+  if (raw.waiting_on && typeof raw.waiting_on === 'object' && !Array.isArray(raw.waiting_on)) {
+    const waiting = {}
+    for (const [k, v] of Object.entries(raw.waiting_on).slice(0, RESTART_WAITING_KEYS_MAX)) {
+      if (!RESTART_KEY_RE.test(k)) continue
+      if (Array.isArray(v)) {
+        const ids = restartIdList(v)
+        if (ids) waiting[k] = ids
+      } else {
+        const sv = restartScalar(v)
+        if (sv !== undefined) waiting[k] = sv
+      }
+    }
+    out.waiting_on = waiting
+  }
+  if (typeof raw.expected_sha === 'string' && RESTART_SHA_RE.test(raw.expected_sha)) out.expected_sha = raw.expected_sha
+  if (raw.results && typeof raw.results === 'object' && !Array.isArray(raw.results)) {
+    const results = {}
+    for (const k of ['resumed', 'failed', 'possibly_delivered', 'no_note']) {
+      const ids = restartIdList(raw.results[k])
+      if (ids) results[k] = ids
+    }
+    if (typeof raw.results.code_mismatch === 'boolean') results.code_mismatch = raw.results.code_mismatch
+    out.results = results
+  }
+  return out
 }
 
 // Defaults block (matron-bridge docs/specs/box-defaults.md): what a new
