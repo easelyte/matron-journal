@@ -990,7 +990,11 @@ export function startServer({
         routinesSweep: routinesSweeper,
         routineFirer,
         github: resolvedGithub,
-        close: () => new Promise((r) => {
+        // close({ closeCode, closeReason, graceMs }): with a closeCode every
+        // open websocket first gets a close frame carrying it, so a client
+        // can tell a restart from a network drop, and up to graceMs to
+        // acknowledge. Whatever is left is terminated either way.
+        close: ({ closeCode, closeReason, graceMs = 1000 } = {}) => new Promise((r) => {
           closing = true
           startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
@@ -1009,23 +1013,66 @@ export function startServer({
           // each approveSpawn settles its row while the DB is still open.
           hub.close()
           wss.close()
-          for (const c of wss.clients) c.terminate()
-          pushPipeline.close()
-          if (ownsApnsClient) resolvedApnsClient.close()
-          // The transcription queue touches the DB between awaits: abort its
-          // child and let it drain before the handle closes.
-          const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
-          // semanticInFlight: whichever reindex pass (initial or periodic)
-          // is running right now — runVectorIndexer's own shouldStop only
-          // re-checks between batches, so a pass already inside an awaited
-          // embed call could otherwise still be mid-write when db.close()
-          // below fires. Waiting for it here, alongside the other
-          // background work, keeps that from racing a closed db handle.
-          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
+          const finish = () => {
+            for (const c of wss.clients) c.terminate()
+            pushPipeline.close()
+            if (ownsApnsClient) resolvedApnsClient.close()
+            // The transcription queue touches the DB between awaits: abort its
+            // child and let it drain before the handle closes.
+            const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
+            // semanticInFlight: whichever reindex pass (initial or periodic)
+            // is running right now — runVectorIndexer's own shouldStop only
+            // re-checks between batches, so a pass already inside an awaited
+            // embed call could otherwise still be mid-write when db.close()
+            // below fires. Waiting for it here, alongside the other
+            // background work, keeps that from racing a closed db handle.
+            server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
+          }
+          const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
+          if (!open.length) { finish(); return }
+          let grace
+          Promise.race([
+            Promise.all(open.map((c) => new Promise((done) => {
+              c.once('close', done)
+              try { c.close(closeCode, closeReason) } catch { done() }
+            }))),
+            new Promise((done) => { grace = setTimeout(done, graceMs) }),
+          ]).then(() => { clearTimeout(grace); finish() })
         }),
       })
     })
   })
+}
+
+// WebSocket close code 1012 (Service Restart): tells a client the server is
+// going away on purpose and will be back, so it can reconnect at once
+// instead of treating the drop as a network failure and backing off.
+export const RESTART_CLOSE_CODE = 1012
+export const RESTART_CLOSE_REASON = 'restarting'
+const SHUTDOWN_TIMEOUT_MS = 10000
+
+// SIGTERM/SIGINT: close every socket with 1012 "restarting", close the
+// server cleanly, exit 0. The whole sequence is bounded: a close that has
+// not finished in timeoutMs exits 1 so a stuck handle cannot hang a restart.
+export function installShutdownHandlers(s, {
+  proc = process, timeoutMs = SHUTDOWN_TIMEOUT_MS, graceMs = 1000, log = (l) => console.log(l),
+} = {}) {
+  let stopping = false
+  const stop = (signal) => {
+    if (stopping) return
+    stopping = true
+    log(`matron-journal: ${signal}, closing`)
+    const timer = setTimeout(() => {
+      log('matron-journal: shutdown timed out, exiting')
+      proc.exit(1)
+    }, timeoutMs)
+    timer.unref?.()
+    s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs })
+      .then(() => { clearTimeout(timer); proc.exit(0) },
+        (err) => { console.error('shutdown failed', err); proc.exit(1) })
+  }
+  proc.on('SIGTERM', () => stop('SIGTERM'))
+  proc.on('SIGINT', () => stop('SIGINT'))
 }
 
 let isMain = false
@@ -1035,5 +1082,8 @@ try {
 if (isMain) {
   const port = Number(process.env.MATRON_PORT || 9810)
   const bind = process.env.MATRON_BIND || '127.0.0.1'
-  startServer({ port, bind }).then((s) => console.log(`matron-journal listening on ${bind}:${s.port}`))
+  startServer({ port, bind }).then((s) => {
+    console.log(`matron-journal listening on ${bind}:${s.port}`)
+    installShutdownHandlers(s)
+  })
 }
