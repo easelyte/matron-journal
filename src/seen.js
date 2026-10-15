@@ -193,7 +193,7 @@ export function listUnseen(db, userId, {
   if (convoId) { where.push('AND e.convo_id=?'); args.push(convoId) }
   if (missionId) { where.push('AND c.mission_id=?'); args.push(missionId) }
   if (sender) { where.push('AND e.sender=?'); args.push(sender) }
-  if (excludePrivateOwned) where.push('AND (c.agent_device_id IS NULL OR c.agent_device_id NOT IN (SELECT id FROM devices WHERE private=1))')
+  if (excludePrivateOwned) where.push('AND (c.agent_device_id IS NULL OR c.agent_device_id NOT IN (SELECT id FROM private_devices))')
   const rows = db.prepare(
     `SELECT e.seq, e.convo_id, e.ts, e.sender, e.type, e.payload,
             c.title, c.session_state, c.mission_id,
@@ -302,7 +302,7 @@ export function listUnseen(db, userId, {
     const itemArgs = [userId]
     if (convoId) { itemWhere.push('AND i.origin_convo_id=?'); itemArgs.push(convoId) }
     if (missionId) { itemWhere.push('AND i.mission_id=?'); itemArgs.push(missionId) }
-    if (excludePrivateOwned) itemWhere.push('AND NOT EXISTS(SELECT 1 FROM conversations oc JOIN devices d ON d.id=oc.agent_device_id WHERE oc.id=i.origin_convo_id AND d.private=1)')
+    if (excludePrivateOwned) itemWhere.push('AND NOT EXISTS(SELECT 1 FROM conversations oc JOIN private_devices d ON d.id=oc.agent_device_id WHERE oc.id=i.origin_convo_id)')
     const items = db.prepare(
       `SELECT i.id, i.num, i.kind, i.title, i.awaiting, i.created_by, i.created_at, i.origin_convo_id, i.mission_id,
               (SELECT MAX(created_at) FROM item_comments ic WHERE ic.item_id=i.id AND ic.author='agent' AND ic.kind='comment') AS agent_at,

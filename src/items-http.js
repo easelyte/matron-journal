@@ -12,6 +12,7 @@ import {
   ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
   markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
+  requestTurn,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -22,9 +23,12 @@ import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 
-const SORTS = ['rank', 'updated']
+const SORTS = ['rank', 'updated', 'acted']
 const SCOPES = ['mine', 'shared']
 const STATES = ['open', 'closed']
+// `done` is For you's Done view (listItems): closed, or answered and no
+// longer waiting on the user. Own list only.
+const LIST_STATES = [...STATES, 'done']
 const POSITIONS = ['top', 'bottom']
 const ID_MAX = 128
 // Notice items (mission: For you) reach an app only when it says it knows
@@ -76,7 +80,8 @@ function answerKnownError(res, err) {
 }
 
 // A validateItemFields failure: its own named error when it carries one
-// (`invalid_actions`), the generic 400 otherwise.
+// (`invalid_actions`, `too_many_attachments` with its `max`), the generic
+// 400 otherwise.
 // An inline ref (src/inline-refs.js) may only place one of the same write's
 // own attachments: anything else would render as bare caption text, so it is
 // an agent's mistake to hear about now rather than a silent gap later.
@@ -88,7 +93,7 @@ function strayRef(res, body, attachments) {
 }
 
 function badFields(res, v) {
-  if (v.error) { json(res, 400, { error: v.error }); return true }
+  if (v.error) { json(res, 400, { error: v.error, ...(v.max !== undefined && { max: v.max }) }); return true }
   return badRequest(res)
 }
 
@@ -197,7 +202,18 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // Wake keys off the WRITER's device kind, not `by`: an agent filing on
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
-  if (!mirror && who.kind !== 'agent' && WAKE_ACTIONS.has(action) && !extra?.seen) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  if (!mirror && who.kind !== 'agent' && WAKE_ACTIONS.has(action) && !extra?.seen) {
+    // The same write is what an item thread shows as "queued" until the
+    // agent's turn starts. `item` is the object the route answers with, and
+    // it was read before this point, so it is brought up to date in place:
+    // the app that just tapped sees the indicator from the reply alone.
+    try {
+      item.working = requestTurn(db, item.id)
+    } catch (err) {
+      console.error('items: turn request stamp failed', err)
+    }
+    wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  }
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
@@ -221,22 +237,32 @@ export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, de
 // null = absent, undefined = present but not in `list` (i.e. reject).
 const oneOf = (v, list) => (v == null ? null : (list.includes(v) ? v : undefined))
 
+// `kind` names one kind or several, comma-separated ("question,decision,notice"
+// is a client's closed list without the tasks). null = absent, undefined =
+// present but not all known kinds (i.e. reject); otherwise the kinds, once each.
+function kindsOf(v) {
+  if (v == null) return null
+  const kinds = [...new Set(v.split(','))]
+  return kinds.every((k) => ITEM_KINDS.includes(k)) ? kinds : undefined
+}
+
 function handleList(db, res, url, who) {
   const q = url.searchParams
-  const kind = oneOf(q.get('kind'), ITEM_KINDS)
-  const state = oneOf(q.get('state'), STATES)
+  const kind = kindsOf(q.get('kind'))
+  const state = oneOf(q.get('state'), LIST_STATES)
   const awaiting = oneOf(q.get('awaiting'), AWAITING)
   const sort = q.has('sort') ? oneOf(q.get('sort'), SORTS) : 'rank'
   if (kind === undefined || state === undefined || awaiting === undefined || sort === undefined) return badRequest(res)
   // An app that predates notices is shown them as tasks (replyItems), so
   // its kind=task filter has to find them too — on either scope.
-  const kindFilter = kind === 'task' && who.knowsNotice === false ? ['task', 'notice'] : kind
+  const kindFilter = kind && kind.includes('task') && who.knowsNotice === false && !kind.includes('notice') ? [...kind, 'notice'] : kind
   const scope = q.has('scope') ? oneOf(q.get('scope'), SCOPES) : 'mine'
   if (scope === undefined) return badRequest(res)
   if (scope === 'shared') {
     // Own-list-only filters (convo, label, sort, since) are meaningless
     // across users and are rejected rather than ignored.
     for (const k of ['convo', 'label', 'sort', 'since']) if (q.has(k)) return badRequest(res)
+    if (state === 'done') return badRequest(res)
     const sharedLimit = q.has('limit') ? Number(q.get('limit')) : 100
     if (!Number.isInteger(sharedLimit) || sharedLimit < 1) return badRequest(res)
     const r = listSharedItems(db, who.userId, { kind: kindFilter, state, awaiting, limit: sharedLimit, cursor: q.get('cursor') })

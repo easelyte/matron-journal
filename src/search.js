@@ -1,3 +1,7 @@
+import { ORIGIN_SIEVE } from './missions.js'
+import { parseQuery } from './search-query.js'
+import { yieldTurn } from './background.js'
+
 // Single source of truth for what the search index can see (prose only).
 // Called by BOTH the live append path (journal.js, inside the append
 // transaction) and the startup backfill, and by the agent context filter in
@@ -26,32 +30,49 @@ export function indexableBody(type, payload) {
   return null
 }
 
-// Human input → FTS5 MATCH string. Raw MATCH syntax throws on things people
-// actually type (an unbalanced quote, a bare *, a stray NEAR) — so every
-// whitespace-separated term is double-quoted (FTS5 escapes an embedded " by
-// doubling it), giving an implicit AND over literal terms. Returns null for
-// input with no terms; the route maps that to 400.
+// Shared by every FTS5 MATCH string this file builds from human input:
+// double-quote the term (FTS5 escapes an embedded " by doubling it) so raw
+// MATCH syntax a person might type (an unbalanced quote, a bare *, a stray
+// NEAR) is always literal, never parsed.
+function quoteFtsTerm(t) { return `"${t.replace(/"/g, '""')}"` }
+
+// Human input → FTS5 MATCH string. Every whitespace-separated term is
+// quoted (see quoteFtsTerm), giving an implicit AND over literal terms.
+// Returns null for input with no terms; the route maps that to 400.
 export function ftsQueryFor(raw) {
   const terms = String(raw).split(/\s+/).filter(Boolean)
   if (terms.length === 0) return null
-  return terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' ')
+  return terms.map(quoteFtsTerm).join(' ')
 }
 
-// Ranked, user-scoped search (spec: GET /search). bm25() ascending is
-// best-first; ts DESC breaks ties toward recency. `live` is derived from the
-// conversation's session_state so the caller can prefer talking to a working
-// agent over reading its transcript. The try/catch is belt-and-braces: after
-// quoting, a parse failure should be unreachable, but a SQLite error must
-// surface as badQuery (→ 400), never a 500 with internals in it.
+// The ranked search's "fewer than 5 hits" fallback (spec 2026-10-12 unified
+// search): any term present, not every term. Same quoting as
+// ftsQueryFor, OR-joined instead of AND-joined. Only meaningful for 2+
+// terms — a single-term query's some_words tier would be identical to its
+// words tier — so returns null below that, same null-means-skip contract.
+export function ftsAnyQueryFor(raw) {
+  const terms = String(raw).split(/\s+/).filter(Boolean)
+  if (terms.length < 2) return null
+  return terms.map(quoteFtsTerm).join(' OR ')
+}
+
+// WHERE/SELECT builder shared by searchMessages's main (all-words) query and
+// its some_words fallback below — the only difference between the two is
+// the MATCH string and an extra "already have these seqs" exclusion, so
+// they are built from one template rather than two copies of the privacy
+// and subagent predicates drifting apart.
 // excludePrivateOwned (spec: agent visibility & privacy): hits from
 // conversations owned by a private device vanish for ordinary agent
 // callers. NULL-owner (legacy) conversations are never private-owned.
-export function searchMessages(db, userId, { query, limit = 20, convoId = null, excludePrivateOwned = false, excludeSubagents = false } = {}) {
-  const match = ftsQueryFor(query)
-  if (match == null) return { badQuery: true }
-  const sql = `
+// mission_num (spec 2026-10-12 unified search): same sieved scalar subquery searchChats
+// already uses — never a plain LEFT JOIN — so a filtered agent caller
+// never learns a private-origin mission's number even for an otherwise
+// visible hit.
+function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount = 0 }) {
+  return `
     SELECT sm.convo_id, c.title, sm.seq, sm.ts, sm.sender, c.session_state,
-           snippet(search_fts, 0, '**', '**', '…', 12) AS snippet
+           snippet(search_fts, 0, '**', '**', '…', 12) AS snippet,
+           (SELECT m.num FROM missions m WHERE m.id = c.mission_id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num
     FROM search_fts
     JOIN search_messages sm ON sm.rowid = search_fts.rowid
     JOIN conversations c ON c.id = sm.convo_id
@@ -59,25 +80,66 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null, 
     ${excludeSubagents ? 'AND c.parent_convo_id IS NULL' : ''}
     ${excludePrivateOwned
       ? `AND (c.agent_device_id IS NULL OR NOT EXISTS(
-            SELECT 1 FROM devices d WHERE d.id=c.agent_device_id AND d.private=1))`
+            SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`
       : ''}
-    ORDER BY bm25(search_fts), sm.ts DESC
+    ${excludeSeqsCount ? `AND sm.seq NOT IN (${Array(excludeSeqsCount).fill('?').join(',')})` : ''}
+    ORDER BY sm.is_diff, bm25(search_fts), sm.ts DESC
     LIMIT ?`
+}
+
+// Ranked, user-scoped search (spec: GET /search). bm25() ascending is
+// best-first; ts DESC breaks ties toward recency; sm.is_diff first puts a
+// diff hit below prose matching the same terms (spec 2026-10-12 unified
+// search) — a code change is rarely what "why did we do this"
+// means. `live` is derived from the conversation's session_state so the
+// caller can prefer talking to a working agent over reading its
+// transcript. The try/catch is belt-and-braces: after quoting, a parse
+// failure should be unreachable, but a SQLite error must surface as
+// badQuery (→ 400), never a 500 with internals in it.
+//
+// some_words fallback: fewer than 5 all-words (`why: 'words'`)
+// hits, and the query has 2+ terms — any one term, excluding the seqs
+// already returned, up to the remaining limit, tagged `why: 'some_words'`.
+// Inherits the exact same privacy/subagent filters via rankedSql, so the
+// fallback can never surface something the main query would have hidden.
+//
+// Literal queries never get it: `parseQuery`
+// (src/search-query.js) is the one literal rule every tier of /search/all
+// already shares — quoted, carries a digit, id-like, or a single word —
+// reused here rather than re-implemented, because a person who quoted
+// their query or typed an id wanted an exact match, not loose noise.
+export function searchMessages(db, userId, { query, limit = 20, convoId = null, excludePrivateOwned = false, excludeSubagents = false } = {}) {
+  const match = ftsQueryFor(query)
+  if (match == null) return { badQuery: true }
+  const toHit = (r, why) => ({
+    convo_id: r.convo_id, title: r.title, seq: r.seq, ts: r.ts, sender: r.sender,
+    snippet: r.snippet, live: r.session_state === 'running', mission_num: r.mission_num ?? null, why,
+  })
   let rows
   try {
-    rows = convoId != null
-      ? db.prepare(sql).all(match, userId, convoId, limit)
-      : db.prepare(sql).all(match, userId, limit)
+    const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned })
+    const args = convoId != null ? [match, userId, convoId, limit] : [match, userId, limit]
+    rows = db.prepare(sql).all(...args)
   } catch (err) {
     console.error('search query failed', err)
     return { badQuery: true }
   }
-  return {
-    hits: rows.map((r) => ({
-      convo_id: r.convo_id, title: r.title, seq: r.seq, ts: r.ts, sender: r.sender,
-      snippet: r.snippet, live: r.session_state === 'running',
-    })),
+  const hits = rows.map((r) => toHit(r, 'words'))
+  const parsed = parseQuery(query)
+  const orMatch = parsed && !parsed.literal ? ftsAnyQueryFor(query) : null
+  const remaining = limit - hits.length
+  if (hits.length < 5 && orMatch != null && remaining > 0) {
+    try {
+      const excludeSeqs = hits.map((h) => h.seq)
+      const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount: excludeSeqs.length })
+      const args = [orMatch, userId, ...(convoId != null ? [convoId] : []), ...excludeSeqs, remaining]
+      const moreRows = db.prepare(sql).all(...args)
+      hits.push(...moreRows.map((r) => toHit(r, 'some_words')))
+    } catch (err) {
+      console.error('search (some_words) query failed', err)
+    }
   }
+  return { hits }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,14 +182,17 @@ function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOw
   if (excludeSubagents) clauses.push('c.parent_convo_id IS NULL')
   if (excludePrivateOwned) {
     clauses.push(`(c.agent_device_id IS NULL OR NOT EXISTS(
-      SELECT 1 FROM devices d WHERE d.id=c.agent_device_id AND d.private=1))`)
+      SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`)
   }
   return { sql: clauses.join(' AND '), args }
 }
 
 // Flat hits newest first under the typed rule — find-in-chat's match list
 // (the apps step through it by seq), also usable across conversations.
-// No body or snippet: the caller already shows the message.
+// No body or snippet: the caller already shows the message. mission_num
+// (spec 2026-10-12 unified search): same sieved scalar subquery
+// searchChats and searchMessages use — see the mission_num comment on
+// rankedSql above for why a plain LEFT JOIN is wrong here.
 export function searchRecent(db, userId, { query, limit = 50, convoId = null, excludeSubagents = false, excludePrivateOwned = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
@@ -135,7 +200,8 @@ export function searchRecent(db, userId, { query, limit = 50, convoId = null, ex
   let rows
   try {
     rows = db.prepare(`
-      SELECT sm.convo_id, sm.seq, sm.ts, sm.sender
+      SELECT sm.convo_id, sm.seq, sm.ts, sm.sender,
+             (SELECT m.num FROM missions m WHERE m.id = c.mission_id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num
       FROM search_fts_plain
       JOIN search_messages sm ON sm.rowid = search_fts_plain.rowid
       JOIN conversations c ON c.id = sm.convo_id
@@ -146,7 +212,7 @@ export function searchRecent(db, userId, { query, limit = 50, convoId = null, ex
     console.error('search (recent) query failed', err)
     return { badQuery: true }
   }
-  return { hits: rows.map((r) => ({ convo_id: r.convo_id, seq: r.seq, ts: r.ts, sender: r.sender })) }
+  return { hits: rows.map((r) => ({ convo_id: r.convo_id, seq: r.seq, ts: r.ts, sender: r.sender, mission_num: r.mission_num ?? null })) }
 }
 
 // One row per conversation under the typed rule: how many messages match,
@@ -204,9 +270,18 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
   // Bodies and names for just the winning rows; the preview is cut from
   // the excerpt by the app, so nothing is computed for matches not shown.
   const rowids = ranked.map(({ g }) => g.newest_rowid)
+  // mission_num (spec 2026-10-12 unified search):
+  // the conversation's CURRENT mission pointer (conversations.mission_id —
+  // the same column joinMission/createMission maintain, missions.js),
+  // resolved to the mission's own `num`. A scalar subquery, not a plain LEFT JOIN — exactly the shape GET
+  // /conversations uses (src/http.js) — so a filtered (ordinary agent)
+  // caller never learns a private-origin mission's number even when the
+  // conversation carrying it is itself visible. ORIGIN_SIEVE's own
+  // aliases (cv, d) are local to this subquery and don't clash with sm/c/p.
   const detail = new Map(db.prepare(`
     SELECT sm.rowid, sm.seq, sm.ts, sm.sender, sm.body,
-           c.title, c.session_state, c.parent_convo_id, p.title AS parent_title
+           c.title, c.session_state, c.parent_convo_id, p.title AS parent_title,
+           (SELECT m.num FROM missions m WHERE m.id = c.mission_id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num
     FROM search_messages sm
     JOIN conversations c ON c.id = sm.convo_id
     LEFT JOIN conversations p ON p.id = c.parent_convo_id
@@ -217,6 +292,7 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
       if (!d) return []
       return [{
         convo_id: g.convo_id, title: d.title, parent_convo_id: d.parent_convo_id, parent_title: d.parent_title,
+        mission_num: d.mission_num ?? null,
         count: counts.get(g.convo_id) ?? g.hit_count, exact: isExact, live: d.session_state === 'running',
         top: { seq: d.seq, ts: d.ts, sender: d.sender, excerpt: excerpt(d.body, typed) },
       }]
@@ -255,9 +331,10 @@ export function excerpt(body, typed) {
 //     synchronous, and a multi-GB history must not starve the server's
 //     sockets while it indexes. Search returns partial results until the
 //     walk finishes — acceptable and self-healing (spec).
-export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false } = {}) {
+export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false, pause = yieldTurn } = {}) {
   const state = db.prepare('SELECT last_events_rowid FROM search_backfill_state WHERE id=1').get()
   let cursor = state ? state.last_events_rowid : 0
+  if (cursor > 0) log(`search backfill: resuming after events rowid ${cursor}`)
   const saveCursor = db.prepare(
     'INSERT INTO search_backfill_state(id, last_events_rowid) VALUES(1, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET last_events_rowid=excluded.last_events_rowid'
@@ -274,7 +351,7 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
      WHERE rowid>? AND rowid<=? AND type IN ('text','diff') ORDER BY rowid`
   )
   const insert = db.prepare(
-    'INSERT OR IGNORE INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
+    'INSERT OR IGNORE INTO search_messages(user_id, convo_id, seq, ts, sender, body, is_diff) VALUES(?,?,?,?,?,?,?)'
   )
   let scanned = 0
   let indexed = 0
@@ -290,15 +367,73 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
         let payload
         try { payload = JSON.parse(row.payload) } catch { payload = null }
         const body = indexableBody(row.type, payload)
-        if (body != null) indexed += insert.run(row.user_id, row.convo_id, row.seq, row.ts, row.sender, body).changes
+        if (body != null) indexed += insert.run(row.user_id, row.convo_id, row.seq, row.ts, row.sender, body, row.type === 'diff' ? 1 : 0).changes
       }
       cursor = ceiling
       saveCursor.run(cursor)
     })()
     scanned += ids.length
     log(`search backfill: scanned ${scanned} events, indexed ${indexed}`)
-    await new Promise((r) => setImmediate(r))
+    await pause()
   }
   log(`search backfill complete: scanned ${scanned}, indexed ${indexed}`)
   return { scanned, indexed }
+}
+
+// is_diff backfill (spec 2026-10-12 unified search). search_messages
+// carries no `type`, so fixing up is_diff for rows written before the
+// column existed means re-walking `events` for 'diff' rows and flipping
+// their matching search_messages row — same shape as backfillSearchIndex
+// (batches of events rowids, cursor saved per committed batch, one batch
+// per event-loop turn, stoppable for a clean close), but UPDATE-only: it
+// never inserts, so a search_messages row missing because indexableBody
+// rejected the event (or the live/backfill index hasn't reached it yet)
+// is correctly left alone — it will get is_diff right the moment it is
+// indexed, live or by backfillSearchIndex.
+//
+// user_id+seq is the correct key, not a guess: events' PRIMARY KEY is
+// (user_id, seq), user_seq.seq is the per-user monotonic counter append()
+// draws from (nextSeq), and search_messages has UNIQUE(user_id, seq) — seq
+// is unique per user, so this can never touch two rows.
+//
+// Cursor seeding (openDb, db.js): a fresh database's cursor starts at the
+// current max events rowid, so this walk has nothing to scan and every
+// run after is a single cheap SELECT with zero rows — the live path
+// (journal.js append()) already sets is_diff correctly for every row a
+// fresh database will ever see.
+export async function backfillIsDiff(db, { batchSize = 1000, log = () => {}, shouldStop = () => false, pause = yieldTurn } = {}) {
+  const state = db.prepare('SELECT last_rowid FROM search_isdiff_state WHERE id=1').get()
+  let cursor = state ? state.last_rowid : 0
+  if (cursor > 0) log(`search is_diff backfill: resuming after events rowid ${cursor}`)
+  const saveCursor = db.prepare(
+    'INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?) ' +
+    'ON CONFLICT(id) DO UPDATE SET last_rowid=excluded.last_rowid'
+  )
+  const selectBatchIds = db.prepare(
+    'SELECT rowid FROM events WHERE rowid>? ORDER BY rowid LIMIT ?'
+  )
+  const selectDiffs = db.prepare(
+    `SELECT user_id, seq FROM events WHERE rowid>? AND rowid<=? AND type='diff' ORDER BY rowid`
+  )
+  const update = db.prepare('UPDATE search_messages SET is_diff=1 WHERE user_id=? AND seq=?')
+  let scanned = 0
+  let updated = 0
+  for (;;) {
+    if (shouldStop()) break
+    const ids = selectBatchIds.all(cursor, batchSize)
+    if (ids.length === 0) break
+    const floor = cursor
+    const ceiling = ids[ids.length - 1].rowid
+    db.transaction(() => {
+      const rows = selectDiffs.all(floor, ceiling)
+      for (const row of rows) updated += update.run(row.user_id, row.seq).changes
+      cursor = ceiling
+      saveCursor.run(cursor)
+    })()
+    scanned += ids.length
+    log(`search is_diff backfill: scanned ${scanned} events, updated ${updated}`)
+    await pause()
+  }
+  log(`search is_diff backfill complete: scanned ${scanned}, updated ${updated}`)
+  return { scanned, updated }
 }

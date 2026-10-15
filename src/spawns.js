@@ -13,9 +13,10 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
 import { closeSpawnConsentItem } from './consent-items.js'
-import { getMission, joinMission } from './missions.js'
+import { getMission, joinMission, CONVOS_MAX } from './missions.js'
+import { topLevelActiveCount } from './mission-links.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
-import { markerTitleAllowed } from './privacy.js'
+import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
 
 // `model` is the optional Claude model the child session should run — an
@@ -32,13 +33,42 @@ import { startReplyFallback } from './spawn-model.js'
 //
 // `agent` is 'claude' | 'codex' when the requester named one, else NULL:
 // the target bridge then starts its own box default.
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, now = Date.now() }) {
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, missionInherited = false, now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, model, effort, agent, link, mission_num, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, now)
+      workdir, task, topic, model, effort, agent, link, mission_num, mission_inherited, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, missionInherited && missionNum ? 1 : 0, now)
   return { id }
+}
+
+// A spawn that names no mission inherits the parent conversation's CURRENT
+// one, the way a sub-chat does (journal.js inheritableMission) — or null.
+// The child is a top-level conversation on another box, not a sub-chat, so
+// it gets no parent_convo_id; the mission rides the row as mission_num and
+// joins exactly like a named one (joinSpawnMission, how 'spawned'). The
+// gates are inheritance's, plus the cap a top-level conversation counts
+// toward:
+//
+//   1. a private-owned parent never hands its mission to an ordinary box;
+//   2. the mission must be visible to BOTH ends, the sieve a named
+//      mission_num goes through (unfiltered only when both are private);
+//   3. it must be open;
+//   4. it must have room under CONVOS_MAX — joinSpawnMission would refuse
+//      a full mission at start anyway, and the card must not promise it.
+//
+// Failing a gate is never an error: the child simply starts unattached.
+export function inheritedSpawnMission(db, { userId, fromConvoId, fromDeviceId, targetDeviceId }) {
+  const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?')
+    .get(fromConvoId, userId)?.mission_id ?? null
+  if (!missionId) return null
+  const targetPrivate = isPrivateDevice(db, targetDeviceId)
+  if (!targetPrivate && privateOwnedConvo(db, fromConvoId)) return null
+  const excludePrivateOwned = !isPrivateDevice(db, fromDeviceId) || !targetPrivate
+  const mission = getMission(db, userId, missionId, { excludePrivateOwned })
+  if (!mission || mission.state !== 'open') return null
+  if (topLevelActiveCount(db, mission.id) >= CONVOS_MAX) return null
+  return mission
 }
 
 export function getSpawn(db, id) {
@@ -386,8 +416,15 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     if (row.mission_num) {
       const excludePrivateOwned = !isPrivateDevice(db, row.from_device_id) || !isPrivateDevice(db, row.target_device_id)
       const mission = getMission(db, row.user_id, row.mission_num, { excludePrivateOwned })
-      if (!mission) return fail('no_mission')
-      if (mission.state !== 'open') return fail('mission_closed')
+      if (row.mission_inherited && (!mission || mission.state !== 'open')) {
+        // Inherited, not asked for: the child starts unattached instead.
+        console.error(`approveSpawn: inherited mission #${row.mission_num} no longer joinable — child starts unattached`)
+        db.prepare('UPDATE agent_spawn_requests SET mission_num=NULL, mission_inherited=0 WHERE id=?').run(row.id)
+        row = { ...row, mission_num: null, mission_inherited: 0 }
+      } else {
+        if (!mission) return fail('no_mission')
+        if (mission.state !== 'open') return fail('mission_closed')
+      }
     }
     if (roomId) {
       // Titled the way the bridge titles its own agent-chat rooms, so a

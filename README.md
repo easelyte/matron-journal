@@ -20,8 +20,17 @@ TestFlight (iPhone / Mac) and Play Store testing (Android) — see
 
 ## Run
 
-    npm install
+    ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install
     MATRON_DB=./matron.db MATRON_PORT=9810 npm start
+
+Semantic search uses the optional `@huggingface/transformers` dependency.
+Its `onnxruntime-node` dependency downloads CUDA libraries (about 340 MB)
+at install time unless `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` is set; search
+runs on the CPU, so the install line above sets it, as does
+`deploy/vps/setup.sh`. Use
+`npm install --omit=optional` to leave semantic search out entirely. See
+`MATRON_SEMANTIC_SEARCH` below for memory use and the first-boot model
+download.
 
 Node 20+. A systemd unit template is in
 [`deploy/matron-journal.service`](deploy/matron-journal.service).
@@ -79,11 +88,16 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_RETENTION_DAYS` | `30` | Offload `tool_output` payloads older than this (`0` disables) |
 | `MATRON_TOOL_LOG_TTL_HOURS` | `24` | Delete offloaded tool-log blobs older than this |
 | `MATRON_VOICE_NOTE_TTL_DAYS` | `7` | Delete an item voice note's audio this many days after its transcript landed; the transcript stays (`0` disables) |
+| `MATRON_DEVICE_RETENTION` | unset (off) | Comma-separated `<deviceId>:<days>` (e.g. `4:30,9:7`): expire the content of each device's sessions and rooms once older than that many days — payloads become tombstones, search rows and unshared blobs are deleted. Any invalid entry disables the whole setting. See docs/protocol.md *Per-device content expiry* |
 | `MATRON_WS_PING_MS` | `55000` | WebSocket heartbeat interval (kept under common 60s proxy idle timeouts) |
 | `MATRON_RPC_MAX_BYTES` | `16384` | Max inbound WebSocket RPC frame size |
 | `MATRON_TOOL_STREAM_MAX_BYTES` | `1048576` | Max bytes per live tool-output stream buffer |
 | `MATRON_TOOL_STREAM_MAX_BUFFERS` | `64` | Max concurrent tool-output stream buffers |
 | `MATRON_TOOL_STREAM_IDLE_MS` | `1800000` | Idle expiry for tool-output stream buffers |
+| `MATRON_SEMANTIC_SEARCH` | on | `off` disables the similar tier of `/search/all` (the model is never loaded; search stays lexical). When on, the embedding model (`Xenova/bge-small-en-v1.5`, quantised) runs in-process and adds about 150 MB RSS (the whole process peaks under 300 MB while indexing a 3 GB journal). It is on by default: on a host without that headroom, set `MATRON_SEMANTIC_SEARCH=off`. The first index pass embeds every tracker doc, one at a time on one thread, paced like the backfills below. A missing optional dependency or a failed model load also turns it off; neither fails a boot or a request |
+| `MATRON_BACKGROUND_DELAY_MS` | 30000 | How long after listening the startup backfills (message search index, `is_diff`, image sizes) and the first vector index pass wait before starting. They then run one at a time, and each saves its place per batch, so a restart resumes rather than starting over |
+| `MATRON_BACKGROUND_PACE` | 1 | Rest between background batches, as a whole multiple of the batch's own time: 1 keeps that work to at most half of one core, 0 only yields one event-loop turn |
+| `MATRON_SEMANTIC_MODEL_DIR` | unset (`<db dir>/models`, downloaded on first boot) | Directory holding a pre-seeded model, laid out as `<dir>/Xenova/bge-small-en-v1.5/{config.json,tokenizer.json,tokenizer_config.json,onnx/model_quantized.onnx}`. When set, the model is never downloaded, so boot needs no network. When unset, the first boot downloads the model (about 35 MB) into `<db dir>/models`, which must be writable |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |

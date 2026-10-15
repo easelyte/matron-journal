@@ -709,4 +709,181 @@ function recoverStagedOrphans(db, mediaDir) {
       }
     }
   }
+// Per-device content expiry (fifth retention pass). Some agent devices
+// handle third-party content that should not be kept for ever, and quote
+// it in what they write. For each operator rule `{deviceId, days}`
+// (MATRON_DEVICE_RETENTION, see server.js), every content event older than
+// `days` in a conversation that device has a hand in is rewritten to a
+// content tombstone (below), its search rows are deleted, and the blob it
+// names goes too when nothing else still names it.
+//
+// "A hand in" is (deviceConvos below): the device's own sessions and the
+// rooms it owns — conversations.agent_device_id, which records the managing
+// device of a session and the owner of a room alike; every room it is or
+// was a member of — a convo_agents row in ANY state, because a renewed row
+// overwrites the state it had (a device that joined, left and was then
+// re-invited and refused reads 'refused' though it spoke there); its
+// sessions that room_owner_convos records, unless another device has since
+// taken the session over; and the sub-chats under any of those. A room
+// between two people has a twin in the guest's log: the owner device is
+// recorded on both, and a guest device has a membership row on both, so
+// either rule reaches both copies. Nothing else is touched.
+//
+// Rows are found per conversation through idx_events_convo, in bounded
+// batches with one transaction each, so a first run over a long history
+// never holds the write lock for long. `content_expired` marks a row done
+// (attachment and tool-log tombstones only say `expired`, and still carry
+// a caption, a transcript or a command, so they are scrubbed here too);
+// the CASE keeps a malformed payload from erroring the scan and lets it be
+// tombstoned like any other. Search rows go in the same transaction:
+// search_fts and search_fts_plain are external-content tables with an
+// insert trigger only, so each gets the FTS5 'delete' command with the
+// body it indexed before the content row is deleted (deleting the content
+// row alone leaves the index pointing at text it no longer has). A
+// tombstone has no indexable body, so backfillSearchIndex can never put
+// one back.
+//
+// A blob an expired event named (an offloaded tool log, an attachment, a
+// stray ref on a text event) is deleted only when, after this batch's
+// rewrites, no event still names it in its blob_ref column — another
+// conversation's, or a row of this one not yet due — no item comment names
+// it, and the event's own user owns it. Row delete in the transaction, file
+// unlink after commit (ENOENT = already gone), as runExpireLogs does.
+//
+// If the conversation's latest message-type event was tombstoned, its
+// preview is recomputed from the tombstone (snippetOf), and its rolling
+// `summary` — written by the owning bridge from what was said — is blanked,
+// since nothing it could describe survives. Titles are left alone.
+//
+// NOTE: like every pass here, this covers the journal's own store and
+// search. A client that already synced an event keeps its local copy, and
+// a bridge's echo of a room message into another session (and that
+// session's own transcript) carries no room id, so it is out of reach.
+const DEVICE_CONTENT_TYPES = [...MESSAGE_TYPES, 'prompt_reply', 'edit', 'summary']
+
+// The string fields a content tombstone keeps: what the event is, what it
+// answers or belongs to, and how clients route it — ids and enums, never
+// prose. Every other string is emptied (an unknown key fails closed),
+// arrays become [] and objects {}; numbers, booleans and null stay (sizes,
+// exit codes, counts, seqs, flags). Keys are kept rather than removed so a
+// decoder that requires one still finds a value of the right type.
+const TOMBSTONE_KEPT_STRINGS = new Set([
+  'type', 'kind', 'fallback_for', 'mode', 'request', 'outcome', 'error_code', 'action', 'state', 'consent',
+  'message_ref', 'request_id', 'spawn_id', 'room_id', 'prompt_id', 'item_id', 'batch_id',
+  'convo_id', 'from_convo_id', 'to_convo_id', 'target_convo_id', 'child_convo_id',
+  'content_type', 'tool_name', 'tool',
+])
+
+// The one shape a content tombstone takes. `expired: true` is what the
+// apps already render for an expired attachment, tool log or diff;
+// `content_expired: true` says the whole payload's content is gone (and is
+// this pass's done-marker); `blob_ref: null` as on every other tombstone.
+export function contentTombstone(rawPayload) {
+  let payload
+  try { payload = JSON.parse(rawPayload) } catch { payload = null }
+  const out = {}
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    for (const [key, value] of Object.entries(payload)) {
+      if (typeof value === 'string') out[key] = TOMBSTONE_KEPT_STRINGS.has(key) ? value : ''
+      else if (Array.isArray(value)) out[key] = []
+      else if (value && typeof value === 'object') out[key] = {}
+      else out[key] = value
+    }
+  }
+  out.blob_ref = null
+  out.expired = true
+  out.content_expired = true
+  return out
+}
+
+const isDeviceRule = (r) => r && Number.isSafeInteger(r.deviceId) && r.deviceId > 0 && Number.isInteger(r.days) && r.days > 0
+
+export function runExpireDeviceContent(db, { rules, now = Date.now(), batchSize = 500 }) {
+  const result = { expired: 0, blobsDeleted: 0, bytesFreed: 0, searchRowsDeleted: 0 }
+  // Deletes user data: a malformed rule list disables the pass loudly,
+  // never runs part of it.
+  if (!Array.isArray(rules) || !rules.every(isDeviceRule)) {
+    console.warn(`retention: device content rules ${JSON.stringify(rules)} are invalid — device content expiry skipped`)
+    return result
+  }
+  const deviceConvos = db.prepare(`
+    WITH RECURSIVE scope(id) AS (
+      SELECT id FROM conversations WHERE agent_device_id = @device
+      UNION SELECT convo_id FROM convo_agents WHERE agent_device_id = @device
+      UNION SELECT ro.convo_id FROM room_owner_convos ro JOIN conversations c ON c.id = ro.convo_id
+             WHERE ro.device_id = @device AND (c.agent_device_id IS NULL OR c.agent_device_id = @device)
+      UNION SELECT c.id FROM conversations c JOIN scope s ON c.parent_convo_id = s.id
+    )
+    SELECT id FROM scope ORDER BY id`)
+  const due = db.prepare(
+    `SELECT user_id, seq, type, payload, blob_ref FROM events
+     WHERE convo_id = ? AND seq > ? AND ts < ? AND type IN (${DEVICE_CONTENT_TYPES.map(() => '?').join(',')})
+       AND (CASE WHEN json_valid(payload) THEN json_extract(payload, '$.content_expired') END) IS NULL
+     ORDER BY seq LIMIT ?`)
+  const updateEvent = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
+  const searchRow = db.prepare('SELECT rowid, body FROM search_messages WHERE user_id=? AND seq=?')
+  const ftsDelete = db.prepare("INSERT INTO search_fts(search_fts, rowid, body) VALUES('delete', ?, ?)")
+  const ftsPlainDelete = db.prepare("INSERT INTO search_fts_plain(search_fts_plain, rowid, body) VALUES('delete', ?, ?)")
+  const deleteSearchRow = db.prepare('DELETE FROM search_messages WHERE rowid=?')
+  const eventNames = db.prepare('SELECT 1 FROM events WHERE blob_ref = ? LIMIT 1')
+  const commentNames = db.prepare(`SELECT 1 FROM item_comments WHERE attachments LIKE '%"blob_ref":"' || ? || '"%' LIMIT 1`)
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+  const latestMessage = db.prepare(
+    `SELECT seq, type FROM events WHERE convo_id=? AND type IN (${MESSAGE_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 1`)
+  const updateConvo = db.prepare("UPDATE conversations SET snippet=?, summary='' WHERE id=?")
+
+  for (const rule of rules) {
+    const cutoff = now - rule.days * 86400000
+    for (const { id: convoId } of deviceConvos.all({ device: rule.deviceId })) {
+      let after = 0
+      for (;;) {
+        const rows = due.all(convoId, after, cutoff, ...DEVICE_CONTENT_TYPES, batchSize)
+        if (rows.length === 0) break
+        after = rows[rows.length - 1].seq
+        const unlink = []
+        db.transaction(() => {
+          const tombstones = new Map()
+          for (const row of rows) {
+            const tombstone = contentTombstone(row.payload)
+            tombstones.set(row.seq, tombstone)
+            updateEvent.run(JSON.stringify(tombstone), row.user_id, row.seq)
+            const indexed = searchRow.get(row.user_id, row.seq)
+            if (indexed) {
+              ftsDelete.run(indexed.rowid, indexed.body)
+              ftsPlainDelete.run(indexed.rowid, indexed.body)
+              deleteSearchRow.run(indexed.rowid)
+              result.searchRowsDeleted += 1
+            }
+            result.expired += 1
+          }
+          // After every rewrite above, so two rows of this batch naming one
+          // blob don't keep each other's blob alive.
+          const checked = new Set()
+          for (const row of rows) {
+            if (!row.blob_ref || checked.has(row.blob_ref)) continue
+            checked.add(row.blob_ref)
+            const blob = getBlob(db, row.blob_ref)
+            if (!blob || blob.owner_user_id !== row.user_id) continue
+            if (eventNames.get(blob.id) || commentNames.get(blob.id)) continue
+            deleteBlobRow.run(blob.id)
+            unlink.push(blob)
+          }
+          const latest = latestMessage.get(convoId, ...MESSAGE_TYPES)
+          if (latest && tombstones.has(latest.seq)) {
+            updateConvo.run(snippetOf(latest.type, tombstones.get(latest.seq)), convoId)
+          }
+        })()
+        for (const blob of unlink) {
+          try {
+            fs.unlinkSync(blob.disk_path)
+          } catch (err) {
+            if (err.code !== 'ENOENT') console.error(`retention: failed to unlink device-content blob ${blob.id} at ${blob.disk_path}`, err)
+          }
+          result.blobsDeleted += 1
+          result.bytesFreed += blob.size
+        }
+      }
+    }
+  }
+  return result
 }

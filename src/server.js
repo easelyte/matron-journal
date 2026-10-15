@@ -20,8 +20,10 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
-import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes } from './retention.js'
-import { backfillSearchIndex } from './search.js'
+import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent } from './retention.js'
+import { backfillSearchIndex, backfillIsDiff } from './search.js'
+import { loadEmbedder } from './embedder.js'
+import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
 import { backfillImageDims } from './items.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
@@ -41,6 +43,7 @@ import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
+import { throttle, cancellableDelay } from './background.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -173,6 +176,13 @@ export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEF
   return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
 }
 
+// The background pacing knobs take 0 too: no startup delay, and no rest
+// beyond one event-loop turn. Anything else is validated as above.
+export function resolveZeroableEnv(name, raw, defaultValue) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv(name, raw, defaultValue)
+}
+
 // `override` is startServer's `retentionDays` opt — when given, it takes
 // precedence over the env var (this is how tests disable/shrink the window
 // without touching process.env), but BOTH sources run through the same
@@ -268,6 +278,41 @@ function resolveVoiceNoteTtlDays(override) {
   return n
 }
 
+// `override` is startServer's `deviceRetention` opt and beats
+// MATRON_DEVICE_RETENTION, as with the other retention resolvers. The value
+// is a comma-separated list of `<deviceId>:<days>` (e.g. `4:30,9:7`):
+// expire the content of that device's conversations and rooms older than
+// that many days (runExpireDeviceContent). Unset or empty is OFF — unlike
+// the passes above there is no default, it names devices. Fail closed means
+// DISABLED, for the whole setting: this pass deletes user data, so an entry
+// that isn't two positive integers, a device named twice or a non-string
+// override turns it off with one warn line rather than running whatever
+// part of it parsed. Returns [{deviceId, days}] or null.
+export function resolveDeviceRetention(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_DEVICE_RETENTION : override
+  if (raw === undefined) return null
+  const name = fromEnv ? 'MATRON_DEVICE_RETENTION' : 'deviceRetention'
+  const invalid = (why) => {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid (${why}; want <deviceId>:<days>,...) — device content expiry disabled`)
+    return null
+  }
+  if (typeof raw !== 'string') return invalid('not a string')
+  if (raw.trim() === '') return null
+  const rules = []
+  for (const entry of raw.split(',')) {
+    const m = /^\s*(\d+)\s*:\s*(\d+)\s*$/.exec(entry)
+    if (!m) return invalid(`entry ${JSON.stringify(entry)}`)
+    const deviceId = Number(m[1])
+    const days = Number(m[2])
+    if (!Number.isSafeInteger(deviceId) || deviceId <= 0) return invalid(`device id ${JSON.stringify(m[1])}`)
+    if (!Number.isSafeInteger(days) || days <= 0) return invalid(`days ${JSON.stringify(m[2])} for device ${deviceId}`)
+    if (rules.some((r) => r.deviceId === deviceId)) return invalid(`device ${deviceId} named twice`)
+    rules.push({ deviceId, days })
+  }
+  return rules
+}
+
 export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
 export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
 
@@ -324,18 +369,37 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // tick or being scheduled for the next. The quota-pressure media reaper runs
 // LAST: the offload pass just before it converts inline payloads into new
 // blobs, so reaping after offload sees the user's honest post-offload
-// footprint instead of triggering one tick late. The orphan-blob reaper
-// (runReapOrphanBlobs) runs after it, on its own knob
-// (MATRON_ORPHAN_BLOB_GRACE_HOURS). Returns the interval handle
-// (for close()) or null only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, orphanBlobGraceHours }) {
+// footprint instead of triggering one tick late. The per-device content
+// expiry runs FIRST: what it tombstones the later passes skip, so an old
+// tool log of such a device is never offloaded to a blob only to be
+// deleted, and the reaper sees the bytes it freed. Its rules are logged
+// once, here, at boot. Returns the interval handle (for close()) or null
+// only when ALL passes are disabled. The orphan-blob reaper
+// (runReapOrphanBlobs) runs after the media reaper, on its own knob
+// (MATRON_ORPHAN_BLOB_GRACE_HOURS).
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
   const orphanGraceHours = resolveOrphanBlobGraceHours(orphanBlobGraceHours)
-  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && orphanGraceHours === null) return null
+  const deviceRules = resolveDeviceRetention(deviceRetention)
+  if (deviceRules) {
+    console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
+  }
+  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && deviceRules === null && orphanGraceHours === null) return null
   const run = () => {
+    if (deviceRules !== null) {
+      try {
+        const r = runExpireDeviceContent(db, { rules: deviceRules })
+        if (r.expired > 0 || r.blobsDeleted > 0) {
+          console.log(`retention: expired content of ${r.expired} event(s) for ${deviceRules.length} device rule(s), ` +
+            `${r.blobsDeleted} blob(s), ${r.bytesFreed} bytes, ${r.searchRowsDeleted} search row(s)`)
+        }
+      } catch (err) {
+        console.error('retention: device content expiry run failed', err)
+      }
+    }
     if (ttlHours !== null) {
       try {
         const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
@@ -469,7 +533,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
-  toolLogTtlHours, voiceNoteTtlDays, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
   // incus start + bridge start + journal dial is ~3 minutes on the shared
@@ -498,6 +562,18 @@ export function startServer({
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
+  // Unified search's similar tier (spec 2026-10-12 §5): the test seam — an
+  // injected embedder (incl. `null` to force the tier off) bypasses
+  // loadEmbedder entirely, so the suite never loads or downloads a real
+  // model. Undefined (the production default) means "resolve for real",
+  // gated by MATRON_SEMANTIC_SEARCH below.
+  embedder,
+  // Startup backfills and vector indexing (src/background.js): wait this
+  // long after listening before starting them, so a restart's reconnect
+  // burst is served first, and then rest `backgroundPace`× each batch's
+  // time between batches. Tests pass 0 and 0.
+  backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
+  backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -754,6 +830,18 @@ export function startServer({
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
+  // `.embedder` start null — /search/all answers `semantic: 'off'` until
+  // (if ever) the embedder loads and the first index pass finishes, below.
+  // Declared before the handler is built so both it and close() share the
+  // same mutable record. `semanticTimer` is the periodic reindex sweep;
+  // `semanticInFlight` is whichever reindex pass (initial or periodic) is
+  // currently running, so close() can wait for it instead of racing a
+  // write against a closing db handle.
+  const semantic = { store: null, embedder: null }
+  let semanticTimer = null
+  let indexingNow = false
+  let semanticInFlight = Promise.resolve()
   const server = http.createServer(httpHandlerFactory({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
@@ -765,7 +853,7 @@ export function startServer({
     fileOwnerUserId: resolvedFileOwnerUserId,
     workViewOptions,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -788,9 +876,10 @@ export function startServer({
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
+      const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
-        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
         orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
@@ -799,18 +888,90 @@ export function startServer({
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
       blobTranscripts.recover()
-      // Fire-and-forget: search serves partial results until this finishes
-      // (self-healing — spec). shouldStop lets close() end the walk cleanly
-      // instead of racing a closed DB handle.
-      const searchBackfill = backfillSearchIndex(db, {
-        log: (l) => console.log(l),
-        shouldStop: () => closing,
-      }).catch((err) => { console.error('search backfill failed', err) })
-      // Same shape: older item comments get their images' sizes stamped on.
-      const imageDimsBackfill = backfillImageDims(db, {
-        log: (l) => console.log(l),
-        shouldStop: () => closing,
-      }).catch((err) => { console.error('image size backfill failed', err) })
+      // Background work, one job at a time and only after the startup
+      // delay: the message index backfill, the is_diff fix-up, image sizes,
+      // then the embedder load and the first vector pass. Each walk saves
+      // its place per batch, so a restart picks up where the last process
+      // stopped. Search serves partial results meanwhile (self-healing —
+      // spec). shouldStop lets close() end a walk cleanly instead of racing
+      // a closed DB handle, and close() cancels the delay. Each walk gets a
+      // fresh throttle, which times a batch from the end of the last rest,
+      // so the gap before a walk starts never counts as work.
+      const bg = () => ({ log: (l) => console.log(l), shouldStop: () => closing, pause: throttle({ ratio: backgroundPace }) })
+      const searchBackfill = startDelay.promise.then(() => (closing ? null : backfillSearchIndex(db, bg())))
+        .catch((err) => { console.error('search backfill failed', err) })
+      // search_messages.is_diff on rows written before the column existed
+      // (spec 2026-10-12 unified search) — ranked search answers with
+      // whatever is fixed up so far meanwhile.
+      const isDiffBackfill = searchBackfill.then(() => (closing ? null : backfillIsDiff(db, bg())))
+        .catch((err) => { console.error('search is_diff backfill failed', err) })
+      // Older item comments get their images' sizes stamped on.
+      const imageDimsBackfill = isDiffBackfill.then(() => (closing ? null : backfillImageDims(db, bg())))
+        .catch((err) => { console.error('image size backfill failed', err) })
+      // Unified search (spec 2026-10-12 §5): tracker docs are indexed by
+      // trigger; vectors come from a local model loaded in the background.
+      // Off by env, by a missing optional package, or by a failed load —
+      // search answers lexically meanwhile. ensureVectorSchema runs
+      // unconditionally (idempotent, CREATE ... IF NOT EXISTS) so the
+      // search_vectors table exists before the indexer ever touches it,
+      // whether or not an embedder ends up loading.
+      ensureVectorSchema(db)
+      const semanticOff = process.env.MATRON_SEMANTIC_SEARCH === 'off'
+      const embedderReady = imageDimsBackfill.then(() => {
+        if (closing) return null
+        if (embedder !== undefined) return embedder
+        return semanticOff ? null : loadEmbedder({
+          modelDir: process.env.MATRON_SEMANTIC_MODEL_DIR || path.join(path.dirname(resolvedDbPath), 'models'),
+          allowDownload: !process.env.MATRON_SEMANTIC_MODEL_DIR,
+        })
+      })
+      embedderReady.then(async (loadedEmbedder) => {
+        if (!loadedEmbedder || closing) return
+        semantic.embedder = loadedEmbedder
+        semantic.store = createVectorStore(db, loadedEmbedder)
+        // Docs the embedder failed on, kept for this process run so a
+        // sweep doesn't retry them every 30 seconds.
+        const skippedDocs = new Set()
+        // `trackIndexing`: the store
+        // already starts `indexing` (createVectorStore's own default), so
+        // `'indexing'` naturally covers this first pass without an extra
+        // call. Only this initial call flips it back to `'ready'` when
+        // done — a later 30s sweep pass runs with `trackIndexing: false`,
+        // so `semantic` stays `'ready'` between boot and the next edit
+        // instead of flickering to `'indexing'` every 30 seconds.
+        const reindex = async (trackIndexing) => {
+          try {
+            await runVectorIndexer(db, loadedEmbedder, { ...bg(), onWrite: (rows) => semantic.store.upsertVectors(rows), skipped: skippedDocs })
+          } catch (err) {
+            // Never reject: semanticInFlight is awaited both here and by
+            // close() (alongside the other background work) — a rejection
+            // (e.g. a write that lost its race with a closing db handle)
+            // would otherwise stop close() from ever reaching db.close().
+            console.error('vector index: reindex pass failed', err)
+          } finally {
+            if (trackIndexing) semantic.store.setIndexing(false)
+          }
+        }
+        semanticInFlight = reindex(true)
+        await semanticInFlight
+        // Closed while that first pass ran: don't arm a sweep nothing will
+        // ever clear (close() below only clears a timer it can already see).
+        if (closing) return
+        // New and edited docs: a periodic sweep. An edited body drops its
+        // vector by trigger, so an idle pass is one anti-join of search_docs
+        // against search_vectors' primary key — no hashing, no embedding —
+        // that finds nothing pending. unref'd like the
+        // other background timers — never keeps the process alive on its own.
+        // Runs with trackIndexing:false — the similar tier still answers
+        // from whatever is already indexed while a sweep is in flight.
+        semanticTimer = setInterval(() => {
+          if (!indexingNow) {
+            indexingNow = true
+            semanticInFlight = reindex(false).finally(() => { indexingNow = false })
+          }
+        }, 30_000)
+        semanticTimer.unref()
+      }).catch((err) => console.error('semantic search setup failed', err))
       resolve({
         port: server.address().port,
         db,
@@ -823,6 +984,7 @@ export function startServer({
         blobTranscripts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        isDiffBackfill,
         imageDimsBackfill,
         unseenNudge: unseenNudgeSweep,
         routinesSweep: routinesSweeper,
@@ -830,9 +992,15 @@ export function startServer({
         github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
+          startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
+          // No new reindex pass can start after this: the only other
+          // starter is embedderReady's own `.then`, which re-checks
+          // `closing` right after its first pass (above) before ever
+          // arming the timer this clears.
+          if (semanticTimer) clearInterval(semanticTimer)
           stallWakeSweep.stop()
           unseenNudgeSweep.stop()
           routinesSweeper.stop()
@@ -847,7 +1015,13 @@ export function startServer({
           // The transcription queue touches the DB between awaits: abort its
           // child and let it drain before the handle closes.
           const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
-          server.close(() => { Promise.all([searchBackfill, imageDimsBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
+          // semanticInFlight: whichever reindex pass (initial or periodic)
+          // is running right now — runVectorIndexer's own shouldStop only
+          // re-checks between batches, so a pass already inside an awaited
+          // embed call could otherwise still be mid-write when db.close()
+          // below fires. Waiting for it here, alongside the other
+          // background work, keeps that from racing a closed db handle.
+          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
         }),
       })
     })

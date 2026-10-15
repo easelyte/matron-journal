@@ -246,6 +246,14 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
+    // When the session last entered and last left 'running' — a turn's start
+    // and end, for an item thread's working indicator (items.js itemWorking).
+    // Stamped on a real transition only: a bridge that repeats a state, or
+    // moves an idle session from 'waiting' to 'done', starts and ends nothing.
+    if (sessionState != null && sessionState !== existing.session_state) {
+      if (sessionState === 'running') db.prepare('UPDATE conversations SET turn_started_at=? WHERE id=?').run(Date.now(), id)
+      else if (existing.session_state === 'running') db.prepare('UPDATE conversations SET turn_ended_at=? WHERE id=?').run(Date.now(), id)
+    }
     if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
     if (title != null) {
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
@@ -266,8 +274,9 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // 0 ("never"), the same value every pre-existing row has.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, agentKind ?? null, inheritedMission, createdAt)
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, agentKind ?? null, inheritedMission, createdAt,
+        (sessionState || 'running') === 'running' ? createdAt : null)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
       if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
@@ -339,8 +348,8 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     const searchBody = indexableBody(type, payload)
     if (searchBody != null) {
       db.prepare(
-        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
-      ).run(userId, convoId, seq, ts, sender, searchBody)
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body, is_diff) VALUES(?,?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody, type === 'diff' ? 1 : 0)
     }
     if (type === 'session_status') {
       // Guard against a malformed agent payload (null/undefined/non-object,
@@ -475,7 +484,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
-              SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+              SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
        : ''}`
   ).all(userId)
   conversations.sort(byLastMessageThenId)
@@ -500,7 +509,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // because a private box was in it — rows involving a private device
   // neither count as members nor make a conversation a room.
   const sieve = (col) => excludePrivateOwned
-    ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=${col} AND d.private=1)`
+    ? ` AND NOT EXISTS(SELECT 1 FROM private_devices d WHERE d.id=${col})`
     : ''
   const roomIds = new Set(db.prepare(
     `SELECT ca.convo_id AS id FROM convo_agents ca

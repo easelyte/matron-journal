@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
-import { createUser } from '../src/auth.js'
+import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
-import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes } from '../src/retention.js'
-import { resolveReapPcts, resolveOrphanBlobGraceHours } from '../src/server.js'
+import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent, contentTombstone } from '../src/retention.js'
+import { resolveReapPcts, resolveOrphanBlobGraceHours, resolveDeviceRetention } from '../src/server.js'
+import { searchMessages, searchRecent, backfillSearchIndex } from '../src/search.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
 import { createItem, addComment, setAttachmentTranscript, finishAttachmentTranscript, listComments } from '../src/items.js'
 import { makeTmpDir } from './tmp-dir.js'
@@ -1402,4 +1403,295 @@ test('tombstones: a client payload\'s own transcript_by never survives onto an u
   const r0 = append(db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'file', payload: { blob_ref: v.blob.id, name: 'V.m4a', content_type: 'audio/mp4', size: 100, transcript_by: 'journal' }, blobRef: v.blob.id })
   runExpireVoiceNotes(db, { days: 7 })
   assert.equal(JSON.parse(eventOf(db, alice.id, r0.seq).payload).transcript_by, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// runExpireDeviceContent — per-device content expiry
+// ---------------------------------------------------------------------------
+
+test('resolveDeviceRetention: parses <deviceId>:<days> lists; unset and empty are off; any bad entry disables the whole setting', (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => warn.mock.restore())
+  assert.deepEqual(resolveDeviceRetention('4:30,9:7'), [{ deviceId: 4, days: 30 }, { deviceId: 9, days: 7 }])
+  assert.deepEqual(resolveDeviceRetention(' 4 : 30 , 9:7 '), [{ deviceId: 4, days: 30 }, { deviceId: 9, days: 7 }])
+  assert.equal(resolveDeviceRetention(''), null)
+  assert.equal(resolveDeviceRetention('   '), null)
+  assert.equal(warn.mock.callCount(), 0, 'off is not a misconfiguration')
+  for (const bad of ['4', '4:0', '0:30', '4:30,', '4:30,x:7', '4:-1', '4:1.5', '4:30,4:7', '4:30;9:7', 4, ['4:30']]) {
+    const before = warn.mock.callCount()
+    assert.equal(resolveDeviceRetention(bad), null, JSON.stringify(bad))
+    assert.equal(warn.mock.callCount(), before + 1, `one warn line for ${JSON.stringify(bad)}`)
+  }
+  assert.match(warn.mock.calls.at(-1).arguments[0], /deviceRetention=.*device content expiry disabled/)
+
+  // The env var when no override is given; an override (even '') wins.
+  const saved = process.env.MATRON_DEVICE_RETENTION
+  t.after(() => { if (saved === undefined) delete process.env.MATRON_DEVICE_RETENTION; else process.env.MATRON_DEVICE_RETENTION = saved })
+  delete process.env.MATRON_DEVICE_RETENTION
+  assert.equal(resolveDeviceRetention(undefined), null)
+  process.env.MATRON_DEVICE_RETENTION = '3:14'
+  assert.deepEqual(resolveDeviceRetention(undefined), [{ deviceId: 3, days: 14 }])
+  assert.equal(resolveDeviceRetention(''), null)
+  process.env.MATRON_DEVICE_RETENTION = '3:soon'
+  assert.equal(resolveDeviceRetention(undefined), null)
+  assert.match(warn.mock.calls.at(-1).arguments[0], /MATRON_DEVICE_RETENTION="3:soon" is invalid/)
+})
+
+// One user; agent device `brief` is the one whose content expires, `kept`
+// is any other device. Conversations:
+//   own            brief's own session
+//   own-room       a room brief owns
+//   room           kept's room that brief joined and left
+//   asked          kept's room whose row for brief now reads 'refused'
+//   child          a sub-chat under brief's session (no device recorded)
+//   owner-session  brief's session known only to room_owner_convos
+//   taken          was brief's session per room_owner_convos, since taken over by kept
+//   elsewhere      kept's session, nothing to do with brief
+//   c1             (setup) no device at all
+async function deviceFixture() {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const kept = createAgent(db, alice.id, 'kept').deviceId
+  const brief = createAgent(db, alice.id, 'brief').deviceId
+  const convo = (id, fields = {}) => upsertConversation(db, { id, ownerUserId: alice.id, ...fields })
+  convo('own', { agentDeviceId: brief })
+  convo('own-room', { agentDeviceId: brief })
+  convo('room', { agentDeviceId: kept })
+  convo('asked', { agentDeviceId: kept, summary: 'they talked about the quokka' })
+  convo('child', { parentConvoId: 'own' })
+  convo('owner-session')
+  convo('taken', { agentDeviceId: kept })
+  convo('elsewhere', { agentDeviceId: kept })
+  const member = db.prepare('INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES(?,?,?,?,?)')
+  member.run('room', brief, kept, 'left', Date.now())
+  member.run('asked', brief, kept, 'refused', Date.now())
+  const ownerConvo = db.prepare('INSERT INTO room_owner_convos(room_id, convo_id, device_id, created_at) VALUES(?,?,?,?)')
+  ownerConvo.run('own-room', 'owner-session', brief, Date.now())
+  ownerConvo.run('own-room', 'taken', brief, Date.now())
+  const say = (convoId, body, daysAgo, type = 'text', payload = { body }) => {
+    const r = append(db, { userId: alice.id, convoId, sender: 'agent:x', type, payload })
+    backdate(db, r.seq, alice.id, daysAgo)
+    return r.seq
+  }
+  const payloadOf = (seq) => JSON.parse(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seq).payload)
+  const rules = [{ deviceId: brief, days: 30 }]
+  return { db, alice, mediaDir, kept, brief, say, payloadOf, rules }
+}
+
+const DUE_SCOPE = ['own', 'own-room', 'room', 'asked', 'child', 'owner-session']
+const NOT_SCOPE = ['taken', 'elsewhere', 'c1']
+
+test('runExpireDeviceContent expires old content in every conversation the device has a hand in, and nothing else', async () => {
+  const { db, say, payloadOf, rules } = await deviceFixture()
+  const old = new Map()
+  const fresh = new Map()
+  for (const c of [...DUE_SCOPE, ...NOT_SCOPE]) {
+    old.set(c, say(c, `old words in ${c}`, 40))
+    if (c !== 'asked') fresh.set(c, say(c, `fresh words in ${c}`, 5))
+  }
+  const r = runExpireDeviceContent(db, { rules })
+  assert.deepEqual(r, { expired: DUE_SCOPE.length, blobsDeleted: 0, bytesFreed: 0, searchRowsDeleted: DUE_SCOPE.length })
+  for (const c of DUE_SCOPE) {
+    assert.deepEqual(payloadOf(old.get(c)), { body: '', blob_ref: null, expired: true, content_expired: true }, c)
+    if (fresh.has(c)) assert.equal(payloadOf(fresh.get(c)).body, `fresh words in ${c}`, `${c}: inside the window`)
+  }
+  for (const c of NOT_SCOPE) {
+    assert.deepEqual(payloadOf(old.get(c)), { body: `old words in ${c}` }, `${c} is not the device's`)
+  }
+})
+
+test('runExpireDeviceContent: the cutoff is per rule and measured from `now`', async () => {
+  const { db, say, payloadOf, brief } = await deviceFixture()
+  const seq = say('own', 'ten days old', 10)
+  assert.equal(runExpireDeviceContent(db, { rules: [{ deviceId: brief, days: 11 }] }).expired, 0)
+  assert.equal(payloadOf(seq).body, 'ten days old')
+  assert.equal(runExpireDeviceContent(db, { rules: [{ deviceId: brief, days: 11 }], now: Date.now() + 2 * 86400000 }).expired, 1)
+  assert.equal(payloadOf(seq).body, '')
+})
+
+test('runExpireDeviceContent removes the search rows, both FTS mirrors stay consistent, and backfill never re-indexes a tombstone', async () => {
+  const { db, alice, say, rules } = await deviceFixture()
+  const oldSeq = say('room', 'the quokka sang', 40)
+  say('room', 'the wombat sang', 5)
+  const oldDiff = say('own', '', 40, 'diff', { diff: '+ numbat burrow', file_path: 'notes/numbat.md' })
+  const hits = (query) => searchMessages(db, alice.id, { query }).hits.length
+  const typed = (query) => searchRecent(db, alice.id, { query }).hits.length
+  assert.equal(hits('quokka'), 1); assert.equal(typed('quokka'), 1)
+  assert.equal(hits('numbat'), 1); assert.equal(typed('numbat'), 1)
+
+  const r = runExpireDeviceContent(db, { rules })
+  assert.equal(r.searchRowsDeleted, 2)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages WHERE user_id=? AND seq IN (?,?)').get(alice.id, oldSeq, oldDiff).n, 0)
+  assert.equal(hits('quokka'), 0, 'porter mirror still finds expired words')
+  assert.equal(typed('quokka'), 0, 'plain mirror still finds expired words')
+  assert.equal(typed('quok'), 0, 'plain mirror prefix still finds expired words')
+  assert.equal(hits('numbat'), 0); assert.equal(typed('numbat'), 0)
+  assert.equal(hits('wombat'), 1, 'words inside the window stay searchable')
+  assert.equal(typed('wombat'), 1)
+  // Throws on an index out of step with its content table.
+  for (const table of ['search_fts', 'search_fts_plain']) {
+    db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`)
+    db.exec(`INSERT INTO ${table}(${table}, rank) VALUES('integrity-check', 1)`)
+  }
+
+  db.prepare('DELETE FROM search_backfill_state').run()
+  await backfillSearchIndex(db, { pause: async () => {} })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages WHERE user_id=? AND seq IN (?,?)').get(alice.id, oldSeq, oldDiff).n, 0, 'a tombstone was re-indexed')
+  assert.equal(hits('quokka'), 0)
+})
+
+test('runExpireDeviceContent deletes a blob only when nothing outside the pass still names it', async () => {
+  const { db, alice, mediaDir, say, payloadOf, rules } = await deviceFixture()
+  const lone = seedAttachment(db, mediaDir, { userId: alice.id, convoId: 'room', bytes: 100, daysAgo: 40, caption: 'quoted caption' })
+  // The same blob attached twice in the device's conversations, both due: goes once.
+  const twice = seedAttachment(db, mediaDir, { userId: alice.id, convoId: 'own', bytes: 200, daysAgo: 40 })
+  const again = append(db, { userId: alice.id, convoId: 'room', sender: 'agent:x', type: 'image', payload: { blob_ref: twice.blob.id }, blobRef: twice.blob.id })
+  backdate(db, again.seq, alice.id, 40)
+  // Also attached in an unrelated conversation: stays.
+  const shared = seedAttachment(db, mediaDir, { userId: alice.id, convoId: 'room', bytes: 300, daysAgo: 40 })
+  append(db, { userId: alice.id, convoId: 'elsewhere', sender: 'agent:x', type: 'file', payload: { blob_ref: shared.blob.id }, blobRef: shared.blob.id })
+  // Also attached in the device's own conversation, but not yet due: stays.
+  const young = seedAttachment(db, mediaDir, { userId: alice.id, convoId: 'own', bytes: 400, daysAgo: 40 })
+  append(db, { userId: alice.id, convoId: 'own', sender: 'agent:x', type: 'file', payload: { blob_ref: young.blob.id }, blobRef: young.blob.id })
+  // Named by an item comment: stays.
+  const commented = seedAttachment(db, mediaDir, { userId: alice.id, convoId: 'room', bytes: 500, daysAgo: 40 })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: commented.blob.id, mime: 'application/pdf', name: 'c.pdf', size: 500 }] })
+  // An offloaded tool log: its blob holds the whole original payload.
+  const log = say('own', '', 40, 'tool_output', { command: 'cat notes.txt', snippet: 'the quoted notes', output: 'x'.repeat(100) })
+  runOffload(db, { days: 30, mediaDir })
+  const logBlob = getBlob(db, db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, log).blob_ref)
+  assert.ok(logBlob)
+
+  const r = runExpireDeviceContent(db, { rules })
+  assert.equal(r.blobsDeleted, 3)
+  assert.equal(r.bytesFreed, 100 + 200 + logBlob.size)
+  for (const gone of [lone.blob, twice.blob, { id: logBlob.id, diskPath: logBlob.disk_path }]) {
+    assert.equal(getBlob(db, gone.id), undefined)
+    assert.equal(fs.existsSync(gone.diskPath), false, 'the file is unlinked')
+  }
+  for (const stays of [shared.blob, young.blob, commented.blob]) {
+    assert.ok(getBlob(db, stays.id), 'a blob still named elsewhere stays')
+    assert.equal(fs.existsSync(stays.diskPath), true)
+  }
+  // Every due event lets go of its blob, kept or not.
+  for (const seq of [lone.seq, twice.seq, again.seq, shared.seq, young.seq, commented.seq, log]) {
+    const row = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seq)
+    assert.equal(row.blob_ref, null)
+    assert.equal(JSON.parse(row.payload).blob_ref, null)
+  }
+  assert.deepEqual(payloadOf(lone.seq), { blob_ref: null, name: '', content_type: 'application/pdf', size: 100, caption: '', expired: true, content_expired: true })
+  assert.deepEqual(payloadOf(log), { type: 'tool_output', snippet: '', blob_ref: null, expired: true, content_expired: true })
+})
+
+test('runExpireDeviceContent: a blob another user owns is never deleted', async () => {
+  const { db, alice, mediaDir, rules } = await deviceFixture()
+  const bob = await createUser(db, 'bob', 'pw')
+  const blob = seedBlob(db, mediaDir, { userId: bob.id, bytes: 64 })
+  const r = append(db, { userId: alice.id, convoId: 'room', sender: 'agent:x', type: 'file', payload: { blob_ref: blob.id }, blobRef: blob.id })
+  backdate(db, r.seq, alice.id, 40)
+  assert.equal(runExpireDeviceContent(db, { rules }).blobsDeleted, 0)
+  assert.ok(getBlob(db, blob.id))
+})
+
+test('runExpireDeviceContent scrubs earlier tombstones that still carry words, and is idempotent', async () => {
+  const { db, say, payloadOf, rules } = await deviceFixture()
+  // The media reaper's tombstone keeps the caption, the name and a voice note's words.
+  const reaped = say('room', '', 40, 'file', { blob_ref: null, name: 'call.m4a', content_type: 'audio/mp4', size: 9, caption: 'about the quokka', transcript: 'the quokka said', transcript_by: 'journal', expired: true })
+  // The live-log tombstone keeps the command.
+  const logged = say('own', '', 40, 'tool_output', { message_ref: 'toolu_1', command: 'grep quokka notes', exit_code: 0, denied: false, truncated: false, live_log: true, expired: true, blob_ref: null })
+  say('own', 'plain old text', 40)
+  const first = runExpireDeviceContent(db, { rules })
+  assert.equal(first.expired, 3)
+  assert.deepEqual(payloadOf(reaped), { blob_ref: null, name: '', content_type: 'audio/mp4', size: 9, caption: '', transcript: '', transcript_by: '', expired: true, content_expired: true })
+  assert.deepEqual(payloadOf(logged), { message_ref: 'toolu_1', command: '', exit_code: 0, denied: false, truncated: false, live_log: true, expired: true, blob_ref: null, content_expired: true })
+
+  const before = db.prepare('SELECT seq, payload, blob_ref FROM events ORDER BY seq').all()
+  const convosBefore = db.prepare('SELECT id, snippet, summary FROM conversations ORDER BY id').all()
+  assert.deepEqual(runExpireDeviceContent(db, { rules }), { expired: 0, blobsDeleted: 0, bytesFreed: 0, searchRowsDeleted: 0 })
+  assert.deepEqual(db.prepare('SELECT seq, payload, blob_ref FROM events ORDER BY seq').all(), before)
+  assert.deepEqual(db.prepare('SELECT id, snippet, summary FROM conversations ORDER BY id').all(), convosBefore)
+})
+
+test('runExpireDeviceContent: the preview and summary forget expired words, and stay when a newer message owns them', async () => {
+  const { db, say, rules } = await deviceFixture()
+  say('asked', 'the quokka is the answer', 40)
+  say('room', 'the quokka again', 40)
+  say('room', 'something new', 5)
+  db.prepare("UPDATE conversations SET summary='room summary' WHERE id='room'").run()
+  const convo = (id) => db.prepare('SELECT snippet, summary FROM conversations WHERE id=?').get(id)
+  assert.equal(convo('asked').snippet, 'the quokka is the answer')
+  runExpireDeviceContent(db, { rules })
+  assert.deepEqual(convo('asked'), { snippet: '', summary: '' })
+  assert.deepEqual(convo('room'), { snippet: 'something new', summary: 'room summary' })
+})
+
+test('runExpireDeviceContent works through a long history in bounded batches', async () => {
+  const { db, alice, say, rules } = await deviceFixture()
+  for (let i = 0; i < 25; i++) say('own', `message ${i}`, 40)
+  const r = runExpireDeviceContent(db, { rules, batchSize: 4 })
+  assert.equal(r.expired, 25)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE user_id=? AND convo_id='own' AND json_extract(payload,'$.content_expired') = 1").get(alice.id).n, 25)
+})
+
+test('runExpireDeviceContent skips loudly on invalid rules', async (t) => {
+  const { db, say, payloadOf, brief } = await deviceFixture()
+  const seq = say('own', 'kept words', 40)
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => warn.mock.restore())
+  for (const rules of [null, [{ deviceId: brief, days: 0 }], [{ deviceId: brief, days: 30 }, { deviceId: 'x', days: 30 }]]) {
+    assert.deepEqual(runExpireDeviceContent(db, { rules }), { expired: 0, blobsDeleted: 0, bytesFreed: 0, searchRowsDeleted: 0 })
+  }
+  assert.equal(warn.mock.callCount(), 3)
+  assert.equal(payloadOf(seq).body, 'kept words')
+})
+
+test('contentTombstone keeps ids, enums, numbers and flags; empties every other string; clears arrays and objects', () => {
+  const card = {
+    kind: 'agent_chat', request: 'invite', room_id: 'room_1', from_device_id: 7, target_device_id: 9,
+    from_name: 'box a', from_convo_title: 'notes about the quokka', justification: 'quoting the quokka',
+    topic: 'quokka', options: ['Allow', 'Deny'], extra: { nested: 'quokka' },
+  }
+  assert.deepEqual(contentTombstone(JSON.stringify(card)), {
+    kind: 'agent_chat', request: 'invite', room_id: 'room_1', from_device_id: 7, target_device_id: 9,
+    from_name: '', from_convo_title: '', justification: '', topic: '', options: [], extra: {},
+    blob_ref: null, expired: true, content_expired: true,
+  })
+  assert.deepEqual(contentTombstone(JSON.stringify({ request_id: 'sp_1', outcome: 'failed', error_code: 'timeout', detail: 'quokka' })),
+    { request_id: 'sp_1', outcome: 'failed', error_code: 'timeout', detail: '', blob_ref: null, expired: true, content_expired: true })
+  for (const raw of ['not json', 'null', '"a string"', '[1,2]']) {
+    assert.deepEqual(contentTombstone(raw), { blob_ref: null, expired: true, content_expired: true }, raw)
+  }
+})
+
+test('MATRON_DEVICE_RETENTION: the pass runs at boot and logs its rules once; an invalid setting disables it', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const logs = []
+  const log = t.mock.method(console, 'log', (...a) => { logs.push(a.join(' ')) })
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => { log.mock.restore(); warn.mock.restore() })
+  for (const valid of [true, false]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-retention-'))
+    const dbPath = path.join(dir, 'test.db')
+    const preDb = openDb(dbPath)
+    const alice = await createUser(preDb, 'alice', 'pw')
+    const brief = createAgent(preDb, alice.id, 'brief').deviceId
+    upsertConversation(preDb, { id: 'own', ownerUserId: alice.id, agentDeviceId: brief })
+    const r = append(preDb, { userId: alice.id, convoId: 'own', sender: 'agent:x', type: 'text', payload: { body: 'old words' } })
+    preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
+    preDb.close()
+    logs.length = 0
+    const s = await startTestServer({ dbPath, deviceRetention: valid ? `${brief}:30` : `${brief}:thirty` })
+    const body = JSON.parse(s.db.prepare('SELECT payload FROM events WHERE seq=?').get(r.seq).payload).body
+    s.close()
+    if (valid) {
+      assert.equal(body, '')
+      assert.equal(logs.filter((l) => l.includes('device content expiry on')).length, 1)
+      assert.ok(logs.some((l) => l.includes(`device ${brief} after 30d`)))
+      assert.ok(logs.some((l) => /expired content of 1 event\(s\)/.test(l)))
+    } else {
+      assert.equal(body, 'old words')
+      assert.ok(!logs.some((l) => l.includes('device content expiry on')))
+    }
+  }
 })

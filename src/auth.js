@@ -39,7 +39,13 @@ export async function changePassword(db, userId, { oldPassword, newPassword }) {
 function issueDevice(db, userId, kind, name, tagChar = null) {
   const token = newToken()
   const r = db.prepare(
-    'INSERT INTO devices(user_id, kind, name, tag_char, token_hash, created_at) VALUES(?,?,?,?,?,?)'
+    // The id is allocated above every revoked private device's tombstone as
+    // well as every live device: SQLite's own choice (one past the highest
+    // live rowid) would hand a just-revoked private box's id straight back
+    // (db.js, private_devices).
+    `INSERT INTO devices(id, user_id, kind, name, tag_char, token_hash, created_at)
+     VALUES(1 + MAX((SELECT COALESCE(MAX(id), 0) FROM devices), (SELECT COALESCE(MAX(id), 0) FROM revoked_private_devices)),
+       ?,?,?,?,?,?)`
   ).run(userId, kind, name, tagChar, sha256(token), Date.now())
   return { token, deviceId: r.lastInsertRowid }
 }

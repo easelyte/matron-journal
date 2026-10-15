@@ -399,8 +399,8 @@ const PARTICIPANT_CONVO_SQL = (scope, excludePrivateOwned) => `
   ) p
   JOIN conversations room ON room.id = p.room_id
   WHERE p.convo_id IS NOT NULL AND ${scope}${excludePrivateOwned ? `
-    AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id = p.dev AND d.private=1)
-    AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.private=1 AND d.id = COALESCE(
+    AND NOT EXISTS(SELECT 1 FROM private_devices d WHERE d.id = p.dev)
+    AND NOT EXISTS(SELECT 1 FROM private_devices d WHERE d.id = COALESCE(
       (SELECT c.agent_device_id FROM conversations c WHERE c.id = p.convo_id), p.own))` : ''}
   ORDER BY p.room_id, p.side, p.ord, p.rk, p.sub`
 

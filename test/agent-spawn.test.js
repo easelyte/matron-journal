@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getSpawn, createSpawnRequest, claimApprove, approveSpawn, discardSpawnRequest } from '../src/spawns.js'
 import { participantIds } from '../src/participants.js'
+import { CONVOS_MAX } from '../src/missions.js'
 
 // Fleet: one user, a parent agent (box-6), a target agent (opal), a client.
 // Parent owns 'parent-convo' — the conversation the consent card lands in.
@@ -1393,4 +1394,100 @@ test('approve after the mission closed: failed with mission_closed, no start rpc
   assert.equal(target.frames.find((f) => f.kind === 'rpc' && f.request?.method === 'start'), undefined, 'nothing spawned')
   assert.equal(getSpawn(s.db, spawnId).state, 'failed')
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(mission.id).n, 0)
+})
+
+// Inheritance: a spawn that names no mission takes the parent conversation's
+// current one (spawns.js inheritedSpawnMission), through inheritance's gates.
+async function parentOnMission(s, token, title = 'Parent work') {
+  const r = await s.http('/missions', { method: 'POST', token, body: { title, convo_id: 'parent-convo' } })
+  assert.equal(r.status, 201)
+  return r.json.mission
+}
+const askPlain = (parent, targetDev, rid, extra = {}) => parent.send({
+  op: 'spawn_request', request_id: rid, from_convo_id: 'parent-convo',
+  target_device_id: targetDev.deviceId, workdir: '/w', task: 'carry on', ...extra,
+})
+const isPending = (f) => f.kind === 'spawn' && f.event === 'pending'
+
+test('spawn_request with no mission_num inherits the parent conversation\'s current mission: row, card, ack; approval joins the child without making it a sub-chat', async (t) => {
+  const { s, parentDev, targetDev, clientToken, parent, target, client } = await spawnFleet(t)
+  const mission = await parentOnMission(s, parentDev.token)
+  askPlain(parent, targetDev, 'qi')
+  const ack = await parent.waitFor(isPending)
+  assert.equal(ack.mission_num, mission.num); assert.equal(ack.mission_inherited, true)
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.mission_num, mission.num); assert.equal(row.mission_inherited, 1)
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.payload.mission_num, mission.num); assert.equal(card.payload.mission_title, 'Parent work')
+
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.mission_num, mission.num)
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-i1' } })
+  })
+  assert.equal((await approve(s, clientToken, ack.spawn_id)).status, 200)
+  await bridgeTurn
+  assert.equal((await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')).outcome, 'started')
+  const child = s.db.prepare('SELECT mission_id, parent_convo_id FROM conversations WHERE id=?').get('child-i1')
+  assert.equal(child.mission_id, mission.id)
+  assert.equal(child.parent_convo_id, null, 'a spawned child stays top-level')
+  assert.equal(s.db.prepare('SELECT how FROM mission_conversations WHERE mission_id=? AND convo_id=?').get(mission.id, 'child-i1').how, 'spawned')
+})
+
+test('spawn inheritance: a named mission_num wins over the parent\'s; a parent with no mission passes none', async (t) => {
+  const { s, parentDev, targetDev, parent } = await spawnFleet(t)
+  askPlain(parent, targetDev, 'q0')
+  const none = await parent.waitFor(isPending)
+  assert.equal(none.mission_num, undefined); assert.equal(none.mission_inherited, undefined)
+  assert.equal(getSpawn(s.db, none.spawn_id).mission_num, null)
+  parent.frames.length = 0
+  await parentOnMission(s, parentDev.token)
+  const other = await missionFor(s, parentDev.token)
+  askPlain(parent, targetDev, 'q1', { mission_num: other.num })
+  const named = await parent.waitFor(isPending)
+  assert.equal(named.mission_num, other.num); assert.equal(named.mission_inherited, undefined)
+  assert.equal(getSpawn(s.db, named.spawn_id).mission_inherited, 0)
+})
+
+test('spawn inheritance gates: a private parent never hands its mission to an ordinary box; a full mission is not inherited; the spawn is parked either way', async (t) => {
+  const { s, alice, parentDev, targetDev, parent } = await spawnFleet(t)
+  const mission = await parentOnMission(s, parentDev.token)
+  // Full: CONVOS_MAX top-level conversations already on it.
+  const conv = s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,?,'pad','running',?,0)")
+  const link = s.db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at) VALUES(?,?,?,'joined',0)")
+  for (let i = 0; i < CONVOS_MAX - 1; i++) { conv.run(`pad${i}`, alice.id, mission.id); link.run(mission.id, `pad${i}`, alice.id) }
+  askPlain(parent, targetDev, 'q-full')
+  const full = await parent.waitFor(isPending)
+  assert.equal(full.mission_num, undefined)
+  assert.equal(getSpawn(s.db, full.spawn_id).mission_num, null)
+  parent.frames.length = 0
+  s.db.prepare('DELETE FROM mission_conversations WHERE convo_id LIKE ?').run('pad%')
+
+  // Private parent, ordinary target: not inherited.
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(parentDev.deviceId)
+  askPlain(parent, targetDev, 'q-priv')
+  const priv = await parent.waitFor(isPending)
+  assert.equal(priv.mission_num, undefined)
+  parent.frames.length = 0
+  // Both private: inherited.
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(targetDev.deviceId)
+  askPlain(parent, targetDev, 'q-both')
+  assert.equal((await parent.waitFor(isPending)).mission_num, mission.num)
+})
+
+test('an inherited mission that closes before the tap does not fail the spawn: the child starts unattached', async (t) => {
+  const { s, parentDev, targetDev, clientToken, parent, target } = await spawnFleet(t)
+  const mission = await parentOnMission(s, parentDev.token)
+  askPlain(parent, targetDev, 'qc')
+  const ack = await parent.waitFor(isPending)
+  assert.equal(ack.mission_num, mission.num)
+  assert.equal((await s.http(`/missions/${mission.id}/close`, { method: 'POST', token: clientToken, body: { summary: 'done' } })).status, 200)
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.mission_num, undefined, 'no mission named to the target')
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-c1' } })
+  })
+  assert.equal((await approve(s, clientToken, ack.spawn_id)).status, 200)
+  await bridgeTurn
+  assert.equal((await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')).outcome, 'started')
+  assert.equal(getSpawn(s.db, ack.spawn_id).mission_num, null)
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child-c1')?.mission_id ?? null, null)
 })

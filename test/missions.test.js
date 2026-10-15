@@ -597,8 +597,13 @@ test('schema: an existing database gains the mission status columns once, all NU
     db1.prepare(`INSERT INTO missions(id,user_id,num,state,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
       VALUES('ms_old',1,1,'open','t','c1',1,'agent',0,0)`).run()
     db1.close()
-    // Simulate the pre-status shape on a raw handle.
+    // Simulate the pre-status shape on a raw handle. A truly pre-status
+    // database also predates search-docs.js's sync triggers (db1's own
+    // openDb call already installed them); drop the ones that read
+    // missions.status first, or SQLite refuses to drop a column a trigger
+    // references.
     const raw = new Database(dbPath)
+    raw.exec('DROP TRIGGER IF EXISTS sd_missions_status_ai; DROP TRIGGER IF EXISTS sd_missions_status_au; DROP TRIGGER IF EXISTS sd_missions_status_ad')
     for (const c of cols) raw.exec(`ALTER TABLE missions DROP COLUMN ${c}`)
     raw.close()
 
