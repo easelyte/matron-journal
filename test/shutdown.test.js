@@ -33,6 +33,22 @@ test('close({closeCode}) sends every socket the close code and reason, then shut
   for (const g of await Promise.all(got)) assert.deepEqual(g, { code: 1012, reason: 'restarting' })
 })
 
+test('a peer that never acknowledges the close frame is terminated after graceMs and the DB still closes', async () => {
+  const s = await startTestServer()
+  const a = await createUser(s.db, 'alice', 'pw')
+  const dev = createAgent(s.db, a.id, 'jade')
+  const c = await makeWsClient(s.base, { token: dev.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  c.ws._socket.pause() // the client never reads the close frame, so never answers it
+  const t0 = Date.now()
+  await s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs: 150 })
+  const took = Date.now() - t0
+  assert.ok(took >= 100, `waited for the grace period (${took}ms)`)
+  assert.ok(took < 3000, `bounded by graceMs, not left to the outer watchdog (${took}ms)`)
+  assert.equal(s.db.open, false)
+  c.ws.terminate()
+})
+
 test('close() without a code still terminates sockets as before', async () => {
   const s = await startTestServer()
   const a = await createUser(s.db, 'alice', 'pw')
