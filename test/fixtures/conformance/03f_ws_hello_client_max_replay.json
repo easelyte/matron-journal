@@ -150,7 +150,8 @@
         "op": "hello_ok",
         "coordinator_convo_id": null,
         "settings": {
-          "notices": true
+          "notices": true,
+          "auto_approve_coordinator_spawns": false
         },
         "pins": [],
         "seq": 10,
