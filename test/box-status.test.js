@@ -186,13 +186,33 @@ test('box_status: a vitals block persists, fans live, and shows on /devices and 
 // fleet watcher sees it from the journal. Capped on the way in, and kept
 // across later reports that do not mention it (box_status otherwise
 // replaces the whole row).
+// Shapes copied from what a bridge emits: waiting_on carries nested quiet /
+// preflight / collect objects and an unwarned list; results carries a
+// verdicts map (id -> outcome) next to no_note and code_mismatch.
 const RESTART = {
-  id: 'r-20261010-1',
+  id: '5b1f2c0e-7d34-4a8e-9a55-0c1f6e2d9b10',
   state: 'pending',
-  requests: [{ conversation: 'abc', reason: 'deploy', sha: 'deadbee' }],
+  requests: [{ sha: 'deadbeefcafe', reason: 'deploy' }],
   pending_since: 1760000000000,
-  waiting_on: { busy: ['s1', 's2'], code: 'dirty tree' },
+  waiting_on: {
+    quiet: { holders: [{ convoId: 'c-1', why: 'turn in progress' }], probe_error: null },
+    code: null,
+    preflight: { error: 'config invalid' },
+    collect: { remaining_ms: 12000 },
+    unwarned: ['c-2'],
+  },
   expected_sha: 'deadbeefcafe',
+}
+const RESTART_BACK = {
+  ...RESTART,
+  state: 'back',
+  waiting_on: { quiet: { holders: [], probe_error: null }, code: null, preflight: { unknown: true }, collect: null, unwarned: [] },
+  results: {
+    verdicts: { 'c-1': 'resumed', 'c-2': 'failed', 'c-3': 'possibly_delivered' },
+    no_note: ['c-4'],
+    code_mismatch: false,
+  },
+  truncated: { requests: 3 },
 }
 
 test('box_status.restart is stored and relayed; a frame without it keeps the stored one', async (t) => {
@@ -217,7 +237,7 @@ test('box_status.restart is stored and relayed; a frame without it keeps the sto
 
   // A later frame with a new restart state replaces it; the kept one moves on.
   client.frames.length = 0
-  const back = { ...RESTART, state: 'back', results: { resumed: ['s1'], failed: [], possibly_delivered: ['s2'], no_note: [], code_mismatch: false } }
+  const back = RESTART_BACK
   agent.send({ op: 'box_status', limits: LIMITS, restart: back })
   const third = await client.waitFor((f) => f.kind === 'box_status')
   assert.deepEqual(third.restart, back)
@@ -231,14 +251,19 @@ test('box_status.restart is stored and relayed; a frame without it keeps the sto
 
 test('box_status.restart is capped and sanitised; a malformed block is dropped and the old one kept', async (t) => {
   const { s, alice, agDev, agent, client } = await fleet(t)
+  const deep = { a: { b: { c: { d: { e: 1 } } } } }
   const big = {
     id: 'r1',
     state: 'pending',
     requests: Array.from({ length: 100 }, (_, i) => ({ conversation: `c${i}`, note: 'x'.repeat(500), nested: { a: 1 }, 'bad key': 1 })),
     pending_since: 1760000000000,
-    waiting_on: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, i % 2 ? 'y'.repeat(500) : Array.from({ length: 200 }, (_, j) => `s${j}`)])),
+    waiting_on: {
+      ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, i % 2 ? 'y'.repeat(500) : Array.from({ length: 200 }, (_, j) => `s${j}`)])),
+    },
     expected_sha: 'not a sha',
-    results: { resumed: Array.from({ length: 500 }, (_, i) => `s${i}`), failed: 'nope', no_note: ['a\nb'], code_mismatch: true, extra: 1 },
+    results: { resumed: Array.from({ length: 500 }, (_, i) => `s${i}`), failed: 'nope', no_note: ['a\nb'], code_mismatch: true, extra: 1,
+      verdicts: Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`c${i}`, 'z'.repeat(500)])) },
+    truncated: { requests: 3, 'bad key': 1, holders: -1 },
     extra: 'dropped',
   }
   agent.send({ op: 'box_status', restart: big })
@@ -247,8 +272,13 @@ test('box_status.restart is capped and sanitised; a malformed block is dropped a
   assert.equal(r.requests.length, 32)
   assert.deepEqual(Object.keys(r.requests[0]), ['conversation', 'note'])
   assert.equal(r.requests[0].note.length, 200)
-  assert.equal(Object.keys(r.waiting_on).length, 16)
-  for (const v of Object.values(r.waiting_on)) assert.ok(Array.isArray(v) ? v.length === 64 : v.length === 200)
+  // 16 keys at most, and the 200-node budget cuts the tail of a chatty report.
+  assert.ok(Object.keys(r.waiting_on).length > 0 && Object.keys(r.waiting_on).length <= 16)
+  for (const v of Object.values(r.waiting_on)) assert.ok(Array.isArray(v) ? v.length <= 64 : v.length === 200)
+  assert.ok(JSON.stringify(r.waiting_on).length < 12000)
+  assert.equal(Object.keys(r.results.verdicts).length, 64)
+  assert.ok(Object.values(r.results.verdicts).every((v) => v.length === 200))
+  assert.deepEqual(r.truncated, { requests: 3 })
   assert.equal('expected_sha' in r, false)
   assert.equal(r.results.resumed.length, 64)
   assert.equal('failed' in r.results, false)
@@ -268,4 +298,39 @@ test('box_status.restart is capped and sanitised; a malformed block is dropped a
   const err = await agent.waitFor((f) => f.kind === 'control' && f.op === 'error')
   assert.equal(err.code, 'bad_request')
   assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart.id, 'r1')
+})
+
+test('box_status.restart nested values are bounded in depth and unknown result keys are dropped', async (t) => {
+  const { agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', restart: { id: 'r1', state: 'pending',
+    waiting_on: { quiet: { a: { b: { c: { d: { e: 1 } } } } }, other: [[[[['deep']]]]] },
+    results: { verdicts: { 'c-1': 'resumed' }, secret: 'x' } } })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.restart.waiting_on.quiet, { a: { b: { c: {} } } })
+  assert.deepEqual(live.restart.waiting_on.other, [[[[]]]])
+  assert.deepEqual(live.restart.results, { verdicts: { 'c-1': 'resumed' } })
+})
+
+test('box_status.restart cancel path: pending -> cancelling -> cancelled is stored and relayed, and kept across omitting reports', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', restart: RESTART })
+  assert.equal((await client.waitFor((f) => f.kind === 'box_status')).restart.state, 'pending')
+  for (const state of ['cancelling', 'cancelled']) {
+    client.frames.length = 0
+    agent.send({ op: 'box_status', restart: { ...RESTART, state, requests: [] } })
+    const f = await client.waitFor((fr) => fr.kind === 'box_status')
+    assert.equal(f.restart.state, state)
+    assert.deepEqual(f.restart.requests, [])
+    assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart.state, state)
+  }
+  // A later report that omits the field keeps the cancelled state (terminal
+  // states persist until the next restart's block replaces them).
+  client.frames.length = 0
+  agent.send({ op: 'box_status', disk: DISK })
+  const after = await client.waitFor((f) => f.kind === 'box_status')
+  assert.equal(after.restart.state, 'cancelled')
+  assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart.state, 'cancelled')
+  // A new restart supersedes it; abandoned is accepted too.
+  agent.send({ op: 'box_status', restart: { ...RESTART_BACK, state: 'abandoned', id: 'next' } })
+  assert.equal((await client.waitFor((f) => f.kind === 'box_status' && f.restart?.id === 'next')).restart.state, 'abandoned')
 })

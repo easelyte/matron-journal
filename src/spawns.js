@@ -642,14 +642,17 @@ export function sanitizeBoxStatus(raw) {
 // Planned-restart block: the state of a restart a bridge has been asked to
 // perform, so a fleet watcher can see a restart that is pending, under way
 // or finished, what it is waiting on, and how the sessions fared. Shape:
-//   { id, state: pending|restarting|back, requests[], pending_since,
-//     waiting_on, expected_sha, results?: { resumed, failed,
-//     possibly_delivered, no_note: [ids], code_mismatch: bool } }
+//   { id, state: pending|restarting|cancelling|cancelled|back|abandoned,
+//     requests[], pending_since, waiting_on, expected_sha,
+//     results?: { resumed, failed, possibly_delivered, no_note: [ids],
+//     verdicts: { <id>: outcome }, code_mismatch: bool }, truncated?: { <field>: count } }
+// waiting_on values and results.verdicts may be nested (bounded depth,
+// width and total node count; see restartTree).
 // All-or-nothing on the parts that identify it (id, state); the free-form
 // parts are capped and flattened instead, so a chatty bridge cannot grow a
 // stored row without bound. Unknown keys are dropped.
 const RESTART_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
-const RESTART_STATES = new Set(['pending', 'restarting', 'back'])
+const RESTART_STATES = new Set(['pending', 'restarting', 'cancelling', 'cancelled', 'back', 'abandoned'])
 const RESTART_REQUESTS_MAX = 32
 const RESTART_REQUEST_KEYS_MAX = 8
 const RESTART_TEXT_CAP = 200
@@ -664,6 +667,40 @@ function restartScalar(v) {
   if (typeof v === 'boolean') return v
   if (typeof v === 'number' && Number.isFinite(v)) return v
   return undefined
+}
+
+// Bounded recursive value: scalars, null, arrays and objects nested at most
+// RESTART_TREE_DEPTH deep, RESTART_TREE_WIDTH entries per level and
+// RESTART_TREE_NODES nodes in all. Anything past a bound is dropped, keys
+// outside RESTART_TREE_KEY_RE are skipped. `undefined` means "drop this".
+const RESTART_TREE_DEPTH = 4
+const RESTART_TREE_WIDTH = 64
+const RESTART_TREE_NODES = 200
+const RESTART_TREE_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/
+
+function restartTree(v, budget, depth = 0) {
+  if (--budget.n < 0) return undefined
+  if (v === null) return null
+  if (Array.isArray(v)) {
+    if (depth >= RESTART_TREE_DEPTH) return undefined
+    const out = []
+    for (const e of v.slice(0, RESTART_TREE_WIDTH)) {
+      const t = restartTree(e, budget, depth + 1)
+      if (t !== undefined) out.push(t)
+    }
+    return out
+  }
+  if (v && typeof v === 'object') {
+    if (depth >= RESTART_TREE_DEPTH) return undefined
+    const out = {}
+    for (const [k, e] of Object.entries(v).slice(0, RESTART_TREE_WIDTH)) {
+      if (!RESTART_TREE_KEY_RE.test(k)) continue
+      const t = restartTree(e, budget, depth + 1)
+      if (t !== undefined) out[k] = t
+    }
+    return out
+  }
+  return restartScalar(v)
 }
 
 function restartIdList(raw) {
@@ -708,15 +745,11 @@ export function sanitizeBoxRestart(raw) {
   }
   if (raw.waiting_on && typeof raw.waiting_on === 'object' && !Array.isArray(raw.waiting_on)) {
     const waiting = {}
+    const budget = { n: RESTART_TREE_NODES }
     for (const [k, v] of Object.entries(raw.waiting_on).slice(0, RESTART_WAITING_KEYS_MAX)) {
       if (!RESTART_KEY_RE.test(k)) continue
-      if (Array.isArray(v)) {
-        const ids = restartIdList(v)
-        if (ids) waiting[k] = ids
-      } else {
-        const sv = restartScalar(v)
-        if (sv !== undefined) waiting[k] = sv
-      }
+      const t = restartTree(v, budget)
+      if (t !== undefined) waiting[k] = t
     }
     out.waiting_on = waiting
   }
@@ -728,7 +761,18 @@ export function sanitizeBoxRestart(raw) {
       if (ids) results[k] = ids
     }
     if (typeof raw.results.code_mismatch === 'boolean') results.code_mismatch = raw.results.code_mismatch
+    if (raw.results.verdicts && typeof raw.results.verdicts === 'object' && !Array.isArray(raw.results.verdicts)) {
+      const verdicts = restartTree(raw.results.verdicts, { n: RESTART_TREE_NODES }, RESTART_TREE_DEPTH - 2)
+      if (verdicts && typeof verdicts === 'object') results.verdicts = verdicts
+    }
     out.results = results
+  }
+  if (raw.truncated && typeof raw.truncated === 'object' && !Array.isArray(raw.truncated)) {
+    const truncated = {}
+    for (const [k, v] of Object.entries(raw.truncated).slice(0, RESTART_WAITING_KEYS_MAX)) {
+      if (RESTART_KEY_RE.test(k) && Number.isSafeInteger(v) && v >= 0) truncated[k] = v
+    }
+    out.truncated = truncated
   }
   return out
 }
