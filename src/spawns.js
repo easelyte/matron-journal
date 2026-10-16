@@ -645,8 +645,8 @@ export function sanitizeBoxStatus(raw) {
 //   { id, state: pending|restarting|cancelling|cancelled|back|abandoned,
 //     requests[], pending_since, waiting_on, expected_sha,
 //     results?: { resumed, failed, possibly_delivered, no_note: [ids],
-//     verdicts: { <id>: outcome }, code_mismatch: bool }, truncated?: { <field>: count } }
-// waiting_on values and results.verdicts may be nested (bounded depth,
+//     verdicts: { <id>: { outcome, at } }, code_mismatch: bool }, truncated?: { <field>: count } }
+// waiting_on values may be nested (bounded depth,
 // width and total node count; see restartTree).
 // All-or-nothing on the parts that identify it (id, state); the free-form
 // parts are capped and flattened instead, so a chatty bridge cannot grow a
@@ -676,6 +676,7 @@ function restartScalar(v) {
 const RESTART_TREE_DEPTH = 4
 const RESTART_TREE_WIDTH = 64
 const RESTART_TREE_NODES = 200
+const RESTART_OUTCOME_RE = /^[a-z_]{1,32}$/
 const RESTART_TREE_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/
 
 function restartTree(v, budget, depth = 0) {
@@ -762,8 +763,15 @@ export function sanitizeBoxRestart(raw) {
     }
     if (typeof raw.results.code_mismatch === 'boolean') results.code_mismatch = raw.results.code_mismatch
     if (raw.results.verdicts && typeof raw.results.verdicts === 'object' && !Array.isArray(raw.results.verdicts)) {
-      const verdicts = restartTree(raw.results.verdicts, { n: RESTART_TREE_NODES }, RESTART_TREE_DEPTH - 2)
-      if (verdicts && typeof verdicts === 'object') results.verdicts = verdicts
+      // id -> { outcome, at }: outcome a short token, at a ms timestamp.
+      const verdicts = {}
+      for (const [k, v] of Object.entries(raw.results.verdicts).slice(0, RESTART_IDS_MAX)) {
+        if (!RESTART_TREE_KEY_RE.test(k) || !v || typeof v !== 'object' || Array.isArray(v)) continue
+        if (typeof v.outcome !== 'string' || !RESTART_OUTCOME_RE.test(v.outcome)) continue
+        if (!Number.isFinite(v.at) || v.at < 0) continue
+        verdicts[k] = { outcome: v.outcome, at: v.at }
+      }
+      results.verdicts = verdicts
     }
     out.results = results
   }

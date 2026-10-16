@@ -188,7 +188,7 @@ test('box_status: a vitals block persists, fans live, and shows on /devices and 
 // replaces the whole row).
 // Shapes copied from what a bridge emits: waiting_on carries nested quiet /
 // preflight / collect objects and an unwarned list; results carries a
-// verdicts map (id -> outcome) next to no_note and code_mismatch.
+// verdicts map (id -> {outcome, at}) next to no_note and code_mismatch.
 const RESTART = {
   id: '5b1f2c0e-7d34-4a8e-9a55-0c1f6e2d9b10',
   state: 'pending',
@@ -208,7 +208,12 @@ const RESTART_BACK = {
   state: 'back',
   waiting_on: { quiet: { holders: [], probe_error: null }, code: null, preflight: { unknown: true }, collect: null, unwarned: [] },
   results: {
-    verdicts: { 'c-1': 'resumed', 'c-2': 'failed', 'c-3': 'possibly_delivered' },
+    verdicts: {
+      'c-1': { outcome: 'resumed', at: 1760000100000 },
+      'c-2': { outcome: 'failed', at: 1760000100500 },
+      'c-3': { outcome: 'possibly_delivered', at: 1760000101000 },
+      'c-5': { outcome: 'stale', at: 1760000102000 },
+    },
     no_note: ['c-4'],
     code_mismatch: false,
   },
@@ -262,7 +267,7 @@ test('box_status.restart is capped and sanitised; a malformed block is dropped a
     },
     expected_sha: 'not a sha',
     results: { resumed: Array.from({ length: 500 }, (_, i) => `s${i}`), failed: 'nope', no_note: ['a\nb'], code_mismatch: true, extra: 1,
-      verdicts: Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`c${i}`, 'z'.repeat(500)])) },
+      verdicts: Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`c${i}`, { outcome: 'resumed', at: 1760000000000 + i }])) },
     truncated: { requests: 3, 'bad key': 1, holders: -1 },
     extra: 'dropped',
   }
@@ -277,7 +282,7 @@ test('box_status.restart is capped and sanitised; a malformed block is dropped a
   for (const v of Object.values(r.waiting_on)) assert.ok(Array.isArray(v) ? v.length <= 64 : v.length === 200)
   assert.ok(JSON.stringify(r.waiting_on).length < 12000)
   assert.equal(Object.keys(r.results.verdicts).length, 64)
-  assert.ok(Object.values(r.results.verdicts).every((v) => v.length === 200))
+  assert.ok(Object.values(r.results.verdicts).every((v) => v.outcome === 'resumed' && Number.isFinite(v.at)))
   assert.deepEqual(r.truncated, { requests: 3 })
   assert.equal('expected_sha' in r, false)
   assert.equal(r.results.resumed.length, 64)
@@ -304,11 +309,11 @@ test('box_status.restart nested values are bounded in depth and unknown result k
   const { agent, client } = await fleet(t)
   agent.send({ op: 'box_status', restart: { id: 'r1', state: 'pending',
     waiting_on: { quiet: { a: { b: { c: { d: { e: 1 } } } } }, other: [[[[['deep']]]]] },
-    results: { verdicts: { 'c-1': 'resumed' }, secret: 'x' } } })
+    results: { verdicts: { 'c-1': { outcome: 'resumed', at: 5, extra: 1 } }, secret: 'x' } } })
   const live = await client.waitFor((f) => f.kind === 'box_status')
   assert.deepEqual(live.restart.waiting_on.quiet, { a: { b: { c: {} } } })
   assert.deepEqual(live.restart.waiting_on.other, [[[[]]]])
-  assert.deepEqual(live.restart.results, { verdicts: { 'c-1': 'resumed' } })
+  assert.deepEqual(live.restart.results, { verdicts: { 'c-1': { outcome: 'resumed', at: 5 } } })
 })
 
 test('box_status.restart cancel path: pending -> cancelling -> cancelled is stored and relayed, and kept across omitting reports', async (t) => {
@@ -333,4 +338,24 @@ test('box_status.restart cancel path: pending -> cancelling -> cancelled is stor
   // A new restart supersedes it; abandoned is accepted too.
   agent.send({ op: 'box_status', restart: { ...RESTART_BACK, state: 'abandoned', id: 'next' } })
   assert.equal((await client.waitFor((f) => f.kind === 'box_status' && f.restart?.id === 'next')).restart.state, 'abandoned')
+})
+
+test('box_status.restart verdicts keep outcome and at through the handler; malformed verdicts are dropped', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', restart: RESTART_BACK })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.restart.results.verdicts, RESTART_BACK.results.verdicts)
+  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).restart.results.verdicts, RESTART_BACK.results.verdicts)
+
+  client.frames.length = 0
+  agent.send({ op: 'box_status', restart: { ...RESTART_BACK, id: 'r9', results: { verdicts: {
+    ok: { outcome: 'failed', at: 7 },
+    str: 'resumed',
+    noAt: { outcome: 'resumed' },
+    negAt: { outcome: 'resumed', at: -1 },
+    badOutcome: { outcome: 'Re sumed!', at: 1 },
+    nanAt: { outcome: 'resumed', at: 'x' },
+  } } } })
+  const next = await client.waitFor((f) => f.kind === 'box_status' && f.restart?.id === 'r9')
+  assert.deepEqual(next.restart.results.verdicts, { ok: { outcome: 'failed', at: 7 } })
 })
