@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'

@@ -68,6 +68,7 @@ import { createMission, joinMission } from '../src/missions.js'
 import Database from 'better-sqlite3'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 
 function seedUserAndConvo(db, { userId = 1, convoId = 'c1' } = {}) {
   db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(?, ?, 'x', 0)")

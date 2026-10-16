@@ -711,6 +711,30 @@ CREATE INDEX IF NOT EXISTS idx_person_rooms_owner_room ON person_rooms(owner_roo
 CREATE INDEX IF NOT EXISTS idx_person_rooms_contact ON person_rooms(owner_contact_id, state);
 `
 
+// Tombstone table + triggers + view for revoked private devices. Idempotent.
+// Re-run after the devices-table rebuild, which drops the triggers with the
+// old table (and needs the view gone while it renames).
+function ensurePrivateTombstones(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS revoked_private_devices(
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL
+  )`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_private_tombstone AFTER DELETE ON devices WHEN OLD.private = 1
+    BEGIN
+      INSERT OR REPLACE INTO revoked_private_devices(id, user_id, revoked_at)
+        VALUES(OLD.id, OLD.user_id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_no_tombstone_reuse AFTER INSERT ON devices
+    WHEN EXISTS (SELECT 1 FROM revoked_private_devices WHERE id = NEW.id)
+    BEGIN
+      SELECT RAISE(ABORT, 'device id belongs to a revoked private device');
+    END`)
+  db.exec(`CREATE VIEW IF NOT EXISTS private_devices AS
+    SELECT id FROM devices WHERE private = 1
+    UNION ALL SELECT id FROM revoked_private_devices`)
+}
+
 export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
@@ -887,24 +911,7 @@ export function openDb(path) {
   // an ordinary box would read everything private): issueDevice (auth.js)
   // allocates above both tables, and the second trigger refuses anything
   // else that tries.
-  db.exec(`CREATE TABLE IF NOT EXISTS revoked_private_devices(
-    id         INTEGER PRIMARY KEY,
-    user_id    INTEGER NOT NULL,
-    revoked_at INTEGER NOT NULL
-  )`)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_private_tombstone AFTER DELETE ON devices WHEN OLD.private = 1
-    BEGIN
-      INSERT OR REPLACE INTO revoked_private_devices(id, user_id, revoked_at)
-        VALUES(OLD.id, OLD.user_id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
-    END`)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_no_tombstone_reuse AFTER INSERT ON devices
-    WHEN EXISTS (SELECT 1 FROM revoked_private_devices WHERE id = NEW.id)
-    BEGIN
-      SELECT RAISE(ABORT, 'device id belongs to a revoked private device');
-    END`)
-  db.exec(`CREATE VIEW IF NOT EXISTS private_devices AS
-    SELECT id FROM devices WHERE private = 1
-    UNION ALL SELECT id FROM revoked_private_devices`)
+  ensurePrivateTombstones(db)
   // User-chosen roster tag character (spec: box tag characters). ONE grapheme,
   // NULL = automatic (clients derive a letter from the name). Journal-held so
   // the same letter shows on every device — it used to live in each app's
@@ -955,6 +962,9 @@ export function openDb(path) {
     db.pragma('foreign_keys = OFF')
     try {
       db.transaction(() => {
+        // The view names devices; SQLite refuses the RENAME below while it
+        // does. Recreated with the tombstone triggers after the rebuild.
+        db.exec('DROP VIEW IF EXISTS private_devices')
         // Columns added after the base shape (wake_refused_at, consent_user_only,
         // push_level, box defaults ...) ride along when the old table has them,
         // so the rebuild never drops data an earlier migration step added.
@@ -990,6 +1000,7 @@ export function openDb(path) {
         // Recreate the trigger dropped with the old table, from the canonical
         // SCHEMA (every other CREATE ... IF NOT EXISTS is a no-op here).
         db.exec(SCHEMA)
+        ensurePrivateTombstones(db)
         // Lift the sequence above every surviving device-id reference, not just
         // the live device rows, so a revoked-but-still-referenced id (e.g. a
         // dangling conversation owner, an item's origin_device_id, or a

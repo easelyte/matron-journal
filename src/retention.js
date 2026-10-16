@@ -709,6 +709,8 @@ function recoverStagedOrphans(db, mediaDir) {
       }
     }
   }
+}
+
 // Per-device content expiry (fifth retention pass). Some agent devices
 // handle third-party content that should not be kept for ever, and quote
 // it in what they write. For each operator rule `{deviceId, days}`
