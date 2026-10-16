@@ -4,7 +4,7 @@ import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
-import { settingsView } from './settings.js'
+import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
@@ -12,7 +12,8 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
-import { nudgeCoordinator, chatAskId } from './consent.js'
+import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn } from './consent.js'
+import { answerSpawnAsk } from './consent-answer.js'
 import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
@@ -22,7 +23,7 @@ import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAn
 import { predictSpawnRun } from './spawn-model.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
-import { coordinatorFor } from './coordinator.js'
+import { coordinatorFor, getCoordinatorConvoId } from './coordinator.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
@@ -750,7 +751,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -806,7 +807,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, log = console.log }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, log = console.log }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1360,9 +1361,25 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
-        // Then the Coordinator's bridge (spec: 2026-09-29 coordinator
-        // consent) — after the card, so the user is never second to it.
-        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
+        let autoApproved = false
+        if (online && getAutoApproveCoordinatorSpawns(db, conn.userId)
+          && getConsentEnabled(db, conn.userId)
+          && getCoordinatorConvoId(db, conn.userId) === msg.from_convo_id
+          && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })) {
+          // The explicit user opt-in bypasses the daily approval cap. Keep
+          // the shared answer path for claiming, audit and closing the item.
+          // Failure leaves the filed card available for a manual answer.
+          try {
+            const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, {
+              userId: conn.userId, requestId: spawnId, decision: 'approve',
+              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: 'auto-approved (Coordinator)' },
+            })
+            autoApproved = result.status === 200
+          } catch (err) {
+            console.error('spawn_request: auto-approval failed; card remains available', err)
+          }
+        }
+        if (!autoApproved) nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.

@@ -5,9 +5,9 @@
 // replay, since hello_ok carries the current view on every connect.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
-import { settingsView, setNoticesEnabled } from './settings.js'
+import { settingsView, setNoticesEnabled, setAutoApproveCoordinatorSpawns } from './settings.js'
 
-export const SETTINGS_KEYS = ['notices']
+export const SETTINGS_KEYS = ['notices', 'auto_approve_coordinator_spawns']
 
 export async function handleSettingsRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/settings') return false
@@ -22,8 +22,12 @@ export async function handleSettingsRoute(ctx, req, res, url, who) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return badRequest(res)
   const keys = Object.keys(body)
   if (!keys.length || keys.some((k) => !SETTINGS_KEYS.includes(k))) return badRequest(res)
-  if (typeof body.notices !== 'boolean') return badRequest(res)
-  setNoticesEnabled(db, who.userId, body.notices, Date.now())
+  if (keys.some((k) => typeof body[k] !== 'boolean')) return badRequest(res)
+  const now = Date.now()
+  db.transaction(() => {
+    if (keys.includes('notices')) setNoticesEnabled(db, who.userId, body.notices, now)
+    if (keys.includes('auto_approve_coordinator_spawns')) setAutoApproveCoordinatorSpawns(db, who.userId, body.auto_approve_coordinator_spawns, now)
+  })()
   const view = settingsView(db, who.userId)
   for (const c of hub.connsOf(who.userId)) {
     if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ kind: 'control', op: 'settings', settings: view }))

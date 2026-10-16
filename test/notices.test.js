@@ -184,7 +184,7 @@ test('the Seen tap (even from an old app) closes the notice with one quiet marke
   const id = (await mkNotice(s, agent.token)).json.item.id
   const ws = await makeWsClient(s.base, { token: client, cursor: null })
   const hello = await ws.waitFor((f) => f.op === 'hello_ok')
-  assert.deepEqual(hello.settings, { notices: true })
+  assert.deepEqual(hello.settings, { notices: true, auto_approve_coordinator_spawns: false })
   // No header: an app from before the kind, tapping the Seen button it renders.
   const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { action: 'Seen' } })
   assert.equal(r.status, 201)
@@ -210,8 +210,8 @@ test('the Seen tap (even from an old app) closes the notice with one quiet marke
 
 test('GET/PATCH /settings: anyone reads, only the user writes; a change reaches every socket and the next hello_ok', async (t) => {
   const { s, agent, client } = await fleet(t)
-  assert.deepEqual((await s.http('/settings', { token: agent.token })).json, { notices: true })
-  assert.deepEqual((await s.http('/settings', { token: client })).json, { notices: true })
+  assert.deepEqual((await s.http('/settings', { token: agent.token })).json, { notices: true, auto_approve_coordinator_spawns: false })
+  assert.deepEqual((await s.http('/settings', { token: client })).json, { notices: true, auto_approve_coordinator_spawns: false })
   assert.equal((await s.http('/settings', { method: 'PATCH', token: agent.token, body: { notices: false } })).status, 403)
   for (const body of [{}, { notices: 'no' }, { notices: false, other: 1 }]) {
     assert.equal((await s.http('/settings', { method: 'PATCH', token: client, body })).status, 400, JSON.stringify(body))
@@ -219,12 +219,12 @@ test('GET/PATCH /settings: anyone reads, only the user writes; a change reaches 
   const bridge = await makeWsClient(s.base, { token: agent.token, cursor: null })
   await bridge.waitFor((f) => f.op === 'hello_ok')
   const r = await s.http('/settings', { method: 'PATCH', token: client, body: { notices: false } })
-  assert.equal(r.status, 200); assert.deepEqual(r.json, { notices: false })
+  assert.equal(r.status, 200); assert.deepEqual(r.json, { notices: false, auto_approve_coordinator_spawns: false })
   const frame = await bridge.waitFor((f) => f.kind === 'control' && f.op === 'settings')
-  assert.deepEqual(frame.settings, { notices: false })
+  assert.deepEqual(frame.settings, { notices: false, auto_approve_coordinator_spawns: false })
   bridge.close()
   const next = await makeWsClient(s.base, { token: agent.token, cursor: null })
-  assert.deepEqual((await next.waitFor((f) => f.op === 'hello_ok')).settings, { notices: false })
+  assert.deepEqual((await next.waitFor((f) => f.op === 'hello_ok')).settings, { notices: false, auto_approve_coordinator_spawns: false })
   next.close()
-  assert.deepEqual((await s.http('/settings', { token: client })).json, { notices: false })
+  assert.deepEqual((await s.http('/settings', { token: client })).json, { notices: false, auto_approve_coordinator_spawns: false })
 })

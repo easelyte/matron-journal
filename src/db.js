@@ -387,6 +387,7 @@ CREATE TABLE IF NOT EXISTS user_settings(
   user_id INTEGER PRIMARY KEY REFERENCES users(id),
   coordinator_convo_id TEXT,
   coordinator_consent INTEGER NOT NULL DEFAULT 1,
+  auto_approve_coordinator_spawns INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
 -- Coordinator consent decisions (spec: matron-bridge 2026-09-29 coordinator
@@ -1599,6 +1600,9 @@ export function openDb(path) {
   // ask tables who answered a parked row and why — 'coordinator' + reason
   // when the Coordinator did, NULL for a tap or a sweep. No backfill.
   const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!settingsCols.some((c) => c.name === 'auto_approve_coordinator_spawns')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN auto_approve_coordinator_spawns INTEGER NOT NULL DEFAULT 0')
+  }
   if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
   }

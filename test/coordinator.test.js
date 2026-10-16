@@ -20,7 +20,7 @@ async function seedDb() {
 test('user_settings exists with the contract columns', () => {
   const db = openDb(':memory:')
   const cols = db.prepare('PRAGMA table_info(user_settings)').all().map((c) => c.name)
-  assert.deepEqual(cols, ['user_id', 'coordinator_convo_id', 'coordinator_consent', 'updated_at', 'routines_seeded_at', 'notify_prefs', 'default_model', 'default_effort', 'notices'])
+  assert.deepEqual(cols, ['user_id', 'coordinator_convo_id', 'coordinator_consent', 'auto_approve_coordinator_spawns', 'updated_at', 'routines_seeded_at', 'notify_prefs', 'default_model', 'default_effort', 'notices'])
 })
 
 test('coordinator setting: unset reads null; set, unchanged, switch and clear report previous/current/changed', async () => {

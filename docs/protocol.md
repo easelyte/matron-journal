@@ -2903,9 +2903,12 @@ user, from an app, sends no `as_convo_id`.
 
 ## User settings
 
-`GET /settings` (either device kind) → `{notices: boolean}`.
-`PATCH /settings {notices}` (client only, else **403**; an unknown key or a
-non-boolean is **400**) → the new view. `notices` — "Send things I need to
+`GET /settings` (either device kind) →
+`{notices: boolean, auto_approve_coordinator_spawns: boolean}`.
+`PATCH /settings` (or `PUT`) accepts either key alone or both (client only,
+else **403**; an empty object, unknown key or non-boolean is **400**) and
+returns the full new view. Omitted keys keep their current values.
+`notices` — "Send things I need to
 read to For you" — defaults to `true` (no row reads as `true`). While on,
 bridges add the notices block to new sessions' instructions, and the
 unseen lists (`GET /unseen`, the nudge) skip what an open item already
@@ -2914,6 +2917,24 @@ with one has no `final` entry. Prompts, permission asks and failures are
 listed either way. A change is sent live to every socket of the user as
 `{kind: 'control', op: 'settings', settings}`; `hello_ok` carries the
 current view, so nothing needs replaying.
+
+`auto_approve_coordinator_spawns` defaults to `false`, including for existing
+accounts. When enabled, a spawn requested from the user's current Coordinator
+conversation is approved immediately if the target has a live registered
+socket, Coordinator consent is enabled, and neither device is user-only.
+The card and decision item are filed first, then the shared approval flow
+closes the item and starts the session. The requester still receives its
+`spawn/pending` acknowledgement. The decision is recorded as made by the
+Coordinator with reason exactly `auto-approved (Coordinator)`, with the usual
+`consent_decision` event and spawn outcome; no consent nudge is sent.
+
+This explicit opt-in bypasses the daily approval cap, while still recording
+the approval in the decision history (so it counts toward the cap for later
+answers through `/consent/answer`). Other conversations, chat invites, and
+cross-user requests keep their existing rules. Targets without a live socket
+keep their existing wake and consent flow; being wakeable alone does not
+qualify. If automatic answering fails before the decision is claimed, the
+filed card remains available for manual approval.
 
 ## Default model and effort
 
