@@ -12,7 +12,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
-import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn } from './consent.js'
+import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
 import { answerSpawnAsk } from './consent-answer.js'
 import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
@@ -1361,18 +1361,38 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
-        let autoApproved = false
-        if (online && getAutoApproveCoordinatorSpawns(db, conn.userId)
+        // Opt-in auto-approval (user_settings.auto_approve_coordinator_spawns).
+        // Hourly ceiling so a looping Coordinator cannot start sessions without
+        // bound: the pending-ask cap never trips once a row is answered at once.
+        const autoEligible = online && getAutoApproveCoordinatorSpawns(db, conn.userId)
           && getConsentEnabled(db, conn.userId)
           && getCoordinatorConvoId(db, conn.userId) === msg.from_convo_id
-          && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })) {
-          // The explicit user opt-in bypasses the daily approval cap. Keep
-          // the shared answer path for claiming, audit and closing the item.
-          // Failure leaves the filed card available for a manual answer.
+          && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })
+          && autoApprovalsSince(db, conn.userId, Date.now() - AUTO_APPROVE_WINDOW_MS) < AUTO_APPROVE_HOURLY_CAP
+        // target_waking: the box was asleep and is being started; the parent's
+        // tool copy can tell its user the session begins once the box is up
+        // AND the card is answered. Omitted (never false) when it was online.
+        // mission_num: the mission the child will join, named or inherited
+        // (mission_inherited: true for the latter) — omitted when none.
+        // auto_approved: the ask is being answered by the user's standing
+        // opt-in rather than waiting for a tap — omitted otherwise. Sent
+        // BEFORE the approval runs so the requester never sees an outcome
+        // ahead of its acknowledgement.
+        conn.ws.send(JSON.stringify({
+          kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId,
+          ...(targetWaking ? { target_waking: true } : {}),
+          ...(missionNum ? { mission_num: missionNum } : {}),
+          ...(missionInherited ? { mission_inherited: true } : {}),
+          ...(autoEligible ? { auto_approved: true } : {}),
+        }))
+        let autoApproved = false
+        if (autoEligible) {
+          // Keeps the shared answer path for claiming, audit and closing the
+          // item. Failure leaves the filed card available for a manual answer.
           try {
             const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, {
               userId: conn.userId, requestId: spawnId, decision: 'approve',
-              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: 'auto-approved (Coordinator)' },
+              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON },
             })
             autoApproved = result.status === 200
           } catch (err) {
@@ -1380,17 +1400,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
         }
         if (!autoApproved) nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
-        // target_waking: the box was asleep and is being started; the parent's
-        // tool copy can tell its user the session begins once the box is up
-        // AND the card is answered. Omitted (never false) when it was online.
-        // mission_num: the mission the child will join, named or inherited
-        // (mission_inherited: true for the latter) — omitted when none.
-        conn.ws.send(JSON.stringify({
-          kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId,
-          ...(targetWaking ? { target_waking: true } : {}),
-          ...(missionNum ? { mission_num: missionNum } : {}),
-          ...(missionInherited ? { mission_inherited: true } : {}),
-        }))
         break
       }
       case 'spawn_targets': {

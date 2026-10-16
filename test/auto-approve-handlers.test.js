@@ -33,7 +33,7 @@ async function fixture(t) {
   return { db, hub, user, parent, target, targetConn, frames, calls, ctx, request }
 }
 
-for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket', 'consent off', 'user only', 'claim failure', 'claim conflict']) {
+for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket', 'consent off', 'user only', 'claim failure', 'claim conflict', 'hourly cap']) {
   test(`spawn handler: ${scenario}`, async (t) => {
     const f = await fixture(t)
     if (scenario !== 'default') setAutoApproveCoordinatorSpawns(f.db, f.user.id, true)
@@ -46,6 +46,10 @@ for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket'
     }
     if (scenario === 'claim failure') f.db.exec("CREATE TRIGGER fail_approval BEFORE UPDATE OF state ON agent_spawn_requests WHEN NEW.state='approved' BEGIN SELECT RAISE(ABORT, 'test failure'); END")
     if (scenario === 'claim conflict') f.db.exec("CREATE TRIGGER ignore_approval BEFORE UPDATE OF state ON agent_spawn_requests WHEN NEW.state='approved' BEGIN SELECT RAISE(IGNORE); END")
+    if (scenario === 'hourly cap') {
+      const ins = f.db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(?,?,?,?,?,?,?)')
+      for (let i = 0; i < 60; i++) ins.run(f.user.id, 'spawn', `p${i}`, 'approve', 'coordinator', 'auto-approved (Coordinator)', Date.now())
+    }
     if (scenario === 'enabled') f.db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(?,?,?,?,?,?,?)')
       .run(f.user.id, 'spawn', 'previous', 'approve', 'coordinator', 'approved', Date.now())
     await f.request(scenario === 'other' ? 'other' : 'coordinator')
@@ -55,6 +59,7 @@ for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket'
     assert.ok(ack)
     const row = f.db.prepare('SELECT * FROM agent_spawn_requests WHERE id=?').get(ack.spawn_id)
     const item = f.db.prepare('SELECT * FROM items WHERE id=?').get(row.item_id)
+    assert.equal(ack.auto_approved === true, ['enabled', 'claim failure', 'claim conflict'].includes(scenario))
     if (scenario === 'enabled') {
       assert.equal(row.state, 'started')
       assert.equal(row.answered_by, 'coordinator')

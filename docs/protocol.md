@@ -2928,8 +2928,13 @@ closes the item and starts the session. The requester still receives its
 Coordinator with reason exactly `auto-approved (Coordinator)`, with the usual
 `consent_decision` event and spawn outcome; no consent nudge is sent.
 
-This explicit opt-in bypasses the daily approval cap, while still recording
-the approval in the decision history (so it counts toward the cap for later
+This explicit opt-in bypasses the daily approval cap but has its own ceiling
+of 60 automatic approvals per rolling hour (beyond it, asks wait for an answer
+as usual). The requester's `spawn/pending` acknowledgement carries
+`auto_approved: true` (omitted otherwise) and is sent before the approval runs.
+The approval card is still published first, so apps may briefly show a card
+(and send its notification) for a spawn that is already starting. Each approval is recorded
+in the decision history (so it counts toward the cap for later
 answers through `/consent/answer`). Other conversations, chat invites, and
 cross-user requests keep their existing rules. Targets without a live socket
 keep their existing wake and consent flow; being wakeable alone does not
