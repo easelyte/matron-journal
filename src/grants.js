@@ -59,7 +59,7 @@ export function grantRow(row, viewerUserId) {
 // step 2, applied to a read share): counts of exactly what the grantee
 // will be able to read — the same private sieve grantedMissionDetail uses.
 export function sharePreview(db, missionId) {
-  const NOT_PRIVATE = (col) => `NOT EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id WHERE pc.id = ${col} AND pd.private = 1)`
+  const NOT_PRIVATE = (col) => `NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = ${col})`
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = @m AND ${NOT_PRIVATE('l.convo_id')}) AS milestones,
       (SELECT COUNT(*) FROM items i WHERE i.mission_id = @m AND i.consent IS NULL AND ${NOT_PRIVATE('i.origin_convo_id')}) AS items,

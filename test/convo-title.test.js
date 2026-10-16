@@ -231,6 +231,10 @@ test('migration: an existing database gains the columns and auto_title/short/mar
     db1.close()
     const raw = new Database(dbPath)
     for (const c of ['auto_title', 'session_short', 'title_marker']) raw.exec(`ALTER TABLE conversations DROP COLUMN ${c}`)
+    // A truly pre-name database also predates search-docs.js's sync
+    // triggers; drop the one that reads missions.name first, or SQLite
+    // refuses to drop a column a trigger references.
+    raw.exec('DROP TRIGGER IF EXISTS sd_missions_title_ai; DROP TRIGGER IF EXISTS sd_missions_title_au; DROP TRIGGER IF EXISTS sd_missions_title_ad')
     raw.exec('ALTER TABLE missions DROP COLUMN name')
     raw.close()
 

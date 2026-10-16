@@ -92,7 +92,8 @@ install -d -o matron-demo -g matron-demo -m 750 /var/lib/matron-demo
 
 # --- app install ---------------------------------------------------------------
 cd "$REPO_DIR"
-npm ci --omit=dev --no-audit --no-fund
+# Semantic search runs on the CPU: never fetch onnxruntime's CUDA libraries
+ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --omit=dev --no-audit --no-fund
 
 # --- env files (created once; never overwritten — they hold secrets/ids) -----
 if [ ! -f /etc/matron/relay.env ]; then

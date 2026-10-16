@@ -109,37 +109,62 @@ the machine-checkable version of this page.
   passes *Shared visibility*, `around_seq` reads return the prose window
   (`text`, `diff`), `limit` clamped to 30, logged as `journal: shared
   context read …`; `before_seq` paging on it stays 404.
-- `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
-  client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
-  live}]}`. Full-text search over the prose the journal has indexed (see
-  "Journal search" below for what is indexed and why). `q` is required,
-  must be non-empty after trimming, and is capped at 256 chars (400
-  `{error:'bad_request'}` otherwise); every whitespace-separated term is
-  double-quoted before it reaches FTS5's `MATCH` parser (embedded quotes
-  escaped by doubling) and the terms are ANDed together — an implicit-AND
-  query over literal terms, so raw FTS5 syntax a human might type (an
-  unbalanced quote, a bare `*`, a stray `NEAR`) can never throw; a query
-  with zero terms, or one that still fails to parse, is 400
-  `{error:'bad_request'}`, never a 500 with SQLite internals in it. `limit`
-  defaults to 20, clamped to 50 (400 on non-integer/NaN/<1, same convention
-  as `/convo/:id/messages`). `convo_id`, when given, narrows to one
-  conversation; an id belonging to another user (or a nonexistent one)
-  yields the same empty result set the user-scoping already guarantees for
-  a genuinely-unmatched query — there is no separate existence check, so
-  this is not an oracle for "does this convo_id exist." Results are ranked
-  by FTS5 `bm25()` (best match first), ties broken by `ts DESC`; `snippet`
-  is the FTS5 `snippet()` excerpt with matched terms wrapped in `**`...`**`
-  (markdown bold — agents and the apps both render markdown); `live` is
-  `true` when the hit's conversation has `session_state = 'running'`, a
-  hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
-  rather than only read its transcript. Scoped to the caller's own user
-  (`search_messages.user_id`) regardless of device kind — open to both
-  agents (the feature's primary audience) and clients; an ordinary
-  (non-private) agent caller additionally has hits from private-owned
-  conversations excluded — see "Device privacy" below.
-  `exclude_subagents=1` drops hits in subagent child conversations
-  (`conversations.parent_convo_id` set) in every mode — the apps pass it,
-  since those are most of the index and rarely what a person is after.
+- `GET /search?q=&limit=&convo_id=&exclude_subagents=` (Bearer, any
+  authenticated device — client or agent) -> `{hits: [{convo_id, title,
+  seq, ts, sender, snippet, live, mission_num, why}]}`. Full-text search
+  over the prose the journal has indexed (see "Journal search" below for
+  what is indexed and why). `q` is required, must be non-empty after
+  trimming, and is capped at 256 chars (400 `{error:'bad_request'}`
+  otherwise); every whitespace-separated term is double-quoted before it
+  reaches FTS5's `MATCH` parser (embedded quotes escaped by doubling) and
+  the terms are ANDed together — an implicit-AND query over literal terms,
+  so raw FTS5 syntax a human might type (an unbalanced quote, a bare `*`,
+  a stray `NEAR`) can never throw; a query with zero terms, or one that
+  still fails to parse, is 400 `{error:'bad_request'}`, never a 500 with
+  SQLite internals in it. `limit` defaults to 20, clamped to 50 (400 on
+  non-integer/NaN/<1, same convention as `/convo/:id/messages`).
+  `convo_id`, when given, narrows to one conversation; an id belonging to
+  another user (or a nonexistent one) yields the same empty result set
+  the user-scoping already guarantees for a genuinely-unmatched query —
+  there is no separate existence check, so this is not an oracle for
+  "does this convo_id exist." Results are ranked by `sm.is_diff` first (a
+  `diff` hit ranks below every prose hit matching the same terms — a code
+  change is rarely what "why did we do this" means), then FTS5 `bm25()`
+  (best match first), ties broken by `ts DESC`; `snippet` is the FTS5
+  `snippet()` excerpt with matched terms wrapped in `**`...`**` (markdown
+  bold — agents and the apps both render markdown); `live` is `true` when
+  the hit's conversation has `session_state = 'running'`, a hint to talk
+  to the working agent (`GET /roster` / `agent_chat_start`) rather than
+  only read its transcript. `mission_num` is the number of the hit's
+  conversation's current mission (same pointer `mode=chats` reports, see
+  below), sieved the same way for an ordinary agent caller, or `null` when
+  it isn't on one. `why` is `'words'` when the hit matched every query
+  term, or `'some_words'` when it is part of the fallback described next.
+  Fewer than 5 `'words'` hits, with `q` carrying 2+ terms, runs the same
+  query again matching ANY term (still FTS-quoted, same ordering, same
+  privacy and subagent filters) for up to the remaining `limit`, excluding
+  seqs already returned, and tags those `'some_words'` — ranked search
+  never goes from a handful of exact hits to nothing just because no
+  single message happened to contain every word. This fallback is skipped
+  entirely for a **literal** query — quoted, carrying a digit, an id-like
+  token, or a single word, the exact rule `GET /search/all` uses
+  (`parseQuery` in `src/search-query.js`, shared rather than
+  re-implemented): someone who quoted their query or typed an id wanted an
+  exact match, not loose noise, so a literal query that falls short of 5
+  `'words'` hits simply returns fewer than 5 hits rather than padding them
+  out. Scoped to the caller's own user (`search_messages.user_id`)
+  regardless of device kind — open to both agents (the feature's primary
+  audience) and clients; an ordinary (non-private) agent caller
+  additionally has hits from private-owned conversations excluded — see
+  "Device privacy" below.
+  `exclude_subagents=1`/`=0` drops/keeps hits in subagent child
+  conversations (`conversations.parent_convo_id` set); in `chats` and
+  `recent` mode it defaults to off (the apps pass it explicitly), for
+  every caller. In `ranked` mode it defaults to **on** for every agent
+  caller, private agents included — subagent transcripts are most of the
+  index and rarely what "why did we do this" is asking about, for any
+  agent hunting old work — and off for a client; pass it explicitly to
+  override either default.
   `mode` selects the result shape (400 on anything else):
   - `ranked` (default): the list above.
   - `chats` and `recent` are the apps' modes (matron-apple, 2026-10-02)
@@ -155,22 +180,108 @@ the machine-checkable version of this page.
     in `src/search.js` is the one parser. A database from before the
     mirror existed gets it rebuilt once at open (seconds).
   - `mode=chats` -> `{chats: [{convo_id, title, parent_convo_id,
-    parent_title, count, exact, live, top: {seq, ts, sender, excerpt}}]}`:
-    one row per conversation, at most `limit` (clamped to 50).
-    Conversations holding the query as an exact phrase (`exact: true`)
-    come first, then those containing every word; newest first (highest
-    seq) within each. `count` is every matching message in the
+    parent_title, mission_num, count, exact, live, top: {seq, ts, sender,
+    excerpt}}]}`: one row per conversation, at most `limit` (clamped to
+    50). Conversations holding the query as an exact phrase (`exact:
+    true`) come first, then those containing every word; newest first
+    (highest seq) within each. `count` is every matching message in the
     conversation, `top` the previewed one — the newest exact match when
     there is one, else the newest match — and `excerpt` up to ~1 KB of
     its body around the first literal occurrence (the phrase if present,
     else the earliest word; the head of the body when neither is found
     literally), `…`-marked where cut. Highlighting is the client's.
+    `mission_num` is the number of the conversation's current mission
+    (`conversations.mission_id`, the same pointer `POST
+    /missions/:id/join` maintains), or `null` when it isn't on one.
     `convo_id` is ignored in this mode.
-  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender}]}`: flat, newest
-    first, no body or snippet — find-in-chat's match list, which the app
-    steps through by seq while already showing the messages. With
-    `convo_id` the clamp is 500 rather than 50, so a conversation's whole
-    match list fits.
+  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender, mission_num}]}`:
+    flat, newest first, no body or snippet — find-in-chat's match list,
+    which the app steps through by seq while already showing the
+    messages. `mission_num` is the same sieved mission pointer as above.
+    With `convo_id` the clamp is 500 rather than 50, so a conversation's
+    whole match list fits.
+- `GET /search/all?q=&limit=&kinds=&chats=&semantic=` (Bearer, any
+  authenticated device — client or agent) -> `{results, chats?,
+  semantic}`. Unified tracker search (spec 2026-10-12): one tiered,
+  cross-kind lookup over missions, items, memories and projects, instead
+  of listing each separately and intersecting by eye. `q` and `limit`
+  follow the exact same rules as `GET /search` above (required, trimmed
+  non-empty, capped at 256 chars; `limit` defaults to 20, clamped to 50;
+  both 400 `{error:'bad_request'}` on violation). `kinds` is a
+  comma-separated subset of `mission`, `item`, `memory`, `project` (400
+  on anything else); omitted or empty means all four.
+
+  Results are rolled up to the entity a person is actually looking for —
+  a hit on a milestone or a status line is reported as its mission, a hit
+  on a comment as its item, a hit on a mission's own auto-created project
+  as that mission — and tiered strict-to-loose, each result carrying the
+  first (best) tier it was found in as `why`, in this order:
+  0. `number` — the query is nothing but a tracker number, with or
+     without a leading `#` (`412`, `#412`), and the caller's own item,
+     mission, milestone or project carries that number. At most one
+     result, always first; rows that only mention the number follow in
+     the tiers below. A milestone is reported as its mission (`field:
+     'milestone'`); a project is reported as itself even when it is a
+     mission's auto-created twin, since its own number was asked for.
+     Clients must treat an unknown `why` as a plain match.
+  1. `exact` — every query term together, in order, as a phrase.
+  2. `words` — every query term present, any order, over an unstemmed index.
+  3. `stemmed` — every query term present, any order, over a stemmed index
+     (so "exporting" matches a doc that only says "export").
+  4. `similar` — meaning-based, from a local embedding model (below);
+     only tried when `semantic=0` was not passed, `semantic` is
+     `'ready'`, and the strict tiers found fewer than `limit` results.
+  5. `some_words` — any query term present; only tried when the stricter
+     word-match tiers (`exact`, `words`, `stemmed`) together found fewer
+     than five results, measured before `similar` adds anything.
+
+  `similar` sits below every strict word match (`exact`, `words`,
+  `stemmed`) but above the any-word fallback (`some_words`): a result the
+  stricter tiers already found outranks a meaning-based guess, but a
+  meaning-based guess outranks an unrelated any-word match.
+
+  A **literal query** — a single word, a quoted phrase, or any token
+  containing a digit or otherwise looking like an id — never reaches the
+  `some_words` or `similar` tiers: a short, exact-looking query is
+  answered literally or not at all, never padded out with loosely-related
+  guesses.
+
+  `results` is `[{kind, id, num, name, title, state, updated_at,
+  mission_num, why, field, snippet, score?}]`, best match first, capped
+  at `limit`; `score` (the embedding's cosine similarity, 0-1) is present
+  only on a `similar` hit. `chats` is present unless `chats=0` is passed
+  or the chat query fails, in which case it is left out and the tracker
+  `results` still answer. It is the same typed-match conversation
+  grouping `GET /search`'s `mode=chats` returns (see "Journal search" below), over the same `q`,
+  capped at `min(limit, 10)`, with subagent conversations excluded.
+
+  `semantic` is `'off'`, `'indexing'` or `'ready'`. `'off'` means the
+  similar tier was skipped this request — because `semantic=0` was
+  passed, `MATRON_SEMANTIC_SEARCH=off` is set, the optional local
+  embedding package isn't installed, or the model failed to load — and
+  the request still answers 200 with the lexical tiers only; a disabled
+  or failed model is never a 500 or a failed boot. `'indexing'` means a
+  model has loaded but the first full vector index pass hasn't finished
+  yet; that pass is journal-wide, over every user's tracker docs, so it
+  reports `'indexing'` to every user until it ends. Results are
+  lexical-only meanwhile. `'ready'`
+  means that first pass has finished. Once `'ready'`, the similar tier
+  runs over whatever is already indexed, even while a later periodic
+  sweep (picking up new or edited docs) is in flight — `semantic` does
+  not flicker back to `'indexing'` for that ongoing, incremental work; it
+  only ever reports `'indexing'` for the first pass.
+  `MATRON_SEMANTIC_MODEL_DIR`, when set, names a directory of pre-seeded
+  model files so the model loads from disk only, never over the network;
+  left unset, the model is downloaded once on first boot and cached in
+  `<db dir>/models` (the directory holding `MATRON_DB`).
+
+  Same privacy statement as `GET /search`: scoped to the caller's own
+  user, open to both device kinds; an ordinary (non-private) agent caller
+  additionally has private-owned results excluded, exactly as `GET
+  /search` does (see "Device privacy" below) — and, independently, a
+  consent card's tracker mirror (a pending spawn or chat ask) is hidden
+  from every agent caller, private ones included, the same as `GET
+  /items` hides it.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256, width?, height?}`. Content-Type header captured
   (default `application/octet-stream`). For an `image/*` upload the journal
@@ -444,21 +555,25 @@ shared function, not on two filters kept in sync by hand.
 ### Index invariants
 
 - **Append-only, insert-trigger-only.** `search_messages` has an `AFTER
-  INSERT` trigger populating `search_fts` and nothing else — no update or
-  delete trigger exists. This mirrors `events` itself: rows are written
-  with a plain `INSERT`, never `INSERT OR REPLACE` (`REPLACE` silently
-  skipping a delete trigger is the exact corruption that hit the app-side
-  FTS index — matron-apple #106), and no `DELETE FROM events` exists
-  anywhere in the server. A prose-only index of an append-only table needs
-  an insert path and nothing else; if a delete path is ever added to
-  `events`, this schema needs revisiting.
-- **Retention never touches indexed rows.** The two retention passes under
+  INSERT` trigger populating `search_fts` and `search_fts_plain` and
+  nothing else — no update or delete trigger exists. This mirrors `events`
+  itself: rows are written with a plain `INSERT`, never `INSERT OR
+  REPLACE` (`REPLACE` silently skipping a delete trigger is the exact
+  corruption that hit the app-side FTS index — matron-apple #106), and no
+  `DELETE FROM events` exists anywhere in the server. The one path that
+  removes index rows is the per-device content expiry (below), which
+  issues the FTS5 `'delete'` command to both mirrors with the old body
+  before deleting the `search_messages` row, in the same transaction as
+  the event rewrite. Any other path that changes an indexed event must do
+  the same.
+- **Retention and the index.** The tool-log TTL and offload passes under
   "Retention (payload offload)" below only ever rewrite `tool_output`
-  payloads — purging live-streamed output after
-  `MATRON_TOOL_LOG_TTL_HOURS` and offloading older output to a blob after
-  `MATRON_RETENTION_DAYS` — and `tool_output` is never indexed. Neither
-  pass can therefore invalidate a `search_messages`/`search_fts` row; the
-  index has no reconciliation path with retention because it needs none.
+  payloads, which are never indexed, and the media reaper only `file` and
+  `image` ones, also never indexed; none of them touches the index. The
+  per-device content expiry rewrites `text` and `diff` events too, and
+  deletes their index rows as it does; its tombstone has no indexable body
+  (`indexableBody` returns `null` for it), so neither the live path nor the
+  backfill can index it again.
 - **Backfill is resumable and self-healing.** A startup walk over `events`
   by `rowid`, batched, indexing every row `indexableBody` accepts via
   `INSERT OR IGNORE` (never `OR REPLACE`) against `search_messages`'
@@ -470,6 +585,24 @@ shared function, not on two filters kept in sync by hand.
   returns partial results until the walk finishes — acceptable, because any
   event appended after the schema exists is indexed by the live path, so
   the backfill cursor can never miss a row on the way to catching up.
+- **`search_messages.is_diff`, and its own backfill.** `is_diff` marks
+  which indexed row came from a `diff` event (set at insert time by both
+  the live append path and `backfillSearchIndex`'s own `INSERT`) — ranked
+  search orders by it first (prose before a diff hitting the same terms).
+  A row indexed before this column existed defaults to `0` and needs its
+  own fixup: `backfillIsDiff(db, {batchSize, log, shouldStop})`, started
+  fire-and-forget at boot next to `backfillSearchIndex` and stopped the
+  same way on close, walks `events` again for `type='diff'` rows in
+  batches and flips the matching `search_messages` row by `(user_id,
+  seq)` — the correct key, since `events`' own primary key is
+  `(user_id, seq)` and `user_seq` hands out a seq that is unique per user.
+  Its cursor, `search_isdiff_state(id=1, last_rowid)`, is seeded once by
+  `openDb`: `0` for a database that already had a `search_messages` table
+  (pre-existing rows may be wrongly defaulted and need the full walk), or
+  the current max `events` rowid for one just created fresh (every row it
+  will ever hold was, or will be, inserted with `is_diff` already correct
+  by the live path or by `backfillSearchIndex`'s corrected `INSERT` — so
+  there is nothing to fix, and the first run costs one cheap `SELECT`).
 
 ### Agent context access: two regimes
 
@@ -647,6 +780,15 @@ Rows from before the stamp carry neither, and don't count.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+  Agent `text` payloads may carry `notice: {kind, icon, summary}` — a
+  convention between bridges and apps, not checked here. A bridge sets it
+  on the notice it publishes beside a turn it injected into the session
+  (a consent request, a routine or alert fire, a room message, a spawn
+  outcome, a reminder): `summary` is one line, `icon` one emoji, `kind` a
+  short tag (`consent`, `routine`, `room`, `spawn`, …). Apps that know the
+  key render the event as a one-line row that expands to `body`; apps that
+  don't show `body` as usual. A tombstoned event's `notice` becomes `{}`
+  (see *Per-device content expiry*), which apps treat as no tag.
 - `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
   conversations this connection has on screen; viewing-scoped ephemerals
   (`stream`, `stream_append`, `activity`, `status`) go only to connections
@@ -1542,13 +1684,13 @@ A parent agent may ask a target agent to start a new session (child conversation
   "effort": "string (optional, the reasoning effort the child starts at, capped at 16 chars)",
   "agent": "string (optional, \"claude\" | \"codex\" — the agent the child runs; absent = the target box's default)",
   "link": "boolean (optional, default false — also open a chat room between the parent and the child)",
-  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists)"
+  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists; absent = the parent conversation's current mission, when it can be inherited)"
 }
 ```
 
 `link` is opt-in because a spawn is normally a clean break: the child gets the task and its provenance in its opening turn, the parent gets the outcome, and an automatic room only made the child narrate progress back to a parent that relayed it on. A parent that later needs a channel opens one with an ordinary `agent_chat_start` against the child (it is on the roster like any session). With `link: true` the approval also mints a room — see "Answering" below.
 
-Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?, mission_num?, mission_inherited?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM. `mission_num` (omitted when none) is the mission the child will join, and `mission_inherited: true` (omitted otherwise) says it was not named but inherited from the parent conversation — see "Spawning onto a mission" below.
 
 **Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-string or oversized `effort` when present (≤16 chars, `SPAWN_EFFORT_MAX_CHARS`, `detail:'bad effort'`); an `agent` that is not `claude` or `codex` after trimming and lowercasing (`detail:'bad agent'`; absent, `null`, `""` and `"default"` all mean "the box's default"); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below). With `mission_num`: `bad_request` (`detail:'bad mission_num'`) unless it is a positive integer; `no_mission` when no mission with that number is visible to both the asker and the target box (unknown and hidden are indistinguishable); `mission_closed` when it is closed. All three are checked before the wake and before the card, so nothing is parked or woken for them. The card payload carries `mission_num` and `mission_title` (both omitted when absent) and the consent item says "Joins mission #N — <title>".
 
@@ -1719,6 +1861,23 @@ param. A join that fails at that point (the mission closed in the gap, the
 200-conversation cap, a mission the target box cannot see) is logged and
 the child runs unattached; the spawn still reports `started`.
 
+**Inherited.** A `spawn_request` that names no `mission_num` takes the
+parent conversation's (`from_convo_id`'s) *current* mission, so a session
+started on another box stays on the work it was started for. The child is
+still a top-level conversation (no `parent_convo_id`): the mission rides
+the row as `mission_num` and joins exactly as a named one does (`how:
+spawned`, counted toward the cap). It is inherited only through these
+gates, and failing one is not an error — the child simply starts with no
+mission: the parent conversation is not private-owned unless the target is
+private too; the mission is visible to both ends (the same sieve a named
+`mission_num` goes through) and `open`; and it is under `CONVOS_MAX`. The
+row records `mission_inherited = 1`, the card and consent item show the
+mission like a named one, and the ack says `mission_inherited: true`. One
+difference at approval: an inherited mission that has closed or gone since
+the ask is dropped from the row and the child starts unattached, rather than
+failing the spawn with `mission_closed` / `no_mission` — the asker never
+named it.
+
 ### Expiry
 
 A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hours, same clock as agent-chat awaiting-user rows, clocked from `created_at`) is flipped to `expired` by the periodic sweep timer and the parent is notified. Unlike agent-chat, where expiry is masked as `reason:'refused'` (to hide from the requester that the user is unresponsive), **spawn expiry is reported honestly as `outcome:'expired'`** — spawn denials are already told plainly as `'declined'`, and there is no peer to hide behind, so distinguishing "the user never answered" from "the user said no" reveals nothing the parent doesn't already learn from a denial.
@@ -1768,7 +1927,7 @@ degrade path for clients predating the tracker, not a second timeline.
 
 | Route | Body / query | Response |
 |---|---|---|
-| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only; rows carry owner{user_id,name,github_login} and repo)` | `{items:[…], next_cursor}` |
+| `GET /items` | `convo, kind (one or several, comma-separated), state=open\|closed\|done, awaiting, label, sort=rank\|updated\|acted, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only, and not state=done; rows carry owner{user_id,name,github_login} and repo)`. `state=done` is For you's Done view: closed items, plus open agent-filed ones with a `last_user_input_at` that are not awaiting the user (answered, waiting on their agent). `sort=acted` orders by the user's last action on the item (`last_user_input_at`), falling back to `closed_at`, then `updated_at`; newest first | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
 | `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
@@ -1784,7 +1943,7 @@ title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, last_user_input_at, attachments[], has_image,
 mission_id,
-mission_num, consent, actions[], chosen_action, origin_convo_title}`.
+mission_num, consent, actions[], chosen_action, origin_convo_title, working}`.
 `last_user_input_at` is when the user last acted on the item: their latest
 comment, action tap, close or reopen, else the filing time of an item they
 filed themselves; `null` when only agents have touched it. Clients order
@@ -1841,6 +2000,9 @@ blocks or covered by an inline code span are literal text, while a code span
 wholly inside the caption does not hide the ref). A ref must name a blob in the **same
 write's** `attachments` — for `PATCH` `body`, the item's existing body
 attachments — or the write is **400 `{error:'invalid_attachment_ref', ref}`**.
+**Attachment limit.** An item create or a comment carries at most 20
+attachments; more is **400 `{error:'too_many_attachments', max: 20}`** and
+nothing is stored. Clients split a larger set across several comments.
 Apps split the body there (text, attachment, text …), show each attachment
 once (a repeated ref renders as its caption), and append the ones no ref
 places. Apps that render refs send `X-Matron-Item-Inline: attachments` on
@@ -1848,6 +2010,36 @@ item requests; to a client without it, item and comment bodies in `/items`
 replies carry each ref as its caption (`(image)` when empty). Agents always
 get the stored text. The chat fallback line and unseen snippets use the
 caption form.
+
+**Working indicator.** `working` says whether the session that owns the item
+(`origin_convo_id`) is busy, so an item thread can show the indicator a chat
+shows for its own conversation. It is `null` when there is nothing to show,
+else `{state, since, until}`:
+
+- `state: "running"`: the owning conversation's `session_state` is `running`,
+  whether or not the turn is about this item. `since` is when that turn
+  started (`null` when not recorded); `until` is `null`.
+- `state: "queued"`: the user wrote something on the item that reaches the
+  agent as a turn (a comment, an action tap, a close, a reopen, or filing the
+  item; the same writes that wake the box, so never a notice's Seen tap and
+  never a reply that stays on a consent card), and no turn has started since.
+  The box is being started, the session resumed, or the reply is waiting
+  behind the turn in flight. `since` is when the user wrote; `until` is when
+  the state lapses if nothing else happens: 10 minutes after the write, or 15
+  seconds after the end of a turn that was already running when the user
+  wrote (the reply either starts the next turn at once or was taken into the
+  one that ended). A client stops showing the indicator at `until` without
+  asking again.
+
+It is derived at read time from the item's last such write and the
+conversation's last turn start and end, like `origin_convo_title`: a turn
+starting or ending does not bump the item's `updated_at`. An open item view
+follows it by re-reading the item when a `session_status` event arrives for
+`origin_convo_id`, as well as on the item's own markers. The reply to the
+write that queues the turn (`POST /items`, `/comments`, `/close`, `/reopen`)
+already carries the new `working`. An accepted handover drops the pending
+write, which was addressed to the previous owner. Another person's view of an
+item (*Shared visibility*, a granted mission) never carries the field.
 
 `meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
 tap (plus `reply_to:"<comment id>"` when the tap answered a comment's
@@ -2893,9 +3085,10 @@ join, leave, spawn and inheritance.
 
 A conversation gains a link by `POST /missions` (its origin, unless
 `attach: false`), `POST /missions/:id/join`, a spawn that named the mission
-(`spawn_request` `mission_num`; `how: spawned`), and **inheritance** — a
-sub-chat takes its parent's *current* mission at creation (`how:
-inherited`), and never afterwards. Inheritance is a way into a mission, so
+(`spawn_request` `mission_num`, named or — when none is named —
+inherited from the asking conversation; `how: spawned`, see "Spawning onto
+a mission"), and **inheritance** — a sub-chat takes its parent's *current*
+mission at creation (`how: inherited`), and never afterwards. Inheritance is a way into a mission, so
 two of join's gates apply: the mission must be `open`, and **visible to the
 creating device** under *Visibility* (a private-owned parent, or a public
 parent joined to a private-origin mission, is refused for an ordinary
@@ -3443,7 +3636,7 @@ no secret to pair with),
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
-| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, owner:{user_id,name}}`; 404 unknown or invisible. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, num, title, owner:{user_id,name}}`; 404 unknown or invisible. `num` and `title` are the row's own, so a "go to number" field or a search box can label the hit without a second read. A milestone also carries `mission: {id, num}`, the mission it sits on, when the caller may read that mission. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
 own pages name the OAuth App, never the journal user — so the person who
@@ -3852,9 +4045,11 @@ owns it. `private=1` means invisible/unreachable to other agents — not to the
 user: `kind='client'` connections are never filtered by any rule below, and
 `GET /devices` (already client-only, see above) is untouched by this feature
 entirely. `isPrivateDevice(db, deviceId)` (`src/db.js`) is the single read
-helper every enforcement point calls; it answers `false` for an unknown/
-deleted id rather than throwing, so a caller checking a dangling reference
-falls through to its normal not-found path instead of crashing.
+helper every enforcement point calls (SQL sieves read the same
+`private_devices` view it does); it answers `true` for a revoked private
+device (see "Revocation keeps it private" below) and `false` for any other
+unknown/deleted id rather than throwing, so a caller checking a dangling
+reference falls through to its normal not-found path instead of crashing.
 
 **Setting it: hello, then the pin.** The bridge asserts its own flag on every
 WS `hello` frame: an optional top-level `private: boolean`
@@ -4014,18 +4209,19 @@ above:
   the compromised device, this feature bought nothing); the only flag it can
   touch is its own, and unmarking itself only makes it more visible, which
   harms nobody but itself.
-- **Revocation re-exposes.** `matron-admin device revoke` (see "Device
-  revocation" below) deletes the device row outright — there is no
-  soft-delete or tombstone. A private device's conversations still carry its
-  now-dangling `agent_device_id`, so every enforcement point above (whose
-  private check is `isPrivateDevice`, a live lookup against the `devices`
-  table) sees no row, answers `false`, and stops excluding them: a
-  decommissioned private agent's whole history becomes visible and
-  searchable again to ordinary agents the moment it's revoked. Privacy here
-  is a visibility flag on a live device, not a retention policy on its past
-  conversations; if a decommissioned device's history needs to stay hidden,
-  that needs a distinct fail-closed mechanism (e.g. an owner id that
-  survives its device row) — not implemented in v1.
+- **Revocation keeps it private.** Revoking a device (see "Device
+  revocation" below) deletes its row, but a private device leaves a
+  tombstone: an `AFTER DELETE` trigger on `devices` copies its id and user
+  into `revoked_private_devices`, whatever deleted the row. Every
+  enforcement point reads privacy through the `private_devices` view (the
+  live `private=1` rows plus the tombstones) — `isPrivateDevice` and every
+  SQL sieve alike — so the conversations, milestones, items, mission and
+  project statuses a private box wrote stay hidden from ordinary agents
+  after it is revoked, and an ordinary agent cannot take its conversations
+  over. Device ids are reusable rowids, so a tombstoned id is never handed
+  out again: new devices are numbered above both tables, and a trigger
+  refuses any insert that reuses one. A device revoked before tombstones
+  existed left none; its history is judged as before (not private).
 - **`/metrics`'s global aggregates still count private devices.**
   `sockets_connected`, `journal_row_count`, and `db_file_size_bytes` are
   whole-user (or whole-server) aggregates computed before the per-device
@@ -4066,7 +4262,9 @@ too, with the same error frame and `4001` close. WS enforcement is
 therefore **next-frame or ≤60s, whichever comes first**.
 `matron-admin device list <username>` shows each device's kind, cursor,
 and last-seen time. Room membership goes with the row — see "Device
-revocation clears room membership" under agent chat.
+revocation clears room membership" under agent chat. A private device's
+privacy does not: it leaves a tombstone (see "Revocation keeps it private"
+under Device privacy).
 
 Owners can also revoke from a client device over HTTP:
 `POST /devices/:id/revoke` (Bearer, client devices only — agents get 403)
@@ -4377,3 +4575,93 @@ Client rules (binding on all client implementations):
   for a server re-sync — otherwise the server purge is defeated by device
   caches. In-memory display of a currently-open conversation is exempt.
 - The TTL is not communicated in-protocol; clients assume the 24h default.
+
+### Per-device content expiry
+
+Some agent devices handle third-party content that should not be kept for
+ever, and quote it in what they write. `MATRON_DEVICE_RETENTION` (or
+startServer's `deviceRetention` option) is a comma-separated list of
+`<deviceId>:<days>`, e.g. `4:30,9:7`: for each device, the content of the
+conversations it has a hand in is expired once it is older than that many
+days. Unset or empty is off. An entry that is not two positive integers,
+or a device named twice, disables the whole setting with one warn line at
+boot; the active rules are logged once at boot. The pass
+(`runExpireDeviceContent`, `src/retention.js`) runs on the retention
+schedule (at boot, then every 6 h), first of the retention passes.
+
+**Which conversations.** For device D:
+
+- D's own sessions and the rooms D owns: `conversations.agent_device_id =
+  D` (the column records a session's managing device and a room's owner
+  alike);
+- every room D is or was a member of: a `convo_agents` row for D in any
+  state (a renewed row overwrites the state it had, so a device that
+  joined, left and was re-invited may read `refused` though it spoke
+  there);
+- D's sessions recorded in `room_owner_convos`, unless another device has
+  since taken the session over;
+- the sub-chats (`parent_convo_id`) under any of these.
+
+A room between two people has a twin in the guest's log; the owner device
+is recorded on both rooms and a guest device has a membership row on both,
+so either rule reaches both copies. No other conversation is touched.
+Rules name device ids: a box that is re-paired gets a new id (and takes
+its sessions over), and revoking a device deletes its membership rows, so
+review the setting when a device changes.
+
+**Which events.** In those conversations, every event older than the
+cutoff (`ts < now - days × 24 h`) of type `text`, `tool_output`, `diff`,
+`prompt`, `prompt_reply`, `permission_request`, `file`, `image`,
+`spawn_outcome`, `edit` or `summary` that is not already a content
+tombstone. Earlier tombstones that still carry words (an attachment's
+caption or transcript, a tool log's command) are included. Markers
+(`item`, `milestone`, `mission`, …), `convo_meta`, `session_status` and
+`read_marker` are not; tracker content lives in the tracker.
+
+**The tombstone.** The payload is rewritten in place (the event row, its
+`seq`, `ts`, `sender` and `type` stay):
+
+- strings under these keys are kept, because they are ids or enums that
+  clients route by and never prose: `type`, `kind`, `fallback_for`,
+  `mode`, `request`, `outcome`, `error_code`, `action`, `state`,
+  `consent`, `message_ref`, `request_id`, `spawn_id`, `room_id`,
+  `prompt_id`, `item_id`, `batch_id`, `convo_id`, `from_convo_id`,
+  `to_convo_id`, `target_convo_id`, `child_convo_id`, `content_type`,
+  `tool_name`, `tool`;
+- every other string becomes `''` (so `body`, `text`, `diff`, `snippet`,
+  `command`, `question`, `description`, `caption`, `name`, `transcript`,
+  `justification`, `task`, … — and any key not listed above);
+- arrays become `[]` and objects `{}`;
+- numbers, booleans and `null` are kept (sizes, exit codes, counts, seqs,
+  flags);
+- `blob_ref: null`, `expired: true` and `content_expired: true` are set.
+
+Keys are emptied rather than removed so a decoder that requires one still
+finds a value of the right type. `expired: true` is what clients already
+render for an expired attachment, tool log or diff; `content_expired: true`
+says the whole payload's content is gone and should be rendered as an
+expired message. A payload that is not a JSON object becomes `{blob_ref:
+null, expired: true, content_expired: true}`. Example, a `text` event:
+`{body: '', blob_ref: null, expired: true, content_expired: true}`.
+
+**Everything else that held the words.**
+
+- The event's `search_messages` row is deleted (with the FTS5 `'delete'`
+  command to `search_fts` and `search_fts_plain` first), in the same
+  transaction as the rewrite.
+- The blob the event named (`events.blob_ref`: an offloaded tool log, an
+  attachment) is deleted, row and file, when, after the rewrite, no event
+  still names it, no item comment's attachments name it, and the event's
+  own user owns it. Otherwise the blob stays and only this event lets go
+  of it. The file is unlinked after commit.
+- If the conversation's latest message-type event was tombstoned, its
+  preview (`snippet`) is recomputed from the tombstone and its rolling
+  `summary` is blanked. Titles are not changed.
+
+Work is batched per conversation (500 events a transaction), so a first
+run over a long history never holds the write lock for long; the pass is
+idempotent (`content_expired` marks a row done). Like the other passes it
+covers the journal's own store and search only: a client that already
+synced an event keeps its local copy until it re-syncs, and a bridge's
+echo of a room message into another session's conversation (and that
+session's own transcript) carries no room id, so it is not reached.

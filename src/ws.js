@@ -10,7 +10,7 @@ import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { expireContactAsks } from './contacts.js'
@@ -1227,7 +1227,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // shape as agent_invite's from_convo_id.
         if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return fail('bad_request', 'bad from_convo_id')
         const fromConvo = db.prepare(
-          'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
+          'SELECT owner_user_id, agent_device_id, parent_convo_id, title, mission_id FROM conversations WHERE id=?'
         ).get(msg.from_convo_id)
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
@@ -1242,6 +1242,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // private devices.
         let missionNum = null
         let missionTitle = ''
+        let missionInherited = false
         if (msg.mission_num != null) {
           if (!Number.isInteger(msg.mission_num) || msg.mission_num < 1) return fail('bad_request', 'bad mission_num')
           const excludePrivateOwned = !isPrivateDevice(db, conn.deviceId) || !isPrivateDevice(db, msg.target_device_id)
@@ -1253,6 +1254,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // user sees the mission they are sending the child to. Sieved like
           // from_convo_title.
           missionTitle = sanitizePeerText(mission.title, CARD_TITLE_MAX_CHARS)
+        } else if (fromConvo.mission_id != null) {
+          // No mission named: the child inherits the parent conversation's
+          // current one, through inheritance's gates (spawns.js
+          // inheritedSpawnMission). Failing one is not an error — the child
+          // just starts unattached, as before.
+          const inherited = inheritedSpawnMission(db, { userId: conn.userId, fromConvoId: msg.from_convo_id, fromDeviceId: conn.deviceId, targetDeviceId: msg.target_device_id })
+          if (inherited) {
+            missionNum = inherited.num
+            missionTitle = sanitizePeerText(inherited.title, CARD_TITLE_MAX_CHARS)
+            missionInherited = true
+          }
         }
         // A box with no live socket is asleep when this journal can wake it
         // (wake-before-spawn): fire the wake now and park the ask as usual —
@@ -1279,7 +1291,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, effort, agent, link, missionNum,
+          workdir, task, topic, model, effort, agent, link, missionNum, missionInherited,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1354,7 +1366,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.
-        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId, ...(targetWaking ? { target_waking: true } : {}) }))
+        // mission_num: the mission the child will join, named or inherited
+        // (mission_inherited: true for the latter) — omitted when none.
+        conn.ws.send(JSON.stringify({
+          kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId,
+          ...(targetWaking ? { target_waking: true } : {}),
+          ...(missionNum ? { mission_num: missionNum } : {}),
+          ...(missionInherited ? { mission_inherited: true } : {}),
+        }))
         break
       }
       case 'spawn_targets': {

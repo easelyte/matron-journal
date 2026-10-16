@@ -354,7 +354,10 @@ test('at least one conformance fixture is present', () => {
 for (const file of files) {
   const fixture = JSON.parse(fs.readFileSync(path.join(FIXTURES_DIR, file), 'utf8'))
   test(`conformance: ${fixture.name} (${file})`, async (t) => {
-    const serverCfg = { ...(fixture.server || {}) }
+    // Unified search's similar tier (spec 2026-10-12 §5): default to no
+    // embedder, same as test/helpers.js, so a conformance run never loads
+    // or downloads a real model; a fixture can still override it.
+    const serverCfg = { embedder: null, backgroundDelayMs: 0, backgroundPace: 0, ...(fixture.server || {}) }
     let tmpDir = null
     if (serverCfg.tmpDb) {
       delete serverCfg.tmpDb

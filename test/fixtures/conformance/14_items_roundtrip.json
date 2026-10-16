@@ -20,7 +20,8 @@
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
         "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
-        "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false } } } },
+        "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
+          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } } } },
 
     { "kind": "http", "method": "GET", "path": "/items?awaiting=user", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "items": [ {
@@ -29,7 +30,8 @@
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
         "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
-        "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false } ], "next_cursor": null } } },
+        "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
+          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } ], "next_cursor": null } } },
 
     { "kind": "http", "method": "POST", "path": "/items/${item_id}/comments", "token": { "$ref": "alice_token" },
       "body": { "body": "Use A" },
@@ -40,7 +42,8 @@
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
           "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
-          "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false },
+          "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
+          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
           "id": { "$bind": "comment_id" }, "item_id": { "$ref": "item_id" },
           "author": "user", "device_id": { "$type": "integer" }, "kind": "comment", "body": "Use A",
@@ -58,7 +61,8 @@
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
           "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
-          "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false },
+          "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
+          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
           "id": { "$type": "string" }, "item_id": { "$ref": "item_id" },
           "author": "agent", "device_id": { "$ref": "bridge.device_id" }, "kind": "status", "body": "",

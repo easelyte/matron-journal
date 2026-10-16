@@ -168,16 +168,16 @@ export function validateMissionFields(body, { partial = false, withName = false 
 // `alias` names the row's table alias, so projects.js applies the same
 // sieve to its own status columns (projects p).
 export const statusPrivateSql = (alias) => `(
-  EXISTS (SELECT 1 FROM devices sd WHERE sd.id = ${alias}.status_device_id AND sd.private = 1)
-  OR EXISTS (SELECT 1 FROM conversations sc JOIN devices sd ON sd.id = sc.agent_device_id
-             WHERE sc.id = ${alias}.status_convo_id AND sd.private = 1)
+  EXISTS (SELECT 1 FROM private_devices sd WHERE sd.id = ${alias}.status_device_id)
+  OR EXISTS (SELECT 1 FROM conversations sc JOIN private_devices sd ON sd.id = sc.agent_device_id
+             WHERE sc.id = ${alias}.status_convo_id)
 )`
 const STATUS_PRIVATE = statusPrivateSql('m')
 
 // The closing conversation (closed_convo_id) is withheld from an ordinary
 // agent when it is private-owned, as status_convo_id is above.
-const CLOSED_PRIVATE = `EXISTS (SELECT 1 FROM conversations cc JOIN devices cd ON cd.id = cc.agent_device_id
-             WHERE cc.id = m.closed_convo_id AND cd.private = 1)`
+const CLOSED_PRIVATE = `EXISTS (SELECT 1 FROM conversations cc JOIN private_devices cd ON cd.id = cc.agent_device_id
+             WHERE cc.id = m.closed_convo_id)`
 
 // Review fix (Task 7, Critical 1): every COUNTS subquery must apply the same
 // private-owned-conversation sieve the caller's OWN arrays get in
@@ -189,13 +189,13 @@ const CLOSED_PRIVATE = `EXISTS (SELECT 1 FROM conversations cc JOIN devices cd O
 // conversations are their own row.
 function countsSql(excludePrivateOwned) {
   const itemSieve = excludePrivateOwned
-    ? `AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id WHERE oc.id = i.origin_convo_id AND d.private = 1)`
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id WHERE oc.id = i.origin_convo_id)`
     : ''
   const milestoneSieve = excludePrivateOwned
-    ? `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN devices d ON d.id = mc.agent_device_id WHERE mc.id = l.convo_id AND d.private = 1)`
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN private_devices d ON d.id = mc.agent_device_id WHERE mc.id = l.convo_id)`
     : ''
   const convoSieve = excludePrivateOwned
-    ? `AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
+    ? `AND NOT EXISTS (SELECT 1 FROM private_devices d WHERE d.id = c.agent_device_id)`
     : ''
   return `
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${itemSieve}) AS open_items,
@@ -222,8 +222,8 @@ function countsSql(excludePrivateOwned) {
 // used to hand back (and, for milestones, write into) the unsieved row.
 // Same predicate listMissions applies to its WHERE clause; one caller
 // passing `excludePrivateOwned` now gets one consistent answer everywhere.
-export const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
-  WHERE cv.id = m.origin_convo_id AND d.private = 1)`
+export const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN private_devices d ON d.id = cv.agent_device_id
+  WHERE cv.id = m.origin_convo_id)`
 
 // Cross-user variant of ORIGIN_SIEVE: fails closed when the origin
 // conversation's device row is gone (revoked), matching sharedConvoSql.
@@ -332,7 +332,7 @@ export function listMissions(db, userId, { state = null, since = null, projectId
   return rows.map(missionRow)
 }
 
-const PRIVATE_CONVO = `EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
+const PRIVATE_CONVO = `EXISTS (SELECT 1 FROM private_devices d WHERE d.id = c.agent_device_id)`
 
 // Fold the LEFT JOINed conversation_status columns into one `status` block
 // (omitted when the session never reported), the shape GET /roster serves
@@ -416,8 +416,8 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
   // A sub-chat whose parent the caller cannot see (a filtered agent and a
   // private-device parent) must not name it: parent_convo_id is withheld.
   const parentHidden = excludePrivateOwned
-    ? `EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
-         WHERE pc.id = c.parent_convo_id AND pd.private = 1)`
+    ? `EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id
+         WHERE pc.id = c.parent_convo_id)`
     : '0'
   const rows = db.prepare(`SELECT c.id, c.title, c.auto_title, c.session_state AS state, d.name AS box, c.parent_convo_id,
       ${parentHidden} AS parent_hidden,
@@ -577,8 +577,8 @@ export function closeMission(db, { userId, missionId, by, summary, closedConvoId
     if (m.state === 'closed') throw new Error('closed')
     const open = db.prepare(`
       SELECT i.num, i.title, i.awaiting,
-        EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id
-                WHERE oc.id = i.origin_convo_id AND d.private = 1) AS is_private
+        EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
+                WHERE oc.id = i.origin_convo_id) AS is_private
       FROM items i WHERE i.mission_id=? AND i.state='open' ORDER BY i.num
     `).all(m.id)
     const visible = (i) => !excludePrivateOwned || !i.is_private
@@ -812,11 +812,11 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
 // you" is about the viewer, a read grantee is never the one an item waits
 // on, and missionRow derives `activity` from the same number — so the
 // owner's waiting items never read as the grantee's.
-const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id
-  WHERE oc.id = i.origin_convo_id AND d.private = 1)`
-const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN devices d ON d.id = mc.agent_device_id
-  WHERE mc.id = l.convo_id AND d.private = 1)`
-const GRANT_CONVO_SIEVE = `AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
+const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
+  WHERE oc.id = i.origin_convo_id)`
+const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN private_devices d ON d.id = mc.agent_device_id
+  WHERE mc.id = l.convo_id)`
+const GRANT_CONVO_SIEVE = `AND NOT EXISTS (SELECT 1 FROM private_devices d WHERE d.id = c.agent_device_id)`
 
 function grantedCountsSql() {
   return `

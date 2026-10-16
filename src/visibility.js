@@ -120,10 +120,10 @@ export function canReadBlob(db, viewerUserId, blobId) {
       JOIN blobs b ON b.id = @id
       WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND b.owner_user_id = i.user_id
         AND m.user_id = i.user_id
-        AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
-                        WHERE pc.id = i.origin_convo_id AND pd.private = 1)
-        AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN devices md ON md.id = mo.agent_device_id
-                        WHERE mo.id = m.origin_convo_id AND md.private = 1)
+        AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id
+                        WHERE pc.id = i.origin_convo_id)
+        AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN private_devices md ON md.id = mo.agent_device_id
+                        WHERE mo.id = m.origin_convo_id)
         AND ${grantedMissionSql('m')})`).get({ viewer: viewerUserId, id: blobId })
   return !!row
 }

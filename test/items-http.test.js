@@ -111,6 +111,14 @@ test('GET /items and GET /items/:id: filters, #num, other user 404, comments inc
   assert.equal((await s.http('/items?convo=c2', { token: client })).json.items.length, 1)
   assert.equal((await s.http('/items?awaiting=user', { token: client })).json.items.length, 1)
   assert.equal((await s.http('/items?kind=bogus', { token: client })).status, 400)
+  // `kind` takes several, comma-separated: any of them, and all must be known.
+  await mkItem(s, agent.token, { kind: 'decision', title: 'D', convo_id: 'c2' })
+  const kinds = async (list) => (await s.http(`/items?kind=${list}&sort=updated`, { token: client })).json.items.map((i) => i.kind).sort()
+  assert.deepEqual(await kinds('task'), ['task'])
+  assert.deepEqual(await kinds('task,decision'), ['decision', 'task'])
+  assert.deepEqual(await kinds('decision,decision'), ['decision'])
+  assert.equal((await s.http('/items?kind=task,bogus', { token: client })).status, 400)
+  assert.equal((await s.http('/items?kind=', { token: client })).status, 400)
   assert.equal((await s.http('/items?limit=0', { token: client })).status, 400)
   assert.equal((await s.http('/items?cursor=!!', { token: client })).status, 400)
   const one = await s.http('/items/%231', { token: client })
@@ -136,6 +144,10 @@ test('GET /items: query validation, updated sort, cursor paging', async (t) => {
   assert.equal(page2.json.next_cursor, null)
   const byUpdated = await s.http('/items?sort=updated', { token: client })
   assert.deepEqual(byUpdated.json.items.map((i) => i.num), [3, 2, 1])
+  // For you's Done view and the user's-last-action order (own list only).
+  const done = await s.http('/items?state=done&sort=acted&kind=question,decision,notice&limit=50', { token: client })
+  assert.equal(done.status, 200); assert.deepEqual(done.json.items, [])
+  assert.equal((await s.http('/items?scope=shared&state=done', { token: client })).status, 400)
 })
 
 test('privacy sieve: an ordinary agent cannot see items born in a private device\'s convo; clients and private agents can', async (t) => {
@@ -734,4 +746,25 @@ test('a colleague reading a shared item never sees a handover: no pending offer,
   assert.ok(!r.json.comments.some((c) => c.meta?.handover), 'handover lines stay out of the shared thread')
   const list = await s.http('/items?scope=shared', { token: patClient })
   assert.equal(list.json.items[0].handover, null)
+})
+
+test('more than 20 attachments on a comment or a create is a named 400, and nothing is stored', async (t) => {
+  const { s, client } = await fleet(t)
+  const files = (n) => Array.from({ length: n }, (_, i) => ({ blob_ref: `b${i}`, mime: 'text/csv', name: `f${i}.csv`, size: 1 }))
+  const tooMany = await mkItem(s, client, { attachments: files(21) })
+  assert.equal(tooMany.status, 400)
+  assert.deepEqual(tooMany.json, { error: 'too_many_attachments', max: 20 })
+  const created = await mkItem(s, client, { attachments: files(20) })
+  assert.equal(created.status, 201)
+  const id = created.json.item.id
+  const before = (await s.http(`/items/${id}`, { token: client })).json.comments.length
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'exports', attachments: files(42) } })
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'too_many_attachments', max: 20 })
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.comments.length, before, 'the refused comment stored nothing')
+  const ok = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'exports', attachments: files(20) } })
+  assert.equal(ok.status, 201)
+  // A malformed list is still the generic 400.
+  const bad = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'x', attachments: 'nope' } })
+  assert.deepEqual([bad.status, bad.json], [400, { error: 'bad_request' }])
 })

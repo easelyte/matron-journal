@@ -717,6 +717,7 @@ test('devices rebuild preserves inbound FK children and the file_idem revoke tri
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at)
       VALUES(5,1,'agent','box-5','h5',0),(6,1,'agent','box-6','h6',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -770,6 +771,7 @@ test('devices rebuild seeds the sequence above a dangling conversation owner, no
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -808,6 +810,7 @@ test('a devices-parent FK violation rolls the rebuild back and re-fails on resta
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -848,6 +851,7 @@ test('devices rebuild seeds above a dangling id found only in items.origin_devic
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -878,6 +882,7 @@ test('devices rebuild seeds above a dangling id found only in events.idem_key', 
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -912,6 +917,7 @@ test('devices rebuild ignores a malformed events.idem_key numeric prefix (no ID 
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'client','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
@@ -945,6 +951,7 @@ test('devices rebuild scans a table whose name contains a double-quote', (t) => 
       created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
       private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
     INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
+    DROP VIEW IF EXISTS private_devices;
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
