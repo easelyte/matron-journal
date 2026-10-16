@@ -19,10 +19,10 @@
 
     { "kind": "ws_open", "conn": "mac" },
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_open", "conn": "phone" },
     { "kind": "ws_send", "conn": "phone", "frame": { "op": "hello", "token": { "$ref": "phone_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
+    { "kind": "ws_expect", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
 
     { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
     { "kind": "ws_expect", "conn": "mac", "frame": {
