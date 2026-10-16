@@ -61,8 +61,15 @@ test('the signal handler closes the server with 1012 and exits 0; a stuck close 
   const stuckProc = new EventEmitter()
   const stuckExits = []
   stuckProc.exit = (c) => stuckExits.push(c)
+  // The watchdog must stay referenced: if cleanup drops the last other handle while close() is
+  // still pending, an unref'd watchdog would let node exit 0 without finishing or logging.
+  const realSetTimeout = global.setTimeout
+  let watchdog
+  global.setTimeout = (...a) => { watchdog = realSetTimeout(...a); return watchdog }
   installShutdownHandlers({ close: () => new Promise(() => {}) }, { proc: stuckProc, timeoutMs: 30, log: () => {} })
   stuckProc.emit('SIGINT')
+  global.setTimeout = realSetTimeout
+  assert.equal(watchdog.hasRef(), true)
   await new Promise((r) => setTimeout(r, 120))
   assert.deepEqual(stuckExits, [1])
 })

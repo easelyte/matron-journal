@@ -1066,7 +1066,6 @@ export function installShutdownHandlers(s, {
       log('matron-journal: shutdown timed out, exiting')
       proc.exit(1)
     }, timeoutMs)
-    timer.unref?.()
     s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs })
       .then(() => { clearTimeout(timer); proc.exit(0) },
         (err) => { console.error('shutdown failed', err); proc.exit(1) })
