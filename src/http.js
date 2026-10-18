@@ -28,7 +28,7 @@ import { handleSharingRoute } from './sharing-http.js'
 import { handlePersonRoomRoute } from './person-rooms-http.js'
 import { sessionsSharedWith } from './person-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
-import { createWorkView, handleWorkRoute, parseOwnerUserId } from './work-http.js'
+import { parseOwnerUserId } from './owner-user-id.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
@@ -121,7 +121,7 @@ const rejectEarly = (req, res, status, obj) => {
   // credential) and 429 (throttled) -- so a cached copy would be served back
   // to a caller whose credential or throttle window has since changed. It also
   // keeps the guarantee uniform for routes that promise no-store on every
-  // response (see /work), whose own handler never runs when the shared auth
+  // response (see the owner-only routes), whose own handler never runs when the shared auth
   // gate rejects first.
   res.setHeader('Cache-Control', 'private, no-store')
   return json(res, status, obj)
@@ -142,7 +142,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, workViewOptions, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -156,10 +156,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     // trusted boundary, once, bound to the server's own database.
     idem: makeDurableIdemStore({ db }),
   }
-  // Bound once at server startup: explicit producer-root validation happens
-  // before the listener is returned, and no request can supply or replace the
-  // owner/root configuration.
-  const workView = createWorkView({ ...workViewOptions, db })
   // File Explorer owner (see the gate in the handler). Accepts the parsed
   // number from startServer or a raw string; anything else is null, and null
   // refuses every /files request.
@@ -350,7 +346,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // boundary and jailed server-side to the pinned read-roots + always-on
       // secret denylist. Writes are Phase 2 and absent. denialToStatus keeps
       // rejection reasons uniform.
-      // Owner gate (same shape as GET /work): the File Explorer exposes the
+      // Owner gate (owner-only, fail closed): the File Explorer exposes the
       // server's own disk, which belongs to the journal's operator, not to
       // whichever user a client device happens to be signed in as. A second
       // user (including an admin one) must never inherit read access to the
@@ -603,7 +599,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleSharingRoute({ db, hub, pushPipeline }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
-      if (await handleWorkRoute(workView, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
