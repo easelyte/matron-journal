@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
-import { parseOwnerUserId } from './work-http.js'
+import { parseOwnerUserId } from './owner-user-id.js'
 import { ensurePreapproveKey, resolvePreapproveKeyPath } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
 import { makeLinkStore } from './link.js'
@@ -555,7 +555,7 @@ export function startServer({
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, workViewOptions, fileHomeDir,
+  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, fileHomeDir,
   github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
@@ -851,7 +851,6 @@ export function startServer({
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     fileOwnerUserId: resolvedFileOwnerUserId,
-    workViewOptions,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic,
   }))
