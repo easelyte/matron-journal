@@ -2255,6 +2255,21 @@ by a client device (never for an agent's own write — it's already awake),
 and bridges treat those as inbound turns. `reordered` and `updated` are the
 quiet pair: neither ever wakes and neither ever pushes.
 
+**Agent comment on another conversation's item.** When an agent comments on
+an item whose `origin_convo_id` is a different conversation (it sends its own
+`as_convo_id`), the `commented` marker (sender stays `agent:<name>`) carries
+`agent_comment: true`, `from_convo_id` and `from_label` (the commenter's
+conversation title, one line, at most 120 characters), and the owner's box is
+woken so its bridge can deliver the comment as a turn. Delivery is throttled
+in memory: one comment per 30 s per (item, commenting conversation) and six
+per item per 10 min; a throttled comment is still stored and announced, but
+without those fields and without a wake. The `201` reply adds
+`owner_notified` (boolean) and, when false, `owner_notice` ("The owner session
+will not be notified of this comment: <reason>", where the reason is
+rate-limited, commenter conversation unknown, or owner conversation
+unavailable). Both are omitted for the owner's own comments, user comments,
+consent mirrors and replayed idempotency keys.
+
 Push: `attention` only when an **agent-authored** marker (`by:'agent'`)
 leaves an item `awaiting:'user'` via `created`, `commented`, or `reopened`.
 The `by:'agent'` guard applies to every action, `created` included: an

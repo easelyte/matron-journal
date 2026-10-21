@@ -1,3 +1,4 @@
+import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -142,7 +143,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -594,7 +595,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
