@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import { accessSync, constants as fsConstants, realpathSync, readlinkSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -545,6 +546,7 @@ export function startServer({
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  agentCommentClock = Date.now,
   stallWakeIntervalMs = null,
   // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
   unseenNudgeIntervalMs = null,
@@ -847,6 +849,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
+    agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,

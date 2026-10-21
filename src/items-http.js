@@ -214,6 +214,11 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
     }
     wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
   }
+  // A foreign agent's comment (route-vetted: extra.agent_comment) is a turn
+  // for the item's owner: the writer is an agent, so the rule above skips it.
+  if (!mirror && who.kind === 'agent' && action === 'commented' && extra?.agent_comment === true) {
+    wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  }
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
@@ -593,6 +598,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // still flip `awaiting` and wake the box, so it is a bad request.
     if (!text.trim() && attachments.length === 0) return badRequest(res)
     let out
+    let ownerNotice = null // true = owner notified, string = why not, null = not applicable
     try {
       // A consent mirror follows its ask, never a comment: left to the
       // generic rule, a reply on one would reopen it (or take it out of the
@@ -615,14 +621,34 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       out.item = withdrawOnClose(ctx, who.userId, item.id) ?? out.item
       emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.status, extra: { seen: true }, fallback: false })
     } else if (!out.duplicate) {
-      emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+      // Another conversation's agent commenting on this item: tell the owner
+      // (marker flag + wake) unless throttled, and say so in the reply.
+      let extra = null
+      if (who.kind === 'agent' && item.consent == null && convoId !== item.origin_convo_id) {
+        let reason = null
+        if (!convoId) reason = 'commenter conversation unknown (as_convo_id not sent)'
+        else if (!db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=?').get(item.origin_convo_id, who.userId)) reason = 'owner conversation unavailable'
+        else if (!ctx.agentCommentLimiter.take(item.id, convoId)) reason = 'rate-limited'
+        if (reason) {
+          ownerNotice = `The owner session will not be notified of this comment: ${reason}`
+        } else {
+          const row = db.prepare('SELECT title FROM conversations WHERE id=?').get(convoId)
+          const label = (row?.title ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, 120) || senderOf(db, who).replace(/^agent:/, '')
+          extra = { agent_comment: true, from_convo_id: convoId, from_label: label }
+          ownerNotice = true
+        }
+      }
+      emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment, extra })
       // Queued AFTER the marker so the follow-up can never precede it.
       if (transcribeHere) {
         // One job per blob: the same audio attached twice is one whisper run.
         for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
     }
-    replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: seenBy(out.comment) })
+    const reply = { item: out.item, comment: seenBy(out.comment) }
+    if (ownerNotice === true) reply.owner_notified = true
+    else if (ownerNotice != null) { reply.owner_notified = false; reply.owner_notice = ownerNotice }
+    replyItems(who, res, out.duplicate ? 200 : 201, reply)
     return true
   }
 
