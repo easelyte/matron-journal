@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { openDb } from '../src/db.js'
+import { FRESH_ROOM_SQL } from '../src/person-rooms.js'
 
 // Rooms between two people's agents (spec 2026-10-02 matron-to-matron
 // sharing, phase 2), end to end over real HTTP and sockets: alice (a box, a
@@ -419,4 +421,26 @@ test('the list of rooms and asks is the person\'s: agents, the Coordinator inclu
     assert.equal((await agent('/person-rooms')).status, 403)
     assert.equal((await agent(`/person-rooms/${link.id}`)).status, 403)
   }
+})
+
+test('a room made the way agent_chat_start makes it parks the ask at a shared session, with the card and its item', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  await shareTimSession(w)
+  w.ws.aliceBox.send({ op: 'convo_upsert', convo_id: 'made', title: 'A:2c ↔️ 👤 bob — Launch', session_state: 'waiting' })
+  w.ws.aliceBox.send({ op: 'publish', convo_id: 'made', type: 'text', payload: { body: 'Opening', from: 'agent' } })
+  w.ws.aliceBox.send({ op: 'agent_invite', room_id: 'made', target_device_id: w.bobBoxId, target_convo_id: 'bobwork', topic: 'Launch', justification: 'Talk it through', from_convo_id: 'work' })
+  const reply = await w.ws.aliceBox.waitFor((f) => (f.kind === 'invite' && f.event === 'delivered') || (f.op === 'error' && f.ref === 'agent_invite'))
+  assert.equal(reply.event, 'delivered', JSON.stringify(reply))
+  await settle()
+  const card = w.ws.alicePhone.journal().find((f) => f.type === 'permission_request' && f.payload.kind === 'person_room')
+  assert.equal(card.convo_id, 'made')
+  assert.equal((await consentItems(w.alicePhone, 'room')).length, 1)
+})
+
+test('the fresh-room check reads the room through idx_events_convo, not the whole log', () => {
+  const db = openDb(':memory:')
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${FRESH_ROOM_SQL}`).all({ u: 1, r: 'room', s: 'agent:a' }).map((r) => r.detail).join(' | ')
+  assert.match(plan, /idx_events_convo/, plan)
+  db.close()
 })

@@ -7,7 +7,7 @@ import { json, readBody } from './http-body.js'
 import { senderOf, badRequest, notFound } from './http-who.js'
 import { filteredAgent } from './privacy.js'
 import { COORDINATOR_EVENT_TYPE, coordinatorFor, setCoordinatorConvoId } from './coordinator.js'
-import { getConsentEnabled, setConsentEnabled } from './consent.js'
+import { getConsentEnabled, setConsentEnabled, getTransferConsentEnabled, setTransferConsentEnabled } from './consent.js'
 import { seedRoutines } from './routines.js'
 
 export async function handleCoordinatorRoute(ctx, req, res, url, who) {
@@ -16,7 +16,11 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   // `consent` (spec: 2026-09-29 coordinator consent): whether the
   // Coordinator may answer chat and spawn asks on the user's behalf. Read by
   // both kinds; set by a client alone, with or without a convo_id change.
-  const view = () => ({ convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }), consent: getConsentEnabled(db, who.userId) })
+  // `transfer_consent`: whether the Coordinator may also approve a file
+  // transfer it had another session send (src/consent-http.js
+  // answerTransfer). Default off; set by a client alone, like `consent`.
+  const settings = () => ({ consent: getConsentEnabled(db, who.userId), transfer_consent: getTransferConsentEnabled(db, who.userId) })
+  const view = () => ({ convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }), ...settings() })
   if (req.method === 'GET') {
     json(res, 200, view())
     return true
@@ -24,10 +28,15 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (req.method !== 'PUT') return false
   if (who.kind !== 'client') { json(res, 403, { error: 'forbidden' }); return true }
   const body = await readBody(req)
-  if (!('convo_id' in body) && !('consent' in body)) return badRequest(res)
+  if (!('convo_id' in body) && !('consent' in body) && !('transfer_consent' in body)) return badRequest(res)
   if ('consent' in body && typeof body.consent !== 'boolean') return badRequest(res)
+  if ('transfer_consent' in body && typeof body.transfer_consent !== 'boolean') return badRequest(res)
+  const saveSwitches = () => {
+    if ('consent' in body) setConsentEnabled(db, who.userId, body.consent, Date.now())
+    if ('transfer_consent' in body) setTransferConsentEnabled(db, who.userId, body.transfer_consent, Date.now())
+  }
   if (!('convo_id' in body)) {
-    setConsentEnabled(db, who.userId, body.consent, Date.now())
+    saveSwitches()
     json(res, 200, view())
     return true
   }
@@ -69,7 +78,7 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (out.current) {
     try { seedRoutines(db, who.userId, Date.now()) } catch (err) { console.error('coordinator: routine seeding failed (the role stands)', err) }
   }
-  if ('consent' in body) setConsentEnabled(db, who.userId, body.consent, Date.now())
-  json(res, 200, { convo_id: out.current, consent: getConsentEnabled(db, who.userId) })
+  saveSwitches()
+  json(res, 200, { convo_id: out.current, ...settings() })
   return true
 }

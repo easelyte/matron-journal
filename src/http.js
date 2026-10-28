@@ -4,11 +4,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { openGuarded, metaGuarded, listDirGuarded, contentTypeFor, contains, isDeniedPath, FileLinkDenied, denialToStatus, MAX_VIEW_BYTES, MAX_DOWNLOAD_BYTES } from './file-guard.js'
 import { pipeline } from 'node:stream/promises'
-import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
-import { readBlobTranscript } from './blob-transcripts.js'
+import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
@@ -33,6 +33,10 @@ import { parseOwnerUserId } from './owner-user-id.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
+import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
+import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
+import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
+import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleNotifyRoute } from './notify-http.js'
@@ -40,6 +44,7 @@ import { handleDefaultsRoute } from './defaults-http.js'
 import { handleBoxDefaultsRoute } from './box-defaults-http.js'
 import { boxDefaultsByDevice } from './box-defaults.js'
 import { handlePinsRoute } from './pins-http.js'
+import { handleArchiveRoute } from './archive-http.js'
 import { listPins, pinLabels } from './pins.js'
 import { handleSettingsRoute } from './settings-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
@@ -47,11 +52,14 @@ import { handleBriefingsRoute } from './briefings-http.js'
 import { handleRoutinesRoute } from './routines-http.js'
 import { handleSeenRoute } from './seen-http.js'
 import { handleConsentRoute } from './consent-http.js'
+import { handleTransferRoute } from './transfers-http.js'
+import { handleTtsRoute } from './tts-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
+import { handleSummariseRoute } from './summarise-http.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -143,7 +151,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, agentCommentLimiter = makeAgentCommentLimiter() }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -164,6 +172,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
     ? (Number.isSafeInteger(fileOwnerUserId) && fileOwnerUserId > 0 ? fileOwnerUserId : null)
     : parseOwnerUserId(fileOwnerUserId)
   const filesLive = !!fileReadRoots || !!(fileWriteCtx.fileEnableWrites && fileWriteCtx.fileWriteRoots && fileWriteCtx.audit)
+  // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
+  // the defaults keep a bare handler (tests) working the same way.
+  const twoFactorBox = tokenBox || PLAIN_BOX
+  const signInTickets = tickets || makeTwoFactorTickets()
+  const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
+  const passwordChecks = makeKeyedQueue()
+  // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
+  const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -212,11 +228,30 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           res.setHeader('Retry-After', retryAfter)
           return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
         }
-        const s = await login(db, { username, password, deviceName: device_name })
-        if (!s) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        const u = await checkPassword(db, { username, password })
+        if (!u) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        const deviceName = device_name || 'unnamed'
+        // Two-factor (src/two-factor-http.js): a right password alone buys a
+        // short-lived ticket, not a token. The lockout is not reset yet —
+        // only a right code clears it, so wrong codes keep counting. 401,
+        // not 200, so an app that predates the code step shows a failed
+        // sign-in rather than looking for a token that is not there.
+        const enrolled = isTwoFactorEnabled(db, u.userId)
+        if (enrolled || twoFactorRequiredNow(db, twoFactorBox)) {
+          const purpose = enrolled ? 'verify' : 'enrol'
+          const t = signInTickets.issue({ userId: u.userId, username, deviceName, purpose })
+          if (!t) return json(res, 429, { error: 'rate_limited' })
+          return json(res, 401, {
+            error: enrolled ? 'two_factor_required' : 'two_factor_enrolment_required',
+            two_factor_ticket: t.ticket, expires_in: t.expiresIn,
+          })
+        }
         loginGuard.ok(username)
-        return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
+        const d = createClientDevice(db, u.userId, deviceName)
+        return json(res, 200, { token: d.token, device_id: d.deviceId, user_id: u.userId })
       }
+      if (await handleTwoFactorLogin({ db, tokenBox: twoFactorBox, tickets: signInTickets, twoFactorLimiter: codeLimiter, loginGuard }, req, res, url, { rejectEarly })) return
+      if (await handlePasswordResetRoute({ db, mailer, resetLimiter: passwordResetLimiter, loginGuard, signInTickets }, req, res, url, { rejectEarly })) return
       if (req.method === 'POST' && url.pathname === '/pair/start') {
         // Unauthenticated by design: this grants nothing — the pair becomes
         // an agent only if an authenticated client approves the code, and
@@ -595,10 +630,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
-      if (await handleSharingRoute({ db, hub, pushPipeline }, req, res, url, who)) return
-      if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
+      if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
@@ -607,6 +642,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleSeenRoute({ db }, req, res, url, who)) return
       if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
+      // Titles and rolling summaries for the bridges (src/summarise-http.js):
+      // agent tokens only, null summariser = 503.
+      if (await handleSummariseRoute({ db, summariser }, req, res, url, who, { rejectEarly })) return
       const said = url.pathname.match(/^\/said\/([^/]+)$/)
       if (req.method === 'GET' && said) {
         // Did the account's own user write this? (src/said.js) A guarded
@@ -625,12 +663,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         return json(res, 200, out.body)
       }
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
+      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
+      // Cloud speech for voice mode (src/tts-http.js): client devices only.
+      if (await handleTtsRoute({ tts }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
           user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
+          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox) },
           github: githubAccountView(db, who.userId),
-          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
+          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
       }
       if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
@@ -640,10 +683,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // open to agent tokens too, unlike the other /devices/:id routes.
       if (await handleBoxDefaultsRoute({ db, hub }, req, res, url, who)) return
       if (await handlePinsRoute({ db, hub }, req, res, url, who)) return
+      if (await handleArchiveRoute({ db, hub }, req, res, url, who)) return
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return
       // Coordinator consent approval (src/consent-http.js): the same answer
       // path the two client routes below use, gated on the Coordinator.
-      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap }, req, res, url, who)) return
+      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier, mediaDir }, req, res, url, who)) return
+      // Agent-to-agent file transfers (src/transfers-http.js): agent tokens
+      // only. Chunk bodies are streamed to disk there, never read here.
+      if (await handleTransferRoute({ db, hub, waker, mediaDir, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes }, req, res, url, who, { rejectEarly })) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
@@ -677,7 +724,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // agent caller's device list omits private devices; a client or a
         // private agent caller sees the full list, unchanged.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered }))
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered, summariser }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box
@@ -710,12 +757,33 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // Self-service change, client devices only — an agent (the bridge)
         // never holds/knows a user's password.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { old_password, new_password } = await readBody(req)
+        const { old_password, new_password, sign_out_others } = await readBody(req)
         if (typeof old_password !== 'string' || !old_password) return json(res, 400, { error: 'bad_request' })
+        if (sign_out_others !== undefined && typeof sign_out_others !== 'boolean') return json(res, 400, { error: 'bad_request' })
         if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
-        const r = await changePassword(db, who.userId, { oldPassword: old_password, newPassword: new_password })
+        // Wrong current passwords count against the username's lockout like a
+        // sign-in, so a stolen device token cannot grind the password here.
+        // One check per user at a time: parallel guesses would otherwise all
+        // pass the gate before the first failure is counted.
+        const r = await passwordChecks.run(who.userId, async () => {
+          const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
+          const gate = loginGuard.check(user.name)
+          if (!gate.allowed) return { locked: Math.ceil(gate.retryAfterMs / 1000) }
+          const out = await changePassword(db, who.userId, {
+            oldPassword: old_password, newPassword: new_password,
+            deviceId: who.deviceId, signOutOthers: sign_out_others === true,
+          })
+          if (out.ok) { loginGuard.ok(user.name); signInTickets.dropUser(who.userId) }
+          else if (!out.revoked) loginGuard.fail(user.name)
+          return out
+        })
+        if (r.locked) {
+          res.setHeader('Retry-After', r.locked)
+          return json(res, 429, { error: 'locked_out', retry_after: r.locked })
+        }
+        if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
-        return json(res, 200, { ok: true })
+        return json(res, 200, { ok: true, signed_out: r.signedOut })
       }
       if (req.method === 'GET' && url.pathname === '/devices') {
         // Management surface: client devices only, same gating as /password —
@@ -1278,23 +1346,53 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           await fs.promises.unlink(received.diskPath).catch(() => {})
           throw e
         }
-        // A user's voice note goes straight off to the cloud transcriber, so
-        // its words are usually ready before the message naming it is sent.
-        // An agent's upload is never a voice note to transcribe.
+        // A user's voice note (or a video's audio track) goes straight off
+        // to the cloud transcriber, so its words are usually ready before the
+        // message naming it is sent. An agent's upload is never transcribed
+        // at upload (it can still be asked for: POST /media/:id/transcript).
         const transcribing = who.kind !== 'agent' && !!blobTranscripts?.start(received.id, who.userId, contentType)
         return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}), ...(transcribing ? { transcript_status: 'pending' } : {}) })
       }
       const mt = url.pathname.match(/^\/media\/([^/]+)\/transcript$/)
       if (req.method === 'GET' && mt) {
         // The words of a voice note transcribed at upload (blob-transcripts.js):
-        // {status: 'none'|'pending'|'done'|'failed', transcript?}. ?wait=N
+        // {status: 'none'|'pending'|'done'|'failed', transcript?, segments?}
+        // — segments ([{start_ms, text}]) only for a video's. ?wait=N
         // (seconds, at most 30) holds a pending answer until the job settles,
         // so a bridge asks once instead of polling. Same read rule and same
         // 404 for missing-or-not-yours as GET /media/:id.
         const blob = getBlob(db, mt[1])
         if (!blob) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId && !canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
-        const waitS = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0))
+        const waitS = transcriptWaitS(url.searchParams.get('wait'))
+        const gone = new AbortController()
+        res.on('close', () => gone.abort())
+        const out = blobTranscripts
+          ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
+          : readBlobTranscript(db, blob.id)
+        if (gone.signal.aborted && !res.writable) return
+        return json(res, 200, out)
+      }
+      if (req.method === 'POST' && mt) {
+        // Ask the journal to (re)transcribe a note: one never transcribed
+        // here (the backlog was full at upload) or whose job failed is queued
+        // again ({status:'pending'}); one already 'done' or 'pending' answers
+        // as it stands and nothing re-runs. A full backlog answers 200
+        // {status:'none', reason:'busy'}, which an older bridge reads as none.
+        // A journal that cannot take it (no cloud transcriber, or a video
+        // without timed segments) answers the row as it stands, as the GET
+        // would. ?wait=N as on the GET. The owner's own blobs only — a
+        // colleague who may read the words may not spend the owner's
+        // transcription backlog — with the GET's 404 for everyone else.
+        const blob = getBlob(db, mt[1])
+        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        // Checked here too, so the 400 never depends on how the handler was wired.
+        if (!isTranscribableType(blob.content_type)) return json(res, 400, { error: 'not_transcribable' })
+        const asked = blobTranscripts ? blobTranscripts.retry(blob.id, who.userId) : 'unsupported'
+        if (asked === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (asked === 'not_transcribable') return json(res, 400, { error: 'not_transcribable' })
+        if (asked === 'busy') return json(res, 200, { status: 'none', reason: 'busy' })
+        const waitS = asked === 'queued' || asked === 'pending' ? transcriptWaitS(url.searchParams.get('wait')) : 0
         const gone = new AbortController()
         res.on('close', () => gone.abort())
         const out = blobTranscripts

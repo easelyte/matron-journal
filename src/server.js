@@ -7,6 +7,7 @@ const { resolve } = path
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
 import { parseOwnerUserId } from './owner-user-id.js'
 import { ensurePreapproveKey, resolvePreapproveKeyPath } from './preapprove-key.js'
@@ -21,7 +22,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
-import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -32,7 +33,10 @@ import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
+import { makeConfiguredMailer } from './mailer.js'
+import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
+import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
@@ -41,10 +45,13 @@ import { startUnseenNudge } from './unseen-nudge.js'
 import { makeRoutineFirer, startRoutinesSweep } from './routines-sweep.js'
 import { seedRoutines } from './routines.js'
 import { startStallWakeSweep } from './stall-wake.js'
+import { startAutoArchiveSweep } from './archive.js'
 import { sealStoredTokens } from './github-accounts.js'
-import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
+import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT, CONSENT_TRANSFER_DAILY_CAP_DEFAULT } from './consent.js'
+import { makeVerifier } from './verifier.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
+import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -374,11 +381,12 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // expiry runs FIRST: what it tombstones the later passes skip, so an old
 // tool log of such a device is never offloaded to a blob only to be
 // deleted, and the reaper sees the bytes it freed. Its rules are logged
-// once, here, at boot. Returns the interval handle (for close()) or null
-// only when ALL passes are disabled. The orphan-blob reaper
-// (runReapOrphanBlobs) runs after the media reaper, on its own knob
-// (MATRON_ORPHAN_BLOB_GRACE_HOURS).
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
+// once, here, at boot. The orphan-blob reaper (runReapOrphanBlobs) runs
+// after the media reaper, on its own knob (MATRON_ORPHAN_BLOB_GRACE_HOURS).
+// The transfer-expiry pass (runExpireTransfers) runs LAST and
+// unconditionally — see the comment at its call site below.
+// Returns the interval handle (for close()).
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -388,7 +396,12 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
   if (deviceRules) {
     console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
   }
-  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && deviceRules === null && orphanGraceHours === null) return null
+  // Transfer expiry (runExpireTransfers) has no knob and no disable path —
+  // unlike every pass above it deletes only bytes the state machine has
+  // already decided are done for (a collected copy past its grace, an
+  // uncollected one past 7 days), never "everything older than N" against
+  // a setting that could be misconfigured — so the schedule always runs,
+  // even when every other pass below is off.
   const run = () => {
     if (deviceRules !== null) {
       try {
@@ -443,6 +456,15 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
         console.error('retention: orphan-blob reap run failed', err)
       }
     }
+    // Agent-to-agent file transfers: a collected copy past its 1h grace,
+    // and an open or released transfer nobody collected within 7 days —
+    // always on, see the comment above.
+    try {
+      const r = runExpireTransfers(db, { mediaDir, hub })
+      if (r.deleted > 0 || r.expired > 0) console.log(`retention: transfers — ${r.deleted} copy/copies deleted, ${r.expired} expired after 7 days uncollected`)
+    } catch (err) {
+      console.error('retention: transfer expiry run failed', err)
+    }
   }
   run()
   const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
@@ -473,6 +495,28 @@ function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
     }
   }
   const interval = setInterval(run, walCheckpointIntervalMs ?? WAL_CHECKPOINT_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
+
+// Cached speech clips live 24 hours (src/cloud-tts.js). A clip past that age
+// is never served; this hourly pass is what takes it off the disk. Runs once
+// at boot too, for what a previous process left. Unref'd like the retention
+// timer; cleared in close(). null when speech is off.
+const TTS_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+
+function scheduleTtsSweep(tts, ttsSweepIntervalMs) {
+  if (!tts) return null
+  const run = () => {
+    try {
+      const r = tts.sweep()
+      if (r.removed > 0) console.log(`tts: removed ${r.removed} cached clip(s) older than 24h`)
+    } catch (err) {
+      console.error('tts: cache sweep failed', err)
+    }
+  }
+  run()
+  const interval = setInterval(run, ttsSweepIntervalMs ?? TTS_SWEEP_INTERVAL_MS)
   interval.unref()
   return interval
 }
@@ -532,7 +576,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 }
 
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
@@ -547,7 +591,18 @@ export function startServer({
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
   agentCommentClock = Date.now,
+  // Coordinator approvals of file transfers per rolling 24 h, counted apart
+  // from the daily cap above. 0 = no cap.
+  consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
+  // Approvals of the Coordinator's own routine-born asks per rolling 24 h
+  // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
+  consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
+  // The second opinion on those asks (src/verifier.js): off without a key,
+  // and then every routine-born own ask stays for the user.
+  verifier = makeVerifier(),
   stallWakeIntervalMs = null,
+  autoArchiveIntervalMs = null,
+  autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
   // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
@@ -559,11 +614,21 @@ export function startServer({
   mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
   fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, fileHomeDir,
   github, githubRefreshIntervalMs, webDir,
+  // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
+  // it off. `ttsCacheDir` overrides where the clips are kept.
+  tts, ttsCacheDir, ttsSweepIntervalMs,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
+  // POST /summarise (src/summarise.js): the test seam; `null` forces it
+  // off. Undefined resolves from MATRON_SUMMARY_ANTHROPIC_KEY(_FILE).
+  summariser,
+  // Password reset by email (src/mailer.js): the test seam; `null` forces
+  // it off. Undefined resolves from MATRON_RESEND_API_KEY(_FILE),
+  // MATRON_MAIL_FROM and MATRON_PUBLIC_URL.
+  mailer,
   // Unified search's similar tier (spec 2026-10-12 §5): the test seam — an
   // injected embedder (incl. `null` to force the tier off) bypasses
   // loadEmbedder entirely, so the suite never loads or downloads a real
@@ -602,6 +667,13 @@ export function startServer({
   db.pragma('wal_autocheckpoint = 0')
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
+  // Two-factor code steps (/login/2fa*): their own per-IP budget, sized for
+  // a code request or two per sign-in (src/two-factor-http.js).
+  const twoFactorLimiter = makeRateLimiter({ max: 10 })
+  const tickets = makeTwoFactorTickets()
+  if (isTwoFactorRequired(db) && !tokenBox.enabled) {
+    console.warn('two-factor: required for everyone, but MATRON_TOKEN_KEY is not set — nobody can enrol, so the requirement is not enforced')
+  }
   const resolvedPairs = pairs || makePairStore()
   const resolvedLinks = links || makeLinkStore({ db })
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
@@ -616,6 +688,11 @@ export function startServer({
   const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
+  // Agent-to-agent file transfers: a per-file cap and a per-user quota of
+  // their own, apart from the media ones (src/transfers.js).
+  const resolvedTransferMaxBytes = transferMaxBytes ?? resolveNumericEnv('MATRON_TRANSFER_MAX_BYTES', process.env.MATRON_TRANSFER_MAX_BYTES, TRANSFER_MAX_BYTES_DEFAULT)
+  const resolvedTransferUserQuotaBytes = transferUserQuotaBytes ?? resolveNumericEnv('MATRON_TRANSFER_USER_QUOTA_BYTES', process.env.MATRON_TRANSFER_USER_QUOTA_BYTES, TRANSFER_USER_QUOTA_BYTES_DEFAULT)
+  const resolvedTransferMaxAwaiting = transferMaxAwaitingPerSender ?? resolveNumericEnv('MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   // File Explorer read API config (spec §5.4). OPT-IN + fail-safe by design:
   //  - No roots configured (fileReadRoots opt absent AND MATRON_FILE_READ_ROOTS
@@ -770,6 +847,9 @@ export function startServer({
   // usage-limit reset has passed is woken so its bridge can carry on. No-op
   // without a waker; stopped in close().
   const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
+  // Auto-archive (src/archive.js): hourly, archives each user's idle
+  // conversations per their setting. MATRON_AUTO_ARCHIVE=0 stops it.
+  const autoArchiveSweep = startAutoArchiveSweep({ db, hub, enabled: autoArchive, ...(autoArchiveIntervalMs ? { intervalMs: autoArchiveIntervalMs } : {}) })
   const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
   // Coordinator routines (spec 2026-10-01): one firer per process (the
   // sweep and POST /routines/:key/run share its in-flight bound), the
@@ -809,11 +889,18 @@ export function startServer({
     blobTranscripts,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
+  // Speech for voice mode (spec 2026-10-03 voice mode, section 2): Azure,
+  // with MATRON_TTS_AZURE_KEY or, failing that, the transcription key. No
+  // key (or MATRON_TTS_DISABLED=1): null, and POST /tts answers 501.
+  const resolvedTts = tts === undefined
+    ? makeConfiguredTts({ cacheDir: resolveTtsCacheDir(resolvedDbPath, ttsCacheDir) })
+    : tts
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
   // the test seam; env otherwise. An empty client id disables the routes.
   const resolvedGithub = github !== undefined ? github : makeGithub({
     clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
     clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
+    deviceFlow: process.env.MATRON_GITHUB_DEVICE_FLOW !== '0',
     host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
   })
   // Static hosting of the web app (spec 2026-09-23 tracker web/teams). The
@@ -832,6 +919,8 @@ export function startServer({
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
+  const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
   // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
   // `.embedder` start null — /search/all answers `semantic: 'off'` until
   // (if ever) the embedder loads and the first index pass finishes, below.
@@ -845,17 +934,19 @@ export function startServer({
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
   const server = http.createServer(httpHandlerFactory({
-    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+    // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
+    transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     fileOwnerUserId: resolvedFileOwnerUserId,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -875,17 +966,19 @@ export function startServer({
   let retentionInterval = null
   let walCheckpointInterval = null
   let githubRefreshInterval = null
+  let ttsSweepInterval = null
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
         orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
+      ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
@@ -984,12 +1077,14 @@ export function startServer({
         pushPipeline,
         itemTranscription,
         blobTranscripts,
+        tts: resolvedTts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         isDiffBackfill,
         imageDimsBackfill,
         unseenNudge: unseenNudgeSweep,
         routinesSweep: routinesSweeper,
+        autoArchive: autoArchiveSweep,
         routineFirer,
         github: resolvedGithub,
         // close({ closeCode, closeReason, graceMs }): with a closeCode every
@@ -1007,7 +1102,9 @@ export function startServer({
           // `closing` right after its first pass (above) before ever
           // arming the timer this clears.
           if (semanticTimer) clearInterval(semanticTimer)
+          if (ttsSweepInterval) clearInterval(ttsSweepInterval)
           stallWakeSweep.stop()
+          autoArchiveSweep.stop()
           unseenNudgeSweep.stop()
           routinesSweeper.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
@@ -1028,6 +1125,9 @@ export function startServer({
             // embed call could otherwise still be mid-write when db.close()
             // below fires. Waiting for it here, alongside the other
             // background work, keeps that from racing a closed db handle.
+            // A POST /tts waiting on Azure would hold server.close() for up to
+            // its 20 s timeout: abort it, so the caller gets its 502 now.
+            if (resolvedTts) resolvedTts.close()
             server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)

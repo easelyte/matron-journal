@@ -12,11 +12,11 @@ import { refreshGithubAccount } from '../src/github-http.js'
 
 // A scripted stand-in for makeGithub(): poll/identity/exchange answers are
 // queues of thunks; an empty queue answers the default.
-function fakeGithub({ enabled = true, webFlow = false } = {}) {
+function fakeGithub({ enabled = true, webFlow = false, deviceFlow = enabled && !webFlow } = {}) {
   const q = { poll: [], identity: [], exchange: [], start: [] }
   const next = (k, fallback) => (q[k].length ? q[k].shift() : fallback)()
   return {
-    q, enabled, webFlow, host: 'github.com',
+    q, enabled, webFlow, deviceFlow, host: 'github.com',
     startDeviceFlow: async () => next('start', () => ({ device_code: 'dc', user_code: 'ABCD-1234', verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 900 })),
     pollDeviceFlow: async () => next('poll', () => ({ status: 'pending' })),
     authorizeUrl: (state) => `https://github.com/login/oauth/authorize?client_id=abc&scope=read%3Aorg&state=${state}`,
@@ -40,7 +40,7 @@ test('device flow end to end: start, poll pending, poll linked; /me shows the li
   const gh = fakeGithub()
   const { s, aliceTok, agent } = await fleet(t, gh)
   const me0 = await s.http('/me', { token: aliceTok })
-  assert.equal(me0.status, 200); assert.equal(me0.json.github, null); assert.deepEqual(me0.json.github_linking, { enabled: true, web_flow: false })
+  assert.equal(me0.status, 200); assert.equal(me0.json.github, null); assert.deepEqual(me0.json.github_linking, { enabled: true, web_flow: false, device_flow: true })
   assert.equal((await s.http('/github/link', { method: 'POST', token: agent.token, body: { flow: 'device' } })).status, 403, 'agents do not link accounts')
   const start = await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'device' } })
   assert.equal(start.status, 200)
@@ -224,7 +224,7 @@ test('refreshGithubAccount: a concurrent re-link is never clobbered by the old t
 
 test('not configured: every linking route is 404 not_configured; /me says so', async (t) => {
   const { s, aliceTok } = await fleet(t, fakeGithub({ enabled: false }))
-  assert.deepEqual((await s.http('/me', { token: aliceTok })).json.github_linking, { enabled: false, web_flow: false })
+  assert.deepEqual((await s.http('/me', { token: aliceTok })).json.github_linking, { enabled: false, web_flow: false, device_flow: false })
   const r = await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'device' } })
   assert.equal(r.status, 404); assert.equal(r.json.error, 'not_configured')
 })
@@ -304,4 +304,27 @@ test('with MATRON_TOKEN_KEY: link, refresh and unlink work; the plaintext token 
   const me2 = await s2.http('/me', { token: aliceTok2 })
   assert.equal(me2.json.github.login, 'AliceExample'); assert.equal(me2.json.github.state, 'ok')
   await s2.close()
+})
+
+test('device flow is off when the web flow is configured: start is 400 and /me says so', async (t) => {
+  const gh = fakeGithub({ webFlow: true })
+  const { s, aliceTok } = await fleet(t, gh)
+  assert.deepEqual((await s.http('/me', { token: aliceTok })).json.github_linking, { enabled: true, web_flow: true, device_flow: false })
+  assert.equal((await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'device' } })).status, 400)
+  assert.equal(gh.q.start.length, 0)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM github_link_flows WHERE flow='device'").get().n, 0, 'no flow row')
+  assert.equal((await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'web' } })).status, 200, 'web flow still works')
+})
+
+test('device flow turned off by the operator: start is 400 and a flow already in flight cannot finish', async (t) => {
+  const gh = fakeGithub()
+  const { s, aliceTok } = await fleet(t, gh)
+  const start = await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'device' } })
+  assert.equal(start.status, 200)
+  gh.deviceFlow = false
+  gh.q.poll.push(() => ({ status: 'ok', token: 'tok' }))
+  assert.equal((await s.http(`/github/link/${start.json.flow_id}/poll`, { method: 'POST', token: aliceTok })).status, 404)
+  assert.equal((await s.http('/me', { token: aliceTok })).json.github, null, 'nothing linked')
+  assert.equal((await s.http('/github/link', { method: 'POST', token: aliceTok, body: { flow: 'device' } })).status, 400)
+  assert.deepEqual((await s.http('/me', { token: aliceTok })).json.github_linking, { enabled: true, web_flow: false, device_flow: false })
 })

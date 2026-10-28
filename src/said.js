@@ -17,6 +17,13 @@
 //    onto the event (stamped transcript_by 'journal' — only when it was the
 //    blob's own transcript). A bridge-transcribed note (no journal transcript) is
 //    refused: an agent box wrote those words.
+//  - tapped: a `prompt_reply` event whose sender is `user:<account>` — the
+//    user's answer to a question card, by button or by the card's own text
+//    box. Only a client `prompt_reply` op writes one with that sender (a
+//    bridge's own release of a queue card is published as `agent:<box>`),
+//    so the answer is the user's as surely as a typed message. The words
+//    are the reply's free text, else its choice; `before` is the card it
+//    answers, an agent's question, never the user's words.
 //  - the bridge's "[Voice note transcription]: …" copy: an agent message,
 //    but agents find and cite it because it is the only searchable text a
 //    voice note leaves. The journal looks for the user's own voice note just
@@ -86,6 +93,18 @@ function journalTranscript(db, userId, ev) {
   return null
 }
 
+// The question card a prompt_reply answers, as context: { seq, sender, text },
+// or null when target_seq names no prompt of this conversation BEFORE the
+// reply (a card that came later cannot be what the user answered).
+function answeredPrompt(db, convoId, targetSeq, replySeq) {
+  if (!Number.isSafeInteger(targetSeq) || targetSeq <= 0 || targetSeq >= replySeq) return null
+  const r = db.prepare(`SELECT seq, sender, payload FROM events WHERE convo_id=? AND seq=? AND type='prompt'`).get(convoId, targetSeq)
+  if (!r) return null
+  const ev = parse(r)
+  const q = typeof ev.payload.question === 'string' ? ev.payload.question : ''
+  return { seq: ev.seq, sender: ev.sender, text: q.length > BEFORE_CHARS ? `${q.slice(0, BEFORE_CHARS)}…` : q }
+}
+
 function previousProse(db, convoId, seq) {
   const rows = db.prepare(`SELECT seq, sender, type, payload FROM events WHERE convo_id=? AND seq<? AND type IN ('text','diff') ORDER BY seq DESC LIMIT 20`).all(convoId, seq)
   for (const r of rows) {
@@ -115,6 +134,13 @@ function wordsOf(db, userId, ev) {
       return { reason: 'voice_not_transcribed_by_journal' }
     }
     return caption ? { kind: 'typed', text: caption } : { reason: 'no_text' }
+  }
+  if (ev.type === 'prompt_reply') {
+    const text = typeof p.text === 'string' ? p.text.trim() : ''
+    const choice = typeof p.choice === 'string' ? p.choice.trim()
+      : Number.isFinite(p.choice) ? String(p.choice) : ''
+    if (!text && !choice) return { reason: 'no_text' }
+    return { kind: 'tap', text: text || choice, ...(choice ? { choice } : {}) }
   }
   return { reason: 'not_a_message' }
 }
@@ -162,7 +188,9 @@ export function verifySaid(db, who, { convoId, seq }) {
   if (words.reason) {
     return { status: 200, body: { verified: false, convo_id: convoId, seq, sender: ev.sender, reason: words.reason } }
   }
-  const before = previousProse(db, convoId, ev.seq)
+  const before = ev.type === 'prompt_reply'
+    ? answeredPrompt(db, convoId, ev.payload.target_seq, ev.seq) ?? previousProse(db, convoId, ev.seq)
+    : previousProse(db, convoId, ev.seq)
   return {
     status: 200,
     body: {
@@ -175,6 +203,7 @@ export function verifySaid(db, who, { convoId, seq }) {
       kind: words.kind,
       text: words.text,
       ...(words.caption ? { caption: words.caption } : {}),
+      ...(words.choice ? { choice: words.choice } : {}),
       before,
     },
   }

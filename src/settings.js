@@ -2,6 +2,8 @@
 // screen's (mission: For you). Pure reads and writes over user_settings;
 // src/settings-http.js is the surface, and hello_ok carries settingsView.
 //
+import { getAutoArchiveDays } from './archive.js'
+
 // notices — "Send things I need to read to For you". On: bridges tell new
 // sessions to file what the user should read as `notice` items, and the
 // unseen lists skip what an open item already covers (src/seen.js). Off:
@@ -30,7 +32,10 @@ export function setAutoApproveCoordinatorSpawns(db, userId, on, now = Date.now()
     .run(userId, on ? 1 : 0, now)
 }
 
+// auto_archive_days: archive conversations idle this long (src/archive.js);
+// 0 = off.
 export const settingsView = (db, userId) => ({
   notices: getNoticesEnabled(db, userId),
   auto_approve_coordinator_spawns: getAutoApproveCoordinatorSpawns(db, userId),
+  auto_archive_days: getAutoArchiveDays(db, userId),
 })

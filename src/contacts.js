@@ -99,7 +99,7 @@ export function isMutual(db, row) {
 export function parkedAsks(db, deviceId) {
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
+    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner')) AS n`).get({ d: deviceId }).n
 }
 
 function upsertOwn(db, { userId, peer, state, requestedBy, convoId, deviceId, now }) {
@@ -121,15 +121,22 @@ const setState = (db, id, state, now, extra = '') =>
 
 // Revokes every grant that is or may become live between two contact rows,
 // in both directions (spec: "removal revokes every grant between the two").
-// Returns the rows as they stood BEFORE, for the events layer.
+// Returns the rows as they stood BEFORE, for the events layer. An accepted
+// hand-over (level owner, active) is a record of something done, not
+// access, and is left as it is.
+const LIVE_NOT_HANDED = `state IN ${LIVE_GRANT_STATES} AND NOT (level = 'owner' AND state = 'active')`
 function revokeGrantsBetween(db, contactIds, now) {
   const ids = contactIds.filter(Boolean)
   if (!ids.length) return []
   const marks = ids.map(() => '?').join(',')
-  const rows = db.prepare(`SELECT * FROM grants WHERE contact_id IN (${marks}) AND state IN ${LIVE_GRANT_STATES}`).all(...ids)
+  const rows = db.prepare(`SELECT * FROM grants WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED}`).all(...ids)
   if (rows.length) {
-    db.prepare(`UPDATE grants SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=?
-      WHERE contact_id IN (${marks}) AND state IN ${LIVE_GRANT_STATES}`).run(now, now, ...ids)
+    // An ask the owner had not approved was never sent: its brief goes with
+    // it, as when any other path ends one (grants.js forgetBrief).
+    db.prepare(`UPDATE grants SET brief=NULL, exclude_media=NULL, keep_level=NULL, approved=NULL
+      WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED} AND (state='awaiting_owner' OR pending_state='awaiting_owner')`).run(...ids)
+    db.prepare(`UPDATE grants SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=?, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL
+      WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED}`).run(now, now, ...ids)
   }
   return rows
 }

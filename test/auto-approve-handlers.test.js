@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { append, upsertConversation } from '../src/journal.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { setConsentEnabled } from '../src/consent.js'
 import { setAutoApproveCoordinatorSpawns } from '../src/settings.js'
@@ -29,7 +29,12 @@ async function fixture(t) {
   const calls = []
   const broker = { issue: async (...args) => { calls.push(args); return { ok: true, result: { convo_id: 'child' } } } }
   const ctx = { db, hub, conn, broker, spawnStartTimeoutMs: 1234 }
-  const request = (from = 'coordinator') => handleOp({ ...ctx, msg: { op: 'spawn_request', request_id: 'req', from_convo_id: from, target_device_id: target.deviceId, workdir: '/project', task: 'Run checks' } })
+  // The user's verified words in the asking conversation: the cause the
+  // Coordinator own-ask rule needs before an ask may be auto-approved.
+  const request = (from = 'coordinator') => {
+    const { seq } = append(db, { userId: user.id, convoId: from, sender: 'user:user', type: 'text', payload: { body: 'start a helper' } })
+    return handleOp({ ...ctx, msg: { op: 'spawn_request', request_id: 'req', from_convo_id: from, target_device_id: target.deviceId, workdir: '/project', task: 'Run checks', causes: [{ kind: 'user_message', ref: `${from}:${seq}` }] } })
+  }
   return { db, hub, user, parent, target, targetConn, frames, calls, ctx, request }
 }
 
@@ -88,7 +93,7 @@ test('settings handler accepts partial changes, rejects invalid values and agent
     await handleSettingsRoute(f.ctx, req, res, new URL('http://localhost/settings'), { userId: f.user.id, kind })
     return res
   }
-  const defaults = { notices: true, auto_approve_coordinator_spawns: false }
+  const defaults = { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 30 }
   assert.deepEqual((await route('GET')).body, defaults)
   for (const value of [null, 0, 'true', [], {}]) {
     assert.equal((await route('PATCH', { notices: false, auto_approve_coordinator_spawns: value })).status, 400)
@@ -98,7 +103,7 @@ test('settings handler accepts partial changes, rejects invalid values and agent
   assert.equal((await route('PATCH', {})).status, 400)
   assert.equal((await route('PATCH', { other: true })).status, 400)
   assert.deepEqual((await route('PATCH', { auto_approve_coordinator_spawns: true })).body, { ...defaults, auto_approve_coordinator_spawns: true })
-  assert.deepEqual((await route('PATCH', { notices: false })).body, { notices: false, auto_approve_coordinator_spawns: true })
-  assert.deepEqual(f.frames.filter((x) => x.op === 'settings').at(-1).settings, { notices: false, auto_approve_coordinator_spawns: true })
+  assert.deepEqual((await route('PATCH', { notices: false })).body, { ...defaults, notices: false, auto_approve_coordinator_spawns: true })
+  assert.deepEqual(f.frames.filter((x) => x.op === 'settings').at(-1).settings, { ...defaults, notices: false, auto_approve_coordinator_spawns: true })
   assert.deepEqual((await route('PUT', defaults)).body, defaults)
 })

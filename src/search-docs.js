@@ -23,7 +23,9 @@ const SOURCES = [
   { kind: 'milestone', table: 'milestones', field: 'text', body: (r) => `trim(${r}.title || ' ' || ${r}.body)`, when: () => '1' },
   { kind: 'item', table: 'items', field: 'text',
     body: (r) => `trim(${r}.title || ' ' || ${r}.body || ' ' || (SELECT coalesce(group_concat(value,' '),'') FROM json_each(${r}.labels)))`, when: () => '1' },
-  { kind: 'comment', table: 'item_comments', field: 'text', body: (r) => `${r}.body`, when: (r) => `${r}.kind = 'comment' AND trim(${r}.body) <> ''` },
+  // A reply the user withdrew (src/withdrawn-comments.js) is not searchable.
+  { kind: 'comment', table: 'item_comments', field: 'text', body: (r) => `${r}.body`,
+    when: (r) => `${r}.kind = 'comment' AND trim(${r}.body) <> '' AND ${r}.withdrawn_at IS NULL`, recreate: true },
   { kind: 'memory', table: 'memories', field: 'text', body: (r) => `trim(${r}.name || ' ' || ${r}.description || ' ' || ${r}.body)`, when: () => '1' },
   { kind: 'project', table: 'projects', field: 'title', body: (r) => `trim(${r}.title || ' ' || ${r}.body)`, when: () => '1' },
   { kind: 'project', table: 'projects', field: 'status', body: (r) => `${r}.status`, when: (r) => `coalesce(${r}.status,'') <> ''` },
@@ -74,9 +76,16 @@ function upsertSql(s, r) {
     DELETE FROM search_docs WHERE kind='${s.kind}' AND ref_id=${r}.id AND field='${s.field}' AND NOT (${s.when(r)});`
 }
 
+// A source whose rule changed carries `recreate`: its triggers are dropped
+// and made again at every start, since CREATE TRIGGER IF NOT EXISTS
+// would keep the old rule on an existing database.
 function triggersFor(s) {
   const name = `sd_${s.table}_${s.field}`
-  return `
+  const drop = s.recreate ? `
+DROP TRIGGER IF EXISTS ${name}_ai;
+DROP TRIGGER IF EXISTS ${name}_au;
+DROP TRIGGER IF EXISTS ${name}_ad;` : ''
+  return `${drop}
 CREATE TRIGGER IF NOT EXISTS ${name}_ai AFTER INSERT ON ${s.table} BEGIN ${upsertSql(s, 'new')} END;
 CREATE TRIGGER IF NOT EXISTS ${name}_au AFTER UPDATE ON ${s.table} BEGIN ${upsertSql(s, 'new')} END;
 CREATE TRIGGER IF NOT EXISTS ${name}_ad AFTER DELETE ON ${s.table} BEGIN

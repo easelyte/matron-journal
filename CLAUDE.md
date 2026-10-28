@@ -31,3 +31,11 @@ commit messages, title or description match one of its private patterns.
 It reports only a rule number and a location; fix the named places and push
 again. It cannot read images or videos: a new one only gets a warning, so
 check every screenshot by eye before adding it.
+
+## Running a local journal
+
+Start a local journal with `bin/matron-journal` (or `npm start`, which runs
+it), not `node src/server.js`. On macOS it then runs from a copy of node
+named `matron-journal`, so per-app firewalls show it under its own name
+instead of as `node`; elsewhere it just runs node. `MATRON_NAMED_NODE=0`
+opts out.

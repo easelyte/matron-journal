@@ -31,13 +31,13 @@ export const COPY_BODY_MAX = 16000
 const JOURNAL = 'journal'
 const TITLE_CAP = 120
 
-const safely = (what, fn) => { try { return fn() } catch (err) { console.error(`person rooms: ${what} failed (the row stands)`, err); return null } }
-const t = (s, n = TITLE_CAP) => plain(sanitizePeerText(s ?? '', n))
-const deviceName = (db, id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name ?? 'agent'
+export const safely = (what, fn) => { try { return fn() } catch (err) { console.error(`person rooms: ${what} failed (the row stands)`, err); return null } }
+export const t = (s, n = TITLE_CAP) => plain(sanitizePeerText(s ?? '', n))
+export const deviceName = (db, id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name ?? 'agent'
 const sessionTitle = (db, convoId) => db.prepare('SELECT title FROM conversations WHERE id=?').get(convoId)?.title ?? ''
-const roomLink = (id) => ({ url: consentLink('room', id), title: 'Room with another person' })
+export const roomLink = (id) => ({ url: consentLink('room', id), title: 'Room with another person' })
 const shareLink = (id) => ({ url: consentLink('session', id), title: 'Session share' })
-const missionWords = (l) => (l.mission_id ? `mission #${l.mission_num} ${t(l.mission_title)}` : null)
+export const missionWords = (l) => (l.mission_id ? `mission #${l.mission_num} ${t(l.mission_title)}` : null)
 
 // A frame for one agent device, routed by that device's OWN user — the hub
 // keeps each user's sockets apart, and the two agents of a person room
@@ -55,7 +55,7 @@ function fanParticipants({ db, hub }, userId, roomId) {
 
 // What the room's members can do in a turn the other person started, in the
 // words both cards use.
-function scopeWords(l, side) {
+export function scopeWords(l, side) {
   const m = missionWords(l)
   if (side === 'owner') {
     return m
@@ -67,7 +67,7 @@ function scopeWords(l, side) {
     : `In a turn started by ${t(l.owner_name)}'s side, your agent may only reply in the room. Anything more needs your tap.`
 }
 
-function cardPayload(db, l, direction) {
+export function cardPayload(db, l, direction) {
   return {
     kind: ROOM_CARD_KIND, direction, room_link_id: l.id,
     person: { name: direction === 'out' ? l.guest_name : l.owner_name },
@@ -134,14 +134,14 @@ function guestAsk(ctx, l) {
 
 // The owner agent's ask was refused somewhere along the way: the same
 // synthetic answer an expired or refused same-user invite gets.
-function refuseToOwner(ctx, l, reason) {
+export function refuseToOwner(ctx, l, reason) {
   toDevice(ctx, l.owner_user_id, l.owner_device_id, {
     kind: 'invite', event: 'answer', room_id: l.owner_room_id, peer_device_id: l.guest_device_id, accept: false, reason,
     person: { name: l.guest_name },
   })
 }
 
-const roomAudit = (ctx, userId, l, side, event, summary, by = null) => audit(ctx, userId, {
+export const roomAudit = (ctx, userId, l, side, event, summary, by = null) => audit(ctx, userId, {
   event, summary, by,
   extra: { room_link_id: l.id, person: { name: side === 'owner' ? l.guest_name : l.owner_name }, room_id: side === 'owner' ? l.owner_room_id : l.guest_room_id },
 })
@@ -269,7 +269,7 @@ export function onPersonRoomEnded(ctx, before, by) {
     if (by !== 'owner_agent') refuseToOwner(ctx, l, 'left')
     return
   }
-  if (l.state === 'awaiting_guest') {
+  if (l.state === 'awaiting_guest' || l.state === 'starting') {
     closeMirror(ctx, { userId: l.guest_user_id, itemId: l.guest_item_id, consent: 'room', resolution: 'cancelled', author: 'agent', comment: words('guest') })
     if (by !== 'owner_agent') refuseToOwner(ctx, l, 'left')
   }
@@ -288,9 +288,19 @@ export function onPersonRoomEnded(ctx, before, by) {
     }
   }
   roomAudit(ctx, l.owner_user_id, l, 'owner', 'room.ended', words('owner'))
-  if (l.state !== 'awaiting_owner') roomAudit(ctx, l.guest_user_id, l, 'guest', 'room.ended', words('guest'))
+  // Only a guest who was ever told of the link hears that it ended: not
+  // before the owner's approval, and not a talk request held back because
+  // the guest had blocked the owner (it never reached them; a frame naming
+  // it would be the first they hear of it).
+  const guestWasTold = l.state !== 'awaiting_owner' && (l.kind !== 'talk' || l.guest_item_id != null || l.guest_room_id != null)
+  if (guestWasTold) roomAudit(ctx, l.guest_user_id, l, 'guest', 'room.ended', words('guest'))
   changed(ctx, l.owner_user_id, { room_link_id: l.id })
-  changed(ctx, l.guest_user_id, { room_link_id: l.id })
+  if (guestWasTold) changed(ctx, l.guest_user_id, { room_link_id: l.id })
+  // The contact request the talk made, ended with it (endPersonRoom).
+  if (l.ended_contact) {
+    changed(ctx, l.ended_contact.own.user_id, { contact_id: l.ended_contact.own.id })
+    if (l.ended_contact.peer) changed(ctx, l.ended_contact.peer.user_id, { contact_id: l.ended_contact.peer.id })
+  }
 }
 
 export function endAndNotify(ctx, linkId, by, to = 'left') {
@@ -303,7 +313,7 @@ export function endAndNotify(ctx, linkId, by, to = 'left') {
 // ends, both ways round.
 export function onContactEndedRooms(ctx, userA, userB) {
   for (const l of safely('links', () => linksBetween(ctx.db, userA, userB)) ?? []) {
-    endAndNotify(ctx, l.id, 'contact_removed', l.state === 'awaiting_owner' || l.state === 'awaiting_guest' ? 'withdrawn' : 'left')
+    endAndNotify(ctx, l.id, 'contact_removed', ['awaiting_owner', 'awaiting_guest', 'starting'].includes(l.state) ? 'withdrawn' : 'left')
   }
 }
 
@@ -360,10 +370,11 @@ export function copyRoomMessage(ctx, { userId, convoId, sender, type, payload, s
 // wake: the invite delivery that follows is what reaches the guest's agent,
 // and its backlog read finds these.
 export const BACKFILL_MAX = 50
+// `+user_id` keeps the read on idx_events_convo, as isFreshRoom's.
 function backfillTwin(ctx, l) {
   const { db, hub } = ctx
   safely('backfill', () => {
-    const rows = db.prepare(`SELECT seq, sender, payload FROM events WHERE user_id=? AND convo_id=? AND type='text'
+    const rows = db.prepare(`SELECT seq, sender, payload FROM events WHERE +user_id=? AND convo_id=? AND type='text'
       AND sender <> 'journal' AND sender NOT LIKE 'person:%' ORDER BY seq DESC LIMIT ?`).all(l.owner_user_id, l.owner_room_id, BACKFILL_MAX).reverse()
     const copySender = `${PERSON_SENDER_PREFIX}${l.owner_name}`
     for (const r of rows) {

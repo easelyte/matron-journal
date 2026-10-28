@@ -16,11 +16,13 @@ import {
 } from './missions.js'
 import { notifyGrantees } from './sharing-events.js'
 import { getProject } from './projects.js'
+import { handoverInFlight } from './handover.js'
 import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { canReadConvo } from './visibility.js'
+import { handleContributedMilestone, handleContributorMissionPatch } from './contribute-http.js'
 
 const STATES = ['open', 'closed']
 
@@ -220,6 +222,11 @@ async function handlePatch(ctx, req, res, who, mission) {
     const ref = projectRefOf(db, who, body.project)
     if (refusedProjectRef(res, ref)) return true
     fields.projectId = ref.projectId
+    // A hand-over in flight was approved for a set of missions: the mission,
+    // the project it leaves and the project it joins all stay as they are
+    // until it ends (src/handover.js).
+    if (ref.projectId !== mission.project_id && [['mission', mission.id], ['project', mission.project_id], ['project', ref.projectId]]
+      .some(([kind, id]) => id && handoverInFlight(db, kind, id))) return conflict(res, { blocked_by: 'handover_pending' })
   }
   if (Object.keys(fields).length === 0) return badRequest(res)
   const statusWriter = typeof fields.status === 'string'
@@ -373,6 +380,12 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   if (body.mission != null && typeof body.mission !== 'string' && typeof body.mission !== 'number') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
+  // An `ms_…` id that is not the caller's own: another person's mission
+  // the caller may contribute to (src/contribute-http.js).
+  if (typeof body.mission === 'string' && body.mission.startsWith('ms_') && !visibleMission(db, who, body.mission)
+      && !db.prepare('SELECT 1 FROM missions WHERE id=? AND user_id=?').get(body.mission, who.userId)) {
+    return handleContributedMilestone(ctx, res, who, body, { writableConvo })
+  }
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
   const sender = senderOf(db, who)
   const excludePrivateOwned = filteredAgent(db, who)
@@ -507,7 +520,14 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
         : grantedMissionDetail(db, granted))
       return true
     }
-    // Readable, not writable: a read grant never passes canWriteMission.
+    // A contributor sets the status, and nothing else (contribute-http.js);
+    // a read grant never writes.
+    // As for items: a mission also visible through the org rule still takes
+    // a contributor's status.
+    if (!sub && req.method === 'PATCH') {
+      const viaGrant = granted ?? getGrantedMission(db, who.userId, idOrNum)
+      if (viaGrant) return handleContributorMissionPatch(ctx, req, res, who, viaGrant)
+    }
     json(res, 403, { error: 'forbidden' })
     return true
   }

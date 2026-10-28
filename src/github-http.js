@@ -80,6 +80,10 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
       json(res, 200, { url: github.authorizeUrl(state) })
       return true
     }
+    // Off whenever the web flow is configured, or by the operator: see
+    // makeGithub. A client asking for it then gets the same 400 as a web
+    // flow without a secret, and /me says which flows are on.
+    if (!github.deviceFlow) return badRequest(res)
     let start
     try { start = await github.startDeviceFlow() } catch (err) { if (err instanceof GithubError) return upstream(res); throw err }
     // GitHub's expires_in has no upper bound; the spec caps every link flow
@@ -94,6 +98,8 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
 
   const m = path.match(/^\/github\/link\/([^/]+)\/poll$/)
   if (m && req.method === 'POST') {
+    // A flow started before the device flow was turned off cannot finish.
+    if (!github.deviceFlow) return notFound(res)
     // Peek without consuming: a pending poll must leave the row in place.
     const row = db.prepare("SELECT * FROM github_link_flows WHERE id=? AND flow='device' AND user_id=? AND expires_at > ?").get(m[1], who.userId, Date.now())
     if (!row) return notFound(res)

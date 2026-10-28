@@ -56,9 +56,10 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
 - \`GET /said/<convo>:<seq>\` — did your user really write this? For an
   agent checking a \`<convo>:<seq>\` citation another agent gave it, on any box's
   conversation of this account (private-owned ones 404 for an ordinary
-  agent). \`{verified: true, seq, ts, author, kind: 'typed'|'voice', text,
-  caption?, cited_seq?, before}\` when it is a message the user sent from an
-  app, or a voice note with the words the journal itself transcribed;
+  agent). \`{verified: true, seq, ts, author, kind: 'typed'|'voice'|'tap', text,
+  caption?, choice?, cited_seq?, before}\` when it is a message the user sent from an
+  app, a voice note with the words the journal itself transcribed, or the
+  user's answer on a question card (\`tap\`: \`before\` is the card);
   citing a bridge's \`[Voice note transcription]\` copy answers with the
   user's own note (\`seq\`) and the journal's words (\`cited_seq\` = what
   you cited). \`before\` is the message just before it, with its sender —
@@ -182,7 +183,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /settings\` → \`{notices}\` — whether the user wants things to read filed as \`notice\` items (default true; \`hello_ok\` carries it as \`settings\`, and a change arrives as \`{kind:'control', op:'settings', settings}\`). \`PATCH /settings {notices}\` is the user's alone.
 - \`GET /coordinator\` → \`{convo_id, consent}\` — the user's Coordinator, and whether it may approve chats and spawns
 - \`GET /consent/pending?convo_id=<coordinator convo>\` → \`{pending:[…]}\` — parked chat invites, join requests and spawn requests (Coordinator only)
-- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails)
+- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails). Approving the Coordinator's OWN ask needs its \`causes\` to resolve to the user's words or item reply/tap (else 403 own_ask_unverified), or to a routine fire inside the routine's envelope (403 envelope), passed by the verifier (403 verifier / 409 verifier_unavailable) and under the routine cap (409 routine_cap)
   conversation, or null. Only the user sets it; you hear a change as a
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /defaults\` → \`{default_model, default_effort}\` — the user's default
@@ -220,21 +221,31 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a
   prompt the journal fires into the Coordinator conversation on a
   \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips
-  (\`{kind: context_over|disk_under, pct}\` or \`{kind: stalled,
-  reset_minutes}\`), by \`name\`. \`GET /routines/:name\` (or the \`rt_…\` id)
+  (\`{kind: context_over|disk_under, pct}\`, \`{kind: stalled,
+  reset_minutes}\` or \`{kind: allowance_expiring, pct, from_hours?,
+  to_hours?}\` or \`{kind: allowance_expiring, tiers: [{unused_pct,
+  hours_left}]}\`), by \`name\`. \`GET /routines/:name\` (or the \`rt_…\` id)
   → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
   \`last_outcome\`.
 - \`POST /routines\` \`{name, title, schedule | trigger, prompt (≤2000),
-  tz? (default Europe/London), enabled?, convo_id}\` → 201 \`{routine}\`;
+  tz? (default Europe/London), enabled?, envelope?, convo_id}\` → 201 \`{routine}\`;
   \`PATCH /routines/:name\` \`{title?, schedule?, trigger?, tz?, prompt?,
-  enabled?, convo_id}\` → 200 (a routine stays scheduled or triggered).
+  enabled?, envelope? (null clears), convo_id}\` → 200 (a routine stays
+  scheduled or triggered). \`envelope\` \`{spawns_per_fire (0-50), chats,
+  boxes: [names] | null}\` bounds what an ask born of a fire may do.
   Agents: the Coordinator only, naming its own conversation as
   \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
-  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the user's
-  alone (403 for every agent): pause with \`enabled: false\` instead.
+  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE /routines/:name\`
+  \`{convo_id}\` takes the same Coordinator gate and needs no \`causes\`.
 - \`POST /routines/:name/run\` \`{convo_id}\` → 202 — fire it now, whatever
   \`enabled\` says; the schedule is untouched. Every change and fire lands as
   a quiet \`routine\` event in the Coordinator conversation.
+- Creating, rewriting (\`prompt\`, \`schedule\`, \`trigger\`, \`envelope\`) and
+  running a routine needs the user's ask: your bridge sends the turn's
+  \`causes\`, and they must be the user's words in your conversation or the
+  user's comment on one of your items — a routine fire is not enough. 403
+  \`routine_write_unverified\` (with \`why\`) otherwise; ask the user, or
+  leave it for them. Pausing, retitling and \`tz\` need no ask.
 - \`POST /briefings\` \`{convo_id, body (markdown, ≤32 KB)}\` → 201
   \`{briefing}\` — publish a briefing (Coordinator only, naming its own
   conversation). The journal writes it into that conversation as your
@@ -351,9 +362,16 @@ close or merge.
 
 - \`POST /media\` (raw body, Content-Type captured) →
   \`{media_id, size, content_type, sha256}\`; fetch with \`GET /media/:id\`.
-- \`GET /media/:id/transcript?wait=N\` → \`{status, transcript?}\` — a
-  voice note's words when the journal transcribed it at upload (\`status\`
-  none|pending|done|failed; \`wait\` ≤ 30 s holds a pending answer).
+- \`GET /media/:id/transcript?wait=N\` → \`{status, transcript?, segments?}\`
+  — a voice note's words (or a video's, with \`segments\`
+  \`[{start_ms, text}]\`) when the journal transcribed it at upload
+  (\`status\` none|pending|done|failed; \`wait\` ≤ 30 s holds a pending
+  answer).
+- \`POST /media/:id/transcript?wait=N\` — your user's own note: asks the
+  journal to try a none/failed one again (→ pending) when it has a cloud
+  transcriber, otherwise the row as it stands; done/pending answer as they
+  stand, nothing re-runs; \`{status:'none', reason:'busy'}\` = backlog
+  full, try later; 400 \`not_transcribable\` for non audio/video.
 `
 
 /**

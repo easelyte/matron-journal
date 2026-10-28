@@ -18,6 +18,7 @@ import { topLevelActiveCount } from './mission-links.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
+import { recordSpawnStart } from './cause-hops.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -33,12 +34,14 @@ import { startReplyFallback } from './spawn-model.js'
 //
 // `agent` is 'claude' | 'codex' when the requester named one, else NULL:
 // the target bridge then starts its own box default.
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, missionInherited = false, now = Date.now() }) {
+// `causes`: the asking turn's causes, already normalised at the ws boundary
+// (src/ask-causes.js) — stored as JSON, NULL when the ask carried none.
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, missionInherited = false, causes = null, now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, model, effort, agent, link, mission_num, mission_inherited, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, missionInherited && missionNum ? 1 : 0, now)
+      workdir, task, topic, model, effort, agent, link, mission_num, mission_inherited, causes, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, missionInherited && missionNum ? 1 : 0, causes ? JSON.stringify(causes) : null, now)
   return { id }
 }
 
@@ -484,7 +487,10 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     }
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
       {
-        workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}),
+        // spawn_id: the child's bridge names it on the opening turn's cause,
+        // so the journal can follow the child's asks back to this spawn
+        // (cause-hops.js). A bridge predating it ignores the key.
+        workdir: row.workdir, prompt: row.task, spawn_id: row.id, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}),
         // Omit-when-absent like model: a bridge predating the field never
         // sees the key; one that knows it names the mission in the opening turn.
         ...(row.mission_num ? { mission_num: row.mission_num } : {}),
@@ -514,6 +520,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
+      recordSpawnStart(db, { row, childConvoId: r.result.convo_id })
       // Before the room retitle and the outcome: the parent (and every app)
       // must never hear `started` for a child that is not yet on its mission.
       joinSpawnMission(db, hub, row, r.result.convo_id)

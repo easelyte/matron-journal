@@ -20,7 +20,7 @@ async function seedDb() {
 test('user_settings exists with the contract columns', () => {
   const db = openDb(':memory:')
   const cols = db.prepare('PRAGMA table_info(user_settings)').all().map((c) => c.name)
-  assert.deepEqual(cols, ['user_id', 'coordinator_convo_id', 'coordinator_consent', 'auto_approve_coordinator_spawns', 'updated_at', 'routines_seeded_at', 'notify_prefs', 'default_model', 'default_effort', 'notices'])
+  assert.deepEqual(cols, ['user_id', 'coordinator_convo_id', 'coordinator_consent', 'auto_approve_coordinator_spawns', 'updated_at', 'routines_seeded_at', 'notify_prefs', 'default_model', 'default_effort', 'notices', 'auto_archive_days', 'coordinator_transfer_consent'])
 })
 
 test('coordinator setting: unset reads null; set, unchanged, switch and clear report previous/current/changed', async () => {
@@ -73,9 +73,9 @@ const roleEvents = (s) => s.db.prepare("SELECT convo_id, sender, payload FROM ev
 
 test('GET/PUT /coordinator gates: both kinds read; agent PUT 403; foreign/unknown 404; junk 400; nothing written', async (t) => {
   const { s, agent, client } = await fleet(t)
-  assert.deepEqual((await s.http('/coordinator', { token: client })).json, { convo_id: null, consent: true })
+  assert.deepEqual((await s.http('/coordinator', { token: client })).json, { convo_id: null, consent: true, transfer_consent: false })
   const asAgentGet = await s.http('/coordinator', { token: agent.token })
-  assert.equal(asAgentGet.status, 200); assert.deepEqual(asAgentGet.json, { convo_id: null, consent: true })
+  assert.equal(asAgentGet.status, 200); assert.deepEqual(asAgentGet.json, { convo_id: null, consent: true, transfer_consent: false })
   assert.equal((await s.http('/coordinator')).status, 401)
   const asAgent = await put(s, agent.token, 'c1')
   assert.equal(asAgent.status, 403); assert.deepEqual(asAgent.json, { error: 'forbidden' })
@@ -94,29 +94,29 @@ test('PUT /coordinator: assign emits assigned live to the owning bridge; unchang
   const bridge = await makeWsClient(s.base, { token: agent.token, cursor: null })
   await bridge.waitFor((f) => f.op === 'hello_ok')
   let r = await put(s, client, 'c1')
-  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: 'c1', consent: true })
+  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: 'c1', consent: true, transfer_consent: false })
   const live = await bridge.waitFor((f) => f.kind === 'journal' && f.type === 'coordinator')
   assert.equal(live.convo_id, 'c1'); assert.deepEqual(live.payload, { role: 'assigned' }); assert.equal(live.sender, 'user:alice')
   bridge.close()
   assert.deepEqual(roleEvents(s), [{ convo_id: 'c1', sender: 'user:alice', role: 'assigned' }])
 
   r = await put(s, client, 'c1')
-  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: 'c1', consent: true })
+  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: 'c1', consent: true, transfer_consent: false })
   assert.equal(roleEvents(s).length, 1, 'an unchanged PUT emits no events')
 
   r = await put(s, client, 'c2')
-  assert.deepEqual(r.json, { convo_id: 'c2', consent: true })
+  assert.deepEqual(r.json, { convo_id: 'c2', consent: true, transfer_consent: false })
   assert.deepEqual(roleEvents(s).slice(1), [
     { convo_id: 'c1', sender: 'user:alice', role: 'released' },
     { convo_id: 'c2', sender: 'user:alice', role: 'assigned' },
   ])
 
   r = await put(s, client, null)
-  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: null, consent: true })
+  assert.equal(r.status, 200); assert.deepEqual(r.json, { convo_id: null, consent: true, transfer_consent: false })
   assert.deepEqual(roleEvents(s).slice(3), [{ convo_id: 'c2', sender: 'user:alice', role: 'released' }], 'clearing emits released only')
   await put(s, client, null)
   assert.equal(roleEvents(s).length, 4, 'clearing twice emits nothing the second time')
-  assert.deepEqual((await s.http('/coordinator', { token: agent.token })).json, { convo_id: null, consent: true })
+  assert.deepEqual((await s.http('/coordinator', { token: agent.token })).json, { convo_id: null, consent: true, transfer_consent: false })
 })
 
 test('a coordinator event cannot be forged through an agent publish', async (t) => {
@@ -136,9 +136,9 @@ test('GET /coordinator hides a private-owned coordinator from an ordinary agent,
   pinDevicePrivate(s.db, priv.deviceId, true)
   upsertConversation(s.db, { id: 's1', ownerUserId: alice.id, title: 'S1', agentDeviceId: priv.deviceId })
   assert.equal((await put(s, client, 's1')).status, 200)
-  assert.deepEqual((await s.http('/coordinator', { token: client })).json, { convo_id: 's1', consent: true })
-  assert.deepEqual((await s.http('/coordinator', { token: priv.token })).json, { convo_id: 's1', consent: true })
-  assert.deepEqual((await s.http('/coordinator', { token: agent.token })).json, { convo_id: null, consent: true })
+  assert.deepEqual((await s.http('/coordinator', { token: client })).json, { convo_id: 's1', consent: true, transfer_consent: false })
+  assert.deepEqual((await s.http('/coordinator', { token: priv.token })).json, { convo_id: 's1', consent: true, transfer_consent: false })
+  assert.deepEqual((await s.http('/coordinator', { token: agent.token })).json, { convo_id: null, consent: true, transfer_consent: false })
 })
 
 const helloOf = async (s, token) => {
@@ -200,5 +200,5 @@ test('PUT /coordinator: a failing assigned append during a switch rolls back the
   // Next attempt, with the disk back, still works (nothing was wedged).
   const recovered = await put(s, client, 'c2')
   assert.equal(recovered.status, 200)
-  assert.deepEqual(recovered.json, { convo_id: 'c2', consent: true })
+  assert.deepEqual(recovered.json, { convo_id: 'c2', consent: true, transfer_consent: false })
 })

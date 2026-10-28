@@ -63,6 +63,8 @@ export function describeTrigger(t) {
   if (!t || typeof t !== 'object') return 'no trigger'
   if (t.kind === 'context_over') return `when a session passes ${t.pct}% of its context window`
   if (t.kind === 'disk_under') return `when a box drops under ${t.pct}% free disk`
+  if (t.kind === 'allowance_expiring' && Array.isArray(t.tiers)) return `when a weekly limit has ${t.tiers.map((x) => `${x.unused_pct}% unused with ${x.hours_left} h left`).join(' or ')}`
+  if (t.kind === 'allowance_expiring') return `when a weekly limit resets within ${t.from_hours}–${t.to_hours} h and is under ${t.pct}%`
   if (t.kind === 'stalled') return t.reset_minutes > 0 ? `when a session stalls on a usage limit with no reset within ${inWords(t.reset_minutes * 60000)}` : 'when a session stalls on a usage limit'
   return 'no trigger'
 }
@@ -125,8 +127,86 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
       if (pct >= trigger.pct) continue
       out.push({ subject: `device:${d.id}`, line: `- ${sanitizePeerText(d.name, 64) || `device ${d.id}`}: ${pct}% free (${gb(disk.free_bytes)} of ${gb(disk.total_bytes)})` })
     }
+  } else if (trigger.kind === 'allowance_expiring') {
+    out.push(...expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }))
   }
   return out.sort((a, b) => (a.subject < b.subject ? -1 : a.subject > b.subject ? 1 : 0))
+}
+
+// allowance_expiring: the weekly meters about to reset with room left.
+// The unit is the allowance, not the box — several boxes burn one Claude
+// account, and each reports the same meter — so boxes are grouped by the
+// account they report (a box with none stands alone; a Codex weekly meter
+// is the box's own, since the account the box reports is its Claude one).
+// The group's reading is the freshest report's reset time and the highest
+// percent any box saw: a sleeping box's figure can only be low, never
+// high. A line whose reset has passed is no evidence and is skipped. The
+// subject is the allowance plus its reset time, so one weekly window fires
+// at most once and the next window is a new subject.
+const isWeekly = (l) => l?.id === 'week_all' || (typeof l?.id === 'string' && l.id.startsWith('codex:') && /· Weekly$/.test(l.label || ''))
+
+// Tiers: any tier met is enough; the window is from now to hours_left out.
+// The legacy form is one band: under pct% used, from_hours..to_hours away.
+export function allowanceMet(trigger, percent, left) {
+  if (Array.isArray(trigger.tiers)) return trigger.tiers.some((t) => 100 - percent >= t.unused_pct && left <= t.hours_left * 3600000)
+  return percent < trigger.pct && left >= trigger.from_hours * 3600000 && left <= trigger.to_hours * 3600000
+}
+
+function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
+  const statuses = deviceStatuses(db, userId)
+  const devices = db.prepare("SELECT id, name, private FROM devices WHERE user_id=? AND kind='agent' ORDER BY name").all(userId)
+  const groups = new Map()
+  for (const d of devices) {
+    if (excludePrivateOwned && d.private) continue
+    const st = statuses.get(d.id)
+    const lines = Array.isArray(st?.limits?.lines) ? st.limits.lines : []
+    for (const l of lines) {
+      if (!isWeekly(l) || !Number.isFinite(l.percent)) continue
+      const resetAt = typeof l.resets_at === 'string' ? Date.parse(l.resets_at) : NaN
+      if (!Number.isFinite(resetAt) || resetAt <= now) continue
+      const email = l.id === 'week_all' && typeof st.account?.email === 'string' ? st.account.email.toLowerCase() : null
+      const key = email ? `account:${email}` : `device:${d.id}:${l.id}`
+      const asOf = Number.isFinite(st.limits.as_of) ? st.limits.as_of : (st.reported_at || 0)
+      const g = groups.get(key) || { key, label: l.label, percent: 0, resetAt, resetIso: l.resets_at, asOf: -1, boxes: [] }
+      g.percent = Math.max(g.percent, l.percent)
+      if (asOf > g.asOf) Object.assign(g, { asOf, resetAt, resetIso: l.resets_at, label: l.label })
+      g.boxes.push(sanitizePeerText(d.name, 64) || `device ${d.id}`)
+      groups.set(key, g)
+    }
+  }
+  const out = []
+  for (const g of groups.values()) {
+    const left = g.resetAt - now
+    if (!allowanceMet(trigger, g.percent, left)) continue
+    const boxes = [...new Set(g.boxes)].join(', ')
+    // Boxes on one account report the same reset a minute apart (11:59 and
+    // 12:00, as their /usage text rounds); the subject takes the nearest
+    // hour so a weekly window stays one subject whichever box reported last.
+    const hour = Math.round(g.resetAt / 3600000) * 3600000
+    out.push({ subject: `allowance:${g.key}@${new Date(hour).toISOString()}`, line: `- ${sanitizePeerText(g.label, 64)} at ${g.percent}%, resets ${g.resetIso} (in ${inWords(left)}); boxes: ${boxes}` })
+  }
+  return out
+}
+
+// The spare-allowance backlog (spec: mission "spare-allowance backlog"):
+// open tasks labelled BACKLOG_LABEL and not yet DISPATCHED_LABEL, in the
+// Tasks list's own order. An allowance_expiring fire lists the first few.
+export const BACKLOG_LABEL = 'spare-allowance'
+export const DISPATCHED_LABEL = 'dispatched'
+const BACKLOG_SHOWN = 3
+
+// With excludePrivateOwned (a Coordinator on an ordinary box), tasks filed
+// from a private box's conversations are left out, as listItems does for
+// any ordinary agent: the Coordinator could not read or act on them.
+export function spareBacklog(db, userId, { limit = BACKLOG_SHOWN, excludePrivateOwned = false } = {}) {
+  const hidePrivate = excludePrivateOwned
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations cv JOIN private_devices d ON d.id = cv.agent_device_id WHERE cv.id = i.origin_convo_id)`
+    : ''
+  return db.prepare(`SELECT num, title FROM items i WHERE user_id=? AND state='open' AND kind='task'
+      AND EXISTS (SELECT 1 FROM json_each(i.labels) WHERE value=?)
+      AND NOT EXISTS (SELECT 1 FROM json_each(i.labels) WHERE value=?)
+      ${hidePrivate}
+    ORDER BY rank LIMIT ?`).all(userId, BACKLOG_LABEL, DISPATCHED_LABEL, limit)
 }
 
 // The prompt plus its subjects, kept under the session-control message
@@ -144,6 +224,29 @@ export function trigMessage(prompt, subjects, cap = PROMPT_MAX) {
   }
   const bare = `${head}\n+${lines.length} more`
   return bare.length <= cap ? bare : prompt
+}
+
+// The turn a fire sends: trigMessage, plus for allowance_expiring the head
+// of the backlog it is meant to spend the allowance on.
+export function fireMessage(db, routine, subjects, cap = PROMPT_MAX) {
+  if (routine.trigger?.kind !== 'allowance_expiring' || !subjects.length) return trigMessage(routine.prompt, subjects, cap)
+  const tasks = spareBacklog(db, routine.user_id, { excludePrivateOwned: viewFor(db, routine).excludePrivateOwned })
+  if (!tasks.length) {
+    const tail = `\n\nThe ${BACKLOG_LABEL} backlog is empty.`
+    const head = trigMessage(routine.prompt, subjects, cap - tail.length)
+    return head.length + tail.length <= cap ? head + tail : trigMessage(routine.prompt, subjects, cap)
+  }
+  // Every allowance line first, then as many backlog lines as fit, in order
+  // (the head of the backlog is the one the Coordinator needs most); only
+  // when not even one task fits beside them are allowance lines folded.
+  const lines = tasks.map((t) => `- #${t.num} ${linkLabel(t.title)}`)
+  const tailOf = (keep) => `\n\nNext in the ${BACKLOG_LABEL} backlog:\n${lines.slice(0, keep).join('\n')}`
+  const full = trigMessage(routine.prompt, subjects, cap)
+  for (let keep = lines.length; keep >= 1; keep--) {
+    if (full.length + tailOf(keep).length <= cap) return full + tailOf(keep)
+  }
+  const head = trigMessage(routine.prompt, subjects, cap - tailOf(1).length)
+  return head.length + tailOf(1).length <= cap ? head + tailOf(1) : full
 }
 
 function viewFor(db, routine) {
@@ -164,6 +267,17 @@ export function currentSubjects(db, routine, { now = Date.now() } = {}) {
 // routine resting inside its gap) the forgetting still happens, so a
 // subject that clears and crosses again inside the gap fires at the first
 // sweep after it, but nothing is recorded and `fresh` is only a report.
+// An allowance subject is kept until its weekly window has reset, not just
+// while it matches: a tiered trigger can stop matching between tiers (the
+// first fire's sessions spend the unused share) and match again at a later
+// tier, and that must not fire the same window twice. The subject's reset
+// is rounded to the hour, so it is kept an hour past it.
+function allowanceWindowOpen(subject, now) {
+  if (!subject.startsWith('allowance:')) return false
+  const reset = Date.parse(subject.slice(subject.lastIndexOf('@') + 1))
+  return Number.isFinite(reset) && reset + 3600000 > now
+}
+
 export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false, record = true } = {}) {
   return db.transaction(() => {
     // Paused (or deleted) since the sweep listed it: nothing is recorded
@@ -174,8 +288,11 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
     const known = new Set(db.prepare('SELECT subject FROM routine_trigger_state WHERE routine_id=?').all(routine.id).map((r) => r.subject))
     const still = new Set(matching.map((s) => s.subject))
     const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
-    for (const s of known) if (!still.has(s)) forget.run(routine.id, s)
-    const fresh = matching.filter((s) => !known.has(s.subject))
+    for (const s of known) if (!still.has(s) && !allowanceWindowOpen(s, now)) forget.run(routine.id, s)
+    // An allowance with nothing to spend it on is not consumed: it fires
+    // when a task lands in the backlog, if that is still inside the window.
+    const idle = routine.trigger.kind === 'allowance_expiring' && !spareBacklog(db, routine.user_id, { limit: 1, excludePrivateOwned }).length
+    const fresh = idle ? [] : matching.filter((s) => !known.has(s.subject))
     if (record) {
       const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')
       for (const s of fresh) mark.run(routine.id, s.subject, now)
@@ -224,7 +341,7 @@ export async function runTriggerSweep({ db, firer, log = console }, now = Date.n
         }
       })()
     }
-    deliveries.push(firer.fire(r, { now, message: trigMessage(r.prompt, fresh), onOutcome }).catch((err) => {
+    deliveries.push(firer.fire(r, { now, message: fireMessage(db, r, fresh), onOutcome }).catch((err) => {
       try { log.error(`routines: ${r.name}: trigger fire failed`, err) } catch { /* never throw from a timer */ }
     }))
   }

@@ -129,6 +129,21 @@ test('itemMarkerPayload carries the comment\'s actions, chosen_action and reply_
   assert.equal(tp.chosen_action, null) // the item's own pair is untouched
 })
 
+test('itemMarkerPayload carries the comment\'s created_at in ms, the time an item_tap / item_reply cause names', async () => {
+  const { ask, tap } = await seed()
+  const asked = ask(['Merge'])
+  const tapped = tap('Merge', asked.comment.id)
+  const tp = itemMarkerPayload({ item: tapped.item, action: 'commented', by: 'user', comment: tapped.comment })
+  assert.ok(Number.isSafeInteger(tp.comment.created_at))
+  assert.equal(tp.comment.created_at, tapped.comment.created_at)
+  // A ref built from it round-trips to the same ms: what src/ask-cause.js looks up.
+  assert.equal(Date.parse(new Date(tp.comment.created_at).toISOString()), tapped.comment.created_at)
+  const bare = itemMarkerPayload({ item: tapped.item, action: 'commented', by: 'user', comment: { id: 'ic_x', body: 'hi' } })
+  assert.equal(bare.comment.created_at, null)
+  const odd = itemMarkerPayload({ item: tapped.item, action: 'commented', by: 'user', comment: { id: 'ic_y', body: 'hi', created_at: '2026-01-01T00:00:00Z' } })
+  assert.equal(odd.comment.created_at, null) // a non-integer time is no time: never a string a bridge would misparse
+})
+
 test('openDb adds actions / chosen_action to a pre-existing item_comments table; old rows read as [] / null', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-comment-actions-'))
   const file = path.join(dir, 'j.db')

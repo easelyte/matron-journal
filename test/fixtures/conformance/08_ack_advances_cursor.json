@@ -25,12 +25,13 @@
         "sockets_connected": 0,
         "journal_row_count": 3,
         "db_file_size_bytes": 0,
-        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} }
+        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} },
+        "summarise": { "enabled": false, "model": null, "requests": 0, "outcomes": {}, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "devices": [] }
       } } },
 
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "pins": [], "seq": 3, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 3, "device_id": { "$type": "integer" }, "name": "mac" } },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "ack", "cursor": 3 } },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: ack applied" }, "local_id": "b1" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
@@ -46,7 +47,8 @@
         "sockets_connected": 1,
         "journal_row_count": 4,
         "db_file_size_bytes": 0,
-        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} }
+        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} },
+        "summarise": { "enabled": false, "model": null, "requests": 0, "outcomes": {}, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "devices": [] }
       } } }
   ]
 }

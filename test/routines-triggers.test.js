@@ -6,7 +6,8 @@ import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { upsertConversation } from '../src/journal.js'
 import { upsertConvoStatus } from '../src/convo-status.js'
 import { validateRoutineFields, createRoutine, getRoutine, seedRoutines, listRoutines, STARTER_ROUTINES, TRIGGER_KINDS } from '../src/routines.js'
-import { evaluateTrigger, trippedSubjects, trigMessage, describeTrigger, contextWindowOf, isCodexModel } from '../src/routines-triggers.js'
+import { evaluateTrigger, trippedSubjects, trigMessage, fireMessage, describeTrigger, allowanceMet, contextWindowOf, isCodexModel, spareBacklog } from '../src/routines-triggers.js'
+import { createItem } from '../src/items.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 // Triggered routines (spec 2026-10-01 coordinator routines, "Triggers"):
@@ -53,7 +54,7 @@ test('validateRoutineFields: a trigger instead of a schedule, exactly one of the
   bad({ trigger: { kind: 'volcano' } }); bad({ trigger: 'context_over' }); bad({ trigger: { kind: 'context_over' } })
   bad({ trigger: { kind: 'context_over', pct: 0 } }); bad({ trigger: { kind: 'context_over', pct: 100 } }); bad({ trigger: { kind: 'context_over', pct: '40' } })
   bad({ trigger: { kind: 'disk_under', pct: 20, extra: 1 } }); bad({ trigger: { kind: 'stalled', reset_minutes: 100000 } })
-  assert.deepEqual(TRIGGER_KINDS, ['context_over', 'stalled', 'disk_under'])
+  assert.deepEqual(TRIGGER_KINDS, ['context_over', 'stalled', 'disk_under', 'allowance_expiring'])
   // PATCH: a trigger may change; schedule and trigger cannot both be given.
   assert.deepEqual(validateRoutineFields({ trigger: { kind: 'context_over', pct: 50 } }, { partial: true }).value, { trigger: { kind: 'context_over', pct: 50 } })
   assert.equal(validateRoutineFields({ trigger: { kind: 'context_over', pct: 50 }, schedule: '5 7 * * *' }, { partial: true }).ok, false)
@@ -203,6 +204,129 @@ test('no Coordinator when a trigger trips: the crossing is not consumed — it f
   assert.equal(getRoutine(s.db, alice.id, 'ctx').last_outcome, 'applied now')
 })
 
+test('validateTrigger: allowance_expiring takes a percent and an optional 6–12 h window', () => {
+  const base = { name: 'spare', title: 'Spare', prompt: 'p' }
+  const v = (trigger) => validateRoutineFields({ ...base, trigger })
+  assert.deepEqual(v({ kind: 'allowance_expiring', pct: 70 }).value.trigger, { kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 })
+  assert.deepEqual(v({ kind: 'allowance_expiring', pct: 50, from_hours: 0, to_hours: 24 }).value.trigger, { kind: 'allowance_expiring', pct: 50, from_hours: 0, to_hours: 24 })
+  for (const bad of [{ kind: 'allowance_expiring' }, { kind: 'allowance_expiring', pct: 100 }, { kind: 'allowance_expiring', pct: 70, from_hours: 12, to_hours: 12 },
+    { kind: 'allowance_expiring', pct: 70, to_hours: 169 }, { kind: 'allowance_expiring', pct: 70, from_hours: -1 }, { kind: 'allowance_expiring', pct: 70, reset_minutes: 5 }]) {
+    assert.equal(v(bad).ok, false, JSON.stringify(bad))
+  }
+  assert.equal(describeTrigger({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }), 'when a weekly limit resets within 6–12 h and is under 70%')
+})
+
+test('validateTrigger: allowance_expiring takes 1–4 tiers of unused percent and hours left', () => {
+  const base = { name: 'spare', title: 'Spare', prompt: 'p' }
+  const v = (trigger) => validateRoutineFields({ ...base, trigger })
+  const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }]
+  assert.deepEqual(v({ kind: 'allowance_expiring', tiers }).value.trigger, { kind: 'allowance_expiring', tiers })
+  const t = (x) => ({ kind: 'allowance_expiring', tiers: [x] })
+  for (const bad of [{ kind: 'allowance_expiring', tiers: [] }, { kind: 'allowance_expiring', tiers: 'x' }, { kind: 'allowance_expiring', tiers, pct: 70 },
+    { kind: 'allowance_expiring', tiers, from_hours: 6 }, { kind: 'allowance_expiring', tiers: Array(5).fill(tiers[0]) },
+    t({ unused_pct: 0, hours_left: 2 }), t({ unused_pct: 100, hours_left: 2 }), t({ unused_pct: 50, hours_left: 0 }), t({ unused_pct: 50, hours_left: 169 }),
+    t({ unused_pct: 50.5, hours_left: 2 }), t({ unused_pct: 50 }), t({ unused_pct: 50, hours_left: 2, pct: 3 }), t(null), t([50, 2])]) {
+    assert.equal(v(bad).ok, false, JSON.stringify(bad))
+  }
+  assert.equal(describeTrigger({ kind: 'allowance_expiring', tiers }), 'when a weekly limit has 50% unused with 12 h left or 25% unused with 2 h left')
+})
+
+test('allowance_expiring tiers: any tier met fires; the legacy band is unchanged', () => {
+  const H = 3600000
+  const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }]
+  const trig = { kind: 'allowance_expiring', tiers }
+  // [percent used, hours to reset, fires?]
+  for (const [pct, h, want] of [[40, 11, true], [50, 12, true], [51, 11, false], [40, 13, false], [70, 2, true], [75, 1, true], [76, 1, false], [70, 3, false], [10, 0.1, true]]) {
+    assert.equal(allowanceMet(trig, pct, h * H), want, `${pct}% used, ${h} h left`)
+  }
+  assert.equal(allowanceMet({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }, 40, 3 * H), false, 'the legacy band keeps its lower bound')
+})
+
+test('allowance_expiring tiers: a window that drops between tiers does not fire again at the later tier', async () => {
+  const { db, alice, maple } = await seedDb()
+  const H = 3600000
+  const reset = Math.round((NOW + 12 * H) / H) * H
+  const report = (percent, at) => upsertDeviceStatus(db, { userId: alice.id, deviceId: maple.deviceId, status: { limits: { as_of: at, lines: [{ id: 'week_all', label: 'Week (all models)', percent, resets_at: new Date(reset).toISOString() }] }, account: { email: 'shared@example.com' } }, reportedAt: at })
+  createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] } }).value, now: NOW })
+  createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title: 'Backlog task', labels: ['spare-allowance'] })
+  const routine = getRoutine(db, alice.id, 'spare')
+  report(40, NOW)
+  assert.equal(trippedSubjects(db, routine, { now: NOW, excludePrivateOwned: true }).fresh.length, 1, 'tier 1 fires')
+  report(60, NOW + 5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 5 * H, excludePrivateOwned: true }).matching.length, 0, 'between tiers')
+  report(70, NOW + 10.5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 10.5 * H, excludePrivateOwned: true }).fresh.length, 0, 'tier 2 is the same window')
+  // The next window is a new subject once this one has reset.
+  report(10, NOW + 14 * H)
+  trippedSubjects(db, routine, { now: NOW + 14 * H, excludePrivateOwned: true })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM routine_trigger_state WHERE routine_id=?').get(routine.id).n, 0, 'forgotten after the reset')
+})
+
+test('allowance_expiring: grouped by account, fires once per weekly window, only while the backlog has an undispatched task', async () => {
+  const { db, alice, maple, jade, priv } = await seedDb()
+  const oak = createAgent(db, alice.id, 'oak')
+  const lone = createAgent(db, alice.id, 'lone')
+  const iso = (ms) => new Date(ms).toISOString()
+  const H = 3600000
+  const report = (dev, lines, { email = 'shared@example.com', asOf = NOW } = {}) => upsertDeviceStatus(db, { userId: alice.id, deviceId: dev.deviceId, status: { limits: { as_of: asOf, lines }, ...(email ? { account: { email } } : {}) }, reportedAt: asOf })
+  const week = (percent, resetAt) => ({ id: 'week_all', label: 'Week (all models)', percent, resets_at: iso(resetAt) })
+  // maple and jade share an account; jade's older report reads low, maple's fresh one is the truth for %.
+  report(maple, [{ id: 'session', label: 'Session', percent: 90, resets_at: iso(NOW + H) }, week(40, NOW + 9 * H)])
+  report(jade, [week(20, NOW + 9 * H)], { asOf: NOW - 6 * H })
+  // oak: its own account, too full. lone: no account, reset too far. priv: private box.
+  report(oak, [week(85, NOW + 8 * H)], { email: 'other@example.com' })
+  report(lone, [week(10, NOW + 30 * H), { id: 'codex:codex:secondary', label: 'Codex · Weekly', percent: 5, resets_at: iso(NOW + 7 * H) }], { email: null })
+  report(priv, [week(10, NOW + 7 * H)], { email: 'private@example.com' })
+  const trig = { kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }
+  const subjects = evaluateTrigger(db, alice.id, trig, { now: NOW, excludePrivateOwned: true })
+  assert.deepEqual(subjects.map((s) => s.subject), [
+    `allowance:account:shared@example.com@${iso(NOW + 9 * H)}`,
+    `allowance:device:${lone.deviceId}:codex:codex:secondary@${iso(NOW + 7 * H)}`,
+  ])
+  assert.match(subjects[0].line, /Week \(all models\) at 40%, resets .* \(in 9 h\); boxes: jade, maple$/)
+  assert.equal(evaluateTrigger(db, alice.id, trig, { now: NOW, excludePrivateOwned: false }).length, 3, 'a private box counts for a private Coordinator')
+  // A reset already passed is no evidence.
+  assert.equal(evaluateTrigger(db, alice.id, trig, { now: NOW + 10 * H, excludePrivateOwned: true }).length, 0)
+
+  const r = createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', pct: 70 } }).value, now: NOW })
+  const view = { coordinatorConvoId: 'coord', excludePrivateOwned: true }
+  // Empty backlog: matching, but nothing fires and nothing is consumed.
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW, ...view }).fresh, [])
+  const mk = (title, labels) => createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title, labels }).item
+  const audit = mk('Flaky-test hunt: storefront suite', ['spare-allowance'])
+  mk('Unrelated task', [])
+  mk('Already running', ['spare-allowance', 'dispatched'])
+  assert.deepEqual(spareBacklog(db, alice.id).map((t) => t.title), ['Flaky-test hunt: storefront suite'])
+  const first = trippedSubjects(db, r, { now: NOW + 1, ...view })
+  assert.equal(first.fresh.length, 2)
+  // Once per window: still matching later in the window, nothing new.
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW + H, ...view }).fresh, [])
+  // A box on the account reporting the same reset a minute early is the same window.
+  report(jade, [week(25, NOW + 9 * H - 60000)], { asOf: NOW + 2 * H })
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW + 2 * H, ...view }).fresh, [])
+  // The next week's window is a new subject.
+  report(maple, [week(30, NOW + (7 * 24 + 9) * H)], { asOf: NOW + 7 * 24 * H })
+  report(jade, [week(30, NOW + (7 * 24 + 9) * H)], { asOf: NOW + 7 * 24 * H })
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW + 7 * 24 * H, ...view }).fresh.map((s) => s.subject), [`allowance:account:shared@example.com@${iso(NOW + (7 * 24 + 9) * H)}`])
+
+  // The turn names the head of the backlog.
+  const msg = fireMessage(db, r, first.fresh)
+  assert.match(msg, /^p\n\nTripped by:\n- Week/)
+  assert.match(msg, new RegExp(`Next in the spare-allowance backlog:\n- #${audit.num} Flaky-test hunt: storefront suite$`))
+  assert.equal(fireMessage(db, { ...r, trigger: { kind: 'disk_under', pct: 20 } }, first.fresh), trigMessage('p', first.fresh))
+  assert.ok(fireMessage(db, r, first.fresh, 120).length <= 120)
+  // Only part of the backlog fits: the head is kept.
+  mk('Second backlog task', ['spare-allowance'])
+  const tight = fireMessage(db, r, first.fresh, msg.length + 5)
+  assert.match(tight, new RegExp(`Next in the spare-allowance backlog:\\n- #${audit.num} [^\\n]+$`))
+  // A task filed from a private box's conversation is invisible to an ordinary Coordinator.
+  upsertConversation(db, { id: 'p-task', ownerUserId: alice.id, title: 'Private', sessionState: 'running', agentDeviceId: priv.deviceId })
+  createItem(db, { userId: alice.id, originDeviceId: priv.deviceId, originConvoId: 'p-task', createdBy: 'agent', kind: 'task', title: 'Private backlog task', labels: ['spare-allowance'], position: 'top' })
+  assert.equal(spareBacklog(db, alice.id, { excludePrivateOwned: true }).some((t) => t.title === 'Private backlog task'), false)
+  assert.equal(spareBacklog(db, alice.id).some((t) => t.title === 'Private backlog task'), true)
+
+})
+
 test('seedRoutines: the starter set includes the three trigger routines', async () => {
   const { db, alice } = await seedDb()
   db.prepare('UPDATE user_settings SET routines_seeded_at=NULL WHERE user_id=?').run(alice.id)
@@ -211,7 +335,9 @@ test('seedRoutines: the starter set includes the three trigger routines', async 
   assert.deepEqual(byName['context-over'].trigger, { kind: 'context_over', pct: 40 })
   assert.deepEqual(byName['stalled-session'].trigger, { kind: 'stalled', reset_minutes: 120 })
   assert.deepEqual(byName['disk-low'].trigger, { kind: 'disk_under', pct: 20 })
-  for (const n of ['context-over', 'stalled-session', 'disk-low']) {
+  assert.deepEqual(byName['spare-allowance'].trigger, { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] })
+  assert.deepEqual(byName['spare-allowance'].envelope, { spawns_per_fire: 2, chats: false, boxes: null })
+  for (const n of ['context-over', 'stalled-session', 'disk-low', 'spare-allowance']) {
     assert.equal(byName[n].schedule, null); assert.equal(byName[n].next_at, null)
     assert.match(byName[n].prompt, new RegExp(`^Routine ${n}: `))
   }

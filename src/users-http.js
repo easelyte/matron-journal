@@ -9,6 +9,8 @@ import { json, readBody } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { createUser, setPassword } from './auth.js'
 import { deleteGithubAccount } from './github-accounts.js'
+import { disableTwoFactor } from './two-factor.js'
+import { normaliseEmail, setUserEmail } from './password-reset.js'
 
 // A journal name is a URL path segment in shareable links (/u/<name>/<n>)
 // and a sender prefix (user:<name>), so it is ASCII, starts alphanumeric,
@@ -34,12 +36,14 @@ function stillAdmin(db, who) {
   return !!db.prepare('SELECT 1 FROM devices WHERE id=?').get(who.deviceId) && isAdmin(db, who)
 }
 
-const USER_SQL = `SELECT u.id, u.name, u.is_admin, u.unlisted, u.created_at,
+const USER_SQL = `SELECT u.id, u.name, u.email, u.is_admin, u.unlisted, u.created_at,
+    (SELECT COUNT(*) FROM two_factor tf WHERE tf.user_id = u.id AND tf.secret IS NOT NULL) AS two_factor,
     ga.login AS github_login, ga.state AS github_state, ga.host AS github_host
   FROM users u LEFT JOIN github_accounts ga ON ga.user_id = u.id`
 const userRow = (db, id) => db.prepare(`${USER_SQL} WHERE u.id=?`).get(id)
 const shape = (r) => ({
-  id: r.id, name: r.name, is_admin: !!r.is_admin, unlisted: !!r.unlisted, created_at: r.created_at,
+  id: r.id, name: r.name, email: r.email ?? null, is_admin: !!r.is_admin, unlisted: !!r.unlisted, created_at: r.created_at,
+  two_factor: !!r.two_factor,
   github: r.github_login ? { login: r.github_login, state: r.github_state, host: r.github_host } : null,
 })
 
@@ -72,7 +76,7 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     return true
   }
 
-  const m = path.match(/^\/users\/(\d+)(?:\/(password|github-link|link-code))?$/)
+  const m = path.match(/^\/users\/(\d+)(?:\/(password|email|github-link|link-code|two-factor))?$/)
   if (!m) return notFound(res)
   const target = userRow(db, Number(m[1]))
   if (!target) return notFound(res)
@@ -104,8 +108,27 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     json(res, 200, { ok: true })
     return true
   }
+  // The address a forgot-password link goes to; null clears it. Same as
+  // `matron-admin user email`.
+  if (sub === 'email' && req.method === 'PUT') {
+    const { email } = await readBody(req)
+    if (!stillAdmin(db, who)) return forbidden(res)
+    const fresh = userRow(db, target.id); if (!fresh) return notFound(res)
+    const clean = email === null ? null : normaliseEmail(email)
+    if (email !== null && !clean) { json(res, 400, { error: 'bad_email' }); return true }
+    if (setUserEmail(db, fresh.id, clean).conflict) { json(res, 409, { error: 'email_taken' }); return true }
+    json(res, 200, { user: shape(userRow(db, fresh.id)) })
+    return true
+  }
   if (sub === 'github-link' && req.method === 'DELETE') {
     if (!deleteGithubAccount(db, target.id)) return notFound(res)
+    json(res, 200, { ok: true })
+    return true
+  }
+  // An admin's reset for a user who lost their authenticator app and their
+  // recovery codes: same effect as `matron-admin user 2fa-reset`.
+  if (sub === 'two-factor' && req.method === 'DELETE') {
+    if (!disableTwoFactor(db, target.id)) return notFound(res)
     json(res, 200, { ok: true })
     return true
   }

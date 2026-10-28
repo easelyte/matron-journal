@@ -15,12 +15,17 @@ import {
   requestTurn,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
-import { visibleMission } from './missions-http.js'
+import { visibleMission, writableConvo } from './missions-http.js'
+import { handleContributedItem, handleContributorItemSub, forwardToContributor } from './contribute-http.js'
+import { contributableItem } from './contribute.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
+import { transferTapAnswer } from './transfer-consent.js'
+import { consentItemTapAnswer } from './consent-answer.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
+import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 
 const SORTS = ['rank', 'updated', 'acted']
@@ -117,11 +122,19 @@ function visibleItem(db, who, idOrNum) {
 //     joiner, who is not in it — parking exists to keep the ask from the
 //     room's owner until the user says yes, so the reply stays client-only;
 //   - contact and share mirrors are answered on the item and never reach an
-//     agent.
+//     agent;
+//   - a hand-over's OWNER mirror lives in the asking agent's conversation,
+//     and a reply there is how the user declines with a reason ("not yet:
+//     finish X first"), so it reaches that agent — answered or not. The
+//     recipient's mirror is in their People conversation and reaches no one.
 // A chat row renewed since (its item_id names a newer item) no longer vouches
 // for this one: client-only.
 function replyReachesAsker(db, item) {
   if (item.consent === 'spawn') return true
+  if (item.consent === 'handover') {
+    return !!db.prepare(`SELECT 1 FROM grants g JOIN conversations c ON c.id = g.origin_convo_id
+      WHERE g.owner_item_id = ? AND g.origin_convo_id = ? AND c.agent_device_id = g.origin_device_id`).get(item.id, item.origin_convo_id)
+  }
   if (item.consent !== 'chat') return false
   return !!db.prepare(`
     SELECT 1 FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
@@ -160,7 +173,10 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   const mirror = item.consent != null && !(userReply && replyReachesAsker(db, item))
   if (mirror) { extra = { ...extra, consent: item.consent }; fallback = false }
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
-  const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
+  // A later marker about a withdrawn reply (a transcript landing after the
+  // cancel) must not carry its words back into the log: without them the
+  // marker carries no comment at all (src/withdrawn-comments.js).
+  const payload = itemMarkerPayload({ item, action, by: author, comment: presentWithdrawn(comment), extra })
   const sender = senderOf(db, who)
   let r
   try {
@@ -222,7 +238,12 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
-  if (item.mission_id && item.consent == null) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  // Nor for an owner-only item (`private`): no grantee can read it, so
+  // there is nothing to follow and nobody to forward to.
+  if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  // An item a contributor filed: the owner's reply reaches the conversation
+  // that filed it, as another person's turn (src/contribute-http.js).
+  if (item.mission_id && item.consent == null && !item.private) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -306,6 +327,17 @@ const noticeActionsOk = (list) => list === undefined || list.length === 0 || sam
 async function handleCreate(ctx, req, res, who) {
   const { db } = ctx
   const body = await readBody(req)
+  // `mission`: an item filed into another person's mission the caller
+  // contributes to (src/contribute-http.js). One's own items follow their
+  // conversation and never name a mission.
+  // `private`: an owner-only item (db.js) — what a bridge files for the
+  // user alone (a secure-input request, a foreign "Allow once" ask). Set at
+  // create only, and never on an item filed into someone else's mission.
+  if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
+  if (body.mission !== undefined) {
+    if (body.private !== undefined) return badRequest(res)
+    return handleContributedItem(ctx, res, who, body, { writableConvo })
+  }
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
   const v = validateItemFields(body)
   if (!v.ok) return badFields(res, v)
@@ -359,7 +391,7 @@ async function handleCreate(ctx, req, res, who) {
       position: body.position, after: body.after, before: body.before,
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
-      supersedes: body.supersedes ?? null, idemKey,
+      supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true
@@ -476,6 +508,11 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
       replyItems(who, res, 200, { item: shared, comments: shared.shared_via === 'grant' ? listGrantedComments(db, shared.id) : listSharedComments(db, shared.id) })
       return true
     }
+    // A contributor to the item's mission may comment, close and reopen
+    // (src/contribute-http.js answers everything else 403 too) — whichever
+    // rule the read came back under: an item also visible through the org
+    // rule is still on a mission they contribute to.
+    if (sub && contributableItem(db, who.userId, shared.id)) return handleContributorItemSub(ctx, req, res, who, shared, sub, subId)
     json(res, 403, { error: 'forbidden' })
     return true
   }
@@ -493,8 +530,12 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 
   if (!sub) {
     if (req.method === 'GET') {
-      const comments = listComments(db, item.id)
-      replyItems(who, res, 200, { item, comments: filteredAgent(db, who) ? hidePrivateAuthors(db, comments) : comments })
+      let comments = listComments(db, item.id)
+      if (filteredAgent(db, who)) comments = hidePrivateAuthors(db, comments)
+      // A reply the user withdrew before it reached the agent: every agent
+      // reads that it was there, never what it said (src/withdrawn-comments.js).
+      if (who.kind === 'agent') comments = comments.map(presentWithdrawn)
+      replyItems(who, res, 200, { item, comments })
       return true
     }
     if (req.method === 'PATCH') return handlePatch(ctx, req, res, who, item)
@@ -554,8 +595,18 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // A contact or share card's mirror (sharing-events.js): the tap is the
       // answer to the card, applied by the journal itself — never a comment
       // for an agent to read.
-      if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action)
-      if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action)
+      if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action, body.reply_to ?? null)
+      // A file transfer's card, or a spawn or chat ask's mirror: the tap is
+      // the answer, through the same path as the card (transfer-consent.js,
+      // consent-answer.js).
+      if (item.consent === 'transfer' || item.consent === 'spawn' || item.consent === 'chat') {
+        if (body.reply_to != null) { json(res, 400, { error: 'unknown_action' }); return true }
+        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action) : consentItemTapAnswer(ctx, who, item, action)
+        if (r.status !== 200) { json(res, r.status, r.body); return true }
+        json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, ...r.body })
+        return true
+      }
+      if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment
     // whose button was tapped — a follow-up question in this thread. It only
@@ -675,7 +726,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // announces with (emitTranscriptionMarker) — including `for_action`: the
     // item body's synthetic comment belongs to the `created` turn.
     emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
-    json(res, 200, { comment: seenBy(c) })
+    json(res, 200, { comment: presentWithdrawn(seenBy(c)) })
     return true
   }
 

@@ -3,7 +3,13 @@ import path from 'node:path'
 import { writeBlobSync } from './media.js'
 import { insertBlob, getBlob } from './db.js'
 import { isAudioAttachment } from './items.js'
-import { snippetOf, MESSAGE_TYPES } from './journal.js'
+import { snippetOf, MESSAGE_TYPES, appendAndBroadcast } from './journal.js'
+import {
+  LIVE_PHASES, getTransfer, setTransferState, deleteTransferFiles, forgetChunks, isTransferId,
+  TRANSFER_DELIVERED_GRACE_MS, TRANSFER_EXPIRE_MS,
+} from './transfers.js'
+import { closeTransferConsentItem } from './transfer-consent.js'
+import { codeSpan } from './consent-items.js'
 
 const OFFLOAD_TYPE = 'tool_output'
 
@@ -519,8 +525,10 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       }
       db.transaction(() => {
         // A voice note the journal transcribed keeps its words (stamped, so
-        // said.js can still vouch for them); everything else is the bare
-        // tombstone, with any payload-supplied transcript_by dropped.
+        // said.js can still vouch for them; it takes audio only); everything
+        // else is the bare tombstone, with any payload-supplied
+        // transcript_by dropped. A reaped video's words go along too; its
+        // segments do not.
         const words = journalWordsOf(blob)
         for (const ref of refs.all(cand.blobRef, user.userId)) {
           let payload
@@ -888,4 +896,116 @@ export function runExpireDeviceContent(db, { rules, now = Date.now(), batchSize 
     }
   }
   return result
+}
+
+// Agent-to-agent file-transfer retention (sixth retention pass,
+// src/transfers.js / src/transfer-consent.js own the state machine and the
+// card). Two independent clocks, both anchored on the row itself (`now`
+// injected for tests):
+//
+//   - a DELIVERED copy is removed `TRANSFER_DELIVERED_GRACE_MS` (1h) after
+//     the receiver's verified receipt (`delivered_at`): the file WAS
+//     collected, so only its bytes go — `deleted_at` is stamped but the
+//     phase stays `delivered`;
+//   - an OPEN or RELEASED row — nobody has collected it yet, whether or
+//     not the user has even answered the card — is moved to `expired`
+//     `TRANSFER_EXPIRE_MS` (7d) after `created_at`: its bytes go, its
+//     consent card closes (one still open closes `cancelled`, "Expired
+//     after 7 days."; one already answered — approved and released — was
+//     already closed on approval and is left exactly as it was), the
+//     sender is told (`{event:'expired'}`) and the room gets a line in the
+//     journal's voice.
+//
+// A `delivered` row is deliberately excluded from the second clock (it is
+// not in LIVE_PHASES): it WAS collected, so calling it "expired … without
+// being collected" would be false, even if `created_at` is also 7 days
+// gone by the time its 1h grace runs out.
+//
+// Exactly once: the delivered-copy deletion claims its row with a plain
+// `deleted_at IS NULL` guard (outside the consent/upload/phase state
+// machine PATCH_COLUMNS covers), and the expiry goes through the guarded
+// `setTransferState` — the same guard an in-flight approve, decline or
+// complete uses — so a sweep that runs twice, or lands moments after an
+// API call already settled the row, changes nothing on its second look.
+//
+// Also sweeps any leftover transfer directory the state-changing passes
+// above (or a chunk PUT racing one of them) left behind — see the
+// filesystem scan at the end of this function for why it is driven from
+// disk, not a table scan: a crash can land between a state change and its
+// delete in more places than a `declined | cancelled | failed` table scan
+// could ever find, and `transfers` rows are never deleted, so a scan over
+// every row this feature has ever written would grow forever.
+export function runExpireTransfers(db, { mediaDir, hub, now = Date.now() }) {
+  let deleted = 0
+  let expired = 0
+
+  const deliveredDue = db.prepare(
+    "SELECT id FROM transfers WHERE phase='delivered' AND deleted_at IS NULL AND delivered_at IS NOT NULL AND delivered_at<=?"
+  ).all(now - TRANSFER_DELIVERED_GRACE_MS)
+  for (const { id } of deliveredDue) {
+    const claimed = db.prepare('UPDATE transfers SET deleted_at=? WHERE id=? AND deleted_at IS NULL').run(now, id).changes === 1
+    if (!claimed) continue
+    deleteTransferFiles(mediaDir, id)
+    forgetChunks(db, id)
+    deleted += 1
+  }
+
+  const uncollected = db.prepare(
+    `SELECT id FROM transfers WHERE phase IN ('${LIVE_PHASES.join("','")}') AND created_at<=?`
+  ).all(now - TRANSFER_EXPIRE_MS)
+  for (const { id } of uncollected) {
+    const row = getTransfer(db, id)
+    if (!row || !setTransferState(db, id, { phase: 'expired', deleted_at: now })) continue
+    deleteTransferFiles(mediaDir, id)
+    forgetChunks(db, id)
+    closeTransferConsentItem({ db, hub }, id, { outcome: 'expired' })
+    if (hub) hub.sendToDevice(row.user_id, row.sender_device_id, { kind: 'transfer', event: 'expired', transfer_id: id })
+    try {
+      appendAndBroadcast(db, hub, {
+        userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+        payload: { body: `File ${codeSpan(row.name)} expired after 7 days without being collected.` },
+      })
+    } catch (err) {
+      console.error(`retention: transfer expiry room notice for ${id} failed (the expiry stands)`, err)
+    }
+    expired += 1
+  }
+
+  // Crash-safety sweep, driven from the filesystem so its cost is bounded
+  // by what is actually still on disk (rows are never deleted, so a table
+  // scan would grow forever) and so it catches every way a delete can be
+  // missing, not just the three terminal phases a table scan could name:
+  //   - a crash between the delivered-copy claim above (`deleted_at` set)
+  //     and its `deleteTransferFiles` a few lines later;
+  //   - a crash between the expiry's `setTransferState` (phase ->
+  //     `expired`) and ITS `deleteTransferFiles` — `expired` isn't in
+  //     LIVE_PHASES, but it also isn't `declined`/`cancelled`/`failed`, so
+  //     the old phase-list scan could never find it;
+  //   - a chunk PUT that raced either pass and wrote a chunk file after
+  //     the row had already been read as due.
+  // A directory is kept only when its row still legitimately needs it: an
+  // open or released (LIVE_PHASES) row, or a delivered one still within
+  // its grace (`deleted_at IS NULL` — the pass above hasn't claimed it
+  // yet). Everything else — no row at all, or a row whose own state says
+  // the bytes should be gone — is deleted. Entries that don't look like a
+  // transfer id are left alone, so nothing a different feature or an
+  // operator ever drops under `<mediaDir>/transfers` is touched.
+  let entries
+  try {
+    entries = fs.readdirSync(path.join(mediaDir, 'transfers'))
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
+    entries = []
+  }
+  for (const id of entries) {
+    if (!isTransferId(id)) continue
+    const row = getTransfer(db, id)
+    const keep = row && (LIVE_PHASES.includes(row.phase) || (row.phase === 'delivered' && row.deleted_at == null))
+    if (keep) continue
+    deleteTransferFiles(mediaDir, id)
+    forgetChunks(db, id)
+    deleted += 1
+  }
+
+  return { deleted, expired }
 }

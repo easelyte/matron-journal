@@ -12,6 +12,10 @@
 // design; the device flow needs nothing else, so linking works out of the
 // box. MATRON_GITHUB_CLIENT_ID overrides it — set it to the empty string to
 // disable linking, or to your own app's id (with its secret) for the web flow.
+// The device flow is only offered when there is no web flow and the operator
+// has not turned it off (deviceFlow: false): its code can be handed to
+// someone else, and the journal can show the person who enters it nothing,
+// so it can bind a stranger's GitHub identity to the starter's account.
 export const DEFAULT_GITHUB_CLIENT_ID = 'Ov23likaFmqoegaDMTtz'
 export const GITHUB_SCOPE = 'read:org'
 
@@ -26,9 +30,10 @@ const form = (obj) => new URLSearchParams(obj).toString()
 // worst — the daily refresh, which walks accounts one after another and is
 // what shrinks memberships and marks refused tokens stale. An abort maps
 // to 'unreachable' so every caller keeps its existing handling.
-export function makeGithub({ clientId, clientSecret = null, host = 'github.com', fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
+export function makeGithub({ clientId, clientSecret = null, deviceFlow: deviceFlowAllowed = true, host = 'github.com', fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
   const enabled = typeof clientId === 'string' && clientId.length > 0
   const webFlow = enabled && typeof clientSecret === 'string' && clientSecret.length > 0
+  const deviceFlow = enabled && !webFlow && deviceFlowAllowed !== false
   const loginBase = `https://${host}`
   const apiBase = host === 'github.com' ? 'https://api.github.com' : `https://${host}/api/v3`
 
@@ -50,7 +55,7 @@ export function makeGithub({ clientId, clientSecret = null, host = 'github.com',
   }
 
   async function startDeviceFlow() {
-    if (!enabled) throw new GithubError('bad_response', 'github linking not configured')
+    if (!deviceFlow) throw new GithubError('bad_response', 'device flow not offered')
     const { json } = await call('POST', `${loginBase}/login/device/code`, { body: form({ client_id: clientId, scope: GITHUB_SCOPE }) })
     const { device_code, user_code, verification_uri, interval, expires_in } = json || {}
     if (typeof device_code !== 'string' || typeof user_code !== 'string' || typeof verification_uri !== 'string') throw new GithubError('bad_response')
@@ -115,5 +120,5 @@ export function makeGithub({ clientId, clientSecret = null, host = 'github.com',
     return { github_id: user.json.id, login: user.json.login, scopes: [...scopes].sort() }
   }
 
-  return { enabled, webFlow, host, startDeviceFlow, pollDeviceFlow, authorizeUrl, exchangeCode, fetchIdentity }
+  return { enabled, webFlow, deviceFlow, host, startDeviceFlow, pollDeviceFlow, authorizeUrl, exchangeCode, fetchIdentity }
 }

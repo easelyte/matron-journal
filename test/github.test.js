@@ -26,6 +26,10 @@ test('makeGithub: enabled/webFlow reflect configuration', () => {
   const g = makeGithub({ clientId: 'abc' })
   assert.equal(g.enabled, true); assert.equal(g.webFlow, false)
   assert.equal(makeGithub({ clientId: 'abc', clientSecret: 's' }).webFlow, true)
+  assert.equal(g.deviceFlow, true, 'device flow only with no secret')
+  assert.equal(makeGithub({ clientId: 'abc', clientSecret: 's' }).deviceFlow, false)
+  assert.equal(makeGithub({ clientId: 'abc', deviceFlow: false }).deviceFlow, false)
+  assert.equal(makeGithub({ clientId: '' }).deviceFlow, false)
 })
 
 test('device flow: start posts client_id + read:org; poll maps GitHub errors to statuses', async () => {

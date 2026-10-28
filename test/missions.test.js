@@ -22,10 +22,10 @@ test('schema: missions and milestones exist with the expected columns; mission_i
   assert.deepEqual(cols('missions'), [
     'id', 'user_id', 'num', 'state', 'title', 'body', 'close_summary', 'closed_by', 'closed_over_open_items',
     'origin_convo_id', 'origin_device_id', 'created_by', 'idem_key', 'created_at', 'updated_at', 'last_milestone_at', 'closed_at',
-    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id', 'closed_convo_id', 'project_id', 'name',
+    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id', 'closed_convo_id', 'project_id', 'name', 'status_contributor',
   ])
   assert.deepEqual(cols('milestones'), [
-    'id', 'mission_id', 'user_id', 'num', 'kind', 'title', 'body', 'convo_id', 'seq', 'device_id', 'created_by', 'idem_key', 'created_at',
+    'id', 'mission_id', 'user_id', 'num', 'kind', 'title', 'body', 'convo_id', 'seq', 'device_id', 'created_by', 'idem_key', 'created_at', 'contributor_name', 'contributor_via',
   ])
   assert.ok(cols('conversations').includes('mission_id'))
   assert.ok(cols('items').includes('mission_id'))

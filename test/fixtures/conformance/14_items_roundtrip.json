@@ -19,7 +19,7 @@
         "state": "open", "resolution": null, "awaiting": "user", "rank": 1024,
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
+        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
         "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } } } },
 
@@ -29,7 +29,7 @@
         "state": "open", "resolution": null, "awaiting": "user", "rank": 1024,
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
+        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
         "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } ], "next_cursor": null } } },
 
@@ -41,7 +41,7 @@
           "state": "open", "resolution": null, "awaiting": "agent", "rank": 1024,
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
@@ -60,7 +60,7 @@
           "state": "closed", "resolution": "answered", "awaiting": null, "rank": 1024,
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "origin_convo_title": "Session", "filed_convo_id": null, "handover": null,
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
@@ -85,7 +85,7 @@
           "payload": { "item_id": { "$ref": "item_id" }, "num": 1, "kind": "question", "title": "Which auth library?",
                        "origin_convo_id": "c1", "origin_convo_title": "Session", "action": "commented", "by": "user", "awaiting": "agent", "resolution": null, "actions": [], "chosen_action": null,
                        "comment": { "id": { "$ref": "comment_id" }, "body": "Use A", "action": null, "attachments": [],
-                                    "actions": [], "chosen_action": null, "reply_to": null } } },
+                                    "actions": [], "chosen_action": null, "reply_to": null, "created_at": { "$type": "integer" } } } },
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "user:alice", "type": "text",
           "payload": { "body": "📌 Question #1 \"Which auth library?\" — alice commented:\nUse A", "fallback_for": "item",
                        "item_id": { "$ref": "item_id" }, "num": 1, "action": "commented" } },

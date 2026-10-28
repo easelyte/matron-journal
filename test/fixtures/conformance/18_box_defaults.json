@@ -17,10 +17,10 @@
 
     { "kind": "ws_open", "conn": "agent" },
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } },
     { "kind": "ws_open", "conn": "client" },
     { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "coordinator_convo_id": null, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "coordinator_convo_id": null, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "http", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "alice_token" },
       "body": { "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" },
@@ -39,6 +39,6 @@
 
     { "kind": "ws_open", "conn": "agent2" },
     { "kind": "ws_send", "conn": "agent2", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent2", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false }, "box_defaults": { "default_agent": "claude", "default_model": null, "default_effort": "high" }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } }
+    { "kind": "ws_expect", "conn": "agent2", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": "claude", "default_model": null, "default_effort": "high" }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } }
   ]
 }

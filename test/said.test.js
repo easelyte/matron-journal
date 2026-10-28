@@ -69,6 +69,45 @@ test('/said: an item-reply fallback copy carries the user sender but is refused'
   assert.equal(r.json.reason, 'item_reply_copy')
 })
 
+test('/said: the user\'s tap on a question card is verified, with the card as context', async (t) => {
+  const { add, said, boxB } = await setup(t)
+  const card = add('agent:box-a', 'prompt', { question: 'Start a helper on box-b?', options: [{ label: 'Yes', value: 'Yes' }, { label: 'No', value: 'No' }] })
+  add('agent:box-a', 'text', { body: 'Waiting for your answer.', from: 'assistant' })
+  const tap = add('user:alice', 'prompt_reply', { target_seq: card, choice: 'Yes', text: null })
+  const r = await said(boxB.token, `c1:${tap}`)
+  assert.equal(r.json.verified, true)
+  assert.equal(r.json.kind, 'tap')
+  assert.equal(r.json.text, 'Yes')
+  assert.equal(r.json.choice, 'Yes')
+  assert.equal(r.json.author, 'user:alice')
+  assert.deepEqual(r.json.before, { seq: card, sender: 'agent:box-a', text: 'Start a helper on box-b?' })
+  // The card's own text box: the words are the text, the choice kept apart.
+  const typed = add('user:alice', 'prompt_reply', { target_seq: card, choice: 'Other', text: 'only on box-b, please' })
+  const r2 = await said(boxB.token, `c1:${typed}`)
+  assert.equal(r2.json.text, 'only on box-b, please')
+  assert.equal(r2.json.choice, 'Other')
+  // A reply naming no card of this conversation falls back to the prose before it.
+  const loose = add('user:alice', 'prompt_reply', { target_seq: 999999, choice: 'Yes' })
+  assert.equal((await said(boxB.token, `c1:${loose}`)).json.before.text, 'Waiting for your answer.')
+  // So does one naming a card that only came after it.
+  const early = add('user:alice', 'prompt_reply', { target_seq: loose + 2, choice: 'Yes' })
+  add('agent:box-a', 'prompt', { question: 'A later question?', options: [] })
+  assert.equal((await said(boxB.token, `c1:${early}`)).json.before.text, 'Waiting for your answer.')
+})
+
+test('/said: a prompt_reply an agent published, another person\'s, or an empty one is refused', async (t) => {
+  const { add, said, boxB } = await setup(t)
+  const card = add('agent:box-a', 'prompt', { question: 'Send it?', options: [] })
+  // A bridge's release of its own queue card is an agent row.
+  const release = add('agent:box-a', 'prompt_reply', { target_seq: card, choice: 'send' })
+  assert.deepEqual((await said(boxB.token, `c1:${release}`)).json, { verified: false, convo_id: 'c1', seq: release, sender: 'agent:box-a', reason: 'agent_message' })
+  // Another person's words in a shared room land as `person:`.
+  const foreign = add('person:bob', 'prompt_reply', { target_seq: card, choice: 'Yes' })
+  assert.equal((await said(boxB.token, `c1:${foreign}`)).json.reason, 'not_from_user')
+  const empty = add('user:alice', 'prompt_reply', { target_seq: card, choice: null, text: '  ' })
+  assert.equal((await said(boxB.token, `c1:${empty}`)).json.reason, 'no_text')
+})
+
 test('/said: a voice note is verified by the words the journal transcribed, caption kept apart', async (t) => {
   const { voice, voiceBlob, said, boxB } = await setup(t)
   const seq = voice(voiceBlob(), { caption: 'see below' })

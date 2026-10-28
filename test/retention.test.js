@@ -1370,6 +1370,19 @@ test('runExpireVoiceNotes: chat audio not transcribed here, failed, or shared wi
   for (const b of [failed.blob, bridgeDid.blob, shared.blob, onText.blob, inItem.blob, orphan]) assert.ok(getBlob(db, b.id), `blob ${b.id} must stay`)
 })
 
+test('runExpireVoiceNotes: a video transcribed at upload keeps its file however old its words are', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const blob = seedBlob(db, mediaDir, { userId: alice.id, bytes: 100, contentType: 'video/mp4', fill: 6 })
+  db.prepare("UPDATE blobs SET transcript_status='done', transcript='narration', transcript_segments=?, transcribed_at=? WHERE id=?")
+    .run(JSON.stringify([{ start_ms: 0, text: 'narration' }]), Date.now() - 30 * DAY, blob.id)
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'file', payload: { blob_ref: blob.id, name: 'Screen.mp4', content_type: 'video/mp4', size: 100 }, blobRef: blob.id })
+  assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, blob.id))
+  assert.ok(fs.existsSync(blob.diskPath))
+  assert.equal(eventOf(db, alice.id, r.seq).blob_ref, blob.id)
+})
+
 test('runExpireVoiceNotes: a recording in both an item thread and a chat goes on the item clock, and the chat event becomes a tombstone with the words', async () => {
   const { db, alice } = await setup()
   const mediaDir = tmpMediaDir()

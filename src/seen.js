@@ -220,7 +220,7 @@ export function listUnseen(db, userId, {
     `SELECT convo_id, MAX(CASE WHEN sender LIKE 'user:%' THEN seq END) AS u,
             MAX(CASE WHEN sender NOT LIKE 'user:%'
                       AND json_extract(payload, '$.fallback_for') IS NULL
-                      AND (type!='permission_request' OR COALESCE(json_extract(payload, '$.kind'), '') NOT IN ('agent_chat','agent_spawn','contact_request','mission_share'))
+                      AND (type!='permission_request' OR COALESCE(json_extract(payload, '$.kind'), '') NOT IN ('agent_chat','agent_spawn','contact_request','mission_share','mission_handover'))
                      THEN seq END) AS o
        FROM events WHERE user_id=? AND seq>=? AND type IN (${UNSEEN_TYPES_SQL},'prompt_reply') GROUP BY convo_id`
   ).iterate(userId, lowSeq)) {

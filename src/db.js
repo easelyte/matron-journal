@@ -396,7 +396,7 @@ CREATE TABLE IF NOT EXISTS user_settings(
 CREATE TABLE IF NOT EXISTS consent_decisions(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL REFERENCES users(id),
-  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn','transfer')),
   ask_id     TEXT NOT NULL,
   decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
   convo_id   TEXT NOT NULL,
@@ -679,24 +679,33 @@ CREATE INDEX IF NOT EXISTS idx_session_shares_contact ON session_shares(contact_
 --   awaiting_guest  the owner approved; the guest person has not accepted
 --   invited         the guest accepted; the invite is with the guest agent
 --   joined          the guest agent joined
+--   starting        (talk only) the guest chose a new session; it is starting
 --   declined (owner said no) refused (guest person or agent said no)
 --   withdrawn left expired (ended)
 -- owner_contact_id is the owner's contact row for the guest. mission_id is
 -- the owner's mission the room is attached to, if any.
+--
+-- kind 'session' is an invite aimed at a session the guest shares; kind
+-- 'talk' is a talk request aimed at the PERSON: the guest picks where to
+-- talk when they accept, so guest_device_id / guest_convo_id stay NULL
+-- until then, and owner_contact_id stays NULL until the owner's Send when
+-- the two were not contacts yet. contact_by_talk: the owner's Send made the
+-- contact request. pick_options: the label -> session map of the guest's
+-- "Pick a session" follow-up. spawn_id: the new session in flight.
 CREATE TABLE IF NOT EXISTS person_rooms(
   id               TEXT PRIMARY KEY,
   owner_user_id    INTEGER NOT NULL REFERENCES users(id),
   owner_room_id    TEXT NOT NULL,
   owner_device_id  INTEGER NOT NULL,
   owner_convo_id   TEXT,
-  owner_contact_id TEXT NOT NULL REFERENCES contacts(id),
+  owner_contact_id TEXT REFERENCES contacts(id),
   guest_user_id    INTEGER NOT NULL REFERENCES users(id),
-  guest_device_id  INTEGER NOT NULL,
-  guest_convo_id   TEXT NOT NULL,
+  guest_device_id  INTEGER,
+  guest_convo_id   TEXT,
   guest_room_id    TEXT,
   mission_id       TEXT,
   state            TEXT NOT NULL CHECK(state IN
-                     ('awaiting_owner','awaiting_guest','invited','joined','declined','refused','withdrawn','left','expired')),
+                     ('awaiting_owner','awaiting_guest','starting','invited','joined','declined','refused','withdrawn','left','expired')),
   topic            TEXT NOT NULL DEFAULT '',
   justification    TEXT NOT NULL DEFAULT '',
   owner_item_id    TEXT,
@@ -705,11 +714,81 @@ CREATE TABLE IF NOT EXISTS person_rooms(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   answered_at      INTEGER,
+  kind             TEXT NOT NULL DEFAULT 'session',
+  contact_by_talk  INTEGER NOT NULL DEFAULT 0,
+  pick_options     TEXT,
+  spawn_id         TEXT,
   UNIQUE(owner_room_id, guest_device_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_person_rooms_guest_room ON person_rooms(guest_room_id) WHERE guest_room_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_person_rooms_owner_room ON person_rooms(owner_room_id, state);
 CREATE INDEX IF NOT EXISTS idx_person_rooms_contact ON person_rooms(owner_contact_id, state);
+-- Two-factor sign-in (src/two-factor.js). secret is the active TOTP secret,
+-- sealed by the token box; NULL means two-factor is off. pending_secret is a
+-- setup the user has started but not yet confirmed with a code. last_step is
+-- the newest 30-second step a code was accepted for (replay guard).
+CREATE TABLE IF NOT EXISTS two_factor(
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id),
+  secret         TEXT,
+  enabled_at     INTEGER,
+  last_step      INTEGER NOT NULL DEFAULT 0,
+  pending_secret TEXT,
+  pending_at     INTEGER
+);
+-- Single-use recovery codes, SHA-256 only.
+CREATE TABLE IF NOT EXISTS two_factor_recovery(
+  user_id   INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL,
+  used_at   INTEGER,
+  PRIMARY KEY(user_id, code_hash)
+);
+-- Journal-wide switches set by the operator or an admin (key → value).
+CREATE TABLE IF NOT EXISTS journal_settings(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- Agent-to-agent file transfers (src/transfers.js): one row per file a
+-- session sends into a room. Three axes: consent (the user's card), upload
+-- (the sender's chunks) and phase (where the file is in its life; every
+-- phase but open and released is terminal). size is the declared size,
+-- reserved against the user's transfer quota while the phase is live.
+-- scan_findings is a JSON array of {kind, line}, never the matched value.
+-- Chunk bytes live under <mediaDir>/transfers/<id>/<n>; transfer_chunks
+-- records which of them arrived whole and verified.
+CREATE TABLE IF NOT EXISTS transfers(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  room_id          TEXT NOT NULL,
+  sender_device_id INTEGER NOT NULL,
+  from_convo_id    TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  size             INTEGER NOT NULL,
+  sha256           TEXT NOT NULL,
+  content_type     TEXT NOT NULL,
+  reason           TEXT NOT NULL DEFAULT '',
+  scan_verdict     TEXT NOT NULL CHECK(scan_verdict IN ('clean','flagged','not_scanned')),
+  scan_findings    TEXT NOT NULL DEFAULT '[]',
+  consent          TEXT NOT NULL DEFAULT 'awaiting_user' CHECK(consent IN ('awaiting_user','approved','declined')),
+  upload           TEXT NOT NULL DEFAULT 'uploading' CHECK(upload IN ('uploading','uploaded','failed')),
+  phase            TEXT NOT NULL DEFAULT 'open' CHECK(phase IN ('open','released','delivered','expired','cancelled','failed','declined')),
+  item_id          TEXT,
+  decided_by       TEXT,
+  decided_reason   TEXT,
+  created_at       INTEGER NOT NULL,
+  approved_at      INTEGER,
+  uploaded_at      INTEGER,
+  released_at      INTEGER,
+  delivered_at     INTEGER,
+  deleted_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_user_phase ON transfers(user_id, phase);
+CREATE INDEX IF NOT EXISTS idx_transfers_room ON transfers(room_id);
+CREATE TABLE IF NOT EXISTS transfer_chunks(
+  transfer_id TEXT NOT NULL,
+  n           INTEGER NOT NULL,
+  size        INTEGER NOT NULL,
+  PRIMARY KEY(transfer_id, n)
+);
 `
 
 // Tombstone table + triggers + view for revoked private devices. Idempotent.
@@ -897,6 +976,19 @@ export function openDb(path) {
     if (dropped > 0) {
       console.log(`agent_idem: dropped ${dropped} row(s) whose device was already revoked`)
     }
+  }
+  // `private_eligible` decides whether the bridge's hello may RAISE the flag.
+  // NULL = the device has not said hello yet: its first hello decides (a box
+  // paired with MATRON_AGENT_PRIVATE set comes up private, as before). After
+  // that a hello may only raise the flag on an eligible device (1); lowering
+  // is always allowed and never clears eligibility, so a private box whose
+  // env var goes missing for a restart can come back. An ordinary device
+  // (0) cannot make itself private: being private lifts every sieve, so it
+  // takes the operator (matron-admin device private <id> on). Existing rows
+  // are backfilled from their current flag.
+  if (!deviceCols.some((c) => c.name === 'private_eligible')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private_eligible INTEGER')
+    db.exec('UPDATE devices SET private_eligible = private')
   }
   // Revoked private devices keep a tombstone. Revocation deletes the
   // devices row (the cascades and the token check depend on that), but the
@@ -1191,6 +1283,14 @@ export function openDb(path) {
   // When the words landed: the clock runExpireVoiceNotes (retention.js)
   // measures a chat voice note's audio life from.
   if (!blobCols.some((c) => c.name === 'transcribed_at')) db.exec('ALTER TABLE blobs ADD COLUMN transcribed_at INTEGER')
+  // A video upload's words with their timing: JSON [{start_ms, text}], set
+  // with transcript when a video job is 'done'; NULL for audio and for every
+  // row before this column.
+  if (!blobCols.some((c) => c.name === 'transcript_segments')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_segments TEXT')
+  // When the journal was last asked to transcribe the row (at upload, or by
+  // a retry): the clock blob-transcripts.js recover() judges a leftover
+  // 'pending' row by. NULL on rows before it (created_at stands in).
+  if (!blobCols.some((c) => c.name === 'transcript_asked_at')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_asked_at INTEGER')
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
@@ -1476,6 +1576,16 @@ export function openDb(path) {
   if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
     db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
   }
+  // Owner-only items (2026-10-17): `private` is 1 on an item that must never
+  // leave its owner however its mission is shared — a bridge's secure-input
+  // request (its body carries the live form link), a foreign "Allow once"
+  // ask (the exact call another person's turn asked for). Hidden from every
+  // grantee and contributor, never copied by a hand-over, never counted on
+  // a share card. To the owner's own agents and clients it is an item like
+  // any other. 0 on every pre-existing row.
+  if (!itemActionCols.some((c) => c.name === 'private')) {
+    db.exec('ALTER TABLE items ADD COLUMN private INTEGER NOT NULL DEFAULT 0')
+  }
   // Comment action buttons (2026-10-04 comment-actions contract): the same
   // pair as the item's, one level down. `actions` is the list an agent
   // offered on ONE comment (a follow-up question in the thread),
@@ -1496,6 +1606,13 @@ export function openDb(path) {
   if (!commentActionCols.some((c) => c.name === 'convo_id')) {
     db.exec('ALTER TABLE item_comments ADD COLUMN convo_id TEXT')
   }
+  // Withdrawn replies (src/withdrawn-comments.js): when the user cancelled a
+  // reply while it waited on a busy session's queue, so it never reached the
+  // agent. The row stays for the user; agents and search no longer see its
+  // words. NULL = never withdrawn.
+  if (!commentActionCols.some((c) => c.name === 'withdrawn_at')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN withdrawn_at INTEGER')
+  }
   // Notice items (mission: For you): kind 'notice' widens the items CHECK.
   // SQLite cannot ALTER a CHECK, so a database from before it is rebuilt once
   // from its OWN stored definition (every column added by the ALTERs above
@@ -1503,6 +1620,8 @@ export function openDb(path) {
   // procedure, foreign keys off so item_comments' references survive the
   // drop. Placed after every items ALTER so the copy carries them all.
   rebuildItemsForNotice(db)
+  // Talk requests: person_rooms rows aimed at a person, not a session.
+  migratePersonRoomsForTalk(db)
   // Item handover (mission: hand a tracker item from one session to another).
   // An item's origin_convo_id / origin_device_id is its OWNER: every reply,
   // tap, wake and transcript follows it, and a handover moves it. The
@@ -1632,6 +1751,11 @@ export function openDb(path) {
   if (!settingsCols.some((c) => c.name === 'notices')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN notices INTEGER NOT NULL DEFAULT 1')
   }
+  // Auto-archive idle conversations after this many days (src/archive.js).
+  // NULL = the default, 0 = off.
+  if (!settingsCols.some((c) => c.name === 'auto_archive_days')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN auto_archive_days INTEGER')
+  }
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
   }
@@ -1671,6 +1795,20 @@ export function openDb(path) {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(user_id, convo_id)
   )`)
+  // Archived conversations (src/archive.js): the user's own "out of the
+  // way" flag, synced to every app. archived_at NULL = not archived; the
+  // row stays after an unarchive so unarchived_at can restart the
+  // auto-archive idle clock. updated_at versions changes for `since` reads.
+  db.exec(`CREATE TABLE IF NOT EXISTS convo_archive(
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    convo_id TEXT NOT NULL,
+    archived_at INTEGER,
+    auto INTEGER NOT NULL DEFAULT 0,
+    unarchived_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, convo_id)
+  )`)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_convo_archive_updated ON convo_archive(user_id, updated_at)')
   // The startup resume of held consent pushes (push.js resumeHeldConsent)
   // reads recent permission_request cards; partial, so ordinary appends
   // never touch it.
@@ -1679,6 +1817,58 @@ export function openDb(path) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
     if (!cols.some((c) => c.name === 'answer_reason')) db.exec(`ALTER TABLE ${table} ADD COLUMN answer_reason TEXT`)
+  }
+  // The causes the asking bridge stamped on a spawn or chat ask
+  // (src/ask-causes.js): a JSON array of {kind, ref?, at?}, NULL when the
+  // ask carried none — a bridge that predates the field, and every row
+  // predating the column. On convo_agents it describes the CURRENT ask:
+  // upsertRow rewrites it on every renewal like justification and topic.
+  for (const table of ['convo_agents', 'agent_spawn_requests']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all()
+    if (!cols.some((c) => c.name === 'causes')) db.exec(`ALTER TABLE ${table} ADD COLUMN causes TEXT`)
+  }
+  // The journal's own record of the hops an ask the Coordinator had another
+  // session make passes through (src/cause-hops.js): every carry-on the
+  // Coordinator sends (`carry_on:<id>`, with its target) and every room
+  // message it posts (`room:<room>@<seq>`), each with the causes of the
+  // Coordinator's turn that sent it (coordinator = 1); and every room
+  // message another session posts in a turn such a hop reached, with the
+  // keys of those hops in `origins` (coordinator = 0). Pruned after 14 days.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cause_hops(
+      user_id       INTEGER NOT NULL,
+      key           TEXT NOT NULL,
+      room_id       TEXT,
+      seq           INTEGER,
+      from_convo_id TEXT NOT NULL,
+      to_convo_id   TEXT,
+      coordinator   INTEGER NOT NULL,
+      causes        TEXT,
+      origins       TEXT,
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY(user_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS cause_hops_room ON cause_hops(user_id, room_id, seq) WHERE room_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS cause_hops_age ON cause_hops(created_at);
+  `)
+  // When the Coordinator approves an ask it made itself, the root cause the
+  // journal resolved it to ('user' | 'item' | 'routine', and its ref) and
+  // what the verifier said about it. NULL on every other decision and on
+  // every decision made before the columns.
+  const decisionCols = db.prepare('PRAGMA table_info(consent_decisions)').all()
+  for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) {
+    if (!decisionCols.some((d) => d.name === c)) db.exec(`ALTER TABLE consent_decisions ADD COLUMN ${c} TEXT`)
+  }
+  widenConsentDecisionKinds(db)
+  addTransferCauses(db)
+  addTransferRecipient(db)
+  addTransferConsentSetting(db)
+  // A routine's envelope (JSON): the bounds on what an ask born of one of
+  // its fires may do — how many spawns per fire, whether chats, which boxes.
+  // NULL = no envelope, the value for every routine predating the column.
+  const routineCols = db.prepare('PRAGMA table_info(routines)').all()
+  if (!routineCols.some((c) => c.name === 'envelope')) {
+    db.exec('ALTER TABLE routines ADD COLUMN envelope TEXT')
   }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
@@ -1813,6 +2003,30 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'unlisted')) {
     db.exec('ALTER TABLE users ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0')
   }
+  // Forgot password (src/password-reset.js): an optional address per
+  // account, unique whatever its case, so an address names one account.
+  // Reset links are stored only as a SHA-256 of their token, with a hash
+  // of the password and address they were mailed for (account_state);
+  // password_reset_sends counts the mails per account for the hourly cap.
+  if (!userCols.some((c) => c.name === 'email')) {
+    db.exec('ALTER TABLE users ADD COLUMN email TEXT')
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS password_resets(
+      token_hash TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id),
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      account_state TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS password_resets_user ON password_resets(user_id);
+    CREATE TABLE IF NOT EXISTS password_reset_sends(
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      sent_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS password_reset_sends_user ON password_reset_sends(user_id, sent_at);
+  `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
@@ -1851,6 +2065,54 @@ export function openDb(path) {
       db.pragma('user_version = 2')
     })()
   }
+  // Hand-over and level changes (person-to-person sharing, phase 3). `brief`
+  // is the owner's hand-over brief; `exclude_media` the JSON array of media
+  // ids the owner unticked; `copy_subject_id` the recipient's copy once a
+  // hand-over is accepted. `pending_level` / `pending_state` carry an ask to
+  // raise the level of a grant that is already active (read → owner): the
+  // row stays active at its old level until both yeses are in, then takes
+  // the new one. pending_state is 'awaiting_owner' | 'pending', like state.
+  const grantCols = db.prepare('PRAGMA table_info(grants)').all()
+  // `approved` is what the owner said yes to for a hand-over: the mission ids
+  // and the attachment ids that would cross, fixed at the owner's approval.
+  // `keep_level` is what the old owner keeps on the copy after a hand-over:
+  // 'contribute', or NULL for read.
+  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT'], ['keep_level', 'TEXT']]) {
+    if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
+  }
+  // `sent_at`: when the row was sent to its grantee (moved to pending). The
+  // grantee reads a row only once it has been: an ask its owner never
+  // approved — still waiting, declined, expired or revoked — stays a 404 to
+  // them. `pending_by` / `pending_at` are a raise's own asker and time, so
+  // the share's requested_by and updated_at stay as its grantee knows them
+  // while a raise waits. Added together; the backfill runs once, with them.
+  // `pick_options`: the boxes a hand-over's "Pick a box" offered its
+  // recipient (label -> device id), for the follow-up tap to resolve
+  // (src/handover-session.js), as person_rooms.pick_options does for a talk.
+  if (!grantCols.some((c) => c.name === 'pick_options')) db.exec('ALTER TABLE grants ADD COLUMN pick_options TEXT')
+  if (!grantCols.some((c) => c.name === 'sent_at')) {
+    db.transaction(() => {
+      db.exec('ALTER TABLE grants ADD COLUMN sent_at INTEGER')
+      db.exec('ALTER TABLE grants ADD COLUMN pending_by TEXT')
+      db.exec('ALTER TABLE grants ADD COLUMN pending_at INTEGER')
+      backfillGrantSent(db)
+    })()
+  }
+  // Contributors (person-to-person sharing, phase 3): a write a contributor
+  // made in the owner's log names them. contributor_name/_via ('user' |
+  // 'agent') are what the owner reads ("by bob", "by bob's agent").
+  // items.contributor_user_id / contributor_convo_id say where the owner's
+  // replies go: the conversation, in the CONTRIBUTOR's log, that filed the
+  // item — never shown to the owner. missions.status_contributor names who
+  // set the status, until the owner next does.
+  const contribCols = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name)
+  const addCols = (table, cols) => {
+    const have = contribCols(table)
+    for (const [name, type] of cols) if (!have.includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`)
+  }
+  addCols('items', [['contributor_user_id', 'INTEGER'], ['contributor_convo_id', 'TEXT'], ['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
+  addCols('milestones', [['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
+  addCols('missions', [['status_contributor', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
@@ -1858,6 +2120,39 @@ export function openDb(path) {
   // items, which drops its triggers with it).
   installSearchDocs(db)
   return db
+}
+
+// Whether a row was ever sent to its grantee (sent_at), for rows written
+// before the column: one that is pending or active was, and so was one the
+// grantee answered or ended — their card (grantee_item_id) or their own
+// revoke says so. Anything else (still awaiting the owner, declined or
+// revoked by the owner before approving, expired unanswered) was not.
+// Idempotent: only rows with no sent_at are touched.
+// The grantee's card is filed best-effort, so a sent row may have none: the
+// grantee's own "received" audit line, in their People conversation, counts
+// as evidence too (only the journal writes `people` events) — but only for
+// the row's CURRENT ask. A row is reused for a later ask, which may have
+// ended unsent, and an old receipt says nothing about it: so the receipt
+// must be newer than the current ask. A client's ask is sent as it is made,
+// so any receipt is its own; an agent's ask is dated by its owner's card
+// (owner_item_id), and one with no card cannot be dated and is not counted.
+// A row still awaiting its owner is never counted.
+export function backfillGrantSent(db) {
+  return db.prepare(`UPDATE grants SET sent_at = COALESCE(answered_at, updated_at, created_at)
+    WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee'
+      -- Revoked after the grantee answered it: answered_at on a revoked row
+      -- is only ever the grantee's accept (a renewal resets it), and it
+      -- survives the raises that older code wrote over the card ids.
+      OR (state = 'revoked' AND answered_at IS NOT NULL)
+      OR (state <> 'awaiting_owner' AND EXISTS (
+        SELECT 1 FROM events e
+        JOIN conversations pc ON pc.id = e.convo_id AND pc.system = 'people'
+        JOIN contacts c ON c.id = grants.contact_id
+        WHERE e.user_id = c.peer_user_id AND pc.owner_user_id = c.peer_user_id AND e.type = 'people'
+          AND json_extract(e.payload, '$.grant_id') = grants.id
+          AND json_extract(e.payload, '$.event') IN ('grant.received', 'grant.handover_received')
+          AND (grants.requested_by IS NOT 'agent'
+               OR e.ts >= (SELECT oi.created_at FROM items oi WHERE oi.id = grants.owner_item_id)))))`).run().changes
 }
 
 export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath, width = null, height = null }) {
@@ -2045,8 +2340,10 @@ export function setDeviceConsentUserOnly(db, deviceId, on) {
 
 // matron-admin's write: sets the value AND takes ownership (pin). Both
 // directions pin — `off` is "force-visible", not "hands off".
+// The pin also sets eligibility, so `auto` afterwards hands back a flag the
+// bridge may keep raising (on) or may not raise (off).
 export function pinDevicePrivate(db, deviceId, value) {
-  db.prepare('UPDATE devices SET private=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, deviceId)
+  db.prepare('UPDATE devices SET private=?, private_eligible=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, value ? 1 : 0, deviceId)
 }
 
 // Hands the flag back to the bridge's hello assertion. Deliberately does not
@@ -2058,9 +2355,15 @@ export function unpinDevicePrivate(db, deviceId) {
 // The bridge's per-hello assertion (MATRON_AGENT_PRIVATE on the bridge
 // side). A no-op while pinned. Hello-without-the-field asserts false — a
 // bridge-set flag does NOT survive a re-register without the env var; an
-// admin-set one does (the pin).
+// admin-set one does (the pin). Raising needs eligibility (see
+// private_eligible): the first hello decides it, later ones may only lower
+// the flag of a device that came up ordinary.
 export function applyBridgePrivate(db, deviceId, value) {
-  db.prepare('UPDATE devices SET private=? WHERE id=? AND private_pinned=0').run(value ? 1 : 0, deviceId)
+  const v = value ? 1 : 0
+  db.prepare(`UPDATE devices SET
+      private = CASE WHEN ? = 0 THEN 0 WHEN COALESCE(private_eligible, 1) = 1 THEN 1 ELSE private END,
+      private_eligible = COALESCE(private_eligible, ?)
+    WHERE id=? AND private_pinned=0`).run(v, v, deviceId)
 }
 
 const ITEM_KIND_CHECK_OLD = "CHECK(kind IN ('task','question','decision'))"
@@ -2088,6 +2391,102 @@ export function rebuildItemsForNotice(db) {
       // was already in the data before the rebuild and must not stop a boot.
       const broken = db.prepare('PRAGMA foreign_key_check(item_comments)').all().filter((r) => r.parent === 'items')
       if (broken.length) console.warn(`items rebuild: ${broken.length} item comment(s) point at no item`)
+    })()
+  } finally {
+    db.pragma('foreign_keys = ON')
+  }
+  return true
+}
+
+// Talk requests (docs/protocol.md "Rooms between people"): a person_rooms
+// row may name no guest session yet (and, before the owner's Send, no
+// contact row), and has the 'starting' state. SQLite cannot drop NOT NULL
+// or widen a CHECK, so a database from before is rebuilt once, the same
+// 12-step procedure as rebuildItemsForNotice. The new columns are added
+// after, by ALTER, so they land whichever path the table took. Idempotent.
+export function migratePersonRoomsForTalk(db) {
+  const def = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='person_rooms'").get()
+  if (def && !def.sql.includes("'starting'")) {
+    const createNew = def.sql
+      .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`]?person_rooms["`]?\s*\(/i, 'CREATE TABLE person_rooms_talk_new(')
+      .replace(/(owner_contact_id\s+TEXT)\s+NOT NULL/, '$1')
+      .replace(/(guest_device_id\s+INTEGER)\s+NOT NULL/, '$1')
+      .replace(/(guest_convo_id\s+TEXT)\s+NOT NULL/, '$1')
+      .replace("'awaiting_guest','invited'", "'awaiting_guest','starting','invited'")
+    if (!createNew.includes("'starting'")) throw new Error('person_rooms: unexpected state CHECK, cannot add talk requests')
+    const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='person_rooms' AND sql IS NOT NULL").all().map((r) => r.sql)
+    db.pragma('foreign_keys = OFF')
+    try {
+      db.transaction(() => {
+        db.exec(createNew)
+        db.exec('INSERT INTO person_rooms_talk_new SELECT * FROM person_rooms')
+        db.exec('DROP TABLE person_rooms')
+        db.exec('ALTER TABLE person_rooms_talk_new RENAME TO person_rooms')
+        for (const sql of indexes) db.exec(sql)
+      })()
+    } finally {
+      db.pragma('foreign_keys = ON')
+    }
+  }
+  const cols = db.prepare('PRAGMA table_info(person_rooms)').all()
+  const add = (name, ddl) => { if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE person_rooms ADD COLUMN ${ddl}`) }
+  add('kind', "kind TEXT NOT NULL DEFAULT 'session'")
+  add('contact_by_talk', 'contact_by_talk INTEGER NOT NULL DEFAULT 0')
+  add('pick_options', 'pick_options TEXT')
+  add('spawn_id', 'spawn_id TEXT')
+}
+
+// The causes the sending bridge stamped on a transfer (src/ask-causes.js),
+// as on a spawn or chat ask: a JSON array of {kind, ref?, at?}, NULL when
+// it stamped none — a bridge that predates the field, and every row
+// predating the column. Idempotent.
+export function addTransferCauses(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'causes')) db.exec('ALTER TABLE transfers ADD COLUMN causes TEXT')
+}
+
+// The user's switch "Let the Coordinator approve file transfers"
+// (src/consent-http.js answerTransfer): while on, a transfer the Coordinator
+// had another session send is answered like any other. Default OFF, and no
+// row reads as off too. Idempotent.
+export function addTransferConsentSetting(db) {
+  const cols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!cols.some((c) => c.name === 'coordinator_transfer_consent')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_transfer_consent INTEGER NOT NULL DEFAULT 0')
+  }
+}
+
+// The one device a transfer goes to (src/transfers.js recipientCandidates),
+// fixed at create. NULL on every row predating the column: those fall back
+// to the room's current recipients (transferRecipients). Idempotent.
+export function addTransferRecipient(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// The Coordinator answers file transfers too: consent_decisions.kind gains
+// 'transfer'. SQLite cannot widen a CHECK, so a table from before is
+// rebuilt once, the same procedure as rebuildItemsForNotice (its own
+// definition with the one CHECK replaced, so every column added by ALTER
+// since is kept). Idempotent.
+const DECISION_KIND_CHECK_OLD = "CHECK(kind IN ('chat','spawn'))"
+const DECISION_KIND_CHECK_NEW = "CHECK(kind IN ('chat','spawn','transfer'))"
+export function widenConsentDecisionKinds(db) {
+  const def = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='consent_decisions'").get()
+  if (!def || def.sql.includes("'transfer'")) return false
+  if (!def.sql.includes(DECISION_KIND_CHECK_OLD)) throw new Error('consent_decisions: unexpected kind CHECK, cannot add transfer')
+  const createNew = def.sql
+    .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`]?consent_decisions["`]?\s*\(/i, 'CREATE TABLE consent_decisions_transfer_new(')
+    .replace(DECISION_KIND_CHECK_OLD, DECISION_KIND_CHECK_NEW)
+  const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='consent_decisions' AND sql IS NOT NULL").all().map((r) => r.sql)
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.transaction(() => {
+      db.exec(createNew)
+      db.exec('INSERT INTO consent_decisions_transfer_new SELECT * FROM consent_decisions')
+      db.exec('DROP TABLE consent_decisions')
+      db.exec('ALTER TABLE consent_decisions_transfer_new RENAME TO consent_decisions')
+      for (const sql of indexes) db.exec(sql)
     })()
   } finally {
     db.pragma('foreign_keys = ON')

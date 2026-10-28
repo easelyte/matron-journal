@@ -10,7 +10,10 @@
 //   GET    /person-rooms[?room_id=]             my rooms with other people; an
 //                                                agent names a room it is in
 //   POST   /person-rooms/:id/answer {decision}  approve|decline (owner) or
-//                                                accept|decline (guest), client only
+//                                                accept|decline (guest), client only;
+//                                                a talk request's guest accepts with
+//                                                target 'coordinator'|'new_session'
+//                                                or convo_id
 //   DELETE /person-rooms/:id                    end a room (client of either side)
 //
 // The room ask itself is the ordinary `agent_invite` op aimed at a shared
@@ -24,14 +27,23 @@ import { writableConvo } from './missions-http.js'
 import { getItem } from './items.js'
 import {
   shareSession, answerSessionShare, revokeSessionShare, listSessionShares, sessionShareRow,
-  answerPersonRoom, getPersonRoom, linkOfRoom, listPersonRooms, personRoomRow,
+  answerPersonRoom, getPersonRoom, linkOfRoom, listPersonRooms, personRoomRow, guestSees,
 } from './person-rooms.js'
 import { shareAsk, onShareAnswered, onShareEnded, onPersonRoomOutcome, endAndNotify } from './person-rooms-events.js'
+import { answerTalkOwner, answerTalkGuest, pickedConvo, CHOICE } from './talk-requests.js'
+import { onTalkOwnerOutcome, onTalkGuestOutcome, talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
 
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const SHARE_CONFLICTS = new Set(['private_session', 'not_contact', 'pending', 'too_many_asks', 'not_pending', 'not_active'])
-const ROOM_CONFLICTS = new Set(['not_pending'])
+const ROOM_CONFLICTS = new Set(['not_pending', 'not_available'])
 const DECISIONS = new Set(['approve', 'accept', 'decline'])
+// A talk request guest's accept names where their side talks.
+function talkTargetOf(body) {
+  if (typeof body.convo_id === 'string' && body.convo_id) return { convoId: body.convo_id }
+  if (body.target === 'coordinator') return 'coordinator'
+  if (body.target === 'new_session') return 'new'
+  return null
+}
 
 export function applyShareAnswer(ctx, who, shareId, decision) {
   let out
@@ -58,11 +70,76 @@ export function applyRoomAnswer(ctx, who, linkId, decision) {
   return { status: 200, body: { person_room: personRoomRow(out.link, side) }, closed }
 }
 
+// A talk request's answer, from either side. `choice` for the guest:
+// 'decline' | 'coordinator' | 'pick' | 'new' | {convoId}; for the owner
+// 'approve' | 'decline'.
+export function applyTalkAnswer(ctx, who, link, choice) {
+  const owner = link.owner_user_id === who.userId
+  let out
+  try {
+    out = owner
+      ? answerTalkOwner(ctx.db, { userId: who.userId, linkId: link.id, decision: choice === 'decline' ? 'decline' : 'approve' })
+      : answerTalkGuest(ctx.db, { userId: who.userId, linkId: link.id, choice })
+  } catch (err) {
+    if (ROOM_CONFLICTS.has(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+    throw err
+  }
+  if (!out) return { status: 404, body: { error: 'not_found' } }
+  let closed = null
+  let comment = null
+  if (owner) {
+    closed = onTalkOwnerOutcome(ctx, who, out)
+    comment = closed?.comment ?? null
+  } else {
+    ({ closed = null, comment = null } = onTalkGuestOutcome(ctx, who, out) ?? {})
+  }
+  if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed, comment }
+  return { status: 200, body: { person_room: personRoomRow(out.link, owner ? 'owner' : 'guest') }, closed, comment }
+}
+
+// The guest's label, from the card's own buttons or a follow-up's.
+function talkChoiceOf(link, label) {
+  if (label === CHOICE.decline) return 'decline'
+  if (label === CHOICE.coordinator) return 'coordinator'
+  if (label === CHOICE.pick) return 'pick'
+  if (label === CHOICE.new) return 'new'
+  const convoId = pickedConvo(link, label)
+  return convoId ? { convoId } : null
+}
+
+function handleTalkTap(ctx, res, who, item, action, replyTo, link) {
+  const { db } = ctx
+  const owner = link.owner_user_id === who.userId && link.owner_item_id === item.id
+  let choice
+  if (replyTo != null) {
+    // A follow-up's button: only on the guest's mirror, only the journal's
+    // own question, only one of its labels.
+    const offered = owner ? null : talkQuestionActions(db, item.id, replyTo)
+    if (!offered || !offered.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
+    choice = talkChoiceOf(link, action)
+  } else {
+    if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
+    choice = owner ? (action === 'Cancel' ? 'decline' : 'approve') : talkChoiceOf(link, action)
+  }
+  if (!choice) { json(res, 400, { error: 'unknown_action' }); return true }
+  const r = applyTalkAnswer(ctx, who, link, choice)
+  if (r.status !== 200) { json(res, r.status, r.body); return true }
+  if (replyTo != null) recordFollowUpTap(ctx, who, item.id, action, replyTo)
+  json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, comment: r.comment ?? null, ...r.body })
+  return true
+}
+
 // A tap on a room or session-share mirror (POST /items/:id/comments
 // {action}) IS the answer, like a contact or share mirror's. Client only
-// (items-http refuses an agent's action before it gets here).
-export function handlePeopleRoomTap(ctx, res, who, item, action) {
+// (items-http refuses an agent's action before it gets here). `replyTo` is
+// a talk request's follow-up question (the comment-actions contract).
+export function handlePeopleRoomTap(ctx, res, who, item, action, replyTo = null) {
   const { db } = ctx
+  if (item.consent === 'room') {
+    const row = db.prepare('SELECT id, kind FROM person_rooms WHERE (owner_user_id=@u AND owner_item_id=@i) OR (guest_user_id=@u AND guest_item_id=@i)').get({ u: who.userId, i: item.id })
+    if (row?.kind === 'talk') return handleTalkTap(ctx, res, who, item, action, replyTo, getPersonRoom(db, row.id))
+  }
+  if (replyTo != null) { json(res, 400, { error: 'unknown_action' }); return true }
   if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
   const decision = action === 'Decline' ? 'decline' : 'approve'
   let r
@@ -168,13 +245,23 @@ async function handleRooms(ctx, req, res, url, who) {
   let id
   try { id = decodeURIComponent(m[1]) } catch { return badRequest(res) }
   const link = getPersonRoom(db, id)
-  const side = link?.owner_user_id === who.userId ? 'owner' : (link?.guest_user_id === who.userId && link.state !== 'awaiting_owner' ? 'guest' : null)
+  const side = link?.owner_user_id === who.userId ? 'owner' : (link?.guest_user_id === who.userId && guestSees(db, link) ? 'guest' : null)
   if (!link || !side) return notFound(res)
   if (m[2] === 'answer') {
     if (req.method !== 'POST') return false
     if (who.kind !== 'client') return forbidden(res)
     const body = await readBody(req)
     if (!DECISIONS.has(body.decision)) return badRequest(res)
+    if (link.kind === 'talk') {
+      let choice = body.decision === 'decline' ? 'decline' : 'approve'
+      if (side === 'guest' && choice !== 'decline') {
+        choice = talkTargetOf(body)
+        if (!choice) return badRequest(res)
+      }
+      const r = applyTalkAnswer(ctx, who, link, choice)
+      json(res, r.status, r.body)
+      return true
+    }
     const r = applyRoomAnswer(ctx, who, id, body.decision)
     json(res, r.status, r.body)
     return true
@@ -184,7 +271,7 @@ async function handleRooms(ctx, req, res, url, who) {
   // Either person ends a room from their own device. Agents leave through
   // agent_leave, like any room.
   if (who.kind !== 'client') return forbidden(res)
-  const before = endAndNotify(ctx, id, side === 'owner' ? 'owner_user' : 'guest_user', ['awaiting_owner', 'awaiting_guest'].includes(link.state) ? 'withdrawn' : 'left')
+  const before = endAndNotify(ctx, id, side === 'owner' ? 'owner_user' : 'guest_user', ['awaiting_owner', 'awaiting_guest', 'starting'].includes(link.state) ? 'withdrawn' : 'left')
   if (!before) return conflict(res, { blocked_by: 'not_active' })
   json(res, 200, { person_room: personRoomRow(getPersonRoom(db, id), side) })
   return true

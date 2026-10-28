@@ -73,7 +73,7 @@ export function missionRow(row) {
   if (!row) return null
   const {
     idem_key: _idemKey, sieved_last_milestone_at: sievedLastMilestoneAt,
-    status_device_id: _statusDeviceId, status_hidden: statusHidden,
+    status_device_id: _statusDeviceId, status_hidden: statusHidden, status_contributor: statusContributor,
     running_convos: runningConvos, waiting_convos: waitingConvos, convo_activity_at: convoActivityAt, ...rest
   } = row
   const { closed_hidden: closedHidden, ...bare } = rest
@@ -91,6 +91,9 @@ export function missionRow(row) {
   // countsSql / sharedCountsSql. A withheld status reads as four nulls, the
   // same shape as "never set", so its absence says nothing.
   if (Number(statusHidden || 0)) for (const k of STATUS_FIELDS) out[k] = null
+  // A contributor set the status (src/contribute.js): their name. Absent
+  // otherwise, so a mission row's shape is unchanged.
+  else if (statusContributor && out.status != null) out.status_contributor = statusContributor
   // Spec 2026-09-30 §2 activity — computed after the status sieve, so a
   // withheld status_updated_at never counts. Every input here is the
   // caller's own sieved view (countsSql / sharedCountsSql). One argument
@@ -109,10 +112,12 @@ export function missionRow(row) {
 // `idem_key` is internal, and so is `user_id` (fix round 2, minor 2): it is
 // always the caller's own id — no route hands back another user's milestone —
 // so returning it only widened the wire shape for nothing.
+// `contributor` {name, via} is present only on a contributor's milestone
+// (src/contribute.js).
 export function milestoneRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, user_id: _userId, ...rest } = row
-  return rest
+  const { idem_key: _idemKey, user_id: _userId, contributor_name: name, contributor_via: via, ...rest } = row
+  return name ? { ...rest, contributor: { name, via: via ?? 'agent' } } : rest
 }
 
 // `detail` (name only, so far) says which rule a refused field broke; the
@@ -424,7 +429,7 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
       (c.mission_id IS NOT NULL AND c.mission_id = l.mission_id) AS current, l.how, l.joined_at, l.ended_at,
       s.reported_at AS status_reported_at, s.status AS status_json
     FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
-    LEFT JOIN devices d ON d.id = c.agent_device_id
+    LEFT JOIN devices d ON d.id = c.agent_device_id AND d.user_id = c.owner_user_id
     LEFT JOIN conversation_status s ON s.convo_id = c.id
     WHERE l.mission_id = ? ${history ? '' : 'AND l.ended_at IS NULL'} ${sieve}
     ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)
@@ -459,10 +464,12 @@ export function conversationMissions(db, userId, convoId, { excludePrivateOwned 
     }))
 }
 
-// `statusWriter` {by, convoId, deviceId} (spec 2026-09-28 missions dashboard
+// `statusWriter` {by, convoId, deviceId, contributor?} (spec 2026-09-28 missions dashboard
 // §1) is required whenever fields.status is a string: the status columns are
 // always written as one set, never one of them alone, with the same `ts` as
 // updated_at. A null status clears all of them, status_device_id included.
+// `contributor` names a contributor who wrote it (src/contribute.js); every
+// other status write clears it.
 // A title or name change recomposes every conversation whose current mission
 // this is; `onRetitled` receives the rows that changed (convo-title.js), so
 // the return value stays the mission row every caller already reads.
@@ -483,8 +490,8 @@ export function updateMission(db, { userId, missionId, fields, statusWriter = nu
     if (fields.status !== undefined) {
       if (fields.status !== null && !statusWriter) throw new Error('status_writer_required')
       const w = fields.status === null ? { by: null, convoId: null, deviceId: null } : statusWriter
-      sets.push('status=?', 'status_by=?', 'status_convo_id=?', 'status_device_id=?', 'status_updated_at=?')
-      args.push(fields.status, w.by, w.convoId ?? null, w.deviceId ?? null, fields.status === null ? null : ts)
+      sets.push('status=?', 'status_by=?', 'status_convo_id=?', 'status_device_id=?', 'status_updated_at=?', 'status_contributor=?')
+      args.push(fields.status, w.by, w.convoId ?? null, w.deviceId ?? null, fields.status === null ? null : ts, fields.status === null ? null : w.contributor ?? null)
     }
     if (fields.projectId !== undefined) { sets.push('project_id=?'); args.push(fields.projectId) }
     sets.push('updated_at=?'); args.push(ts)
@@ -720,9 +727,9 @@ const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts g
 function sharedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
-       WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS open_items,
+       WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('ic')}) AS open_items,
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
-       WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS needs_you,
+       WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('ic')}) AS needs_you,
     (SELECT COUNT(*) FROM mission_conversations sl JOIN conversations cc ON cc.id = sl.convo_id
        WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND cc.parent_convo_id IS NULL AND ${sharedConvoSql('cc')}) AS conversations,
     (SELECT COUNT(*) FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
@@ -777,7 +784,7 @@ export function sharedMissionDetail(db, viewerUserId, mission, { subchats = fals
     WHERE l.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`).all(args).map(milestoneRow)
   const items = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, i.origin_convo_id, i.updated_at
     FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
-    WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
+    WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('cv')}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
   // parent_convo_id is withheld when the colleague cannot read the parent.
   const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.auto_title, cv.session_state AS state, cv.repo, d.name AS box,
@@ -812,7 +819,7 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
 // you" is about the viewer, a read grantee is never the one an item waits
 // on, and missionRow derives `activity` from the same number — so the
 // owner's waiting items never read as the grantee's.
-const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
+const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND i.private = 0 AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
   WHERE oc.id = i.origin_convo_id)`
 const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN private_devices d ON d.id = mc.agent_device_id
   WHERE mc.id = l.convo_id)`
@@ -833,7 +840,7 @@ function grantedCountsSql() {
     ,${activitySql(GRANT_CONVO_SIEVE)},
     NULL AS project_num,
     (SELECT json_object('id', g.id, 'level', g.level) FROM grants g JOIN contacts oc ON oc.id = g.contact_id
-       WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.state = 'active' AND oc.peer_user_id = @viewer LIMIT 1) AS grant_json
+       WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.state = 'active' AND g.level <> 'owner' AND oc.peer_user_id = @viewer LIMIT 1) AS grant_json
   `
 }
 
@@ -870,8 +877,8 @@ export function getGrantedMission(db, viewerUserId, missionId) {
 // they anchor is in a transcript that did not cross. Items: the open list,
 // as the owner's detail shows it, without the origin conversation.
 export function grantedMissionDetail(db, mission) {
-  const milestones = db.prepare(`SELECT l.id, l.mission_id, l.num, l.kind, l.title, l.body, l.created_by, l.created_at
-    FROM milestones l WHERE l.mission_id = ? ${GRANT_MILESTONE_SIEVE} ORDER BY l.created_at DESC, l.seq DESC`).all(mission.id)
+  const milestones = db.prepare(`SELECT l.id, l.mission_id, l.num, l.kind, l.title, l.body, l.created_by, l.created_at, l.contributor_name, l.contributor_via
+    FROM milestones l WHERE l.mission_id = ? ${GRANT_MILESTONE_SIEVE} ORDER BY l.created_at DESC, l.seq DESC`).all(mission.id).map((r) => milestoneRow(r))
   const items = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, '' AS origin_convo_id, i.updated_at
     FROM items i WHERE i.mission_id = ? AND i.state='open' ${GRANT_ITEM_SIEVE}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)

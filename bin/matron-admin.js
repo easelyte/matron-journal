@@ -11,17 +11,25 @@ import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
+import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
+import { setTransferConsentEnabled } from '../src/consent.js'
+import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
   matron-admin user unlisted <name> on|off
+  matron-admin user email <name> <address>|--clear
+  matron-admin user 2fa-reset <name>
+  matron-admin two-factor status
+  matron-admin two-factor require on|off
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
   matron-admin device private <device_id> on|off|auto
   matron-admin device consent <device_id> user-only|any
+  matron-admin coordinator transfers <username> on|off
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
@@ -154,6 +162,46 @@ export async function runAdmin(db, argv, deps = {}) {
       ? `${name} is now unlisted: left out of the add-contact user list, and cannot send or be sent a contact request`
       : `${name} is listed again in the add-contact user list`
   }
+  // The address a forgot-password link goes to (src/password-reset.js).
+  if (a === 'user' && b === 'email') {
+    const name = argv[2]
+    const value = argv[3]
+    if (!name || !value) throw new Error(USAGE)
+    const email = value === '--clear' ? null : normaliseEmail(value)
+    if (value !== '--clear' && !email) throw new Error(`not an email address: ${value}`)
+    const u = db.prepare('SELECT id FROM users WHERE name=?').get(name)
+    if (!u) throw new Error(`no such user: ${name}`)
+    if (setUserEmail(db, u.id, email).conflict) throw new Error(`another account already has ${email}`)
+    return email ? `${name}'s email is now ${email}` : `${name} has no email address now`
+  }
+  // The lockout escape hatch: a user who has lost their authenticator app
+  // and their recovery codes signs in with the password alone again, and
+  // can set two-factor up afresh (or is made to, when it is required).
+  if (a === 'user' && b === '2fa-reset') {
+    const name = argv[2]
+    if (!name) throw new Error(USAGE)
+    const user = requireUser(db, name)
+    return disableTwoFactor(db, user.id)
+      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again`
+      : `${name} did not have two-factor on`
+  }
+  if (a === 'two-factor' && b === 'status') {
+    const users = db.prepare('SELECT id, name FROM users ORDER BY name').all()
+    const lines = users.map((u) => {
+      const s = twoFactorState(db, u.id)
+      return `${u.name}\t${s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'}`
+    })
+    const keyNote = process.env.MATRON_TOKEN_KEY ? '' : ' (MATRON_TOKEN_KEY is not set in this shell; the server needs it for two-factor)'
+    return [`required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`, ...lines].join('\n')
+  }
+  if (a === 'two-factor' && b === 'require') {
+    const value = argv[2]
+    if (value !== 'on' && value !== 'off') throw new Error(USAGE)
+    setTwoFactorRequired(db, value === 'on')
+    return value === 'on'
+      ? 'two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)'
+      : 'two-factor is optional again'
+  }
   if (a === 'agent' && b === 'add') {
     const [, , username, agentName] = argv
     if (!username || !agentName) throw new Error(USAGE)
@@ -190,7 +238,9 @@ export async function runAdmin(db, argv, deps = {}) {
   // Visibility flag override (spec: agent visibility & privacy). on/off PIN
   // the flag — the bridge's per-hello MATRON_AGENT_PRIVATE assertion is
   // ignored until `auto` releases it. This is what makes admin authoritative:
-  // a deploy that forgot the env var cannot unmark a pinned machine.
+  // a deploy that forgot the env var cannot unmark a pinned machine. The pin
+  // also sets whether the bridge may raise the flag after `auto` (on: yes,
+  // off: no) — an ordinary device can never make itself private.
   if (a === 'device' && b === 'private') {
     const deviceId = Number(argv[2])
     const mode = argv[3]
@@ -199,7 +249,7 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     if (mode === 'auto') {
       unpinDevicePrivate(db, deviceId)
-      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect`
+      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect; a device last pinned off may lower but not raise it`
     }
     pinDevicePrivate(db, deviceId, mode === 'on')
     return `device ${deviceId} pinned private=${mode} — the bridge's hello assertion is ignored until 'auto' releases it`
@@ -217,6 +267,21 @@ export async function runAdmin(db, argv, deps = {}) {
     return mode === 'user-only'
       ? `device ${deviceId} consent=user-only — only the user's tap approves its asks; the Coordinator may still decline`
       : `device ${deviceId} consent=any — the Coordinator may approve its asks again`
+  }
+  // The user's switch "Let the Coordinator approve file transfers" (also
+  // PUT /coordinator transfer_consent from the user's own app): while on,
+  // the Coordinator may approve a transfer it had another session send.
+  // Flagged files, user-only boxes and its own sends stay the user's.
+  if (a === 'coordinator' && b === 'transfers') {
+    const username = argv[2]
+    const mode = argv[3]
+    if (!username || !['on', 'off'].includes(mode)) throw new Error(USAGE)
+    const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+    if (!user) throw new Error(`no such user: ${username}`)
+    setTransferConsentEnabled(db, user.id, mode === 'on')
+    return mode === 'on'
+      ? `${username}: the Coordinator may approve file transfers, including ones it had another session send (flagged files and user-only boxes stay the user's)`
+      : `${username}: file transfers the Coordinator had another session send are the user's to approve again`
   }
   if (a === 'link-code') {
     const username = argv[1]

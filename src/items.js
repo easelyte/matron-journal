@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto'
 import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { blobImageDims, isPrivateDevice } from './db.js'
 import { yieldTurn } from './background.js'
+import { presentWithdrawn } from './withdrawn-comments.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -154,6 +155,10 @@ export function rowToItem(row) {
     labels, links, attachments, actions, idem_key: _idemKey,
     turn_requested_at: turnRequestedAt, owner_session_state: sessionState,
     owner_turn_started_at: turnStartedAt, owner_turn_ended_at: turnEndedAt,
+    // Internal: where a contributor's replies go (src/contribute.js), never
+    // on the wire — least of all to the owner.
+    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId,
+    contributor_name: contributorName, contributor_via: contributorVia,
     ...rest
   } = row
   const out = {
@@ -163,7 +168,13 @@ export function rowToItem(row) {
     attachments: parseJson(attachments ?? '[]', []),
     actions: parseJson(actions ?? '[]', []),
     chosen_action: rest.chosen_action ?? null,
+    // Owner-only (see db.js): never on another person's wire, so a row
+    // that reaches one is always false there.
+    private: !!rest.private,
   }
+  // Filed by another person, a contributor to the item's mission: who, in
+  // words. Absent on every other item, so their shape is unchanged.
+  if (contributorName) out.contributor = { name: contributorName, via: contributorVia ?? 'agent' }
   if ('handover' in out) out.handover = out.handover == null ? null : parseJson(out.handover, null)
   if ('comment_count' in out) out.comment_count = Number(out.comment_count)
   if ('has_image' in out) out.has_image = !!out.has_image
@@ -233,7 +244,7 @@ export function requestTurn(db, itemId, now = Date.now()) {
 // reader may not learn them (hidePrivateAuthors, listSharedComments).
 export function rowToComment(row) {
   if (!row) return null
-  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, ...rest } = row
+  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, withdrawn_at: withdrawnAt, ...rest } = row
   const agent = rest.author === 'agent'
   rest.device_name = agent ? rest.device_name ?? null : null
   rest.convo_id = agent ? rest.convo_id ?? null : null
@@ -241,8 +252,20 @@ export function rowToComment(row) {
   const m = meta == null ? null : parseJson(meta, null)
   const action = typeof m?.action === 'string' ? m.action : null
   const replyTo = typeof m?.reply_to === 'string' ? m.reply_to : null
+  // `attribution`: who wrote a comment that came from another person, in
+  // words — a hand-over copy (src/handover.js) carries "alice" or "alice's
+  // agent". Absent on every comment written in this log, so the shape
+  // every client already decodes is unchanged.
+  const attribution = typeof m?.attribution === 'string' ? { attribution: m.attribution } : {}
+  // `contributor` {name, via}: written by a contributor to the item's
+  // mission (src/contribute.js). Absent otherwise, like attribution.
+  if (m?.contributor && typeof m.contributor.name === 'string') attribution.contributor = { name: m.contributor.name, via: m.contributor.via === 'user' ? 'user' : 'agent' }
+  // `withdrawn_at`: when the user cancelled this reply before it reached the
+  // agent (src/withdrawn-comments.js). Absent on every other comment, like
+  // attribution.
+  if (withdrawnAt != null) attribution.withdrawn_at = withdrawnAt
   return {
-    ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo,
+    ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
   }
 }
@@ -344,7 +367,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 
 export function createItem(db, {
   userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], awaiting, position, after, before,
-  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, now = Date.now(),
+  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, isPrivate = false, now = Date.now(),
 }) {
   return db.transaction(() => {
     if (idemKey) {
@@ -364,10 +387,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions))
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -426,7 +449,25 @@ const DONE_VIEW = `(i.state = 'closed' OR (i.created_by = 'agent' AND i.awaiting
 // closed tops the list, however long its agent takes to close it.
 const ACTED_AT = `COALESCE(${LAST_USER_INPUT}, i.closed_at, i.updated_at)`
 
+// The device that filed item `i`: the writer of its first post. A handover
+// (src/item-handover.js) moves origin_device_id to the new owner and keeps
+// the filing conversation in filed_convo_id, so a handed-over item is named
+// by the box that hosts that conversation.
+const FILER_DEVICE = `CASE WHEN i.filed_convo_id IS NULL THEN i.origin_device_id
+    ELSE (SELECT fc.agent_device_id FROM conversations fc WHERE fc.id = i.filed_convo_id AND fc.owner_user_id = i.user_id) END`
+
 const DECORATE = `${WORKING_DECORATE},
+  -- device_name: the box whose session filed an agent's item, as a comment's
+  -- device_name names the box that wrote it, so the item's own post is headed
+  -- the same way. NULL on the user's items, a contributor's (they name
+  -- themselves), when the device is gone, and when a private box filed into a
+  -- conversation that is not private-owned: an ordinary agent can read that
+  -- item, and a private box's name never crosses to one (privacy.js).
+  (SELECT d.name FROM devices d WHERE i.created_by = 'agent' AND i.contributor_name IS NULL
+     AND d.id = ${FILER_DEVICE} AND d.user_id = i.user_id AND d.kind = 'agent'
+     AND (NOT EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = d.id)
+          OR EXISTS (SELECT 1 FROM conversations oc JOIN private_devices od ON od.id = oc.agent_device_id
+                     WHERE oc.id = i.origin_convo_id))) AS device_name,
   (SELECT COUNT(*) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS comment_count,
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   -- When the user last acted on the item: their latest comment, action tap,
@@ -590,9 +631,10 @@ const OWNER_DECORATE = `
 
 // The grant rule for an item (spec 2026-10-02 matron-to-matron sharing): it
 // sits on a mission granted to @viewer, is not a consent mirror (callers add
-// i.consent IS NULL), and was not filed from a private box — the same sieve
-// the grantee's mission view applies (missions.js grantedMissionDetail).
-const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND EXISTS (
+// i.consent IS NULL), is not owner-only (`private`, db.js), and was not
+// filed from a private box — the same sieve the grantee's mission view
+// applies (missions.js grantedMissionDetail).
+const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND i.private = 0 AND EXISTS (
     SELECT 1 FROM missions m WHERE m.id = i.mission_id AND m.user_id = i.user_id
       AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN private_devices md ON md.id = mo.agent_device_id
                       WHERE mo.id = m.origin_convo_id)
@@ -617,8 +659,9 @@ function rowToSharedItem(row) {
   const item = rowToItem(rest)
   item.owner = parseJson(ownerJson, null)
   // Item handover (src/item-handover.js) names conversations that need not
-  // pass the sharing rule themselves: never shown to another person.
-  Object.assign(item, { filed_convo_id: null, handover: null })
+  // pass the sharing rule themselves, and the filing box is the user's own:
+  // never shown to another person (listSharedComments drops a comment's).
+  Object.assign(item, { filed_convo_id: null, handover: null, device_name: null })
   // Whether the owner's session is busy is the owner's to see.
   delete item.working
   if (orgShared === 0) {
@@ -639,15 +682,18 @@ export function listGrantedComments(db, itemId) {
 
 // Another person's view of a thread: the handover lines (src/item-handover.js)
 // are dropped — they name the user's conversations and boxes — and so are
-// the author's box and conversation on every comment.
+// the author's box and conversation on every comment. A reply the user
+// withdrew (src/withdrawn-comments.js) shows without its words.
 export function listSharedComments(db, itemId) {
   return listComments(db, itemId).filter((c) => !c.meta?.handover)
-    .map((c) => ({ ...c, device_name: null, convo_id: null, convo_title: null }))
+    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
   limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
-  const where = [`(${ORG_SHARED} OR ${GRANTED_ITEM})`, 'i.consent IS NULL']
+  // Owner-only items (`private`) stay out of every other person's read,
+  // the org rule included.
+  const where = [`(${ORG_SHARED} OR ${GRANTED_ITEM})`, 'i.consent IS NULL', 'i.private = 0']
   const args = { viewer: viewerUserId }
   if (Array.isArray(kind)) { where.push(`i.kind IN (${kind.map((_, i) => `@kind${i}`).join(',')})`); kind.forEach((k, i) => { args[`kind${i}`] = k }) }
   else if (kind != null) { where.push('i.kind = @kind'); args.kind = kind }
@@ -667,7 +713,7 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
 export function getSharedItem(db, viewerUserId, itemId) {
   if (typeof itemId !== 'string' || !itemId.startsWith('it_')) return null
   const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
-    WHERE i.id = @id AND i.consent IS NULL AND (${ORG_SHARED} OR ${GRANTED_ITEM})`).get({ viewer: viewerUserId, id: itemId })
+    WHERE i.id = @id AND i.consent IS NULL AND i.private = 0 AND (${ORG_SHARED} OR ${GRANTED_ITEM})`).get({ viewer: viewerUserId, id: itemId })
   return rowToSharedItem(row)
 }
 
@@ -787,18 +833,20 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
 
 const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
 
-export function closeItem(db, { userId, itemId, resolution, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
+// `meta` is merged into the status row's own: a contributor's close
+// (src/contribute.js) says who closed it.
+export function closeItem(db, { userId, itemId, resolution, author, deviceId, convoId = null, comment = '', meta = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'closed') return null
     const to = { state: 'closed', resolution, awaiting: null }
     db.prepare("UPDATE items SET state='closed', resolution=?, awaiting=NULL, closed_at=?, updated_at=? WHERE id=?").run(resolution, now, now, itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { ...meta, from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }
 
-export function reopenItem(db, { userId, itemId, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
+export function reopenItem(db, { userId, itemId, author, deviceId, convoId = null, comment = '', meta = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'open') return null
@@ -807,7 +855,7 @@ export function reopenItem(db, { userId, itemId, author, deviceId, convoId = nul
     db.prepare("UPDATE items SET state='open', resolution=NULL, awaiting=?, closed_at=NULL, updated_at=? WHERE id=?").run(awaiting, now, itemId)
     // A reopened notice is unread again: its Seen button goes back live.
     if (row.kind === 'notice') db.prepare('UPDATE items SET chosen_action=NULL WHERE id=?').run(itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { ...meta, from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }

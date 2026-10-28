@@ -43,8 +43,23 @@ export function writeBlobSync(root, data) {
 export function receiveBlob(req, { root, maxBytes, createWriteStream = fs.createWriteStream }) {
   const id = crypto.randomBytes(16).toString('hex')
   const finalPath = shardedPath(root, id)
-  const tmpPath = `${finalPath}.tmp`
+  const accept = ({ size }) => {
+    if (size === 0) throw Object.assign(new Error('empty media upload'), { code: 'empty' })
+  }
+  return receiveToPath(req, { tmpPath: `${finalPath}.tmp`, finalPath, maxBytes, accept, createWriteStream })
+    .then(({ size, sha256 }) => ({ id, size, sha256, diskPath: finalPath }))
+}
 
+// The streaming half of receiveBlob, for any caller that picks its own
+// paths (media blobs, transfer chunks): streams `req` to `tmpPath`, hashing
+// and counting as it goes, and renames it to `finalPath` once the body is
+// fully on disk. More than `maxBytes` rejects with code 'too_large' and
+// stops reading (the socket is the caller's to close). `accept({size,
+// sha256})` runs after the flush and before the rename: throwing there
+// deletes the temp file and rejects with what it threw, so a body the caller
+// does not want never appears at `finalPath`. The temp file never outlives
+// a failure.
+export function receiveToPath(req, { tmpPath, finalPath, maxBytes, accept = () => {}, createWriteStream = fs.createWriteStream }) {
   return fs.promises.mkdir(path.dirname(finalPath), { recursive: true }).then(() => new Promise((resolve, reject) => {
     const out = createWriteStream(tmpPath)
     const hash = crypto.createHash('sha256')
@@ -73,7 +88,7 @@ export function receiveBlob(req, { root, maxBytes, createWriteStream = fs.create
       if (settled) return
       size += chunk.length
       if (size > maxBytes) {
-        abort(Object.assign(new Error('media upload exceeds size cap'), { code: 'too_large' }))
+        abort(Object.assign(new Error('upload exceeds size cap'), { code: 'too_large' }))
         return
       }
       hash.update(chunk)
@@ -94,13 +109,15 @@ export function receiveBlob(req, { root, maxBytes, createWriteStream = fs.create
         if (settled) return
         if (flushErr) return abort(flushErr)
         settled = true
-        if (size === 0) {
-          fs.promises.unlink(tmpPath).catch(() => {})
-            .finally(() => reject(Object.assign(new Error('empty media upload'), { code: 'empty' })))
+        const sha256 = hash.digest('hex')
+        try {
+          accept({ size, sha256 })
+        } catch (err) {
+          fs.promises.unlink(tmpPath).catch(() => {}).finally(() => reject(err))
           return
         }
         fs.promises.rename(tmpPath, finalPath)
-          .then(() => resolve({ id, size, sha256: hash.digest('hex'), diskPath: finalPath }))
+          .then(() => resolve({ size, sha256, path: finalPath }))
           .catch((err) => { fs.promises.unlink(tmpPath).catch(() => {}); reject(err) })
       })
     })

@@ -8,14 +8,18 @@
     "matron-push-relay": "bin/matron-push-relay.js"
   },
   "scripts": {
-    "start": "node src/server.js",
+    "start": "bin/matron-journal",
     "test": "node --test --test-timeout=30000 'test/**/*.js'",
     "loadtest": "node tools/load-test.js"
   },
   "engines": {
     "node": ">=20"
   },
+  "overrides": {
+    "sharp": "^0.35.5"
+  },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
     "argon2": "^0.41.0",
     "better-sqlite3": "^11.0.0",
     "croner": "^10.0.1",

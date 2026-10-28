@@ -7,7 +7,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { listComments, listPendingTranscripts } from '../src/items.js'
-import { makeTranscriber, cleanWhisperText, resolveWhisperPrompt, withDeviceNames, promptLooksTruncated, DEFAULT_WHISPER_PROMPT } from '../src/transcribe.js'
+import { makeTranscriber, cleanWhisperText, parseSegments, resolveWhisperPrompt, withDeviceNames, promptLooksTruncated, DEFAULT_WHISPER_PROMPT } from '../src/transcribe.js'
 
 // A transcriber whose jobs the test releases by hand, so "pending" is a state
 // the assertions can actually observe rather than a race.
@@ -164,6 +164,7 @@ test('makeTranscriber: off without a model, off (loudly) when the model path is 
   const errs = []
   assert.equal(makeTranscriber({ modelPath: '/nope/models/ggml-base.bin', log: { error: (m) => errs.push(m) } }), null)
   assert.equal(errs.length, 1)
+  assert.match(errs[0], /whisper model is missing at .* voice notes will NOT be transcribed here/)
   assert.equal(cleanWhisperText(' [BLANK_AUDIO]\n Use option A.\n'), 'Use option A.')
 })
 
@@ -260,6 +261,139 @@ test('resolveWhisperPrompt: unset -> built-in vocabulary, empty -> off, set -> t
   assert.equal(resolveWhisperPrompt(''), '')
   assert.equal(resolveWhisperPrompt('  '), '')
   assert.equal(resolveWhisperPrompt(' Acme, widget-2. '), 'Acme, widget-2.')
+})
+
+// A whisper transcriber whose model and cli exist only for the boot check;
+// `exec` stands in for ffmpeg and whisper-cli and records every call.
+function fakeWhisper(t, stdout, extra = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  const calls = []
+  const exec = async (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { stdout: cmd === cliPath ? stdout : '' } }
+  return { tr: makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec, ...extra }), calls, cliPath }
+}
+
+test('segments: runs whisper without --no-timestamps and parses "[00:00:01.200 --> 00:00:02.000]  b" to start_ms 1200', async (t) => {
+  const { tr, calls, cliPath } = fakeWhisper(t, '[00:00:00.000 --> 00:00:01.200]   a\n[00:00:01.200 --> 00:00:02.000]  b\n[00:00:02.000 --> 00:00:03.000]   [BLANK_AUDIO]\n')
+  assert.deepEqual(await tr.transcribeFileSegments('/blob', { userId: 7 }), { text: 'a b', segments: [{ start_ms: 0, text: 'a' }, { start_ms: 1200, text: 'b' }] })
+  const ffmpeg = calls.find((c) => c.cmd === 'ffmpeg')
+  assert.ok(ffmpeg.args.includes('-vn'), 'a video container decodes to its audio track')
+  const w = calls.find((c) => c.cmd === cliPath)
+  assert.ok(!w.args.includes('--no-timestamps'))
+  assert.ok(w.args.includes('--prompt'))
+  // transcribeFile keeps its untimed run.
+  calls.length = 0
+  await tr.transcribeFile('/blob')
+  assert.ok(calls.find((c) => c.cmd === cliPath).args.includes('--no-timestamps'))
+})
+
+test('parseSegments: hours and minutes count, markers and empty lines are dropped', () => {
+  assert.deepEqual(parseSegments('[01:02:03.004 --> 01:02:04.000]  late\n  [00:00:05.500 --> 00:00:06.000] (typing)\nnoise\n[00:00:07.000 --> 00:00:08.000]   \n'), [{ start_ms: 3723004, text: 'late' }])
+  assert.deepEqual(parseSegments(''), [])
+})
+
+test('segments: timeout is 600000', async (t) => {
+  const { tr, calls, cliPath } = fakeWhisper(t, '[00:00:00.000 --> 00:00:01.000]  a\n')
+  await tr.transcribeFileSegments('/blob')
+  assert.equal(calls.find((c) => c.cmd === cliPath).opts.timeout, 600000)
+  calls.length = 0
+  await tr.transcribeFile('/blob')
+  assert.equal(calls.find((c) => c.cmd === cliPath).opts.timeout, 120000)
+  const custom = fakeWhisper(t, '[00:00:00.000 --> 00:00:01.000]  a\n', { segmentsTimeoutMs: 5000 })
+  await custom.tr.transcribeFileSegments('/blob')
+  assert.equal(custom.calls.find((c) => c.cmd === custom.cliPath).opts.timeout, 5000)
+})
+
+test('segments: no words throws "empty transcription result"; ffmpeg failing (a video with no audio stream) throws', async (t) => {
+  const silent = fakeWhisper(t, '[00:00:00.000 --> 00:00:30.000]   [BLANK_AUDIO]\n')
+  await assert.rejects(silent.tr.transcribeFileSegments('/blob'), { message: 'empty transcription result' })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  let wavDir = null
+  let whisperRan = false
+  const mute = makeTranscriber({ modelPath, cliPath, exec: async (cmd, args) => {
+    if (cmd !== 'ffmpeg') { whisperRan = true; return { stdout: '' } }
+    wavDir = path.dirname(args[args.length - 1])
+    throw new Error('Output file does not contain any stream')
+  } })
+  await assert.rejects(mute.transcribeFileSegments('/blob'), /does not contain any stream/)
+  assert.equal(whisperRan, false)
+  assert.equal(fs.existsSync(wavDir), false)
+})
+
+test('segments: the prompt guard reruns a truncated prompted run without the prompt', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  const lines = (n) => Array.from({ length: n }, (_, i) => `[00:00:${String(i % 60).padStart(2, '0')}.000 --> 00:00:59.999]  w${i}`).join('\n')
+  const calls = []
+  const tr = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => {
+    calls.push({ cmd, args })
+    if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } }
+    return { stdout: args.includes('--prompt') ? lines(16) : lines(300) }
+  } })
+  const out = await tr.transcribeFileSegments('/blob')
+  assert.equal(calls.filter((c) => c.cmd === cliPath).length, 2)
+  assert.equal(out.segments.length, 300)
+  assert.equal(out.text.split(' ').length, 300)
+})
+
+// A whisper whose prompted run comes back implausibly short for a 124-second
+// WAV (so the prompt guard wants a rerun), on a clock the test moves: each
+// whisper run takes `runMs` of it.
+function guardedWhisper(t, { runMs, segmentsTimeoutMs, timed = true }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  let clock = 1_000_000
+  const runs = []
+  const out = (n) => Array.from({ length: n }, (_, i) => (timed ? `[00:00:${String(i % 60).padStart(2, '0')}.000 --> 00:00:59.999]  w${i}` : `w${i}`)).join('\n')
+  const exec = async (cmd, args, opts) => {
+    if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } }
+    runs.push({ prompted: args.includes('--prompt'), timeout: opts.timeout })
+    clock += runMs
+    return { stdout: args.includes('--prompt') ? out(16) : out(300) }
+  }
+  const tr = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec, now: () => clock, ...(segmentsTimeoutMs ? { segmentsTimeoutMs } : {}) })
+  return { tr, runs }
+}
+
+test('segments: the prompt-guard rerun gets what is left of the one 600 s budget, not a fresh one', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 200_000 })
+  const got = await tr.transcribeFileSegments('/blob')
+  assert.deepEqual(runs.map((r) => [r.prompted, r.timeout]), [[true, 600000], [false, 400000]])
+  assert.equal(got.segments.length, 300)
+  assert.ok(200_000 + runs[1].timeout <= 600000, 'the first run\'s time plus the rerun\'s limit fit the single budget')
+})
+
+test('segments: no rerun when under 60 s of the budget is left; the prompted run stands', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 545_000 })
+  const got = await tr.transcribeFileSegments('/blob')
+  assert.equal(runs.length, 1)
+  assert.equal(got.segments.length, 16)
+  // A custom budget is honoured the same way.
+  const custom = guardedWhisper(t, { runMs: 1_000, segmentsTimeoutMs: 10_000 })
+  await custom.tr.transcribeFileSegments('/blob')
+  assert.equal(custom.runs.length, 1)
+})
+
+test('transcribeFile: the prompt-guard rerun still gets its own 120 s timeout (voice notes unchanged)', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 100_000, timed: false })
+  await tr.transcribeFile('/blob')
+  assert.deepEqual(runs.map((r) => [r.prompted, r.timeout]), [[true, 120000], [false, 120000]])
+})
+
+test('parseSegments: inline markers are stripped like a note\'s, and segments come back in time order', () => {
+  assert.deepEqual(parseSegments('[00:00:03.000 --> 00:00:04.000]  later\n[00:00:01.000 --> 00:00:02.000]  [MUSIC] hello [BLANK_AUDIO]\n[00:00:02.000 --> 00:00:03.000]  [MUSIC] \n'), [
+    { start_ms: 1000, text: 'hello' },
+    { start_ms: 3000, text: 'later' },
+  ])
 })
 
 test('the same blob attached twice is one whisper run and settles both attachments', async (t) => {

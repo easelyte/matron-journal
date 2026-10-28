@@ -23,6 +23,10 @@ import { emitMarker } from './items-http.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 
 export const CONSENT_LABEL = 'consent'
+// The item's own buttons: a tap on one answers the ask exactly as the card
+// does (consentItemTapAnswer, consent-answer.js), so the user can decide
+// from For you without finding the card.
+export const CONSENT_ACTIONS = Object.freeze(['Approve', 'Decline'])
 // Titles are capped at TITLE_MAX; the box name (PEER_NAME_CAP) plus the
 // prefix leaves room for a short topic or the head of the task.
 const TITLE_TAIL_MAX = 100
@@ -40,8 +44,8 @@ const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // itself is never altered (it is what the user approves and the child
 // runs): a task carrying backtick runs simply gets a longer fence than
 // its longest run, which is the CommonMark rule for keeping it inside.
-const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
-const fenced = (s) => {
+export const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
+export const fenced = (s) => {
   const text = String(s)
   const longest = Math.max(0, ...(text.match(/`+/g) || []).map((run) => run.length))
   const fence = '`'.repeat(Math.max(3, longest + 1))
@@ -95,7 +99,7 @@ export function spawnConsentItemFields(card) {
     '',
     fenced(card.task),
     '',
-    `**To answer:** open the conversation "${plain(card.from_convo_title)}" and tap **Approve** or **Decline** on the spawn card there. Unanswered, the request expires 24 h after it was made.`,
+    `**To answer:** tap **Approve** or **Decline** here, or on the spawn card in the conversation "${plain(card.from_convo_title)}". Unanswered, the request expires 24 h after it was made.`,
   ]
   return {
     title,
@@ -203,7 +207,7 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
     // then rolls back).
     const item = db.transaction(() => {
       const { item } = createItem(db, {
-        userId, kind: 'question', ...fields, awaiting: 'user',
+        userId, kind: 'question', ...fields, actions: [...CONSENT_ACTIONS], awaiting: 'user',
         // A time-limited ask belongs at the top of the list, not under
         // everything the user has been putting off.
         position: 'top',
@@ -300,7 +304,7 @@ export function chatConsentItemFields(card) {
     '',
     fenced(card.justification),
     '',
-    '**To answer:** open the room conversation this item belongs to and tap **Approve** or **Decline** on the chat request card (also listed under Settings → Agent Chats). Unanswered, the request expires 24 h after it was made.',
+    '**To answer:** tap **Approve** or **Decline** here, or on the chat request card in the room conversation this item belongs to. Unanswered, the request expires 24 h after it was made.',
   ]
   return {
     title,
@@ -360,7 +364,7 @@ export function fileChatConsentItem({ db, hub }, { userId, fromDeviceId, fromNam
       const row = db.prepare("SELECT created_at FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").get(roomId, agentDeviceId)
       if (!row) throw new Error(`no parked row for ${roomId}/${agentDeviceId}`)
       const { item } = createItem(db, {
-        userId, kind: 'question', ...fields, awaiting: 'user', position: 'top',
+        userId, kind: 'question', ...fields, actions: [...CONSENT_ACTIONS], awaiting: 'user', position: 'top',
         originConvoId: roomId, originDeviceId: fromDeviceId, createdBy: 'agent', consent: 'chat',
         idemKey: `consent:chat:${roomId}:${agentDeviceId}:${row.created_at}`,
       })
@@ -419,6 +423,7 @@ const CHAT_STATE_OUTCOME = { invited: 'approved', joined: 'approved', denied: 'd
 
 export function reconcileConsentItems({ db, hub }) {
   let closed = 0
+  offerConsentActions(db)
   try {
     const stale = db.prepare(`
       SELECT i.id, i.user_id, i.consent, i.origin_device_id FROM items i
@@ -442,6 +447,26 @@ export function reconcileConsentItems({ db, hub }) {
   }
   if (closed) console.log(`consent items: closed ${closed} whose request was no longer waiting`)
   return closed
+}
+
+// Items filed before spawn and chat mirrors carried their own buttons get
+// them, while their ask still waits: Approve and Decline on the item answer
+// it exactly as the card does. updated_at moves so an app's next item sync
+// picks the buttons up. Never throws.
+export function offerConsentActions(db) {
+  try {
+    const n = db.prepare(`
+      UPDATE items SET actions=?, updated_at=?
+      WHERE consent IN ('spawn','chat') AND state='open' AND actions='[]'
+        AND (EXISTS (SELECT 1 FROM agent_spawn_requests r WHERE r.item_id = items.id AND r.state='awaiting_user')
+          OR EXISTS (SELECT 1 FROM convo_agents ca WHERE ca.item_id = items.id AND ca.state='awaiting_user'))`)
+      .run(JSON.stringify(CONSENT_ACTIONS), Date.now()).changes
+    if (n) console.log(`consent items: offered Approve/Decline on ${n} waiting item(s) filed without them`)
+    return n
+  } catch (err) {
+    console.error('consent item: offering actions failed', err)
+    return 0
+  }
 }
 
 // An open mirror with no ask row behind it at all.

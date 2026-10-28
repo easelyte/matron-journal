@@ -26,7 +26,7 @@ test('chat asks: decline reaches the requester as the usual refusal; approve del
   assert.equal(note.body, 'Approved by the Coordinator — a review chat between two of my sessions. The invitation is on its way.')
   const decision = await f.client.waitFor((x) => x.kind === 'journal' && x.type === 'consent_decision' && x.payload.decision === 'approve')
   assert.equal(decision.convo_id, 'room')
-  assert.deepEqual(decision.payload, { kind: 'chat', room_id: 'room', target_device_id: f.targetDev.deviceId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'a review chat between two of my sessions' })
+  assert.deepEqual(decision.payload, { kind: 'chat', room_id: 'room', target_device_id: f.targetDev.deviceId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'a review chat between two of my sessions', cause: null })
   assert.equal((await answer(f, f.coordDev.token, { kind: 'chat', id: 'room/abc', decision: 'approve', reason: 'x' })).status, 400)
   assert.equal((await answer(f, f.coordDev.token, { kind: 'chat', id: 'nope/1', decision: 'approve', reason: 'x' })).status, 404)
 })

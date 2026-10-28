@@ -246,6 +246,9 @@ export function searchRecent(db, userId, { query, limit = 50, convoId = null, ex
 // MAX(sm.seq) rides SQLite's documented single-MAX rule: with exactly one
 // MAX() aggregate, bare columns take their values from the row that
 // supplied the maximum.
+// How many of the newest matching messages searchChats groups (see there).
+export const CHAT_SCAN_CAP = 2000
+
 export function searchChats(db, userId, { query, limit = 20, excludeSubagents = false, excludePrivateOwned = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
@@ -256,15 +259,23 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
       scope = ` AND sm.convo_id IN (${convoIds.map(() => '?').join(',')})`
       where.args.push(...convoIds)
     }
+    // Grouped over the newest CHAT_SCAN_CAP matching messages only. A
+    // common word ("the", "a", a name) matches a large share of the whole
+    // journal, and counting every one of those took seconds; walking the
+    // index newest first and stopping at the cap keeps every query fast.
     return db.prepare(`
-      SELECT sm.convo_id, COUNT(*) AS hit_count, MAX(sm.seq) AS newest_seq, sm.rowid AS newest_rowid
-      FROM search_fts_plain
-      JOIN search_messages sm ON sm.rowid = search_fts_plain.rowid
-      JOIN conversations c ON c.id = sm.convo_id
-      WHERE ${where.sql}${scope}
-      GROUP BY sm.convo_id
+      SELECT convo_id, COUNT(*) AS hit_count, MAX(seq) AS newest_seq, rowid AS newest_rowid
+      FROM (
+        SELECT sm.convo_id, sm.seq, sm.rowid
+        FROM search_fts_plain
+        JOIN search_messages sm ON sm.rowid = search_fts_plain.rowid
+        JOIN conversations c ON c.id = sm.convo_id
+        WHERE ${where.sql}${scope}
+        ORDER BY search_fts_plain.rowid DESC
+        LIMIT ?)
+      GROUP BY convo_id
       ORDER BY newest_seq DESC
-      LIMIT ?`).all(...where.args, n)
+      LIMIT ?`).all(...where.args, CHAT_SCAN_CAP, n)
   }
   let exact = []
   let all

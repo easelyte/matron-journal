@@ -55,7 +55,7 @@ test('session_control: Coordinator -> journal -> target bridge -> result frame',
 })
 
 test('session_control: set_model carries model and agent; carry_on carries message and when; strings are sanitised', async (t) => {
-  const { parent, target } = await fleet(t)
+  const { s, parent, target } = await fleet(t)
   parent.send({ op: 'session_control', request_id: 'r2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'set_model', model: 'sonnet\u0007', agent: 'claude' })
   let req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
   assert.deepEqual(req.request.params, { convo_id: 'tgt', action: 'set_model', model: 'sonnet', agent: 'claude', from_convo_id: 'parent-convo', from_name: 'box-6' })
@@ -63,9 +63,19 @@ test('session_control: set_model carries model and agent; carry_on carries messa
   const err = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'r2')
   assert.deepEqual(err, { kind: 'session_control', event: 'result', request_id: 'r2', ok: false, error: { code: 'bad_model', detail: 'unknown alias [0m' } })
   target.frames.length = 0
-  parent.send({ op: 'session_control', request_id: 'r3', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: '  carry on with the tests ', when: 'after_limit_reset' })
+  const causes = [{ kind: 'user_message', ref: 'parent-convo:3', at: 1 }]
+  parent.send({ op: 'session_control', request_id: 'r3', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: '  carry on with the tests ', when: 'after_limit_reset', causes })
   req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
-  assert.deepEqual(req.request.params, { convo_id: 'tgt', action: 'carry_on', message: 'carry on with the tests', when: 'after_limit_reset', from_convo_id: 'parent-convo', from_name: 'box-6' })
+  const { carry_on_id: carryOnId, ...rest } = req.request.params
+  assert.deepEqual(rest, { convo_id: 'tgt', action: 'carry_on', message: 'carry on with the tests', when: 'after_limit_reset', from_convo_id: 'parent-convo', from_name: 'box-6' })
+  // The carry-on is on record, with the Coordinator turn's causes, for the
+  // target's turn to name (src/cause-hops.js); the causes are never relayed.
+  assert.match(carryOnId, /^co_[0-9a-f]{16}$/)
+  const hop = s.db.prepare('SELECT * FROM cause_hops WHERE key=?').get(`carry_on:${carryOnId}`)
+  assert.equal(hop.from_convo_id, 'parent-convo')
+  assert.equal(hop.to_convo_id, 'tgt')
+  assert.equal(hop.coordinator, 1)
+  assert.deepEqual(JSON.parse(hop.causes), causes)
   target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'scheduled' } })
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'r3')
 })
@@ -112,6 +122,7 @@ test('session_control: refused for a non-Coordinator, a client, a foreign or pri
   const bad = [
     { action: 'reboot' }, { action: 'set_model' }, { action: 'set_model', agent: 'gemini' }, { action: 'set_model', model: 'x'.repeat(65) },
     { action: 'carry_on' }, { action: 'carry_on', message: '   ' }, { action: 'carry_on', message: 'go', when: 'later' }, { action: 'compact', reason: 'r'.repeat(201) },
+    { action: 'carry_on', message: 'go', causes: [{ kind: 'nonsense' }] }, { action: 'carry_on', message: 'go', causes: 'x' },
   ]
   for (const [i, b] of bad.entries()) {
     parent.send({ ...base, ...b, request_id: `b${i}` })
@@ -123,7 +134,11 @@ test('session_control: refused for a non-Coordinator, a client, a foreign or pri
 })
 
 test('validateSessionControl: pure shape checks', () => {
-  assert.deepEqual(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'compact' }), { ok: true, rid: 'a', params: { convo_id: 't', action: 'compact' } })
+  assert.deepEqual(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'compact' }), { ok: true, rid: 'a', params: { convo_id: 't', action: 'compact' }, causes: null })
+  // A carry-on's causes are handed back beside the params, never inside them.
+  const co = validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'carry_on', message: 'go', causes: [{ kind: 'routine', ref: 'routine:x@2026-01-01T00:00:00.000Z' }] })
+  assert.deepEqual(co.causes, [{ kind: 'routine', ref: 'routine:x@2026-01-01T00:00:00.000Z' }])
+  assert.equal('causes' in co.params, false)
   assert.equal(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'set_model', agent: 'codex' }).params.agent, 'codex')
   assert.equal(validateSessionControl({}).code, 'bad_request')
   // Effort on its own is a whole set_model; the level is the bridge's call.

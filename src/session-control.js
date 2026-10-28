@@ -4,10 +4,12 @@
 // caller IS the Coordinator (the one route the role gates), resolves the
 // target to its box, wakes it if asleep, issues a journal-originated RPC and
 // hands the reply back. Nothing is journaled here; the target bridge writes
-// the visible record into the session's own chat.
+// the visible record into the session's own chat. (A carry-on is recorded
+// for the consent guard, src/cause-hops.js, but that writes no event.)
 import { sanitizePeerText } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
+import { causesFromFrame } from './ask-causes.js'
 
 export const SESSION_CONTROL_ACTIONS = new Set(['set_model', 'compact', 'carry_on'])
 export const SESSION_CONTROL_AGENTS = new Set(['claude', 'codex'])
@@ -33,10 +35,13 @@ function peerStr(v, max, name) {
   return sanitizePeerText(v, max)
 }
 
-// Shape check only (no DB). Returns {ok, rid, params} — params is what the
-// target bridge receives, minus from_convo_id/from_name which the op stamps —
-// or {code, detail}. `rid` is set whenever request_id was usable so every
-// later error can carry it.
+// Shape check only (no DB). Returns {ok, rid, params, causes} — params is
+// what the target bridge receives, minus from_convo_id/from_name (and a
+// carry-on's carry_on_id) which the op stamps — or {code, detail}. `rid` is
+// set whenever request_id was usable so every later error can carry it.
+// `causes` (carry_on only) are the Coordinator turn's, as on a spawn
+// request: never relayed, kept on the carry-on's record
+// (src/cause-hops.js); null when it sent none.
 export function validateSessionControl(msg) {
   const rid = msg?.request_id
   if (typeof rid !== 'string' || !rid || rid.length > ID_MAX) return { code: 'bad_request', detail: 'bad request_id' }
@@ -68,9 +73,11 @@ export function validateSessionControl(msg) {
         params.when = msg.when
       }
     }
+    const frame = msg.action === 'carry_on' ? causesFromFrame(msg) : { ok: true, causes: null }
+    if (!frame.ok) return { rid, code: 'bad_request', detail: 'bad causes' }
     const reason = peerStr(msg.reason, SESSION_CONTROL_REASON_MAX, 'reason')
     if (reason) params.reason = reason
-    return { ok: true, rid, params }
+    return { ok: true, rid, params, causes: frame.causes }
   } catch (e) {
     if (e instanceof BadParam) return { rid, code: e.code, detail: e.detail }
     throw e

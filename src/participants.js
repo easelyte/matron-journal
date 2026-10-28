@@ -20,15 +20,17 @@ const RENEWABLE = new Set(['refused', 'denied', 'left', 'expired'])
 // row lands in. `delivered_at` is always reset to NULL here — a renewed row
 // is a brand new ask, not a continuation of whatever was or wasn't delivered
 // before. `spawn_id` likewise: a renewed row is a new membership generation,
-// never the one a spawn created (see recordJoined).
-function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null, initiatorConvoId = null, spawnId = null }) {
+// never the one a spawn created (see recordJoined). `causes` (the asking
+// turn's, src/ask-causes.js) belongs to the ask the row now carries, so a
+// renewal rewrites it — to NULL for every write that is not a park.
+function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId = null, initiatorConvoId = null, spawnId = null, causes = null }) {
   const existing = db.prepare(
     'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId)
   if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
   db.prepare(`
-    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, initiator_convo_id, spawn_id, created_at, answered_at, delivered_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)
+    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, initiator_convo_id, spawn_id, causes, created_at, answered_at, delivered_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
     ON CONFLICT(convo_id, agent_device_id) DO UPDATE SET
       initiator_device_id=excluded.initiator_device_id,
       state=excluded.state,
@@ -37,10 +39,11 @@ function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justi
       target_convo_id=excluded.target_convo_id,
       initiator_convo_id=excluded.initiator_convo_id,
       spawn_id=excluded.spawn_id,
+      causes=excluded.causes,
       created_at=excluded.created_at,
       answered_at=NULL,
       delivered_at=NULL
-  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, spawnId, Date.now())
+  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, spawnId, causes ? JSON.stringify(causes) : null, Date.now())
   return { ok: true, prior: existing ?? null }
 }
 
@@ -56,8 +59,8 @@ export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceI
 // semantics as inviteParticipant, but the row lands in 'awaiting_user'
 // (never delivered to the target) and carries the topic the user will see
 // on the approval card. See answerParkedInvite for how a park resolves.
-export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', topic = '', targetConvoId = null, initiatorConvoId = null }) {
-  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic, targetConvoId, initiatorConvoId })
+export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', topic = '', targetConvoId = null, initiatorConvoId = null, causes = null }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic, targetConvoId, initiatorConvoId, causes })
 }
 
 // A direct joined row, no invite round-trip — the spawn approval path
@@ -215,9 +218,9 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
     return
   }
   db.prepare(`
-    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, spawn_id=?, created_at=?, answered_at=?, delivered_at=?
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, spawn_id=?, causes=?, created_at=?, answered_at=?, delivered_at=?
     WHERE convo_id=? AND agent_device_id=?
-  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.spawn_id ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.spawn_id ?? null, prior.causes ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
 }
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
@@ -296,7 +299,7 @@ export function participantIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, spawn_id, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, spawn_id, causes, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 

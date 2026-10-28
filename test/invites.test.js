@@ -196,6 +196,37 @@ test('agent_leave flips joined to left and notifies the owner', async (t) => {
   assert.equal(err.code, 'conflict')
 })
 
+test('a guest leaving a room others are still in sends member_left, not left, to everyone remaining', async (t) => {
+  const { s, alice, agA, agB, a, b } = await fleet(t)
+  const agC = createAgent(s.db, alice.id, 'dev-c')
+  const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => c.close())
+  for (const ag of [agB, agC]) {
+    inviteParticipant(s.db, { convoId: 'room', agentDeviceId: ag.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+    answerInvite(s.db, { convoId: 'room', agentDeviceId: ag.deviceId, accept: true })
+  }
+  c.send({ op: 'agent_leave', room_id: 'room' })
+  const toOwner = await a.waitFor((f) => f.kind === 'invite' && f.event === 'member_left')
+  const toGuest = await b.waitFor((f) => f.kind === 'invite' && f.event === 'member_left')
+  for (const f of [toOwner, toGuest]) {
+    assert.equal(f.room_id, 'room')
+    assert.equal(f.from_device_id, agC.deviceId)
+    assert.deepEqual(f.participants, [agA.deviceId, agB.deviceId].sort((x, y) => x - y))
+  }
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'left')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'joined')
+  // The room did not end for anyone: no `left` reached the owner or B.
+  assert.ok(!a.frames.some((f) => f.kind === 'invite' && f.event === 'left'))
+  assert.ok(!b.frames.some((f) => f.kind === 'invite' && f.event === 'left'))
+
+  // The last guest leaving leaves the owner alone: that is the room ending,
+  // so the owner hears `left` as before.
+  b.send({ op: 'agent_leave', room_id: 'room' })
+  const left = await a.waitFor((f) => f.kind === 'invite' && f.event === 'left')
+  assert.equal(left.from_device_id, agB.deviceId)
+})
+
 test('owner leave dissolves the room: joined peers are told, pending invites die', async (t) => {
   const { s, alice, agA, agB, a, b } = await fleet(t)
   const agC = createAgent(s.db, alice.id, 'dev-c')

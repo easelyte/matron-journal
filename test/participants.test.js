@@ -49,6 +49,20 @@ test('inviteParticipant refuses while invited or joined, renews after refused/le
   assert.equal(row.answered_at, null)
 })
 
+test('parkInvite carries the causes of the CURRENT ask: a renewal rewrites them, a renewal without any clears them', () => {
+  const d = db()
+  const causesOf = () => JSON.parse(getParticipant(d, 'room', 2).causes ?? 'null')
+  assert.equal(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', causes: [{ kind: 'user_message', ref: 'c:1' }] }).ok, true)
+  assert.deepEqual(causesOf(), [{ kind: 'user_message', ref: 'c:1' }])
+  answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: false })
+  assert.equal(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'y', causes: [{ kind: 'routine', ref: 'r', at: 5 }] }).ok, true)
+  assert.deepEqual(causesOf(), [{ kind: 'routine', ref: 'r', at: 5 }])
+  expireAwaiting(d, 0, Date.now() + 1000)
+  assert.equal(getParticipant(d, 'room', 2).state, 'expired')
+  assert.equal(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'z' }).ok, true)
+  assert.equal(getParticipant(d, 'room', 2).causes, null)
+})
+
 test('answerInvite flips only a pending row', () => {
   const d = db()
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Start the journal server: node src/server.js [args...].
+#
+# On macOS it runs from a copy of node named "matron-journal" (see
+# bin/run-named-node), so a per-app firewall can tell a local journal apart
+# from other Node programs. Elsewhere, or with MATRON_NAMED_NODE=0, it runs
+# under node itself.
+
+# Find this script's own directory, following a symlink to it.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self") || break
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+root=$(cd "$(dirname "$self")/.." && pwd -P) || exit 1
+
+exec "$root/bin/run-named-node" matron-journal "$root/src/server.js" "$@"

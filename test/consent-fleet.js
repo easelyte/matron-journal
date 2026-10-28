@@ -33,14 +33,17 @@ export async function fleet(t, serverOpts = {}) {
   for (const w of [coord, asker, target, client]) w.frames.length = 0
   return { s, alice, coordDev, askerDev, targetDev, clientToken, coord, asker, target, client }
 }
-export const parkSpawn = async (f, { rid = 'q1', from = 'ask', ws = null } = {}) => {
-  (ws || f.asker).send({ op: 'spawn_request', request_id: rid, from_convo_id: from, target_device_id: f.targetDev.deviceId, workdir: '/home/alice/proj', task: 'fix the flaky test', topic: 'flaky test' })
+export const parkSpawn = async (f, { rid = 'q1', from = 'ask', ws = null, causes } = {}) => {
+  (ws || f.asker).send({ op: 'spawn_request', request_id: rid, from_convo_id: from, target_device_id: f.targetDev.deviceId, workdir: '/home/alice/proj', task: 'fix the flaky test', topic: 'flaky test', ...(causes !== undefined ? { causes } : {}) })
   const ack = await (ws || f.asker).waitFor((x) => x.kind === 'spawn' && x.event === 'pending' && x.request_id === rid)
   return ack.spawn_id
 }
-export const parkInviteAsk = async (f) => {
-  f.asker.send({ op: 'agent_invite', room_id: 'room', target_device_id: f.targetDev.deviceId, justification: 'need eyes on the diff', topic: 'review', from_convo_id: 'ask' })
-  await f.asker.waitFor((x) => x.kind === 'invite' && x.event === 'delivered')
+// `ws`, `room` and `from` default to the asker's own room and session; an
+// own ask of the Coordinator passes its socket, a room it owns and 'coord'
+// (`from: null` sends no from_convo_id, as an older bridge would).
+export const parkInviteAsk = async (f, { causes, ws = null, room = 'room', from = 'ask' } = {}) => {
+  (ws || f.asker).send({ op: 'agent_invite', room_id: room, target_device_id: f.targetDev.deviceId, justification: 'need eyes on the diff', topic: 'review', ...(from != null ? { from_convo_id: from } : {}), ...(causes !== undefined ? { causes } : {}) })
+  await (ws || f.asker).waitFor((x) => x.kind === 'invite' && x.event === 'delivered' && x.room_id === room)
 }
 export const pending = (f, token, convoId = 'coord') => f.s.http(`/consent/pending?convo_id=${encodeURIComponent(convoId)}`, { token })
 export const answer = (f, token, body) => f.s.http('/consent/answer', { method: 'POST', token, body: { convo_id: 'coord', ...body } })

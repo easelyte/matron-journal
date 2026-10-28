@@ -24,7 +24,17 @@ export async function setPassword(db, name, password) {
 // with a valid device token has a real password_hash row to verify
 // against), so no dummy-hash path is needed. Returns {ok:false} on a bad
 // old password rather than throwing, so http.js can map it to 401 cleanly.
-export async function changePassword(db, userId, { oldPassword, newPassword }) {
+//
+// signOutOthers: sign every OTHER client device of the user out (their rows
+// deleted, as POST /devices/:id/revoke does). Agent devices are never touched: a bridge
+// never held the password, so changing it is no reason to cut off a box.
+//
+// deviceId: the calling device. The write is a compare-and-swap on the hash
+// that was verified, and needs that device to still exist: the hashing
+// awaits leave room for another device to change the password (and sign
+// this one out) first, and a stale check must not then overwrite it.
+// { ok:false, revoked:true } means the caller was signed out meanwhile.
+export async function changePassword(db, userId, { oldPassword, newPassword, deviceId, signOutOthers = false }) {
   const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
   // Defensive only: Bearer auth (authToken) already guarantees a devices row
   // whose user_id references a real users row — this should be unreachable.
@@ -32,8 +42,15 @@ export async function changePassword(db, userId, { oldPassword, newPassword }) {
   const verified = await argon2.verify(user.password_hash, oldPassword)
   if (!verified) return { ok: false }
   const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, userId)
-  return { ok: true }
+  return db.transaction(() => {
+    if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return { ok: false, revoked: true }
+    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(hash, userId, user.password_hash).changes
+    if (!swapped) return { ok: false }
+    const signedOut = signOutOthers
+      ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, deviceId).changes
+      : 0
+    return { ok: true, signedOut }
+  })()
 }
 
 function issueDevice(db, userId, kind, name, tagChar = null) {
@@ -65,7 +82,10 @@ const dummyHashPromise = argon2.hash(crypto.randomBytes(32).toString('hex'), { t
 // login would then surface the same error itself, failing closed).
 dummyHashPromise.catch(() => {})
 
-export async function login(db, { username, password, deviceName }) {
+// The password half of a sign-in: the user's id, or null. POST /login
+// calls this first so a two-factor user gets a sign-in ticket instead of a
+// device (src/two-factor-http.js).
+export async function checkPassword(db, { username, password }) {
   const user = db.prepare('SELECT id, password_hash FROM users WHERE name=?').get(username)
   if (!user) {
     // No user-enumeration timing oracle: verify against a fixed dummy hash
@@ -76,8 +96,22 @@ export async function login(db, { username, password, deviceName }) {
     return null
   }
   if (!(await argon2.verify(user.password_hash, password))) return null
-  const d = issueDevice(db, user.id, 'client', deviceName || 'unnamed')
-  return { ...d, userId: user.id }
+  return { userId: user.id }
+}
+
+// Re-check the signed-in user's own password before a security change
+// (turning two-factor on or off, new recovery codes).
+export async function verifyUserPassword(db, userId, password) {
+  const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
+  if (!user || typeof password !== 'string' || !password) return false
+  return argon2.verify(user.password_hash, password)
+}
+
+export async function login(db, { username, password, deviceName }) {
+  const u = await checkPassword(db, { username, password })
+  if (!u) return null
+  const d = issueDevice(db, u.userId, 'client', deviceName || 'unnamed')
+  return { ...d, userId: u.userId }
 }
 
 export function createAgent(db, userId, name, tagChar = null) {
@@ -209,6 +243,23 @@ export function makeRateLimiter({ max = 5, windowMs = 60000 } = {}) {
     blocked(key) {
       const now = Date.now()
       return (hits.get(key) || []).filter((t) => now - t < windowMs).length >= max
+    },
+  }
+}
+
+// Runs async jobs one at a time per key, in arrival order (POST /password's
+// per-user check, so the lockout counts every guess before the next one).
+// The map only holds keys with a job pending.
+export function makeKeyedQueue() {
+  const tails = new Map()
+  return {
+    run(key, job) {
+      const prev = tails.get(key) || Promise.resolve()
+      const result = prev.then(job, job)
+      const tail = result.catch(() => {})
+      tails.set(key, tail)
+      tail.then(() => { if (tails.get(key) === tail) tails.delete(key) })
+      return result
     },
   }
 }

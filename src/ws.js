@@ -7,10 +7,10 @@ import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceSta
 import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
-import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle, getSpawn } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
 import { answerSpawnAsk } from './consent-answer.js'
@@ -18,12 +18,19 @@ import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
-import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expirePersonRoomAsks, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
+import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
+import { parkTalk } from './talk-requests.js'
+import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
+import { causesFromFrame } from './ask-causes.js'
+import { resolveAskCause } from './ask-cause.js'
+import { recordCarryOn, recordRoomPublish } from './cause-hops.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
+import { archiveChanges, sendArchiveFrame } from './archive.js'
 import { coordinatorFor, getCoordinatorConvoId } from './coordinator.js'
+import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
@@ -468,7 +475,8 @@ export function attachWs({
       try {
         for (const row of expireContactAsks(db)) onContactAskExpired({ db, hub }, row)
         for (const row of expireGrantAsks(db)) onGrantAskExpired({ db, hub }, row)
-        for (const row of expirePersonRoomAsks(db)) onPersonRoomOutcome({ db, hub }, null, { outcome: 'expired', link: row, before: row })
+        // Room asks, session or talk (the owner's 24 h, a talk guest's week).
+        sweepTalkAsks({ db, hub, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
         for (const row of expireSessionShareAsks(db)) onShareAnswered({ db, hub }, null, { outcome: 'expired', share: { ...row, state: 'expired' }, before: row })
       } catch (err) {
         console.error('sharing: ask expiry sweep failed', err)
@@ -618,10 +626,18 @@ export function attachWs({
           // box_defaults (src/box-defaults.js): an agent's own defaults for
           // new sessions, nulls when unset, so a bridge is right from its
           // first frame; the box_defaults frame keeps it current after.
+          // archive (src/archive.js): only for a client that asks with
+          // `archive_since` (ms; 0 = everything), so an app that predates
+          // archiving is not sent every archived id on each connect.
+          const archive = who.kind === 'client' && Number.isInteger(msg.archive_since) && msg.archive_since >= 0
+            ? archiveChanges(db, who.userId, msg.archive_since)
+            : null
+          conn.archiveAt = archive?.at ?? null
           ws.send(JSON.stringify({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
             ...(who.kind === 'client' ? { pins: listPins(db, who.userId) } : {}),
+            ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
           }))
           if (msg.cursor != null) {
@@ -728,6 +744,10 @@ export function attachWs({
             }
           }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
+          if (yielded && conn.archiveAt != null) {
+            const missed = archiveChanges(db, who.userId, conn.archiveAt)
+            if (missed.changes.length) ws.send(JSON.stringify({ kind: 'archive', ...missed }))
+          }
           // Catch-up delivery for THIS device only (spec: single pump, three
           // callers) — an invite approved while this agent was offline sits
           // undelivered until it next connects; this is that moment. Scoped
@@ -892,6 +912,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         sender: args.sender, type: args.type, payload: args.payload,
       }), args.pushHint)
       if (hintBefore) sendPinsFrame(db, hub, args.userId)
+      if (r.unarchived) sendArchiveFrame(hub, args.userId, [r.unarchived], r.ts)
     }
     return r
   }
@@ -1212,6 +1233,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // default); anything but a boolean is a bad ask, not a coerced one.
         if (msg.link != null && typeof msg.link !== 'boolean') return fail('bad_request', 'bad link')
         const link = msg.link === true
+        // Optional causes of the asking turn (src/ask-causes.js), stored on
+        // the row for GET /consent/pending and never put on the client card.
+        // Absent or null stores NULL; any other value that does not
+        // normalise is a bad ask, refused before the wake below so it never
+        // starts a box.
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         // Spawning on the caller's own box is allowed: the start rpc lands on
         // the same bridge, which already runs several sessions side by side
@@ -1292,7 +1321,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, effort, agent, link, missionNum, missionInherited,
+          workdir, task, topic, model, effort, agent, link, missionNum, missionInherited, causes,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1364,11 +1393,27 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Opt-in auto-approval (user_settings.auto_approve_coordinator_spawns).
         // Hourly ceiling so a looping Coordinator cannot start sessions without
         // bound: the pending-ask cap never trips once a row is answered at once.
+        // The opt-in does not waive the Coordinator own-ask rule
+        // (src/consent-own-ask.js): the ask's causes must resolve to the
+        // user's verified words or a comment/tap on one of the Coordinator
+        // conversation's items. A routine-fire root (envelope + verifier +
+        // routine cap) and an unverified or absent cause both fall through to
+        // the filed card, for the user or the checked POST /consent/answer.
+        const autoCause = () => {
+          const row = getSpawn(db, spawnId)
+          if (!row) return false
+          const res = resolveAskCause(db, {
+            who: { userId: conn.userId, deviceId: conn.deviceId, kind: conn.kind, name: conn.name },
+            userId: conn.userId, causes: causes ?? [], createdAt: row.created_at, fromConvoId: msg.from_convo_id,
+          })
+          return res.ok && res.root.kind !== 'routine'
+        }
         const autoEligible = online && getAutoApproveCoordinatorSpawns(db, conn.userId)
           && getConsentEnabled(db, conn.userId)
           && getCoordinatorConvoId(db, conn.userId) === msg.from_convo_id
           && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })
           && autoApprovalsSince(db, conn.userId, Date.now() - AUTO_APPROVE_WINDOW_MS) < AUTO_APPROVE_HOURLY_CAP
+          && autoCause()
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.
@@ -1535,6 +1580,50 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner may invite')
+        // The asking turn's causes, same rules as spawn_request's. Checked
+        // ahead of both paths so the op has one shape; only the same-user
+        // park below stores them.
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
+        // A talk request: aimed at a PERSON, who chooses where their side
+        // talks when they accept (talk-requests.js). Exactly one of
+        // target_person and target_device_id. Every refusal that would say
+        // something about the person (unknown, self, a block) is not_found.
+        if (msg.target_person != null) {
+          if (msg.target_device_id != null || msg.target_convo_id != null) return fail('bad_request', 'target_person or target_device_id, not both')
+          if (typeof msg.target_person !== 'string' || !msg.target_person || msg.target_person.length > 64) return fail('bad_request', 'bad target_person')
+          if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+          if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+          if (msg.mission != null && !((Number.isInteger(msg.mission) && msg.mission > 0) || (typeof msg.mission === 'string' && msg.mission.length > 0 && msg.mission.length <= 64))) {
+            return fail('bad_request', 'bad mission')
+          }
+          const from = resolveFromConvo()
+          if (from.err) return fail(...from.err)
+          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          if (!pJustification) return fail('bad_request', 'bad justification')
+          let link
+          try {
+            link = parkTalk(db, {
+              ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
+              person: msg.target_person, missionRef: msg.mission ?? null,
+              topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+            })
+          } catch (err) {
+            if (err.message === 'not_found') return fail('not_found')
+            if (err.message === 'pending') return fail('conflict', 'pending: a talk request to this person is already waiting')
+            if (err.message === 'room_busy') return fail('conflict', 'room_busy: a room with another person holds just the two agents: start a new room')
+            if (err.message === 'too_many_asks') return fail('conflict', 'too_many_asks: too many requests awaiting user approval')
+            if (err.message === 'no_mission') return fail('not_found', 'no such mission')
+            if (err.message === 'mission_not_shared') return fail('conflict', 'mission_not_shared: that mission is not shared with this person: share it first')
+            if (err.message === 'private_box') return fail('forbidden', 'private_box: a private box cannot open a room with another person')
+            if (err.message === 'not_fresh') return fail('conflict', 'not_fresh: a room with another person must be a new room: everything said in it crosses to them (use agent_chat_start)')
+            throw err
+          }
+          ownerTalkAsk(personCtx, link)
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_person: link.guest_name, room_link_id: link.id }))
+          break
+        }
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
@@ -1633,7 +1722,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId, initiatorConvoId: msg.from_convo_id ?? null })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId, initiatorConvoId: msg.from_convo_id ?? null, causes })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // An asleep target is started now, while the ask waits for the user:
         // by the time they approve, the box is usually up to receive it, and
@@ -1685,6 +1774,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        // The asking turn's causes, same rules as spawn_request's.
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         if (personLinked(msg.room_id)) return fail('conflict', 'a room with another person holds just the two agents')
@@ -1709,7 +1802,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null, causes })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // The recipient of a join is the room's owner box; start it if asleep
         // (same stance as agent_invite above).
@@ -1821,7 +1914,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (room.agent_device_id === conn.deviceId) {
           const hit = linkOfRoom(db, msg.room_id)
           if (hit?.side === 'owner' && LIVE_ROOM_STATES.includes(hit.link.state)) {
-            const pending = hit.link.state === 'awaiting_owner' || hit.link.state === 'awaiting_guest'
+            const pending = ['awaiting_owner', 'awaiting_guest', 'starting'].includes(hit.link.state)
             endAndNotify(personCtx, hit.link.id, 'owner_agent', pending ? 'withdrawn' : 'left')
             if (!hasParticipants(db, msg.room_id)) break
           }
@@ -1889,11 +1982,26 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           if (hit && LIVE_ROOM_STATES.includes(hit.link.state)) endAndNotify(personCtx, hit.link.id, 'guest_agent')
           break
         }
-        // A participant left: tell the room's recorded owner, if there is
-        // one. (No need to exclude the caller — a caller that IS the owner
-        // has no convo_agents row to have been 'joined' in, so leaveConvo
-        // above would have failed it into the conflict.)
-        if (room.agent_device_id != null) {
+        // A participant left. While other members are still joined the room
+        // goes on, so the owner and every remaining member hear
+        // `member_left` with the membership that remains, and nobody's room
+        // ends. Bridges read `left` as "this room is over" (rooms began as
+        // pairs), so it is kept for the last guest leaving, when the owner
+        // is left alone. A bridge that predates `member_left` ignores the
+        // event and keeps the room live, which is the right outcome for
+        // it too. (No need to exclude the caller from the owner — a caller
+        // that IS the owner has no convo_agents row to have been 'joined'
+        // in, so leaveConvo above would have failed it into the conflict.)
+        const remaining = joinedAgentIds(db, msg.room_id)
+        if (remaining.length > 0) {
+          const participants = participantIds(db, msg.room_id)
+          for (const deviceId of participants) {
+            if (deviceId === conn.deviceId) continue
+            notify(deviceId, {
+              kind: 'invite', event: 'member_left', room_id: msg.room_id, from_device_id: conn.deviceId, participants,
+            })
+          }
+        } else if (room.agent_device_id != null) {
           notify(room.agent_device_id, {
             kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
           })
@@ -2063,6 +2171,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // owner can't reach this branch at all (the outer condition above
           // already requires agent_device_id !== conn.deviceId).
           if (isPrivateDevice(db, existingRoom.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) {
+            return fail('forbidden', 'only the room owner may upsert a room')
+          }
+          // Coordinator takeover guard. The Coordinator's authority (consent
+          // answers, session control, routines) follows the device recorded
+          // on the conversation the user designated, so no other device may
+          // take that conversation over while its owner still exists — not
+          // even a private one. A re-paired Coordinator bridge gets it back
+          // once the old device is revoked, or the user designates a new one.
+          if (getCoordinatorConvoId(db, conn.userId) === msg.convo_id &&
+              db.prepare('SELECT 1 FROM devices WHERE id=?').get(existingRoom.agent_device_id)) {
             return fail('forbidden', 'only the room owner may upsert a room')
           }
         }
@@ -2305,7 +2423,29 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: publishBlobRef(msg.type, msg),
           idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
         }
-        copyOut(publishArgs, appendAndFan(publishArgs))
+        const published = appendAndFan(publishArgs)
+        copyOut(publishArgs, published)
+        // A room message names the session that wrote it and that session's
+        // turn causes: kept when the Coordinator wrote it, or reached the
+        // turn that did (src/cause-hops.js). Never fatal to the publish.
+        if (!published.duplicate && ROOM_WAKE_PUBLISH_TYPES.has(msg.type) && msg.from_convo_id != null) {
+          try {
+            recordRoomPublish(db, { userId: conn.userId, deviceId: conn.deviceId, roomId: msg.convo_id, seq: published.seq, msg })
+          } catch (err) {
+            console.error(`publish: recording a room hop failed: ${err?.message || err}`)
+          }
+        }
+        // The bridge's cancel of a queued item reply: the reply never reached
+        // the agent, so no agent may read it any other way either. After the
+        // append, so it runs only once the release itself is on record. A
+        // republished release runs it again, a no-op once it is done.
+        if (msg.type === 'prompt_reply') {
+          try {
+            withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
+          } catch (err) {
+            console.error('ws: withdrawing a cancelled item reply failed', err)
+          }
+        }
         // After the append (which authorized the write): a message into a
         // room should also start any joined peer whose box is asleep. The
         // writer's own box is awake by definition. Additive, like the
@@ -2429,6 +2569,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
+        // A carry-on is recorded before it is relayed, so the target's turn
+        // can name it (src/cause-hops.js): an ask that turn makes is then
+        // held to the Coordinator's own-ask rule. Without the record the
+        // target stamps a bare carry_on, which that rule refuses.
+        if (v.params.action === 'carry_on') {
+          try {
+            params.carry_on_id = recordCarryOn(db, { userId: conn.userId, fromConvoId: msg.from_convo_id, targetConvoId: msg.target_convo_id, causes: v.causes })
+          } catch (err) {
+            console.error(`session_control: recording a carry-on failed: ${err?.message || err}`)
+          }
+        }
         const rid = v.rid
         conn._sessionControlInflight = (conn._sessionControlInflight || 0) + 1
         void (async () => {

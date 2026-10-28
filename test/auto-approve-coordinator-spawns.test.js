@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { append, upsertConversation } from '../src/journal.js'
 import { getSpawn } from '../src/spawns.js'
 import { getAutoApproveCoordinatorSpawns, setAutoApproveCoordinatorSpawns, setNoticesEnabled } from '../src/settings.js'
 import { makeWsClient } from './helpers.js'
@@ -14,8 +14,15 @@ import { fleet, parkInviteAsk } from './consent-fleet.js'
 
 const reason = 'auto-approved (Coordinator)'
 const enable = (f) => setAutoApproveCoordinatorSpawns(f.s.db, f.alice.id, true)
-async function request(f, { from = 'coord', ws = f.coord, target = f.targetDev.deviceId } = {}) {
-  ws.send({ op: 'spawn_request', request_id: 'auto-test', from_convo_id: from, target_device_id: target, workdir: '/project', task: 'Run the checks' })
+// The user's words in the asking conversation: the verified cause the
+// Coordinator own-ask rule (src/consent-own-ask.js) needs before an ask may
+// be auto-approved.
+const userSays = (f, convo = 'coord') => {
+  const { seq } = append(f.s.db, { userId: f.alice.id, convoId: convo, sender: 'user:alice', type: 'text', payload: { body: 'please start a helper' } })
+  return [{ kind: 'user_message', ref: `${convo}:${seq}` }]
+}
+async function request(f, { from = 'coord', ws = f.coord, target = f.targetDev.deviceId, causes = userSays(f, from) } = {}) {
+  ws.send({ op: 'spawn_request', request_id: 'auto-test', from_convo_id: from, target_device_id: target, workdir: '/project', task: 'Run the checks', ...(causes ? { causes } : {}) })
   const ack = await ws.waitFor((x) => x.kind === 'spawn' && x.event === 'pending')
   return getSpawn(f.s.db, ack.spawn_id)
 }
@@ -130,7 +137,7 @@ test('opt-in does not approve chat invites or requests targeting another user', 
 
 test('settings roundtrip accepts either switch alone or both, validates all keys, and broadcasts the full view', async (t) => {
   const f = await fleet(t)
-  const defaults = { notices: true, auto_approve_coordinator_spawns: false }
+  const defaults = { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 30 }
   assert.deepEqual((await f.s.http('/settings', { token: f.coordDev.token })).json, defaults)
   assert.equal((await f.s.http('/settings', { method: 'PATCH', token: f.coordDev.token, body: { auto_approve_coordinator_spawns: true } })).status, 403)
   for (const value of [null, 0, 1, 'true', [], {}]) {
@@ -142,8 +149,8 @@ test('settings roundtrip accepts either switch alone or both, validates all keys
   }
   assert.deepEqual((await f.s.http('/settings', { token: f.clientToken })).json, defaults)
   for (const [body, expected] of [
-    [{ auto_approve_coordinator_spawns: true }, { notices: true, auto_approve_coordinator_spawns: true }],
-    [{ notices: false }, { notices: false, auto_approve_coordinator_spawns: true }],
+    [{ auto_approve_coordinator_spawns: true }, { ...defaults, auto_approve_coordinator_spawns: true }],
+    [{ notices: false }, { ...defaults, notices: false, auto_approve_coordinator_spawns: true }],
     [{ notices: true, auto_approve_coordinator_spawns: false }, defaults],
   ]) {
     for (const w of [f.coord, f.client]) w.frames.length = 0
@@ -179,4 +186,12 @@ test('existing databases migrate the opt-in as off without changing settings; re
   db.close()
   db = openDb(path)
   try { assert.equal(getAutoApproveCoordinatorSpawns(db, user.id), true) } finally { db.close() }
+})
+
+test('opt-in does not waive the own-ask rule: no cause, an unverified cause or a non-user cause stays parked', async (t) => {
+  const f = await fleet(t)
+  enable(f)
+  parked(f, await request(f, { causes: null }))
+  parked(f, await request(f, { causes: [{ kind: 'user_message', ref: 'coord:99999' }] }))
+  parked(f, await request(f, { causes: [{ kind: 'reminder' }] }))
 })

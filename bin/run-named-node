@@ -1,0 +1,138 @@
+#!/bin/sh
+# Run a Node script from a copy of the node binary that carries a Matron name.
+#
+#   bin/run-named-node <name> <script> [args...]
+#
+# Per-app firewalls on macOS identify a program by its executable file and its
+# code signature. Every Node script runs through the same `node` binary, so
+# without this all of Matron's processes look like any other `node` (npm, a
+# dev server, a test runner) and cannot get rules of their own. A wrapper
+# script, a symlink or process.title does not change that: the executable is
+# still node. So on macOS this keeps a copy of the node binary under the
+# given name, e.g. $HOME/.matron/bin/matron-bridge, and execs the script with
+# it. The copy keeps node's embedded code signature, which stays valid.
+#
+# <name> must match ^matron-[a-z0-9-]+$.
+#
+# Environment:
+#   NODE_BIN                  node to run (default: `node` on PATH)
+#   MATRON_NAMED_NODE=0       opt out: run the script with node itself
+#   MATRON_NAMED_NODE_DIR     where the copies live (default $HOME/.matron/bin)
+#   MATRON_NAMED_NODE_FORCE=1 test-only: take the macOS path on any OS
+#
+# The same launcher ships with matron-bridge; keep the two copies in step.
+#
+# On other systems, or with MATRON_NAMED_NODE=0, this simply execs node.
+# The copy is refreshed whenever node's size or mtime no longer match it, so
+# a node upgrade is picked up on the next start. If the copy cannot be made
+# (no space, no permission), one warning goes to stderr and the script runs
+# with node itself: this never stops the process from starting.
+#
+# The script sees MATRON_REAL_NODE, the node binary the copy was made from,
+# so it can put that binary's directory on PATH for children that look up
+# `node` there.
+
+set -u
+
+warn() {
+  printf 'run-named-node: %s\n' "$*" >&2
+}
+
+if [ "$#" -lt 2 ]; then
+  warn 'usage: run-named-node <name> <script> [args...]'
+  exit 64
+fi
+
+name=$1
+shift
+
+# ^matron-[a-z0-9-]+$, spelled out so the check does not depend on the
+# locale's collation order for ranges.
+case $name in
+  matron-*) suffix=${name#matron-} ;;
+  *) suffix= ;;
+esac
+case $suffix in
+  '' | *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+    warn "refusing name '$name': it must match ^matron-[a-z0-9-]+\$"
+    exit 64
+    ;;
+esac
+
+node=${NODE_BIN:-}
+if [ -z "$node" ]; then
+  node=$(command -v node 2>/dev/null) || node=
+fi
+if [ -z "$node" ]; then
+  warn 'node not found: set NODE_BIN or put node on PATH'
+  exit 127
+fi
+
+if [ "${MATRON_NAMED_NODE:-}" = 0 ]; then
+  exec "$node" "$@"
+fi
+if [ "${MATRON_NAMED_NODE_FORCE:-}" != 1 ] && [ "$(uname -s 2>/dev/null)" != Darwin ]; then
+  exec "$node" "$@"
+fi
+
+# The binary to copy is the one node itself reports. NODE_BIN or PATH may name
+# a symlink (Homebrew, nvm) or a version manager's shim (a script, or a binary
+# that picks the tool from its own file name); copying a shim under another
+# name would break it, while process.execPath is always the real binary.
+# NODE_OPTIONS is cleared so a --require hook cannot add to the output.
+real=$(NODE_OPTIONS= "$node" -e 'process.stdout.write(process.execPath)' 2>/dev/null) || real=
+case $real in
+  /*) ;;
+  *) real= ;;
+esac
+if [ -z "$real" ] || [ ! -f "$real" ] || [ ! -x "$real" ]; then
+  warn "could not locate the node binary behind $node; running it without a Matron name"
+  exec "$node" "$@"
+fi
+
+if [ -n "${MATRON_NAMED_NODE_DIR:-}" ]; then
+  dir=$MATRON_NAMED_NODE_DIR
+elif [ -n "${HOME:-}" ]; then
+  dir=$HOME/.matron/bin
+else
+  warn 'neither MATRON_NAMED_NODE_DIR nor HOME is set; running node without a Matron name'
+  exec "$node" "$@"
+fi
+copy=$dir/$name
+
+# Byte count of a file; $(( )) drops the padding BSD wc puts in front.
+file_size() {
+  _size=$(wc -c < "$1") || return 1
+  echo $((_size))
+}
+
+fresh=0
+if [ -f "$copy" ] && [ -x "$copy" ] &&
+  [ ! "$real" -nt "$copy" ] && [ ! "$copy" -nt "$real" ] &&
+  [ "$(file_size "$real")" = "$(file_size "$copy")" ]; then
+  fresh=1
+fi
+
+if [ "$fresh" = 0 ]; then
+  # Copy to a private temp name, then rename over the old copy: a launcher
+  # running at the same time execs either the old file or the new one, never
+  # a half-written one, and a running process keeps its own inode. Writing
+  # into a signed binary in place can also leave macOS holding a stale
+  # signature for it; a fresh inode avoids that. cp -p keeps node's mtime,
+  # which is what the freshness check above compares.
+  tmp=$dir/.$name.tmp.$$
+  if mkdir -p "$dir" 2>/dev/null &&
+    cp -p "$real" "$tmp" 2>/dev/null &&
+    chmod 755 "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$copy" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" 2>/dev/null
+    warn "could not copy $real to $copy; running node without a Matron name"
+    exec "$node" "$@"
+  fi
+fi
+
+MATRON_REAL_NODE=$real
+export MATRON_REAL_NODE
+exec "$copy" "$@"

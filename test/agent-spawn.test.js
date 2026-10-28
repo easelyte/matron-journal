@@ -238,6 +238,41 @@ test('spawn_request rejects a non-string or oversized effort', async (t) => {
   }
 })
 
+test('spawn_request stores the causes it carries on the row, NULL for none or null; the client card never carries them', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  const causes = [{ kind: 'user_message', ref: 'parent-convo:12', at: 1700000000000 }, { kind: 'item_tap', ref: 'it_1\nforged' }]
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work', causes,
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === 'q1')
+  assert.deepEqual(JSON.parse(getSpawn(s.db, ack.spawn_id).causes), [
+    { kind: 'user_message', ref: 'parent-convo:12', at: 1700000000000 },
+    { kind: 'item_tap', ref: 'it_1 forged' },
+  ])
+  const card = await client.waitFor(isSpawnCard)
+  assert.ok(!('causes' in card.payload), 'causes are for the Coordinator, not the client card')
+  // Absent and an explicit null both mean "no causes": the ask parks, NULL.
+  for (const [rid, extra] of [['q2', {}], ['q3', { causes: null }]]) {
+    parent.send({ op: 'spawn_request', request_id: rid, from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work', ...extra })
+    const a = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === rid)
+    assert.equal(getSpawn(s.db, a.spawn_id).causes, null, rid)
+  }
+})
+
+test('spawn_request rejects causes that are present but unusable, before any row exists', async (t) => {
+  const { s, targetDev, parent } = await spawnFleet(t)
+  const bad = [[], 'user_message', [{ kind: 'telepathy' }], [{ kind: 'alert', ref: 'r'.repeat(201) }], Array.from({ length: 9 }, () => ({ kind: 'alert' }))]
+  for (const [i, causes] of bad.entries()) {
+    parent.frames.length = 0
+    parent.send({ op: 'spawn_request', request_id: `q${i}`, from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', causes })
+    const e = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+    assert.equal(e.code, 'bad_request', JSON.stringify(causes))
+    assert.equal(e.detail, 'bad causes')
+  }
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+})
+
 test('spawn_targets lists other agent boxes with online flags and brokered folders', async (t) => {
   const { s, targetDev, parent, target } = await spawnFleet(t)
   // the caller is a box too now, so it is asked for its own folders
@@ -441,6 +476,7 @@ test('approve: room exists BEFORE start rpc; started outcome carries room and ch
     assert.equal(req.request.params.prompt, 'do it')
     assert.equal(req.request.params.workdir, '/w')
     assert.equal(req.request.params.from_name, 'box-6') // parent device name, for the child's opening turn
+    assert.equal(req.request.params.spawn_id, spawnId) // the child names it on its opening turn's cause
     const room = s.db.prepare('SELECT * FROM conversations WHERE id=?').get(req.request.params.room_id)
     assert.ok(room, 'room row must exist before the bridge is asked to spawn')
     assert.equal(room.agent_device_id, parentDev.deviceId) // parent owns the room
@@ -461,6 +497,8 @@ test('approve: room exists BEFORE start rpc; started outcome carries room and ch
   // both ends of the pair are in: parent as recorded owner, target joined
   const joined = s.db.prepare('SELECT agent_device_id, state FROM convo_agents WHERE convo_id=?').all(roomId)
   assert.deepEqual(joined, [{ agent_device_id: targetDev.deviceId, state: 'joined' }])
+  // No Coordinator had a hand in this spawn, so it is no hop.
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS c FROM cause_hops').get().c, 0)
 })
 
 test('approve with the target gone by approval time: failed outcome, room gets the epitaph', async (t) => {

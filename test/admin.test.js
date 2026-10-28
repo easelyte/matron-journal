@@ -10,6 +10,7 @@ import { authToken, createUser, createAgent, login, authorizeAgentWrite } from '
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
+import { getTransferConsentEnabled } from '../src/consent.js'
 import { startTestServer } from './helpers.js'
 import { parkInvite, answerParkedInvite, answerInvite, getParticipant } from '../src/participants.js'
 
@@ -724,5 +725,35 @@ test('device consent: user-only sets the flag and device list shows it; any clea
   assert.doesNotMatch(await runAdmin(db, ['device', 'list', 'alice']), /consent=/)
   await assert.rejects(() => runAdmin(db, ['device', 'consent', '999', 'user-only']), /no such device/)
   await assert.rejects(() => runAdmin(db, ['device', 'consent', String(a.deviceId), 'coordinator']), /usage/i)
+  db.close()
+})
+
+test('admin CLI: user email sets, normalises and clears the address; refuses a bad or taken one', async () => {
+  const db = openDb(':memory:')
+  await runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123456'])
+  await runAdmin(db, ['user', 'add', 'bob', '--password', 'pw123456'])
+  const emailOf = (n) => db.prepare('SELECT email FROM users WHERE name=?').get(n).email
+  assert.match(await runAdmin(db, ['user', 'email', 'alice', ' alice@example.com ']), /alice's email is now alice@example\.com/)
+  assert.equal(emailOf('alice'), 'alice@example.com')
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob', 'ALICE@example.com']), /already has/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob', 'nope']), /not an email address/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'nobody', 'x@example.com']), /no such user/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob']), /usage/i)
+  assert.match(await runAdmin(db, ['user', 'email', 'alice', '--clear']), /no email address/)
+  assert.equal(emailOf('alice'), null)
+  db.close()
+})
+
+test('coordinator transfers on|off: the user\'s switch for Coordinator file approvals; unknown user and bad value refused', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'alice', 'pw')
+  assert.equal(getTransferConsentEnabled(db, u.id), false)
+  assert.match(await runAdmin(db, ['coordinator', 'transfers', 'alice', 'on']), /alice: the Coordinator may approve file transfers/)
+  assert.equal(getTransferConsentEnabled(db, u.id), true)
+  assert.match(await runAdmin(db, ['coordinator', 'transfers', 'alice', 'off']), /alice: file transfers .* the user's/)
+  assert.equal(getTransferConsentEnabled(db, u.id), false)
+  await assert.rejects(() => runAdmin(db, ['coordinator', 'transfers', 'nobody', 'on']), /no such user/)
+  await assert.rejects(() => runAdmin(db, ['coordinator', 'transfers', 'alice', 'maybe']), /usage/i)
+  await assert.rejects(() => runAdmin(db, ['coordinator', 'transfers', 'alice']), /usage/i)
   db.close()
 })

@@ -7,6 +7,7 @@ import { upsertConversation } from '../src/journal.js'
 import {
   validateRoutineFields, nextRunAt, createRoutine, updateRoutine, deleteRoutine, getRoutine, listRoutines,
   dueRoutines, advanceRoutine, recordOutcome, seedRoutines, STARTER_ROUTINES, ROUTINES_MAX, MIN_GAP_MS,
+  validateEnvelope, parseEnvelope, ENVELOPE_SPAWNS_MAX, ENVELOPE_BOXES_MAX,
 } from '../src/routines.js'
 
 // Pure DB state for Coordinator routines (spec 2026-10-01 coordinator
@@ -50,6 +51,63 @@ test('validateRoutineFields: the full shape, defaults, and every refusal', () =>
   assert.equal(validateRoutineFields(fields({ schedule: '30 18 * * 1-5' })).ok, true)
   // Prompt keeps its line breaks, loses other control characters.
   assert.equal(validateRoutineFields(fields({ prompt: 'a\nb\u0007c' })).value.prompt, 'a\nbc')
+})
+
+test('validateEnvelope / parseEnvelope: the bounds on what an ask born of a fire may do', () => {
+  assert.equal(ENVELOPE_SPAWNS_MAX, 50); assert.equal(ENVELOPE_BOXES_MAX, 32)
+  const ok = (raw, value) => assert.deepEqual(validateEnvelope(raw), { ok: true, value }, JSON.stringify(raw))
+  ok({ spawns_per_fire: 2, chats: true, boxes: ['box-a', 'box-b'] }, { spawns_per_fire: 2, chats: true, boxes: ['box-a', 'box-b'] })
+  ok({ spawns_per_fire: 0, chats: false, boxes: null }, { spawns_per_fire: 0, chats: false, boxes: null })
+  ok({ spawns_per_fire: 50, chats: false, boxes: null }, { spawns_per_fire: 50, chats: false, boxes: null })
+  // Absent keys are the narrowest: no spawns, no chats; boxes absent = null (any box).
+  ok({ spawns_per_fire: 1 }, { spawns_per_fire: 1, chats: false, boxes: null })
+  ok({}, { spawns_per_fire: 0, chats: false, boxes: null })
+  // A box named twice is one box.
+  ok({ spawns_per_fire: 1, chats: false, boxes: ['box-a', 'box-a'] }, { spawns_per_fire: 1, chats: false, boxes: ['box-a'] })
+  ok({ spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 32 }, (_, i) => `b${i}`) }, { spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 32 }, (_, i) => `b${i}`) })
+  ok({ spawns_per_fire: 1, chats: false, boxes: ['x'.repeat(64)] }, { spawns_per_fire: 1, chats: false, boxes: ['x'.repeat(64)] })
+  const bad = (raw) => assert.equal(validateEnvelope(raw).ok, false, JSON.stringify(raw))
+  bad(null); bad(undefined); bad('x'); bad([]); bad(3)
+  bad({ spawns_per_fire: 51 }); bad({ spawns_per_fire: -1 }); bad({ spawns_per_fire: 1.5 }); bad({ spawns_per_fire: '1' })
+  bad({ chats: 'yes' }); bad({ chats: 1 })
+  bad({ boxes: [] }); bad({ boxes: 'x' }); bad({ boxes: [''] }); bad({ boxes: [7] }); bad({ boxes: ['x'.repeat(65)] })
+  bad({ boxes: ['two\nlines'] }); bad({ boxes: Array.from({ length: 33 }, (_, i) => `b${i}`) })
+  bad({ spawns_per_fire: 1, extra: true })
+  // parseEnvelope: the stored column back, re-validated; anything unusable is null.
+  assert.deepEqual(parseEnvelope('{"spawns_per_fire":1,"chats":true,"boxes":null}'), { spawns_per_fire: 1, chats: true, boxes: null })
+  for (const text of [null, undefined, '', '{not json', '[]', '{"spawns_per_fire":99}', 'null']) assert.equal(parseEnvelope(text), null, String(text))
+})
+
+test('validateRoutineFields: envelope optional on create, null clears on a PATCH, a bad one refuses the whole body', () => {
+  assert.equal('envelope' in validateRoutineFields(fields()).value, false, 'absent stays absent')
+  assert.deepEqual(validateRoutineFields(fields({ envelope: { spawns_per_fire: 1, chats: true, boxes: ['box-a'] } })).value.envelope, { spawns_per_fire: 1, chats: true, boxes: ['box-a'] })
+  assert.equal(validateRoutineFields(fields({ envelope: null })).value.envelope, null)
+  assert.deepEqual(validateRoutineFields({ envelope: null }, { partial: true }), { ok: true, value: { envelope: null } })
+  assert.deepEqual(validateRoutineFields({ envelope: { spawns_per_fire: 3 } }, { partial: true }), { ok: true, value: { envelope: { spawns_per_fire: 3, chats: false, boxes: null } } })
+  for (const envelope of [{ spawns_per_fire: 51 }, { boxes: [] }, { boxes: 'x' }, { chats: 'yes' }, 'x', []]) {
+    assert.equal(validateRoutineFields(fields({ envelope })).ok, false, JSON.stringify(envelope))
+    assert.equal(validateRoutineFields({ envelope }, { partial: true }).ok, false, JSON.stringify(envelope))
+  }
+})
+
+test('create / update store the envelope; a PATCH without it leaves it alone; null clears it', async () => {
+  const { db, alice } = await seed()
+  const plain = createRoutine(db, { userId: alice.id, origin: 'user', fields: validateRoutineFields(fields({ name: 'plain' })).value, now: T0 })
+  assert.equal(plain.envelope, null)
+  const env = { spawns_per_fire: 2, chats: false, boxes: ['box-a'] }
+  const r = createRoutine(db, { userId: alice.id, origin: 'user', fields: validateRoutineFields(fields({ envelope: env })).value, now: T0 })
+  assert.deepEqual(r.envelope, env)
+  assert.equal(db.prepare('SELECT envelope FROM routines WHERE id=?').get(r.id).envelope, JSON.stringify(env))
+  let u = updateRoutine(db, { userId: alice.id, key: r.id, fields: { title: 'Renamed' }, now: T0 })
+  assert.deepEqual(u.envelope, env, 'untouched by an edit that does not name it')
+  u = updateRoutine(db, { userId: alice.id, key: r.id, fields: validateRoutineFields({ envelope: { spawns_per_fire: 1, chats: true } }, { partial: true }).value, now: T0 })
+  assert.deepEqual(u.envelope, { spawns_per_fire: 1, chats: true, boxes: null })
+  u = updateRoutine(db, { userId: alice.id, key: r.id, fields: { envelope: null }, now: T0 })
+  assert.equal(u.envelope, null)
+  assert.equal(db.prepare('SELECT envelope FROM routines WHERE id=?').get(r.id).envelope, null)
+  // A broken column (never written by the journal) reads as null.
+  db.prepare('UPDATE routines SET envelope=? WHERE id=?').run('{not json', r.id)
+  assert.equal(getRoutine(db, alice.id, r.id).envelope, null)
 })
 
 test('nextRunAt: in the named zone, across the autumn clock change, null for a bad pattern', () => {

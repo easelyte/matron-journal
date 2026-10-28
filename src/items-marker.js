@@ -52,6 +52,12 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
       // The tapped label when the comment is an action tap, else null — what
       // a bridge reads to word the turn as "tapped" rather than "replied".
       action: comment.action ?? null,
+      // When the comment was left, in ms. A bridge names the comment back to
+      // the journal as `item:<num>@<ISO created_at>` in a turn's causes
+      // (docs/protocol.md "Causes"), and src/ask-cause.js looks it up by
+      // exactly that time, so the marker carries it rather than making every
+      // bridge fetch the thread for it.
+      created_at: Number.isSafeInteger(comment.created_at) ? comment.created_at : null,
       // Comment action buttons (2026-10-04 comment-actions contract): the
       // buttons this comment offers and the tap on them so far, and — on a
       // tap — `reply_to`, the id of the comment it answers (null when it

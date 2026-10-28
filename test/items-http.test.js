@@ -651,6 +651,11 @@ test('GET /items?scope=shared: a colleague in the same org sees my items, with o
   upsertConversation(s.db, { id: 'c3', ownerUserId: alice.id, title: 'C3', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/journal' })
   await mkItem(s, priv.token, { title: 'Private', convo_id: 'c3' })
   assert.equal((await s.http('/items?scope=shared', { token: patClient })).json.items.length, 1)
+  // An owner-only item (private: true) stays out of the org share too.
+  const ownerOnly = (await mkItem(s, agent.token, { title: 'Secret needed', private: true })).json.item
+  assert.equal((await s.http('/items?scope=shared', { token: patClient })).json.items.length, 1)
+  assert.equal((await s.http(`/items/${ownerOnly.id}`, { token: patClient })).status, 404)
+  assert.equal((await s.http(`/items/${ownerOnly.id}`, { token: client })).status, 200)
   assert.equal((await s.http('/items?scope=nope', { token: patClient })).status, 400)
   assert.equal((await s.http('/items?scope=shared&convo=c1', { token: patClient })).status, 400, 'own-list filters are rejected on shared')
 })

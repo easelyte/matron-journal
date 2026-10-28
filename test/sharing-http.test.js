@@ -178,6 +178,8 @@ test('an agent\'s contact ask parks for its own user; the tap sends it; the othe
   for (const k of ['aliceBox', 'aliceCoord', 'bobBox']) assert.deepEqual(audits(w.ws[k]), [], `${k} hears no audit event`)
   const activity = (await w.alicePhone(`/contacts/${id}/activity`)).json.events.map((e) => e.event)
   assert.deepEqual(activity, ['contact.accepted', 'contact.requested'])
+  // The trail is the user's, like the events it lists: an agent gets no door to it.
+  assert.equal((await w.aliceBox(`/contacts/${id}/activity`)).status, 403)
 })
 
 test('the Coordinator is never offered, and cannot answer, a contact or share ask', async (t) => {
@@ -249,10 +251,9 @@ test('a read-only mission share: two yeses, a sieved view, live, and no writes',
   assert.equal(early.status, 409)
   assert.equal(early.json.blocked_by, 'not_contact')
   await makeContacts(w)
-  for (const level of ['contribute', 'owner']) {
-    const r = await w.aliceBox(`/missions/${mission.num}/shares`, post({ contact: 'bob', level, convo_id: 'work' }))
-    assert.equal(r.json.blocked_by, 'level_unavailable', `${level} is a later phase`)
-  }
+  // contribute and owner are test/contribute.test.js's and test/handover.test.js's;
+  // owner (a hand-over, test/handover.test.js) needs its brief.
+  assert.equal((await w.aliceBox(`/missions/${mission.num}/shares`, post({ contact: 'bob', level: 'owner', convo_id: 'work' }))).status, 400)
   for (const k of Object.keys(w.ws)) w.ws[k].frames.length = 0
 
   // alice's agent asks; alice gets the card with the preview of what crosses.

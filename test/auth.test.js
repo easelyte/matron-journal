@@ -4,7 +4,7 @@ import argon2 from 'argon2'
 import { openDb } from '../src/db.js'
 import {
   createUser, login, createAgent, authToken, revokeDevice,
-  authorize, makeRateLimiter, makeLoginGuard, setPassword,
+  authorize, makeRateLimiter, makeLoginGuard, setPassword, changePassword, makeKeyedQueue,
 } from '../src/auth.js'
 
 test('login issues a device token; authToken resolves it', async () => {
@@ -121,4 +121,47 @@ test('rate limiter window actually expires', async () => {
   assert.equal(rl.allow('k'), false)
   await new Promise((r) => setTimeout(r, 60))
   assert.equal(rl.allow('k'), true)
+})
+
+test('changePassword: a check made stale by a concurrent change does not overwrite it', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'hunter22')
+  const mac = await login(db, { username: 'alice', password: 'hunter22', deviceName: 'mac' })
+  const phone = await login(db, { username: 'alice', password: 'hunter22', deviceName: 'phone' })
+  // Both verify the same old hash before either writes.
+  const [a, b] = await Promise.all([
+    changePassword(db, alice.id, { oldPassword: 'hunter22', newPassword: 'mac-new-pw-1', deviceId: mac.deviceId, signOutOthers: true }),
+    changePassword(db, alice.id, { oldPassword: 'hunter22', newPassword: 'phone-new-pw', deviceId: phone.deviceId, signOutOthers: true }),
+  ])
+  const oks = [a, b].filter((r) => r.ok)
+  assert.equal(oks.length, 1, 'exactly one change lands')
+  const loser = a.ok ? b : a
+  assert.equal(loser.revoked, true, 'the loser was signed out by the winner')
+  const winner = a.ok ? 'mac-new-pw-1' : 'phone-new-pw'
+  assert.ok(await login(db, { username: 'alice', password: winner, deviceName: 'x' }))
+})
+
+test('changePassword: without sign-out, a stale check loses the compare-and-swap', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'hunter22')
+  const mac = await login(db, { username: 'alice', password: 'hunter22', deviceName: 'mac' })
+  const phone = await login(db, { username: 'alice', password: 'hunter22', deviceName: 'phone' })
+  const [a, b] = await Promise.all([
+    changePassword(db, alice.id, { oldPassword: 'hunter22', newPassword: 'mac-new-pw-1', deviceId: mac.deviceId }),
+    changePassword(db, alice.id, { oldPassword: 'hunter22', newPassword: 'phone-new-pw', deviceId: phone.deviceId }),
+  ])
+  assert.deepEqual([a.ok, b.ok].sort(), [false, true])
+  assert.equal((a.ok ? b : a).revoked, undefined)
+})
+
+test('makeKeyedQueue runs one job per key at a time, keys independently, and survives a throwing job', async () => {
+  const q = makeKeyedQueue()
+  const log = []
+  const job = (name, ms) => async () => { log.push(`${name}+`); await new Promise((r) => setTimeout(r, ms)); log.push(`${name}-`); return name }
+  const boom = q.run(1, async () => { throw new Error('boom') })
+  const r = await Promise.all([q.run(1, job('a', 20)), q.run(1, job('b', 1)), q.run(2, job('c', 1))])
+  await assert.rejects(boom, /boom/)
+  assert.deepEqual(r, ['a', 'b', 'c'])
+  assert.ok(log.indexOf('a-') < log.indexOf('b+'), 'b waits for a')
+  assert.ok(log.indexOf('c-') < log.indexOf('a-'), 'key 2 does not wait for key 1')
 })

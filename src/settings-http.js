@@ -6,8 +6,9 @@
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 import { settingsView, setNoticesEnabled, setAutoApproveCoordinatorSpawns } from './settings.js'
+import { isAutoArchiveDays, setAutoArchiveDays } from './archive.js'
 
-export const SETTINGS_KEYS = ['notices', 'auto_approve_coordinator_spawns']
+export const SETTINGS_KEYS = ['notices', 'auto_approve_coordinator_spawns', 'auto_archive_days']
 
 export async function handleSettingsRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/settings') return false
@@ -22,11 +23,14 @@ export async function handleSettingsRoute(ctx, req, res, url, who) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return badRequest(res)
   const keys = Object.keys(body)
   if (!keys.length || keys.some((k) => !SETTINGS_KEYS.includes(k))) return badRequest(res)
-  if (keys.some((k) => typeof body[k] !== 'boolean')) return badRequest(res)
+  if ('notices' in body && typeof body.notices !== 'boolean') return badRequest(res)
+  if ('auto_approve_coordinator_spawns' in body && typeof body.auto_approve_coordinator_spawns !== 'boolean') return badRequest(res)
+  if ('auto_archive_days' in body && !isAutoArchiveDays(body.auto_archive_days)) return badRequest(res)
   const now = Date.now()
   db.transaction(() => {
-    if (keys.includes('notices')) setNoticesEnabled(db, who.userId, body.notices, now)
-    if (keys.includes('auto_approve_coordinator_spawns')) setAutoApproveCoordinatorSpawns(db, who.userId, body.auto_approve_coordinator_spawns, now)
+    if ('notices' in body) setNoticesEnabled(db, who.userId, body.notices, now)
+    if ('auto_approve_coordinator_spawns' in body) setAutoApproveCoordinatorSpawns(db, who.userId, body.auto_approve_coordinator_spawns, now)
+    if ('auto_archive_days' in body) setAutoArchiveDays(db, who.userId, body.auto_archive_days, now)
   })()
   const view = settingsView(db, who.userId)
   for (const c of hub.connsOf(who.userId)) {

@@ -10,6 +10,7 @@ import { parseRepo } from './repo-identity.js'
 import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
 import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
+import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
 // Conversation-list order: newest last-MESSAGE time first (last_ts, falling
@@ -57,7 +58,7 @@ export const CONVO_ID_MAX_CHARS = 128
 // they come from, or send data to, ANOTHER PERSON, and only a tap on the
 // user's own device may answer them — no agent, the Coordinator included,
 // ever hears of one.
-const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'person_room', 'session_share'])
+const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'mission_handover', 'person_room', 'session_share'])
 export const PEOPLE_EVENT_TYPE = 'people'
 
 export function isClientOnlyEvent(type, payload) {
@@ -82,6 +83,7 @@ export function snippetOf(type, payload) {
   if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
     if (p.kind === 'contact_request') return '🤝 Contact request'
     if (p.kind === 'mission_share') return '🤝 Mission share request'
+    if (p.kind === 'mission_handover') return '🤝 Hand-over request'
     if (p.kind === 'person_room') return '🤝 Room with another person'
     if (p.kind === 'session_share') return '🤝 Session share request'
     return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'
@@ -377,7 +379,14 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     } else {
       db.prepare('UPDATE conversations SET last_seq=? WHERE id=?').run(seq, convoId)
     }
-    return { seq, ts, duplicate: false }
+    // A message brings an archived conversation back (src/archive.js), in
+    // this transaction so the flag and the message can never disagree.
+    // Callers that hold a hub send the `archive` frame; the apps apply the
+    // same rule to the message itself, so none is lost without it.
+    const unarchived = MESSAGE_TYPES.includes(type) && convo.parent_convo_id == null
+      ? unarchiveOnMessage(db, userId, convoId, ts)
+      : null
+    return { seq, ts, duplicate: false, ...(unarchived ? { unarchived } : {}) }
   })()
 }
 
@@ -394,6 +403,7 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
   if (r.duplicate) return r
   broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
   if (hinted) sendPinsFrame(db, hub, userId)
+  if (r.unarchived) sendArchiveFrame(hub, userId, [r.unarchived], r.ts)
   return r
 }
 
@@ -481,13 +491,18 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
               WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
-             ORDER BY e.seq DESC LIMIT 1) AS last_ts
+             ORDER BY e.seq DESC LIMIT 1) AS last_ts,
+            (SELECT a.archived_at FROM convo_archive a
+             WHERE a.user_id = conversations.owner_user_id AND a.convo_id = conversations.id) AS archived_at
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
        : ''}`
   ).all(userId)
   conversations.sort(byLastMessageThenId)
+  // archived_at (src/archive.js) only on archived rows, so the wire stays
+  // the same for everything else; no key = not archived.
+  for (const c of conversations) if (c.archived_at == null) delete c.archived_at
   // Room membership, so a client can chip every participating box, not just
   // the recorded owner (spec: multi-agent room tags), and place a room under
   // its participants' missions (spec: 2026-10-01 rooms under missions).

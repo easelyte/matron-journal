@@ -40,6 +40,9 @@ export const STARTER_ROUTINES = Object.freeze([
   { name: 'context-over', title: 'Session context over the threshold', trigger: { kind: 'context_over', pct: 40 }, prompt: 'Routine context-over: follow the Session context over the threshold section of your playbook.' },
   { name: 'stalled-session', title: 'Session stalled on a usage limit', trigger: { kind: 'stalled', reset_minutes: 120 }, prompt: 'Routine stalled-session: follow the Session stalled on a usage limit section of your playbook.' },
   { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, prompt: 'Routine disk-low: follow the Box disk under the threshold section of your playbook.' },
+  // Spends a weekly allowance that would otherwise expire on the
+  // spare-allowance backlog: up to two sessions a fire, no chats.
+  { name: 'spare-allowance', title: 'Spare weekly allowance before its reset', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] }, envelope: { spawns_per_fire: 2, chats: false, boxes: null }, prompt: 'Routine spare-allowance: follow the Spare weekly allowance section of your playbook.' },
 ])
 
 // Triggers (spec "Triggers"): what a routine can fire on instead of a clock.
@@ -47,9 +50,22 @@ export const STARTER_ROUTINES = Object.freeze([
 //   stalled {reset_minutes}   a session stalled on a usage limit whose reset
 //                             is at least reset_minutes away, or unknown
 //   disk_under {pct}          an agent box with under pct% free disk
-export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under'])
+//   allowance_expiring {pct, from_hours, to_hours}
+//                             an account's weekly meter under pct% with its
+//                             reset from_hours..to_hours away (default 6..12),
+//                             while the spare-allowance backlog has a task
+//   allowance_expiring {tiers: [{unused_pct, hours_left}, …]}
+//                             the same, met by any tier: at least unused_pct%
+//                             of the meter left with its reset at most
+//                             hours_left away (1..4 tiers, e.g. 50% with 12 h,
+//                             25% with 2 h); still once per weekly window
+export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under', 'allowance_expiring'])
 const STALLED_DEFAULT_MINUTES = 120
 const STALLED_MAX_MINUTES = 7 * 24 * 60
+export const ALLOWANCE_FROM_HOURS = 6
+export const ALLOWANCE_TO_HOURS = 12
+const WEEK_HOURS = 7 * 24
+export const ALLOWANCE_TIERS_MAX = 4
 
 export function validateTrigger(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -61,12 +77,75 @@ export function validateTrigger(raw) {
     if (!Number.isInteger(m) || m < 0 || m > STALLED_MAX_MINUTES) return null
     return { kind: 'stalled', reset_minutes: m }
   }
+  if (raw.kind === 'allowance_expiring' && raw.tiers !== undefined) {
+    if (keys.some((k) => !['kind', 'tiers'].includes(k))) return null
+    if (!Array.isArray(raw.tiers) || raw.tiers.length < 1 || raw.tiers.length > ALLOWANCE_TIERS_MAX) return null
+    const tiers = []
+    for (const t of raw.tiers) {
+      if (!t || typeof t !== 'object' || Array.isArray(t)) return null
+      if (Object.keys(t).some((k) => t[k] !== undefined && !['unused_pct', 'hours_left'].includes(k))) return null
+      if (!Number.isInteger(t.unused_pct) || t.unused_pct < 1 || t.unused_pct > 99) return null
+      if (!Number.isInteger(t.hours_left) || t.hours_left < 1 || t.hours_left > WEEK_HOURS) return null
+      tiers.push({ unused_pct: t.unused_pct, hours_left: t.hours_left })
+    }
+    return { kind: 'allowance_expiring', tiers }
+  }
+  if (raw.kind === 'allowance_expiring') {
+    if (keys.some((k) => !['kind', 'pct', 'from_hours', 'to_hours'].includes(k))) return null
+    if (!Number.isInteger(raw.pct) || raw.pct < 1 || raw.pct > 99) return null
+    const from = raw.from_hours === undefined ? ALLOWANCE_FROM_HOURS : raw.from_hours
+    const to = raw.to_hours === undefined ? ALLOWANCE_TO_HOURS : raw.to_hours
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to <= from || to > WEEK_HOURS) return null
+    return { kind: 'allowance_expiring', pct: raw.pct, from_hours: from, to_hours: to }
+  }
   if (keys.some((k) => !['kind', 'pct'].includes(k))) return null
   if (!Number.isInteger(raw.pct) || raw.pct < 1 || raw.pct > 99) return null
   return { kind: raw.kind, pct: raw.pct }
 }
 
 export const parseTrigger = (text) => { try { return text ? validateTrigger(JSON.parse(text)) : null } catch { return null } }
+
+// Envelope (spec "Envelopes"): the bounds on what an ask born of one of this
+// routine's fires may do when the Coordinator approves it itself —
+//   spawns_per_fire  0..50   approved spawns per fire (absent: 0)
+//   chats            boolean chat rooms at all (absent: false)
+//   boxes            1..32 device names a spawn may target or a chat may
+//                    reach (the invitee, or for a join the room's owner),
+//                    or null for any box (absent: null)
+// NULL on the row (no envelope) allows nothing. The value is always stored
+// and read back with all three keys.
+export const ENVELOPE_SPAWNS_MAX = 50
+export const ENVELOPE_BOXES_MAX = 32
+const ENVELOPE_BOX_MAX = 64
+const ENVELOPE_KEYS = ['spawns_per_fire', 'chats', 'boxes']
+
+export function validateEnvelope(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false }
+  if (Object.keys(raw).some((k) => raw[k] !== undefined && !ENVELOPE_KEYS.includes(k))) return { ok: false }
+  const spawns = raw.spawns_per_fire === undefined ? 0 : raw.spawns_per_fire
+  if (!Number.isInteger(spawns) || spawns < 0 || spawns > ENVELOPE_SPAWNS_MAX) return { ok: false }
+  const chats = raw.chats === undefined ? false : raw.chats
+  if (typeof chats !== 'boolean') return { ok: false }
+  let boxes = raw.boxes === undefined ? null : raw.boxes
+  if (boxes !== null) {
+    if (!Array.isArray(boxes) || boxes.length === 0 || boxes.length > ENVELOPE_BOXES_MAX) return { ok: false }
+    if (boxes.some((b) => typeof b !== 'string' || !b || b.length > ENVELOPE_BOX_MAX || LINE_BAD.test(b))) return { ok: false }
+    boxes = [...new Set(boxes)]
+  }
+  return { ok: true, value: { spawns_per_fire: spawns, chats, boxes } }
+}
+
+// The stored column back, re-validated (it is only ever written from
+// validateEnvelope, but a reader should not depend on that): object or null.
+export function parseEnvelope(text) {
+  if (typeof text !== 'string' || !text) return null
+  try {
+    const v = validateEnvelope(JSON.parse(text))
+    return v.ok ? v.value : null
+  } catch {
+    return null
+  }
+}
 
 export const newRoutineId = () => `rt_${randomBytes(8).toString('hex')}`
 
@@ -165,6 +244,15 @@ export function validateRoutineFields(body, { partial = false, now = Date.now() 
     if (typeof e !== 'boolean') return { ok: false }
     out.enabled = e
   }
+  // Optional on create too (absent = no envelope); null clears on a PATCH.
+  if (body.envelope !== undefined) {
+    if (body.envelope === null) out.envelope = null
+    else {
+      const env = validateEnvelope(body.envelope)
+      if (!env.ok) return { ok: false }
+      out.envelope = env.value
+    }
+  }
   return { ok: true, value: out }
 }
 
@@ -174,8 +262,11 @@ export function routineRow(row) {
   out.enabled = !!out.enabled
   out.schedule = out.schedule ?? null
   out.trigger = parseTrigger(out.trigger)
+  out.envelope = parseEnvelope(out.envelope)
   return out
 }
+
+const envelopeText = (env) => (env == null ? null : JSON.stringify(env))
 
 const byKey = (key) => (typeof key === 'string' && key.startsWith('rt_') ? 'id=?' : 'name=?')
 
@@ -195,8 +286,8 @@ export function createRoutine(db, { userId, origin, fields, now = Date.now() }) 
     if (db.prepare('SELECT 1 FROM routines WHERE user_id=? AND name=?').get(userId, fields.name)) throw new Error('conflict')
     const id = newRoutineId()
     const nextAt = fields.enabled && fields.schedule ? nextRunAt(fields.schedule, fields.tz, now) : null
-    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, trigger, tz, prompt, enabled, origin, next_at, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule ?? null, fields.trigger ? JSON.stringify(fields.trigger) : null, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, now, now)
+    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, trigger, tz, prompt, enabled, origin, next_at, envelope, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule ?? null, fields.trigger ? JSON.stringify(fields.trigger) : null, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, envelopeText(fields.envelope), now, now)
     return getRoutine(db, userId, id)
   })()
 }
@@ -221,8 +312,10 @@ export function updateRoutine(db, { userId, key, fields, now = Date.now() }) {
     let retryAt = row.retry_at
     if (!next.enabled) { nextAt = null; retryAt = null } else if (reschedule) { nextAt = nextRunAt(next.schedule, next.tz, now); retryAt = null }
     const triggerText = scheduled ? null : JSON.stringify(fields.trigger ?? parseTrigger(row.trigger))
-    db.prepare(`UPDATE routines SET title=?, schedule=?, trigger=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, updated_at=? WHERE id=?`)
-      .run(next.title, scheduled ? next.schedule : null, triggerText, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, now, row.id)
+    // Absent leaves the stored text as it is; null clears it.
+    const envText = fields.envelope === undefined ? row.envelope : envelopeText(fields.envelope)
+    db.prepare(`UPDATE routines SET title=?, schedule=?, trigger=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, envelope=?, updated_at=? WHERE id=?`)
+      .run(next.title, scheduled ? next.schedule : null, triggerText, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, envText, now, row.id)
     // A paused or re-thresholded trigger starts afresh: its subjects re-trip.
     if (!scheduled && (!next.enabled || fields.trigger !== undefined)) db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=?').run(row.id)
     return getRoutine(db, userId, row.id)

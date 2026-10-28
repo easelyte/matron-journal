@@ -5,4 +5,5 @@ node_modules/
 *.db-wal
 *.db-shm
 /media/
+/tts-cache/
 preapprove.key

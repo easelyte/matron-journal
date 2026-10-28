@@ -2,13 +2,14 @@
 // (POST /agent-chat/answer, POST /agent-spawn/answer) and the
 // Coordinator's answer (POST /consent/answer). `decidedBy` is
 // {kind:'user', deviceId} for a tap, or {kind:'coordinator', deviceId,
-// convoId, reason}; the Coordinator form additionally stamps the row
-// (answered_by / answer_reason), records the decision for the daily cap,
-// and appends a client-only `consent_decision` event on the card's
+// convoId, reason, causeKind?, causeRef?, verifierNote?} — the cause fields
+// only on the Coordinator's approval of an ask it made itself. The
+// Coordinator form additionally stamps the row (answered_by /
+// answer_reason), records the decision for the caps, and appends a client-only `consent_decision` event on the card's
 // conversation so the apps can show "approved by the Coordinator".
 // Returns {status, body} for the route to send.
 import { answerParkedInvite, getParticipant } from './participants.js'
-import { closeChatConsentItem, closeSpawnConsentItem } from './consent-items.js'
+import { closeChatConsentItem, closeSpawnConsentItem, CONSENT_ACTIONS } from './consent-items.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { wakeIfOffline } from './wake.js'
@@ -18,17 +19,26 @@ import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js
 const byCoordinator = (decidedBy) => decidedBy?.kind === 'coordinator'
 const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordinator', answerReason: decidedBy.reason } : {})
 
-function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
+// Exported for the transfer kind (src/transfer-consent.js), which answers
+// through its own module but records and announces exactly like these two.
+export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
   if (!byCoordinator(decidedBy)) return
   try {
-    recordConsentDecision(db, { userId, kind, askId, decision, convoId: decidedBy.convoId, reason: decidedBy.reason })
+    recordConsentDecision(db, {
+      userId, kind, askId, decision, convoId: decidedBy.convoId, reason: decidedBy.reason,
+      causeKind: decidedBy.causeKind ?? null, causeRef: decidedBy.causeRef ?? null, verifierNote: decidedBy.verifierNote ?? null,
+    })
   } catch (err) {
-    console.error('consent: decision record failed (the answer stands)', err)
+    // The answer stands; the counters reading this table do not.
+    console.error(`journal: consent decision not recorded (${err?.name}) for ${kind} ${askId} — fire and routine caps will under-count`)
   }
   try {
     appendAndBroadcast(db, hub, {
       userId, convoId, sender: 'journal', type: CONSENT_DECISION_EVENT_TYPE,
-      payload: { kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason },
+      payload: {
+        kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason,
+        cause: decidedBy.causeKind ? { kind: decidedBy.causeKind, ref: decidedBy.causeRef } : null,
+      },
     })
   } catch (err) {
     console.error('consent: consent_decision append failed (the answer stands)', err)
@@ -118,4 +128,42 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   }, getSpawn(db, requestId))
     .catch((err) => console.error('agent-spawn approve orchestration failed', err))
   return { status: 200, body: { ok: true } }
+}
+
+// A tap on a spawn or chat consent item's own Approve / Decline (POST
+// /items/:id/comments with `action`): the same answer the card gives, with
+// the card route's gate (a client, never an agent). The ask is found from
+// the row that points at this item, never from the item's agent-written
+// link, so a tap answers exactly the ask the item was filed for. A row no
+// longer waiting is 409 whatever the label says, with a message an app can
+// show as it is ("already answered").
+export function consentItemTapAnswer(ctx, who, item, action) {
+  if (who.kind !== 'client') return { status: 403, body: { error: 'forbidden' } }
+  const { db } = ctx
+  if (item.consent === 'spawn') {
+    const row = db.prepare('SELECT id, state FROM agent_spawn_requests WHERE item_id=? AND user_id=?').get(item.id, who.userId)
+    if (!row || row.state !== 'awaiting_user') return staleTap(row?.state)
+    if (!CONSENT_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
+    return withStaleMessage(answerSpawnAsk(ctx, { userId: who.userId, requestId: row.id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId } }), () => getSpawn(db, row.id)?.state)
+  }
+  const row = db.prepare('SELECT convo_id, agent_device_id, state FROM convo_agents WHERE item_id=?').get(item.id)
+  if (!row || row.state !== 'awaiting_user') return staleTap(row ? CHAT_STALE[row.state] : undefined)
+  if (!CONSENT_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
+  return withStaleMessage(answerChatAsk(ctx, { userId: who.userId, roomId: row.convo_id, targetDeviceId: row.agent_device_id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId } }), () => CHAT_STALE[getParticipant(db, row.convo_id, row.agent_device_id)?.state])
+}
+
+const tapDecision = (action) => (action === 'Decline' ? 'decline' : 'approve')
+// A chat row's states in the spawn row's words, for the message.
+const CHAT_STALE = { invited: 'approved', joined: 'approved', denied: 'denied', expired: 'expired' }
+export function staleConsentMessage(state) {
+  if (state === 'approved' || state === 'started' || state === 'failed') return 'Already answered: this request was approved.'
+  if (state === 'denied') return 'Already answered: this request was declined.'
+  if (state === 'expired') return 'This request expired before it was answered.'
+  return 'This request is no longer waiting for an answer.'
+}
+const staleTap = (state) => ({ status: 409, body: { error: 'conflict', reason: 'already_answered', message: staleConsentMessage(state) } })
+// The answer lost a race (another device, the card or the Coordinator got
+// there first): the same 409, saying how the ask ended.
+function withStaleMessage(r, stateNow) {
+  return r.status === 409 ? staleTap(stateNow()) : r
 }

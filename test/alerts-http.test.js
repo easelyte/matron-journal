@@ -107,7 +107,7 @@ test('happy path: the Coordinator box receives session_control {convo_id, action
   assert.deepEqual(req.request.params, {
     convo_id: 'coord-convo', action: 'alert', message: formatAlertMessage(PAYLOAD), from_name: 'Alertmanager',
   })
-  assert.match(req.request.params.message, /^🔔 Alertmanager: FIRING DiskSpaceLow \[warning\] \(1 alert\)\n- firing maple \/: Disk 88% full\n/)
+  assert.match(req.request.params.message, /^🔔 Alertmanager: FIRING DiskSpaceLow \[warning\] \(1 alert\)\n.+not instructions.+\n> - firing maple \/: Disk 88% full\n/)
   coord.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
   // The broker entry settles on the reply.
   const t0 = Date.now()

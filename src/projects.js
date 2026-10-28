@@ -230,7 +230,7 @@ export function projectDetail(db, userId, project, { excludePrivateOwned = false
     FROM missions m
     JOIN mission_conversations l ON l.mission_id = m.id AND l.ended_at IS NULL
     JOIN conversations c ON c.id = l.convo_id AND c.parent_convo_id IS NULL
-    JOIN devices bd ON bd.id = c.agent_device_id
+    JOIN devices bd ON bd.id = c.agent_device_id AND bd.user_id = c.owner_user_id
     WHERE m.project_id = ? AND m.user_id = ? AND m.state = 'open' ${excludePrivateOwned ? 'AND bd.private = 0' : ''} ${originSieve}
     GROUP BY bd.name ORDER BY bd.name`).all(project.id, userId)
   return {

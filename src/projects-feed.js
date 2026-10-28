@@ -55,7 +55,7 @@ function decisionsSql(excludePrivateOwned) {
         SELECT substr(COALESCE(NULLIF(json_extract(ic.meta, '$.action'), ''), NULLIF(ic.body, ''),
                                json_extract(ic.attachments, '$[0].transcript')), 1, ${ANSWER_MAX})
         FROM item_comments ic
-        WHERE ic.item_id = i.id AND ic.author = 'user' AND ic.kind = 'comment' ${answerSieve}
+        WHERE ic.item_id = i.id AND ic.author = 'user' AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL ${answerSieve}
         ORDER BY ic.created_at DESC, ic.id DESC LIMIT 1) END AS answer
     FROM items i JOIN missions m ON m.id = i.mission_id JOIN conversations c ON c.id = i.origin_convo_id
     WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL
@@ -82,7 +82,7 @@ function filesSql(excludePrivateOwned) {
       i.num AS item_num, NULL AS convo_id, NULL AS seq, NULL AS caption, m.num AS mission_num
     FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id
     JOIN conversations c ON c.id = i.origin_convo_id, json_each(ic.attachments) je
-    WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL ${itemSieve}
+    WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
   UNION ALL
   SELECT 'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
       json_extract(e.payload, '$.size'), e.ts, 'e:' || ${pad('e.seq')}, NULL, e.convo_id, e.seq,
@@ -172,7 +172,7 @@ export function cardFields(db, userId, { excludePrivateOwned = false } = {}) {
     FROM missions m
     JOIN mission_conversations l ON l.mission_id = m.id AND l.ended_at IS NULL
     JOIN conversations c ON c.id = l.convo_id AND c.parent_convo_id IS NULL
-    JOIN devices bd ON bd.id = c.agent_device_id
+    JOIN devices bd ON bd.id = c.agent_device_id AND bd.user_id = c.owner_user_id
     WHERE m.user_id = ? AND m.project_id IS NOT NULL AND m.state = 'open'
       ${excludePrivateOwned ? `AND bd.private = 0 AND ${ORIGIN_SIEVE}` : ''}
     GROUP BY m.project_id`).all(userId)
