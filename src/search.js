@@ -56,6 +56,14 @@ export function ftsAnyQueryFor(raw) {
   return terms.map(quoteFtsTerm).join(' OR ')
 }
 
+// Adjacent-phrase match (see searchMessages). Capped so a pasted paragraph
+// is not run as a phrase.
+const MAX_PHRASE_TERMS = 8
+export function ftsPhraseQueryFor(raw) {
+  const terms = String(raw).split(/\s+/).filter(Boolean)
+  return terms.length < 2 ? null : quoteFtsTerm(terms.join(' '))
+}
+
 // WHERE/SELECT builder shared by searchMessages's main (all-words) query and
 // its some_words fallback below — the only difference between the two is
 // the MATCH string and an extra "already have these seqs" exclusion, so
@@ -68,7 +76,7 @@ export function ftsAnyQueryFor(raw) {
 // already uses — never a plain LEFT JOIN — so a filtered agent caller
 // never learns a private-origin mission's number even for an otherwise
 // visible hit.
-function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount = 0 }) {
+function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount = 0, proseOnly = false }) {
   return `
     SELECT sm.convo_id, c.title, sm.seq, sm.ts, sm.sender, c.session_state,
            snippet(search_fts, 0, '**', '**', '…', 12) AS snippet,
@@ -78,6 +86,7 @@ function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqs
     JOIN conversations c ON c.id = sm.convo_id
     WHERE search_fts MATCH ? AND sm.user_id = ?${convoId != null ? ' AND sm.convo_id = ?' : ''}
     ${excludeSubagents ? 'AND c.parent_convo_id IS NULL' : ''}
+    ${proseOnly ? 'AND sm.is_diff = 0' : ''}
     ${excludePrivateOwned
       ? `AND (c.agent_device_id IS NULL OR NOT EXISTS(
             SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`
@@ -115,26 +124,37 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null, 
     convo_id: r.convo_id, title: r.title, seq: r.seq, ts: r.ts, sender: r.sender,
     snippet: r.snippet, live: r.session_state === 'running', mission_num: r.mission_num ?? null, why,
   })
-  let rows
+  const hits = []
+  // One tier: run `matchStr` for up to the remaining `limit`, skipping seqs
+  // an earlier tier already returned. Every tier shares rankedSql, so the
+  // privacy and subagent filters cannot drift between them.
+  const runTier = (matchStr, why, { proseOnly = false } = {}) => {
+    const remaining = limit - hits.length
+    if (remaining <= 0) return
+    const excludeSeqs = hits.map((h) => h.seq)
+    const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount: excludeSeqs.length, proseOnly })
+    const args = [matchStr, userId, ...(convoId != null ? [convoId] : []), ...excludeSeqs, remaining]
+    hits.push(...db.prepare(sql).all(...args).map((r) => toHit(r, why)))
+  }
+  const parsed = parseQuery(query)
+  const termCount = String(query).split(/\s+/).filter(Boolean).length
   try {
-    const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned })
-    const args = convoId != null ? [match, userId, convoId, limit] : [match, userId, limit]
-    rows = db.prepare(sql).all(...args)
+    // Phrase tier (2+ terms): a message holding the terms adjacent and in
+    // order ranks above one that merely contains every term somewhere: a
+    // person recalling what was said types a fragment of it. Prose only, so
+    // a diff never jumps above prose matching the same terms.
+    if (termCount >= 2 && termCount <= MAX_PHRASE_TERMS) {
+      runTier(ftsPhraseQueryFor(query), 'phrase', { proseOnly: true })
+    }
+    runTier(match, 'words')
   } catch (err) {
     console.error('search query failed', err)
     return { badQuery: true }
   }
-  const hits = rows.map((r) => toHit(r, 'words'))
-  const parsed = parseQuery(query)
   const orMatch = parsed && !parsed.literal ? ftsAnyQueryFor(query) : null
-  const remaining = limit - hits.length
-  if (hits.length < 5 && orMatch != null && remaining > 0) {
+  if (hits.length < 5 && orMatch != null) {
     try {
-      const excludeSeqs = hits.map((h) => h.seq)
-      const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount: excludeSeqs.length })
-      const args = [orMatch, userId, ...(convoId != null ? [convoId] : []), ...excludeSeqs, remaining]
-      const moreRows = db.prepare(sql).all(...args)
-      hits.push(...moreRows.map((r) => toHit(r, 'some_words')))
+      runTier(orMatch, 'some_words')
     } catch (err) {
       console.error('search (some_words) query failed', err)
     }
