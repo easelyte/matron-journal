@@ -88,6 +88,9 @@ export const isAutoArchiveDays = (v) => Number.isInteger(v) && v >= 0 && v <= AU
 // a session still running or waiting, the Coordinator, a pin, an open
 // tracker item filed from it, any link to an open mission, or a sub-chat
 // still running or with a message since the cutoff (its parent's work).
+// A sub-chat's newest message is one backward probe on (convo_id, seq); the
+// older form (any event with ts >= cutoff) scanned every event of every
+// sub-chat and blocked the loop for 35-40 s on a cold cache.
 export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
   if (!days) return []
   const cutoff = now - days * DAY_MS
@@ -108,8 +111,9 @@ export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
                     ORDER BY e.seq DESC LIMIT 1), 0) < ?
       AND NOT EXISTS(SELECT 1 FROM conversations k WHERE k.parent_convo_id=c.id
                      AND (k.session_state IN ('running','waiting')
-                          OR EXISTS(SELECT 1 FROM events e WHERE e.convo_id=k.id AND e.ts >= ?
-                                    AND e.type IN (${MESSAGE_TYPES_SQL}))))`).all(userId, cutoff, cutoff, cutoff, cutoff).map((r) => r.id)
+                          OR COALESCE((SELECT e.ts FROM events e WHERE e.convo_id=k.id
+                                       AND e.type IN (${MESSAGE_TYPES_SQL})
+                                       ORDER BY e.seq DESC LIMIT 1), 0) >= ?))`).all(userId, cutoff, cutoff, cutoff, cutoff).map((r) => r.id)
 }
 
 // One pass over every user. Returns {userId: changes} for users with any.
