@@ -7,7 +7,7 @@ export async function startTestServer(opts = {}) {
   // exercise /files as "the operator" get it by default. Owner-gate tests
   // override it (a different id, or null for the unconfigured case).
   // Search: no embedder (never load a real model), background work unpaced.
-  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, backgroundPace: 0, ...opts })
+  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, backgroundPace: 0, retentionInitialDelayMs: 0, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,
