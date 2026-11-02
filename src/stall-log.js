@@ -53,3 +53,23 @@ export function timed(label, fn, { thresholdMs = STALL_THRESHOLD_MS, log = (line
     if (ms >= thresholdMs) log(`stall: ${label} took ${Math.round(ms)}ms`)
   }
 }
+
+// Logs a request that took `thresholdMs` or longer, by method and path (no
+// query string). The event loop is single-threaded, so a request that was
+// slow because the loop was blocked shows up here too, next to the stall
+// line; a request that is itself the blocker ends right at the stall.
+export function logSlowRequests(handler, { thresholdMs = STALL_THRESHOLD_MS, log = (line) => console.warn(line), now = defaultNow } = {}) {
+  return (req, res) => {
+    const start = now()
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      const ms = now() - start
+      if (ms >= thresholdMs) log(`stall: request ${req.method} ${String(req.url || '').split('?')[0]} took ${Math.round(ms)}ms (status ${res.statusCode})`)
+    }
+    res.once('finish', finish)
+    res.once('close', finish)
+    return handler(req, res)
+  }
+}

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { startStallLog, timed } from '../src/stall-log.js'
+import { startStallLog, timed, logSlowRequests } from '../src/stall-log.js'
 
 function fakeTimers() {
   let tick = null
@@ -48,4 +48,25 @@ test('timed logs and rethrows when the call throws', () => {
   let clock = 0
   assert.throws(() => timed('z', () => { clock += 800; throw new Error('boom') }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock }), /boom/)
   assert.deepEqual(lines, ['stall: z took 800ms'])
+})
+
+test('logSlowRequests logs a slow request once, by path without the query', () => {
+  const lines = []
+  let clock = 0
+  const handlers = {}
+  const res = { statusCode: 200, once: (e, f) => { handlers[e] = f } }
+  const wrapped = logSlowRequests((req, r) => { clock += 900; r.statusCode = 200 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })
+  wrapped({ method: 'GET', url: '/items?token=secret' }, res)
+  handlers.finish(); handlers.close()
+  assert.deepEqual(lines, ['stall: request GET /items took 900ms (status 200)'])
+})
+
+test('logSlowRequests stays quiet for a fast request', () => {
+  const lines = []
+  let clock = 0
+  const handlers = {}
+  const res = { statusCode: 200, once: (e, f) => { handlers[e] = f } }
+  logSlowRequests((req, r) => { clock += 5 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })({ method: 'GET', url: '/x' }, res)
+  handlers.finish()
+  assert.deepEqual(lines, [])
 })
