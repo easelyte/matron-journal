@@ -22,7 +22,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
-import { startStallLog, timed } from './stall-log.js'
+import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
@@ -468,7 +468,7 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
     }
   }
   run()
-  const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
+  const interval = setInterval(() => timed('retention run', run), retentionIntervalMs ?? RETENTION_INTERVAL_MS)
   interval.unref()
   return interval
 }
@@ -510,7 +510,7 @@ function scheduleTtsSweep(tts, ttsSweepIntervalMs) {
   if (!tts) return null
   const run = () => {
     try {
-      const r = tts.sweep()
+      const r = timed('tts sweep', () => tts.sweep())
       if (r.removed > 0) console.log(`tts: removed ${r.removed} cached clip(s) older than 24h`)
     } catch (err) {
       console.error('tts: cache sweep failed', err)
@@ -934,7 +934,9 @@ export function startServer({
   let semanticTimer = null
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
-  const server = http.createServer(httpHandlerFactory({
+  const stallLogOn = process.env.MATRON_STALL_LOG !== '0'
+  const wrapHandler = (h) => (stallLogOn ? logSlowRequests(h) : h)
+  const server = http.createServer(wrapHandler(httpHandlerFactory({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
@@ -948,7 +950,7 @@ export function startServer({
     fileOwnerUserId: resolvedFileOwnerUserId,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
-  }))
+  })))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
