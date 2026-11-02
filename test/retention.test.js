@@ -113,7 +113,7 @@ test('server.js retention: runs at boot, offloads old tool_output rows, retrieva
   preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
   preDb.close()
 
-  const s = await startTestServer({ dbPath, retentionDays: 30 })
+  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 0 })
   t.after(() => s.close())
   const row = s.db.prepare('SELECT payload, blob_ref FROM events WHERE seq=?').get(r.seq)
   assert.ok(row.blob_ref, 'boot-time retention run did not offload the old row')
@@ -138,7 +138,7 @@ test('MATRON_RETENTION_DAYS=0 (retentionDays: 0) disables retention — no offlo
   preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 400 * 86400000, alice.id, r.seq)
   preDb.close()
 
-  const s = await startTestServer({ dbPath, retentionDays: 0 })
+  const s = await startTestServer({ dbPath, retentionDays: 0, retentionInitialDelayMs: 0 })
   t.after(() => s.close())
   const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
   assert.equal(row.blob_ref, null)
@@ -158,7 +158,7 @@ test('an invalid retentionDays override (negative/non-integer) disables retentio
     preDb.close()
 
     const mute = t.mock.method(console, 'warn', () => {}) // expected one disabled-log line; keep output clean
-    const s = await startTestServer({ dbPath, retentionDays: badDays })
+    const s = await startTestServer({ dbPath, retentionDays: badDays, retentionInitialDelayMs: 0 })
     const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
     await s.close()
     mute.mock.restore()
@@ -1708,4 +1708,22 @@ test('MATRON_DEVICE_RETENTION: the pass runs at boot and logs its rules once; an
       assert.ok(!logs.some((l) => l.includes('device content expiry on')))
     }
   }
+})
+
+test('the first retention pass waits for retentionInitialDelayMs instead of running at boot', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = makeTmpDir('matron-retention-delay-')
+  const dbPath = path.join(dir, 'test.db')
+  const preDb = openDb(dbPath)
+  const alice = await createUser(preDb, 'alice', 'pw')
+  upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
+  const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'late offload', body: 'x'.repeat(200) } })
+  preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
+  preDb.close()
+
+  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 200 })
+  t.after(() => s.close())
+  assert.equal(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref, null, 'nothing offloaded at boot')
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  assert.ok(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref, 'the deferred pass ran')
 })

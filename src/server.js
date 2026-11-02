@@ -89,6 +89,7 @@ export function prohibitedFileWriteRoots(home = serviceUserHome()) {
 const PROHIBITED_FILE_WRITE_ROOTS = prohibitedFileWriteRoots()
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
+const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // first pass 2 min after boot, not at boot
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
 
@@ -387,7 +388,7 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // The transfer-expiry pass (runExpireTransfers) runs LAST and
 // unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
-function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -467,9 +468,21 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       console.error('retention: transfer expiry run failed', err)
     }
   }
-  run()
+  // The first pass used to run synchronously at boot and blocked the loop for
+  // minutes on a cold cache (a restart then took ~4 min to answer). It now
+  // runs once after RETENTION_INITIAL_DELAY_MS so the server answers first;
+  // 0 keeps the old run-at-boot behaviour (tests).
+  const initialDelay = retentionInitialDelayMs ?? RETENTION_INITIAL_DELAY_MS
+  let firstTimer = null
+  if (initialDelay > 0) {
+    firstTimer = setTimeout(() => timed('retention run (first)', run), initialDelay)
+    firstTimer.unref()
+  } else {
+    timed('retention run (first)', run)
+  }
   const interval = setInterval(() => timed('retention run', run), retentionIntervalMs ?? RETENTION_INTERVAL_MS)
   interval.unref()
+  interval.firstTimer = firstTimer
   return interval
 }
 
@@ -578,7 +591,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
+  retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
@@ -976,7 +989,7 @@ export function startServer({
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
         orphanBlobGraceHours,
       })
@@ -1100,7 +1113,7 @@ export function startServer({
         close: ({ closeCode, closeReason, graceMs = 1000 } = {}) => new Promise((r) => {
           closing = true
           startDelay.cancel()
-          if (retentionInterval) clearInterval(retentionInterval)
+          if (retentionInterval) { clearInterval(retentionInterval); clearTimeout(retentionInterval.firstTimer) }
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (stallLog) stallLog.stop()
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
