@@ -22,6 +22,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
+import { startStallLog, timed } from './stall-log.js'
 import { runOffload, runExpireLogs, runReapMedia, runReapOrphanBlobs, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
@@ -486,7 +487,7 @@ const WAL_CHECKPOINT_INTERVAL_MS = 1000
 function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   const run = () => {
     try {
-      db.pragma('wal_checkpoint(PASSIVE)')
+      timed('wal_checkpoint(PASSIVE)', () => db.pragma('wal_checkpoint(PASSIVE)'))
     } catch (err) {
       // A failed passive pass is retried by the next tick; log once per tick
       // rather than crash — the DB itself is still healthy (busy/locked are
@@ -965,6 +966,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let stallLog = null
   let githubRefreshInterval = null
   let ttsSweepInterval = null
   let closing = false
@@ -977,6 +979,8 @@ export function startServer({
         orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Log-only: names event-loop stalls so a "journal unreachable" can be traced. MATRON_STALL_LOG=0 turns it off.
+      if (process.env.MATRON_STALL_LOG !== '0') stallLog = startStallLog()
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is
@@ -1096,6 +1100,7 @@ export function startServer({
           startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (stallLog) stallLog.stop()
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // No new reindex pass can start after this: the only other
           // starter is embedderReady's own `.then`, which re-checks
