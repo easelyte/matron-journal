@@ -1727,3 +1727,25 @@ test('the first retention pass waits for retentionInitialDelayMs instead of runn
   await new Promise((resolve) => setTimeout(resolve, 600))
   assert.ok(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref, 'the deferred pass ran')
 })
+
+test('retention scans use their partial indexes, and runOffload no longer selects rows it would only skip', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const mk = (payload, raw) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: payload ?? { snippet: 'x' } })
+    backdate(db, r.seq, alice.id, 40)
+    if (raw !== undefined) db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(raw, alice.id, r.seq)
+    return r
+  }
+  mk({ snippet: 'plain', output: 'y'.repeat(100) })                       // offloadable
+  mk({ live_log: true, expired: true, snippet: 's' })                      // tombstone: skipped
+  mk({ live_log: true, snippet: 's' })                                     // live log: skipped
+  mk({ blob_expired: true, snippet: 's' })                                 // pre-purge shape: skipped
+  mk(null, 'not json {')                                                   // malformed: still offloaded
+  const plan = (sql) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(Date.now()).map((r) => r.detail).join(' | ')
+  assert.match(plan("SELECT user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
+    "AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL"), /idx_events_logs_pending/)
+  assert.match(plan("SELECT user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL"), /idx_events_offload_pending/)
+  const r = runOffload(db, { days: 30, mediaDir })
+  assert.equal(r.offloaded, 2)
+})

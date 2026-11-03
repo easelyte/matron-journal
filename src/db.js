@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
 -- A project's "Files and images" (projects-feed.js) reads only these rows.
 CREATE INDEX IF NOT EXISTS idx_events_media ON events(convo_id, seq) WHERE type IN ('image', 'file');
+-- The 6-hourly retention passes (retention.js runExpireLogs / runOffload)
+-- select tool_output rows by age. Without these, each pass scanned every event
+-- (1.6 GB) and blocked the loop for ~100 s. The WHERE terms must match the
+-- queries in retention.js exactly or SQLite will not use the index.
+CREATE INDEX IF NOT EXISTS idx_events_logs_pending ON events(ts)
+  WHERE type='tool_output' AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL;
+CREATE INDEX IF NOT EXISTS idx_events_offload_pending ON events(ts)
+  WHERE type='tool_output' AND blob_ref IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS agent_idem(

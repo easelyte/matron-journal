@@ -41,8 +41,16 @@ function looksAlreadyOffloaded(payload) {
 export function runOffload(db, { days = 30, mediaDir }) {
   const cutoff = Date.now() - days * 86400000
   const rows = db.prepare(
-    'SELECT user_id, seq, ts, payload FROM events WHERE type=? AND ts<? AND blob_ref IS NULL'
-  ).all(OFFLOAD_TYPE, cutoff)
+    // The CASE keeps rows the loop below would only `continue` past (live-log
+    // and tombstoned payloads: ~26k of them, re-parsed on every pass) out of
+    // the result; a malformed payload still comes through (json_extract would
+    // raise on it, hence the json_valid guard).
+    // type is a literal, not a bound parameter: the partial index
+    // idx_events_offload_pending is only usable when SQLite can see it.
+    "SELECT user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
+    "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.live_log') IS NULL " +
+    "AND json_extract(payload,'$.expired') IS NULL AND json_extract(payload,'$.blob_expired') IS NULL ELSE 1 END"
+  ).all(cutoff)
 
   let offloaded = 0
   const update = db.prepare('UPDATE events SET payload=?, blob_ref=? WHERE user_id=? AND seq=?')
