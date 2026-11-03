@@ -829,6 +829,14 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
+  // Keep hot pages (indexes, recent events) in this process instead of
+  // reading them through the OS page cache. SQLite's stock cache here is ~16 MB
+  // against a ~1.6 GB file, so nearly every query went to read(2); with the
+  // disk busy those synchronous reads stalled the single event loop for
+  // seconds (stall log: low CPU, "blocked in a syscall"). Lazy: memory is
+  // only used as pages are touched. MATRON_SQLITE_CACHE_MB overrides it.
+  const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? 256)
+  if (Number.isFinite(cacheMb) && cacheMb > 0) db.pragma(`cache_size = -${Math.floor(cacheMb * 1024)}`)
   // BEFORE the schema exec, and it has to be: SCHEMA builds
   // idx_file_idem_device, and creating that index over a table that predates
   // the column raises `no such column: device_id` — which does not just skip
