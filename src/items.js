@@ -7,6 +7,7 @@ import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { blobImageDims, isPrivateDevice } from './db.js'
 import { yieldTurn } from './background.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
+import { listReplicaItems } from './federation-replica.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -702,12 +703,29 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
   if (cur) { where.push('(i.updated_at < @cu OR (i.updated_at = @cu AND i.id < @cid))'); args.cu = cur[0]; args.cid = cur[1] }
-  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
-    WHERE ${where.join(' AND ')} ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ ...args, lim: limit + 1 })
-  const page = rows.slice(0, limit).map(rowToSharedItem)
+  const local = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
+    WHERE ${where.join(' AND ')} ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ ...args, lim: limit + 1 }).map(rowToSharedItem)
+  // With the copies of items shared from other journals
+  // (src/federation-replica.js), under the same filters and cursor.
+  const rows = [...local, ...listReplicaItems(db, viewerUserId, { kind, state, awaiting, limit, cursor: cur })]
+    .sort((a, b) => b.updated_at - a.updated_at || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+  const page = rows.slice(0, limit)
   const last = page[page.length - 1]
   const next_cursor = rows.length > limit && last ? encCursor([last.updated_at, last.id]) : null
   return { items: page, next_cursor }
+}
+
+// Every item of a mission a grantee may read, open and closed, newest
+// first, each with its thread — for a grant to a contact on another
+// journal (src/federation-replica.js), where there is no grantee user to
+// check: the caller has checked the grant. The same sieve as GRANTED_ITEM,
+// and the same strip as a grantee's read.
+export function grantedItemsExport(db, missionId, { limit = 5000, only = null } = {}) {
+  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, 0 AS org_shared ${SHARED_OR_GRANTED_FROM}
+    WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0 AND (@only IS NULL OR i.id = @only)
+      AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id)
+    ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ m: missionId, lim: limit, only })
+  return rows.map((r) => ({ item: rowToSharedItem(r), comments: listGrantedComments(db, r.id) }))
 }
 
 export function getSharedItem(db, viewerUserId, itemId) {

@@ -1,6 +1,7 @@
 import { snippetOf } from './journal.js'
-import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } from './db.js'
+import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
+import { wakesForYou } from './sync-scope.js'
 import {
   effectiveEvents, eventKey, allowedForUser, allowedForDevice, getConvoNotify,
   holdsConsent, consentStillPending, notifyBadge,
@@ -16,6 +17,10 @@ export const CONSENT_HOLD_MS = 30000
 // before the restart or were never held; resuming them would push twice.
 // The slack covers the restart's own downtime.
 export const CONSENT_RESUME_SLACK_MS = 60 * 1000
+// Min gap between silent background wakes to one device. Apple advises at
+// most two or three background pushes an hour and throttles beyond that, so
+// a wake sent more often than this is wasted budget, not fresher data.
+export const BACKGROUND_WAKE_MS = 20 * 60 * 1000
 
 // Returns null for event types that must not push at all. Product call
 // (dispatcher decision): convo_meta (a title rename) is always journal-sync
@@ -58,8 +63,7 @@ export function classify(type, payload, sender, prevState) {
     const state = payload && payload.state
     const turnFinished = prevState === 'running' && (state === 'waiting' || state === 'done')
     // `stopped` (running -> done: crashed or stopped mid-work) is its own
-    // switch in the notification settings; the kind stays 'done' for the
-    // legacy per-device prefs.
+    // switch in the notification settings; its APNs category stays 'done'.
     return turnFinished ? { priority: 10, coalesce: false, kind: 'done', stopped: state === 'done' } : null
   }
   if (type === 'convo_meta') return null
@@ -98,9 +102,9 @@ export function classify(type, payload, sender, prevState) {
 // cheap no-op).
 // `classify` is injectable (defaults to the real classifier above) purely
 // as a test seam — production callers never override it — so a test can
-// exercise a hypothetical future `cls.kind` the prefs object doesn't know
+// exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -111,6 +115,12 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // Consent-card pushes waiting out their hold (memory only; see
   // resumeHeldConsent for the restart case).
   const held = new Set()
+
+  // APNs token -> when it was last sent a background wake. Keyed by token so a
+  // reused device id or a reinstall starts fresh. Memory only, like the
+  // coalescing state: a restart at worst sends one wake early. Entries past
+  // the interval decide nothing, so maybeWake drops them.
+  const lastWakeAt = new Map()
 
   const bumpReason = (key) => { counters.byReason[key] = (counters.byReason[key] || 0) + 1 }
 
@@ -201,6 +211,47 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     state.timer.unref()
   }
 
+  // A phone only hears about new events while its app holds a socket, and iOS
+  // suspends the app soon after it leaves the screen. This silent push lets
+  // the app catch up in the background, so opening it does not start with a
+  // long replay. It is decided apart from the alert below, and regardless of
+  // the notification settings: it shows nothing, and those settings choose
+  // what buzzes, not how fresh the app is. Leading edge only: when a burst
+  // ends inside the interval the rest waits for the next event or the next
+  // time the app opens, which is the most Apple's budget allows anyway.
+  function maybeWake(userId, event, devices, originDeviceId) {
+    if (!backgroundWakeMs) return
+    for (const [token, at] of lastWakeAt) {
+      if (now() - at >= backgroundWakeMs) lastWakeAt.delete(token)
+    }
+    let connected = null
+    // A for_you phone (src/sync-scope.js) is woken only by what its For you
+    // and mission screens show; the rest it fetches when a chat is opened.
+    let forYouWake
+    for (const device of devices) {
+      if (device.id === originDeviceId || !device.apns_env) continue
+      if (device.cursor >= event.seq) continue
+      if (lastWakeAt.has(device.apns_token)) continue
+      if (device.sync_scope === 'for_you') {
+        forYouWake ??= wakesForYou(event, getCoordinatorConvoId(db, userId))
+        if (!forYouWake) continue
+      }
+      connected ??= new Set(hub.connsOf(userId).map((c) => c.deviceId))
+      if (connected.has(device.id)) continue
+      sendWake(device, userId)
+    }
+  }
+
+  function sendWake(device, userId) {
+    if (backgroundWakeMs) lastWakeAt.set(device.apns_token, now())
+    doSend(device, userId, {
+      payload: { aps: { 'content-available': 1 } },
+      priority: 5,
+      pushType: 'background',
+      category: 'wake',
+    })
+  }
+
   // `pushHint` is optional, in-memory-only extra context a caller (today:
   // ws.js's convo_upsert handler, for session_status's prevSessionState)
   // can pass through to classify(). Every other call site omits it.
@@ -226,15 +277,17 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       for (const device of devices) {
         if (device.id === originDeviceId) continue // never push a device its own read_marker
         if (!device.apns_env) continue
-        doSend(device, userId, {
-          payload: { aps: { 'content-available': 1 } },
-          priority: 5,
-          pushType: 'background',
-          category: 'wake',
-        })
+        // A for_you phone has nothing to fetch for a read elsewhere, only a
+        // badge to update, so its read wakes share the paced wakes' budget.
+        if (device.sync_scope === 'for_you' && backgroundWakeMs && now() - (lastWakeAt.get(device.apns_token) ?? -Infinity) < backgroundWakeMs) continue
+        sendWake(device, userId)
       }
       return
     }
+
+    // Before the settings below can return. `noHold` is a consent card's
+    // second pass through here: its first pass has already been considered.
+    if (!noHold) maybeWake(userId, event, devices, originDeviceId)
 
     const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
     if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
@@ -282,12 +335,6 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (!device.apns_env) continue
       // This device's own level ("On this device: all / needs me / off").
       if (!allowedForDevice(key, device.push_level)) continue
-      // Legacy per-device prefs (PUT /push/prefs), only where a device ever
-      // stored some: a NULL row's defaults (activity off) would otherwise
-      // overrule the user's synced switches. Skip the device only when its
-      // prefs explicitly disable this event's category; a `cls.kind` absent
-      // from the prefs object fails open rather than muting every device.
-      if (device.push_prefs != null && parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({

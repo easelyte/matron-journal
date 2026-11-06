@@ -58,10 +58,11 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin two-factor status
     MATRON_DB=./matron.db npx matron-admin two-factor require on|off
     MATRON_DB=./matron.db npx matron-admin user 2fa-reset alice
+    MATRON_DB=./matron.db npx matron-admin user 2fa-exempt demo-review on|off
 
 Passwords come from stdin (`--password-stdin`) or the `MATRON_PASSWORD` env
-var; the legacy `--password <pw>` flag still works but puts the plaintext on
-argv, where any local user can read it via `ps`.
+var, never from the command line, where any local user could read them via
+`ps`.
 
 Clients log in with `POST /login` and get their own device token; agents are
 provisioned with `matron-admin agent add`, which prints a token once.
@@ -71,6 +72,9 @@ without retyping credentials.
 Two-factor sign-in: each user turns it on in the web app's settings with an
 authenticator app (TOTP) and gets ten recovery codes. `two-factor require on`
 makes it compulsory, so users without it enrol at their next password sign-in.
+`user 2fa-exempt <name> on` lets one account (a review or demo login, say)
+keep signing in with its password while it is required; an exempt user who
+has set two-factor up is still asked for their code.
 `user 2fa-reset` is the way back in for someone who has lost both their app
 and their recovery codes. Details are in [docs/protocol.md](docs/protocol.md),
 "Two-factor sign-in".

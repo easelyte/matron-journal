@@ -18,7 +18,7 @@ import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
-import { makePushPipeline } from './push.js'
+import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
 import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
@@ -32,6 +32,12 @@ import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
+import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
+import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeContactFederation } from './federation-contacts.js'
+import { makeGrantFederation } from './federation-grants.js'
+import { makeOutbox } from './federation-outbox.js'
+import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
@@ -193,52 +199,38 @@ export function resolveZeroableEnv(name, raw, defaultValue) {
   return resolveNumericEnv(name, raw, defaultValue)
 }
 
-// `override` is startServer's `retentionDays` opt — when given, it takes
-// precedence over the env var (this is how tests disable/shrink the window
-// without touching process.env), but BOTH sources run through the same
-// validation: unset means ENABLED at the 30-day default; `0` disables; and
+// The retention windows (`retentionDays`, `toolLogTtlHours`,
+// `voiceNoteTtlDays`). `override` is startServer's opt — when given, it
+// takes precedence over the env var (this is how tests disable/shrink a
+// window without touching process.env), but BOTH sources run through the
+// same validation: unset means ENABLED at the default; `0` disables; and
 // anything that isn't a non-negative integer disables with one log line —
 // fails closed. (A raw pass-through of a negative override would compute a
 // FUTURE cutoff and offload every payload including brand-new ones.)
-// Returns the window in days, or null when retention is disabled.
-function resolveRetentionDays(override) {
+// Returns the window, or null when the pass is disabled.
+function resolveWindow(override, { env, opt, fallback, what }) {
   const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_RETENTION_DAYS : override
-  if (raw === undefined) return DEFAULT_RETENTION_DAYS
-  const name = fromEnv ? 'MATRON_RETENTION_DAYS' : 'retentionDays'
+  const raw = fromEnv ? process.env[env] : override
+  if (raw === undefined) return fallback
+  const name = fromEnv ? env : opt
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — ${what} disabled`)
     return null
   }
   if (n === 0) {
-    console.warn(`retention: ${name}=0 — retention disabled`)
+    console.warn(`retention: ${name}=0 — ${what} disabled`)
     return null
   }
   return n
 }
 
-// `override` is startServer's `toolLogTtlHours` opt — mirrors
-// resolveRetentionDays exactly (same precedence, same fail-closed
-// validation): unset means ENABLED at the 24h default; `0` disables; and
-// anything that isn't a non-negative integer disables with one log line.
-// Returns the TTL window in hours, or null when the TTL pass is disabled.
-function resolveToolLogTtlHours(override) {
-  const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_TOOL_LOG_TTL_HOURS : override
-  if (raw === undefined) return DEFAULT_TOOL_LOG_TTL_HOURS
-  const name = fromEnv ? 'MATRON_TOOL_LOG_TTL_HOURS' : 'toolLogTtlHours'
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
-    return null
-  }
-  if (n === 0) {
-    console.warn(`retention: ${name}=0 — retention disabled`)
-    return null
-  }
-  return n
-}
+const resolveRetentionDays = (override) =>
+  resolveWindow(override, { env: 'MATRON_RETENTION_DAYS', opt: 'retentionDays', fallback: DEFAULT_RETENTION_DAYS, what: 'retention' })
+const resolveToolLogTtlHours = (override) =>
+  resolveWindow(override, { env: 'MATRON_TOOL_LOG_TTL_HOURS', opt: 'toolLogTtlHours', fallback: DEFAULT_TOOL_LOG_TTL_HOURS, what: 'retention' })
+const resolveVoiceNoteTtlDays = (override) =>
+  resolveWindow(override, { env: 'MATRON_VOICE_NOTE_TTL_DAYS', opt: 'voiceNoteTtlDays', fallback: DEFAULT_VOICE_NOTE_TTL_DAYS, what: 'voice-note expiry' })
 
 export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 168
 
@@ -262,27 +254,6 @@ export function resolveOrphanBlobGraceHours(override) {
   }
   if (n === 0) {
     console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — orphan-blob reaper disabled`)
-    return null
-  }
-  return n
-}
-
-// `override` is startServer's `voiceNoteTtlDays` opt — same precedence and
-// fail-closed validation as the two above: unset means ENABLED at 7 days;
-// `0` disables; anything else that isn't a non-negative integer disables
-// with one log line. Returns the window in days, or null when disabled.
-function resolveVoiceNoteTtlDays(override) {
-  const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_VOICE_NOTE_TTL_DAYS : override
-  if (raw === undefined) return DEFAULT_VOICE_NOTE_TTL_DAYS
-  const name = fromEnv ? 'MATRON_VOICE_NOTE_TTL_DAYS' : 'voiceNoteTtlDays'
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — voice-note expiry disabled`)
-    return null
-  }
-  if (n === 0) {
-    console.warn(`retention: ${name}=0 — voice-note expiry disabled`)
     return null
   }
   return n
@@ -633,6 +604,10 @@ export function startServer({
   tts, ttsCacheDir, ttsSweepIntervalMs,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   httpHandlerFactory = makeHttpHandler,
+  // Federation between journals (src/federation-identity.js): the test
+  // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
+  // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
+  federationEnv, federationOps, federationClient,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -884,7 +859,7 @@ export function startServer({
     ...(toolStreamOpts || {}),
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
@@ -923,11 +898,38 @@ export function startServer({
   const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
   // App-link well-known files (spec 2026-09-23 tracker web/teams). The
   // options are the test seam; env otherwise; unset claims nothing (404).
-  const handleWellKnown = makeWellKnown({
+  const handleAppWellKnown = makeWellKnown({
     appleAppIds: appleAppIds !== undefined ? appleAppIds : parseList(process.env.MATRON_APPLE_APP_IDS),
     androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
     androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
   })
+  const federation = loadFederation(db, tokenBox, federationEnv ?? {
+    federation: process.env.MATRON_FEDERATION, publicUrl: process.env.MATRON_PUBLIC_URL,
+    allowJournals: process.env.MATRON_FEDERATION_ALLOW_JOURNALS, denyJournals: process.env.MATRON_FEDERATION_DENY_JOURNALS,
+  })
+  const handleFederationWellKnown = makeFederationWellKnown(federation)
+  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
+  // The outbound client (src/federation-client.js): `federationClient` is
+  // its test seam. Contacts across journals (src/federation-contacts.js)
+  // register their ops with both ends.
+  const federationClientInUse = federation.enabled ? (federationClient ?? makeConfiguredFederationClient()) : null
+  const federationContacts = federation.enabled
+    ? makeContactFederation({ db, hub, pushPipeline, federation, client: federationClientInUse })
+    : null
+  // Mission shares with contacts on other journals (src/federation-grants.js).
+  const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
+  // POST /federation/v1 (src/federation-inbound.js): 404 while off.
+  // `federationOps` is the test seam: extra ops, over the journal's own.
+  const handleFederation = makeFederationHandler({
+    db, federation, client: federationClientInUse,
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
+  })
+  // The outbox (src/federation-outbox.js): built only when federation is on.
+  const federationOutbox = federation.enabled
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound } })
+    : null
+  federationContacts?.setOutbox(federationOutbox)
+  federationGrants?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -961,7 +963,7 @@ export function startServer({
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     fileOwnerUserId: resolvedFileOwnerUserId,
-    github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   })))
   const wss = attachWs({
@@ -982,6 +984,7 @@ export function startServer({
   let retentionInterval = null
   let walCheckpointInterval = null
   let stallLog = null
+  let receiptPruneInterval = null
   let githubRefreshInterval = null
   let ttsSweepInterval = null
   let closing = false
@@ -996,6 +999,14 @@ export function startServer({
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       // Log-only: names event-loop stalls so a "journal unreachable" can be traced. MATRON_STALL_LOG=0 turns it off.
       if (process.env.MATRON_STALL_LOG !== '0') stallLog = startStallLog()
+      // Federation receipts are the replay memory for 30 days, then go.
+      if (federation.enabled) {
+        receiptPruneInterval = setInterval(() => {
+          try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
+        }, 3600_000)
+        receiptPruneInterval.unref()
+        federationOutbox.start()
+      }
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is
@@ -1106,6 +1117,9 @@ export function startServer({
         autoArchive: autoArchiveSweep,
         routineFirer,
         github: resolvedGithub,
+        federationOutbox,
+        federationContacts,
+        federationGrants,
         // close({ closeCode, closeReason, graceMs }): with a closeCode every
         // open websocket first gets a close frame carrying it, so a client
         // can tell a restart from a network drop, and up to graceMs to
@@ -1116,6 +1130,10 @@ export function startServer({
           if (retentionInterval) { clearInterval(retentionInterval); clearTimeout(retentionInterval.firstTimer) }
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (stallLog) stallLog.stop()
+          if (receiptPruneInterval) clearInterval(receiptPruneInterval)
+          // A delivery pass in flight finishes (its requests time out at
+          // 30 s) before the db handle closes.
+          const outboxDone = federationOutbox ? federationOutbox.stop() : Promise.resolve()
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // No new reindex pass can start after this: the only other
           // starter is embedderReady's own `.then`, which re-checks
@@ -1148,7 +1166,7 @@ export function startServer({
             // A POST /tts waiting on Azure would hold server.close() for up to
             // its 20 s timeout: abort it, so the caller gets its 502 now.
             if (resolvedTts) resolvedTts.close()
-            server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
+            server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
           if (!open.length) { finish(); return }

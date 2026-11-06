@@ -30,6 +30,7 @@ import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { getItem, insertComment } from './items.js'
 import { withdrawOnClose } from './item-handover-http.js'
 import { CONSENT_LABEL, consentLink } from './consent-items.js'
+import { onIncomingEnded } from './federation-grants.js'
 
 export const CONTACT_CARD_KIND = 'contact_request'
 export const SHARE_CARD_KIND = 'mission_share'
@@ -48,7 +49,7 @@ const safely = (what, fn) => { try { return fn() } catch (err) { console.error(`
 const asking = (what, fn) => (...args) => { safely(what, () => fn(...args)) }
 const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get(id)?.name ?? `user ${id}`
 const deviceName = (db, id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name ?? null
-const addressOf = (row) => (row.peer_journal ? `${row.peer_user}@${row.peer_journal}` : row.peer_user)
+export const addressOf = (row) => (row.peer_journal ? `${row.peer_user}@${row.peer_journal}` : row.peer_user)
 const titleOf = (t) => plain(sanitizePeerText(t, MISSION_TITLE_CAP))
 
 // The user's People conversation, announced to connected clients the first
@@ -118,6 +119,27 @@ export function fileMirror({ db, hub }, { userId, convoId, deviceId, sender, con
       appendAndBroadcast(db, hub, {
         userId, convoId, sender, type: ITEM_EVENT_TYPE,
         payload: itemMarkerPayload({ item, action: 'created', by: 'agent', extra: { consent } }),
+      })
+    }
+    return item
+  })
+}
+
+// A notice in the user's People conversation: something about their
+// contacts they need to read but not decide (another journal's answer, a
+// changed key). It awaits the user with the built-in Seen button. Like a
+// mirror, its marker never wakes an agent; `idemKey` makes it once only.
+export function fileNotice({ db, hub }, { userId, title, body, idemKey }) {
+  return safely('notice', () => {
+    const convoId = peopleConvo({ db, hub }, userId)
+    const { item, duplicate } = createItem(db, {
+      userId, kind: 'notice', title: cut(title, TITLE_MAX), body, awaiting: 'user', position: 'top',
+      originConvoId: convoId, originDeviceId: 0, createdBy: 'agent', idemKey,
+    })
+    if (!duplicate) {
+      appendAndBroadcast(db, hub, {
+        userId, convoId, sender: JOURNAL, type: ITEM_EVENT_TYPE,
+        payload: itemMarkerPayload({ item, action: 'created', by: 'agent' }),
       })
     }
     return item
@@ -197,7 +219,7 @@ const contactPeerAsk = asking('contact request card', (ctx, peerRow) => {
 // answered, when there was one — the item-tap route answers with it.
 export function onContactOutcome(ctx, who, out) {
   const own = out.contact
-  const peer = plain(own.peer_user)
+  const peer = plain(addressOf(own))
   const before = out.before ?? null
   const tapped = (comment, resolution = 'decided') => closeMirror(ctx, {
     userId: own.user_id, itemId: before?.item_id, consent: 'contact', resolution, author: 'user', deviceId: who.deviceId, comment,
@@ -259,7 +281,7 @@ export function onContactOutcome(ctx, who, out) {
 // a block (spec: a block must not be an oracle).
 export function onContactEnded(ctx, who, out, verb) {
   const own = out.contact
-  const peer = plain(own.peer_user)
+  const peer = plain(addressOf(own))
   const pendingIn = out.before.state === 'pending_in'
   const awaiting = out.before.state === 'awaiting_user'
   // A card of mine that was still open is answered by this.
@@ -287,11 +309,12 @@ export function onContactEnded(ctx, who, out, verb) {
     changed(ctx, out.peer.user_id, { contact_id: out.peer.id })
   }
   for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
+  for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_ended')
   changed(ctx, own.user_id, { contact_id: own.id })
 }
 
 export function onContactUnblocked(ctx, out) {
-  audit(ctx, out.contact.user_id, { event: 'contact.unblocked', summary: `You unblocked ${plain(out.contact.peer_user)}`, contact: out.contact, by: 'user' })
+  audit(ctx, out.contact.user_id, { event: 'contact.unblocked', summary: `You unblocked ${plain(addressOf(out.contact))}`, contact: out.contact, by: 'user' })
   changed(ctx, out.contact.user_id, { contact_id: out.contact.id })
 }
 
@@ -322,7 +345,7 @@ function shareCardPayload(db, g, direction) {
 
 const shareOwnerAsk = asking('share approval card', (ctx, who, g) => {
   const { db } = ctx
-  const to = plain(g.grantee_name)
+  const to = plain(g.grantee_journal ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const p = sharePreview(db, g.subject_id)
   card(ctx, {
     userId: g.owner_user_id, convoId: g.origin_convo_id, sender: `agent:${who.name}`,
@@ -391,10 +414,14 @@ export function onGrantOutcome(ctx, who, out) {
   const { db, hub } = ctx
   const g = out.grant
   const before = out.before ?? null
-  const to = plain(g.grantee_name)
+  // A grantee on another journal: their journal raises their card and
+  // writes their log (src/federation-grants.js). Only the owner's side is
+  // written here.
+  const remote = !!g.grantee_journal
+  const to = plain(remote ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const from = plain(g.owner_name)
   const oc = ownerContact(db, g)
-  const gc = granteeContact(db, g)
+  const gc = remote ? null : granteeContact(db, g)
   const ownerTap = (comment) => closeMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'share', resolution: 'decided', author: 'user', deviceId: who.deviceId, comment })
   const granteeTap = (comment) => closeMirror(ctx, { userId: g.grantee_user_id, itemId: before?.grantee_item_id, consent: 'share', resolution: 'decided', author: 'user', deviceId: who.deviceId, comment })
   let closed = null
@@ -405,6 +432,7 @@ export function onGrantOutcome(ctx, who, out) {
     case 'sent':
       closed = ownerTap(`Approved — ${to} has been asked to accept.`)
       audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to ${verb(g)}`, contact: oc, grant: g, by: g.pending_by ?? g.requested_by })
+      if (remote) break
       shareGranteeAsk(ctx, g)
       audit(ctx, g.grantee_user_id, { event: 'grant.received', summary: `${from} offered you ${missionWordsFor(g)} to ${verb(g)}`, contact: gc, grant: g })
       changed(ctx, g.grantee_user_id, { grant_id: g.id })
@@ -419,6 +447,10 @@ export function onGrantOutcome(ctx, who, out) {
       closeMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'share', resolution: 'cancelled', author: 'agent', deviceId: before?.origin_device_id, comment: 'Expired — no answer within 24 h. Nothing was shared.' })
       break
     case 'accepted':
+      if (remote) {
+        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared read-only`, contact: oc, grant: g, by: 'peer' })
+        break
+      }
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)
       audit(ctx, g.grantee_user_id, { event: 'grant.accepted', summary: `You accepted ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g })
@@ -430,6 +462,10 @@ export function onGrantOutcome(ctx, who, out) {
       changed(ctx, g.owner_user_id, { grant_id: g.id })
       break
     case 'declined':
+      if (remote) {
+        audit(ctx, g.owner_user_id, { event: 'grant.declined', summary: `${to} declined ${missionWords(g)}`, contact: oc, grant: g, by: 'peer' })
+        break
+      }
       closed = granteeTap('Declined.')
       audit(ctx, g.grantee_user_id, { event: 'grant.declined', summary: `You declined ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.declined', summary: `${to} declined ${missionWords(g)}`, contact: oc, grant: g })
@@ -437,7 +473,7 @@ export function onGrantOutcome(ctx, who, out) {
       break
     default: break
   }
-  changed(ctx, out.outcome === 'accepted' || out.outcome === 'declined' ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
+  changed(ctx, !remote && (out.outcome === 'accepted' || out.outcome === 'declined') ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
   return closed
 }
 
@@ -451,10 +487,12 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   // the same join every other path uses.
   const g = before.owner_name ? before : { ...(getGrantRaw(db, before.id) ?? {}), ...before, ...namesOf(db, before.id) }
   const state = before.state
-  const to = plain(g.grantee_name)
+  // A grantee on another journal hears of it from their own journal.
+  const remote = !!g.grantee_journal
+  const to = plain(remote ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const from = plain(g.owner_name)
   const oc = ownerContact(db, g)
-  const gc = oc ? granteeContact(db, g) : null
+  const gc = oc && !remote ? granteeContact(db, g) : null
   const why = by === 'contact_removed' ? 'The contact ended, so this share ended with it.' : (by === 'owner' ? 'Withdrawn.' : 'Ended.')
   const actor = (side) => (by === side && who?.kind !== 'agent' ? { author: 'user', deviceId: who?.deviceId } : { author: 'agent' })
   // An ask still open (a share, a hand-over, or the raise of an active
@@ -464,11 +502,11 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   if (ask.state === 'awaiting_owner') {
     closeMirror(ctx, { userId: g.owner_user_id, itemId: before.owner_item_id, consent, resolution: 'cancelled', comment: `${why} Nothing was shared.`, ...actor('owner') })
   }
-  if (ask.state === 'pending') {
+  if (ask.state === 'pending' && !remote) {
     closeMirror(ctx, { userId: g.grantee_user_id, itemId: before.grantee_item_id, consent, resolution: 'cancelled', comment: by === 'grantee' ? 'Declined.' : `${from} withdrew the offer.`, ...actor('grantee') })
   }
   // The grantee was never told of a row that was never sent to them.
-  if (before.sent_at != null) {
+  if (before.sent_at != null && !remote) {
     audit(ctx, g.grantee_user_id, {
       event: 'grant.revoked', contact: gc, grant: g, by: by === 'grantee' ? 'you' : 'peer',
       summary: by === 'grantee' ? `You ended the share of ${subjectWordsFor(g)} from ${from}` : `${from} ended the share of ${subjectWordsFor(g)}`,
@@ -613,6 +651,7 @@ function announceHandover(ctx, g, h) {
     if (!m) continue
     marker(owner, m.origin_convo_id, m, 'closed')
     for (const it of o.closedItems) {
+      notifyGrantees(ctx, m.id, 'item', it.item.id)
       safely('handover item marker', () => {
         const item = withdrawOnClose(ctx, owner, it.item.id) ?? getItem(db, owner, it.item.id) ?? it.item
         appendAndBroadcast(db, hub, { userId: owner, convoId: item.origin_convo_id, sender: JOURNAL, type: ITEM_EVENT_TYPE, payload: itemMarkerPayload({ item, action: 'closed', by: 'agent', comment: it.comment }) })
@@ -764,8 +803,16 @@ function onHandoverOutcome(ctx, who, out) {
 // content — the grantee refetches through the sieved reads, so nothing
 // here can leak what those reads would withhold. `what` is 'mission' |
 // 'milestone' | 'item'. Client sockets only; never throws.
-export function notifyGrantees({ db, hub }, missionId, what) {
+//
+// Contacts on other journals get the record itself instead
+// (federation-grants.js registers here): `ref` names the milestone or item
+// that changed; for 'mission' the mission's own fields.
+const remoteWriters = new WeakMap()
+export function onRemoteMissionWrite(db, fn) { remoteWriters.set(db, fn) }
+
+export function notifyGrantees({ db, hub }, missionId, what, ref = null) {
   if (!missionId) return
+  safely('remote events', () => remoteWriters.get(db)?.(missionId, what, ref))
   safely('live frame', () => {
     const ids = activeGranteeIds(db, missionId)
     if (!ids.length) return

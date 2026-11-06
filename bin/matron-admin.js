@@ -13,17 +13,24 @@ import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled } from '../src/consent.js'
-import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
+import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
+import { formatFingerprint } from '../src/federation-envelope.js'
+import { makeTokenBox } from '../src/token-box.js'
+import {
+  disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
+} from '../src/two-factor.js'
 
 const USAGE = `usage:
-  matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
-  matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
+  matron-admin user add <name> (--password-stdin | env MATRON_PASSWORD)
+  matron-admin user passwd <name> (--password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
   matron-admin user unlisted <name> on|off
   matron-admin user email <name> <address>|--clear
   matron-admin user 2fa-reset <name>
+  matron-admin user 2fa-exempt <name> on|off
   matron-admin two-factor status
   matron-admin two-factor require on|off
+  matron-admin federation status
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -49,22 +56,22 @@ async function readAllStdin() {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-// Resolve the password for `user add`/`user passwd` from an OFF-ARGV source
-// when asked, so the plaintext never lands in this process's argv (readable
-// by any local user via `ps`/`/proc/<pid>/cmdline`). Precedence:
+// Resolve the password for `user add`/`user passwd` from an OFF-ARGV source,
+// so the plaintext never lands in this process's argv (readable by any
+// local user via `ps`/`/proc/<pid>/cmdline`). Precedence:
 //   1. --password-stdin : read it from stdin (strip one trailing newline so
 //      `echo "$pw" | ...` and `printf %s "$pw" | ...` both work)
-//   2. --password <pw>  : legacy, on argv — kept for back-compat
-//   3. MATRON_PASSWORD  : env var (in the process environment, not argv)
-// Returns null when none is supplied; callers turn that into USAGE.
+//   2. MATRON_PASSWORD  : env var (in the process environment, not argv)
+// A password on argv (`--password <pw>`) is refused outright, not ignored,
+// so an old script fails loudly instead of creating a user with another
+// password. Returns null when none is supplied; callers turn that into USAGE.
 async function resolvePassword(argv, deps) {
   const env = deps.env ?? process.env
+  if (argv.includes('--password')) throw new Error('--password <pw> puts the password on argv and is no longer accepted: use --password-stdin or MATRON_PASSWORD')
   if (argv.includes('--password-stdin')) {
     const read = deps.readStdin ?? readAllStdin
     return (await read()).replace(/\r?\n$/, '')
   }
-  const flagged = flag(argv, '--password')
-  if (flagged != null) return flagged
   const envPw = env.MATRON_PASSWORD
   return envPw != null && envPw !== '' ? envPw : null
 }
@@ -181,26 +188,73 @@ export async function runAdmin(db, argv, deps = {}) {
     const name = argv[2]
     if (!name) throw new Error(USAGE)
     const user = requireUser(db, name)
+    // The exemption is the operator's choice about the requirement, not
+    // part of the factor, so a reset leaves it as it was.
+    const exemptNote = isTwoFactorExempt(db, user.id) ? ' (still exempt from the requirement)' : ''
     return disableTwoFactor(db, user.id)
-      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again`
-      : `${name} did not have two-factor on`
+      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again${exemptNote}`
+      : `${name} did not have two-factor on${exemptNote}`
+  }
+  // An account (a review or demo login, say) that keeps signing in with its
+  // password while two-factor is required for everyone else. It waives the
+  // requirement only: a user who has set two-factor up is still asked for
+  // their code. Shell only, like the other operator switches.
+  if (a === 'user' && b === '2fa-exempt') {
+    const name = argv[2]
+    const value = argv[3]
+    if (!name || (value !== 'on' && value !== 'off')) throw new Error(USAGE)
+    const user = requireUser(db, name)
+    const changed = setTwoFactorExempt(db, user.id, value === 'on')
+    if (value === 'off') {
+      return changed
+        ? `${name} is no longer exempt: when two-factor is required they set it up at their next password sign-in`
+        : `${name} was not exempt`
+    }
+    if (!changed) return `${name} is already exempt from the two-factor requirement`
+    return twoFactorState(db, user.id).enabled
+      ? `${name} is exempt from the two-factor requirement, but has two-factor on, so they are still asked for their code (turn it off with \`user 2fa-reset ${name}\`)`
+      : `${name} is exempt from the two-factor requirement: they sign in with their password alone, even while it is required`
   }
   if (a === 'two-factor' && b === 'status') {
-    const users = db.prepare('SELECT id, name FROM users ORDER BY name').all()
+    const users = db.prepare('SELECT id, name, two_factor_exempt FROM users ORDER BY name').all()
+    let on = 0
+    const exempt = []
     const lines = users.map((u) => {
       const s = twoFactorState(db, u.id)
-      return `${u.name}\t${s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'}`
+      if (s.enabled) on += 1
+      if (u.two_factor_exempt) exempt.push(u.name)
+      const state = s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'
+      return `${u.name}\t${state}${u.two_factor_exempt ? ', exempt' : ''}`
     })
     const keyNote = process.env.MATRON_TOKEN_KEY ? '' : ' (MATRON_TOKEN_KEY is not set in this shell; the server needs it for two-factor)'
-    return [`required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`, ...lines].join('\n')
+    return [
+      `required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${exempt.length ? ` (journal-wide switch; exempt users are not held to it)` : ''}${keyNote}`,
+      `users: ${users.length} (on: ${on}, off: ${users.length - on}), exempt: ${exempt.length}`,
+      `exempt: ${exempt.length ? exempt.join(', ') : 'none'}`,
+      ...lines,
+    ].join('\n')
+  }
+  if (a === 'federation' && b === 'status') {
+    const env = deps.env ?? process.env
+    const config = resolveFederationConfig({ federation: env.MATRON_FEDERATION, publicUrl: env.MATRON_PUBLIC_URL })
+    const box = makeTokenBox(env.MATRON_TOKEN_KEY || null)
+    const key = storedFederationKeyInfo(db, box)
+    const switchLine = config.enabled
+      ? `on in this shell, as ${config.host} (${config.baseUrl})`
+      : ({ off: 'off in this shell (MATRON_FEDERATION is not on)', bad_switch: 'off in this shell: MATRON_FEDERATION must be on or off', no_public_url: 'off in this shell: MATRON_FEDERATION is on but MATRON_PUBLIC_URL is not an https URL' })[config.reason]
+    const keyLine = !key ? 'key: none yet (made the first time the server starts with federation on)'
+      : !key.readable ? `key: stored, but it does not open under ${env.MATRON_TOKEN_KEY ? 'this' : 'a missing'} MATRON_TOKEN_KEY`
+      : `key: ${key.pub}\nfingerprint: ${formatFingerprint(key.fingerprint)}${key.createdAt ? `\nmade: ${new Date(key.createdAt).toISOString()}` : ''}`
+    return [`federation: ${switchLine}`, keyLine].join('\n')
   }
   if (a === 'two-factor' && b === 'require') {
     const value = argv[2]
     if (value !== 'on' && value !== 'off') throw new Error(USAGE)
     setTwoFactorRequired(db, value === 'on')
-    return value === 'on'
-      ? 'two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)'
-      : 'two-factor is optional again'
+    if (value === 'off') return 'two-factor is optional again'
+    const exempt = db.prepare('SELECT COUNT(*) AS n FROM users WHERE two_factor_exempt=1').get().n
+    const exemptNote = exempt ? `; ${exempt} exempt ${exempt === 1 ? 'user is' : 'users are'} not (see \`two-factor status\`)` : ''
+    return `two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)${exemptNote}`
   }
   if (a === 'agent' && b === 'add') {
     const [, , username, agentName] = argv

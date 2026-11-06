@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
+import { openDb, setApnsRegistration } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
 import { makePushPipeline, classify } from '../src/push.js'
 import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
@@ -50,18 +50,11 @@ async function setup(t, { apnsClient, coalesceMs } = {}) {
   return { db, hub, alice, stub, pipeline }
 }
 
-// `prefs` defaults to all three explicitly on: most of this file's tests
-// predate per-device prefs and exercise unrelated behavior (coalescing,
-// origin exclusion, badge math, ...) against a device that should just
-// receive everything. Pass `prefs: null` to leave push_prefs NULL — i.e. to
-// exercise the real (activity-off) defaults, as the dedicated push_prefs
-// tests below do.
-function registerDevice(db, userId, name, { token = `${name}-token`, env = 'prod', prefs = { attention: true, done: true, activity: true } } = {}) {
+function registerDevice(db, userId, name, { token = `${name}-token`, env = 'prod' } = {}) {
   const dev = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client',?,?,?)")
     .run(userId, name, `${name}-hash`, Date.now())
   const deviceId = dev.lastInsertRowid
   setApnsRegistration(db, deviceId, { apnsToken: token, apnsEnv: env })
-  if (prefs) setPushPrefs(db, deviceId, prefs)
   return deviceId
 }
 
@@ -554,10 +547,8 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
   const regPhone = await s.http('/push/register', { method: 'POST', token: login.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
   assert.equal(regPhone.status, 200)
   // This test's `text` publish below is a routine (activity) event, which
-  // is opt-in by default (see push_prefs defaults) — opt phone in so this
-  // wiring check isn't tangled up with prefs enforcement.
-  await s.http('/push/prefs', { method: 'PUT', token: login.json.token, body: { activity: true } })
-  // ...and the user-level switch (notification settings), off in both presets.
+  // is opt-in: turn the user-level switch (notification settings) on, off
+  // in both presets.
   assert.equal((await s.http('/notify', { method: 'PUT', token: login.json.token, body: { mode: 'custom', events: { activity: true } } })).status, 200)
 
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
@@ -584,13 +575,14 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
 
   const phone = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
   await phone.waitFor((f) => f.op === 'hello_ok')
+  const callsBeforeRead = stub.calls.length
   phone.send({ op: 'read_marker', convo_id: 'wire-1', up_to_seq: null })
   await phone.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
   await new Promise((res) => setTimeout(res, 50))
 
   const laptopBackground = stub.calls.filter((c) => c.deviceToken === 'laptop-token' && c.pushType === 'background')
   assert.equal(laptopBackground.length, 1, 'read_marker fanOut call site does not appear to be wired to the push pipeline')
-  const phoneBackground = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.pushType === 'background')
+  const phoneBackground = stub.calls.slice(callsBeforeRead).filter((c) => c.deviceToken === 'phone-token' && c.pushType === 'background')
   assert.equal(phoneBackground.length, 0, 'the originating device must never get a push about its own read_marker')
 
   agent.close(); phone.close()
@@ -647,45 +639,22 @@ test('category threading: classify kind reaches apnsClient.send as opts.category
   assert.equal(wake.pushType, 'background')
 })
 
-test('push_prefs: a disabled category skips that device only; wake is never filtered', async (t) => {
-  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
-  const muted = registerDevice(db, alice.id, 'phone')
-  const open = registerDevice(db, alice.id, 'ipad', { token: 'ipad-token' })
-  setPushPrefs(db, muted, { attention: false, activity: false })
+test('a device\'s retired per-device prefs are ignored: the synced settings decide', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  registerDevice(db, alice.id, 'phone')
+  registerDevice(db, alice.id, 'ipad', { token: 'ipad-token' })
+  // A row written by the old PUT /push/prefs, muting everything.
+  db.prepare("UPDATE devices SET push_prefs='{\"attention\":false,\"done\":false,\"activity\":false}' WHERE name='phone'").run()
 
-  const fire = (type, payload, sender = 'agent:a', origin = null, hint = undefined) => {
-    const r = append(db, { userId: alice.id, convoId: 'c1', sender, type, payload })
-    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, origin, hint)
-  }
-
-  // attention off on `muted`: only `open` gets the prompt push.
-  fire('prompt', { question: 'go?' })
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
   await new Promise((res) => setImmediate(res))
-  assert.deepEqual(stub.calls.map((c) => c.deviceToken), ['ipad-token'])
-
-  // done still on for both.
-  fire('session_status', { state: 'done' }, 'agent:a', null, { prevSessionState: 'running' })
-  await new Promise((res) => setImmediate(res))
-  assert.equal(stub.calls.length, 3)
-
-  // activity off on `muted`: routine event reaches only `open`.
-  fire('text', { body: 'hi' })
-  await new Promise((res) => setImmediate(res))
-  assert.equal(stub.calls.length, 4)
-  assert.equal(stub.calls[3].deviceToken, 'ipad-token')
-
-  // wake (read_marker from `open`) still reaches `muted` despite its prefs —
-  // badge sync is invisible to the user and never filtered.
-  fire('read_marker', { convo_id: 'c1', up_to_seq: 1 }, 'user:alice', open)
-  await new Promise((res) => setImmediate(res))
-  const wakes = stub.calls.filter((c) => c.category === 'wake')
-  assert.equal(wakes.length, 1)
-  assert.equal(wakes[0].deviceToken, 'phone-token')
+  assert.deepEqual(stub.calls.map((c) => c.deviceToken).sort(), ['ipad-token', 'phone-token'])
 })
 
-test('push_prefs: a NULL-prefs device follows the user\'s synced switches (default: activity off), attention/done still send', async (t) => {
+test('a device follows the user\'s synced switches (default: activity off), attention/done still send', async (t) => {
   const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
-  registerDevice(db, alice.id, 'phone', { prefs: null }) // exercise the real defaults, not this file's fixture-level all-on override
+  registerDevice(db, alice.id, 'phone')
   // Back to the user defaults (no Coordinator set, so they behave as
   // every-session: activity off, turns on).
   db.prepare('UPDATE user_settings SET notify_prefs=NULL WHERE user_id=?').run(alice.id)
@@ -699,7 +668,7 @@ test('push_prefs: a NULL-prefs device follows the user\'s synced switches (defau
   // trailing coalesced push.
   fire('text', { body: 'routine update' })
   await new Promise((res) => setTimeout(res, 80))
-  assert.equal(stub.calls.length, 0, 'a NULL-prefs device must not get routine activity pushes by default')
+  assert.equal(stub.calls.length, 0, 'a device must not get routine activity pushes by default')
 
   // attention: default on.
   fire('prompt', { question: 'go?' })
@@ -714,23 +683,11 @@ test('push_prefs: a NULL-prefs device follows the user\'s synced switches (defau
   assert.equal(stub.calls[1].category, 'done')
 })
 
-test('push_prefs: {"activity": true} turns routine pushes back on for a NULL-prefs device', async (t) => {
-  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
-  const deviceId = registerDevice(db, alice.id, 'phone', { prefs: null })
-  setPushPrefs(db, deviceId, { activity: true })
-
-  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'routine update' } })
-  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'routine update' } }, null)
-  await new Promise((res) => setImmediate(res))
-  assert.equal(stub.calls.length, 1)
-  assert.equal(stub.calls[0].category, 'activity')
-})
-
-test('push_prefs: a kind unknown to the prefs object fails OPEN, not silently muted', async (t) => {
+test('a push kind unknown to the settings fails OPEN, not silently muted', async (t) => {
   // classify() today only ever returns attention/done/activity, so a real
   // "unknown kind" can't occur through the public onAppend surface — this
   // stubs classify (an injectable seam, see makePushPipeline) to simulate a
-  // future category prefs hasn't caught up to yet.
+  // future category the settings haven't caught up to yet.
   const stubClassify = () => ({ priority: 5, coalesce: false, kind: 'some_future_kind' })
   const db = openDb(':memory:')
   const hub = makeHub()
@@ -739,12 +696,12 @@ test('push_prefs: a kind unknown to the prefs object fails OPEN, not silently mu
   const pipeline = makePushPipeline({ db, hub, apnsClient: stub, classify: stubClassify })
   t.after(() => pipeline.close())
   upsertConversation(db, { id: 'c1', ownerUserId: alice.id })
-  registerDevice(db, alice.id, 'phone', { prefs: null }) // NULL prefs: {attention:true, done:true, activity:false} — has no 'some_future_kind' key
+  registerDevice(db, alice.id, 'phone')
 
   const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
   pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
   await new Promise((res) => setImmediate(res))
-  assert.equal(stub.calls.length, 1, 'a kind absent from prefs must fail open, not be silently filtered')
+  assert.equal(stub.calls.length, 1, 'an unknown kind must fail open, not be silently filtered')
   assert.equal(stub.calls[0].category, 'some_future_kind')
 })
 
@@ -867,4 +824,132 @@ test('item markers: agent-created question pushes as attention; user-authored, n
   pipeline.onAppend(alice.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:alice', type: 'item', payload: { ...base, action: 'created', awaiting: 'user' } }, 0)
   assert.equal(sent.length, 2, 'a user-authored marker must never push, even when action/awaiting alone would qualify')
   void hub; void db; void clientDevice
+})
+
+// ---- Background wakes ----------------------------------------------------
+
+async function setupWakes(t, { wakeIntervalMs = 1000, now } = {}) {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  const stub = makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, backgroundWakeMs: wakeIntervalMs, now })
+  t.after(() => pipeline.close())
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'convo one' })
+  // Nothing alerts: the wake must not depend on the notification settings.
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, false])) })
+  const phone = registerDevice(db, alice.id, 'phone')
+  const wakes = () => stub.calls.filter((c) => c.pushType === 'background')
+  return { db, hub, alice, stub, pipeline, phone, wakes }
+}
+
+const textEvent = (seq, sender = 'agent:box-a') => ({ seq, convo_id: 'c1', ts: seq, sender, type: 'text', payload: { body: `m${seq}` } })
+
+test('background wake: a new event wakes a phone with no live socket, silently', async (t) => {
+  const { alice, pipeline, stub, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 1)
+  const wake = wakes()[0]
+  assert.equal(wake.priority, 5)
+  assert.equal(wake.payload.aps['content-available'], 1)
+  assert.equal(wake.payload.aps.alert, undefined)
+  assert.equal(wake.collapseId, undefined)
+  assert.equal(stub.calls.length, 1, 'the settings turned every alert off')
+})
+
+test('background wake: at most one per device per interval', async (t) => {
+  let clock = 1000000
+  const { alice, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => clock })
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  clock += 999
+  pipeline.onAppend(alice.id, textEvent(3), null)
+  assert.equal(wakes().length, 1)
+  clock += 1
+  pipeline.onAppend(alice.id, textEvent(4), null)
+  assert.equal(wakes().length, 2)
+})
+
+test('background wake: a new token is not held to the old one\'s interval', async (t) => {
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  setApnsRegistration(db, phone, { apnsToken: 'reinstalled-token', apnsEnv: 'prod' })
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  assert.deepEqual(wakes().map((c) => c.deviceToken), ['phone-token', 'reinstalled-token'])
+})
+
+test('background wake: a device already connected is not woken', async (t) => {
+  const { alice, hub, phone, pipeline, wakes } = await setupWakes(t)
+  hub.register(fakeConn({ userId: alice.id, deviceId: phone }))
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: never for a device the event came from, or one already past it', async (t) => {
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1, 'user:alice'), phone)
+  assert.equal(wakes().length, 0)
+  db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(5, phone)
+  pipeline.onAppend(alice.id, textEvent(5), null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: a subagent child conversation wakes nobody', async (t) => {
+  const { db, alice, pipeline, wakes } = await setupWakes(t)
+  upsertConversation(db, { id: 'c1-child', ownerUserId: alice.id, parentConvoId: 'c1' })
+  pipeline.onAppend(alice.id, { ...textEvent(1), convo_id: 'c1-child' }, null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: a read marker\'s own wake counts against the interval', async (t) => {
+  const { alice, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, { seq: 1, convo_id: 'c1', ts: 1, sender: 'user:alice', type: 'read_marker', payload: {} }, null)
+  assert.equal(wakes().length, 1)
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  assert.equal(wakes().length, 1)
+})
+
+test('background wake: off unless the pipeline is given an interval', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, false])) })
+  registerDevice(db, alice.id, 'phone')
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(stub.calls.length, 0)
+})
+
+// ---- For-you-only phones (src/sync-scope.js) ------------------------------
+
+test('background wake: a for_you phone is woken by tracker and Coordinator changes only', async (t) => {
+  // Each read of the clock is a fresh interval, so pacing never hides a wake.
+  let clock = 0
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => (clock += 1000) })
+  upsertConversation(db, { id: 'coord', ownerUserId: alice.id, title: 'Coordinator' })
+  db.prepare("UPDATE devices SET sync_scope='for_you' WHERE id=?").run(phone)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  pipeline.onAppend(alice.id, { ...textEvent(2), type: 'convo_meta', payload: { title: 't' } }, null)
+  assert.equal(wakes().length, 0, 'conversation content and metadata wake nothing')
+  pipeline.onAppend(alice.id, { ...textEvent(3), type: 'item', payload: { item_id: 'it_1', action: 'created' } }, null)
+  assert.equal(wakes().length, 1)
+  db.prepare("INSERT INTO user_settings(user_id, coordinator_convo_id, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET coordinator_convo_id=excluded.coordinator_convo_id").run(alice.id, 'coord', 1)
+  pipeline.onAppend(alice.id, { ...textEvent(4), convo_id: 'coord' }, null)
+  assert.equal(wakes().length, 2)
+})
+
+test('background wake: an everything phone is still woken by any event', async (t) => {
+  const { alice, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 1)
+})
+
+test('background wake: a for_you phone\'s read-elsewhere wakes are paced like the others', async (t) => {
+  let clock = 1000000
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => clock })
+  db.prepare("UPDATE devices SET sync_scope='for_you' WHERE id=?").run(phone)
+  const read = (seq) => ({ seq, convo_id: 'c1', ts: seq, sender: 'user:alice', type: 'read_marker', payload: {} })
+  pipeline.onAppend(alice.id, read(1), null)
+  pipeline.onAppend(alice.id, read(2), null)
+  assert.equal(wakes().length, 1)
+  clock += 1000
+  pipeline.onAppend(alice.id, read(3), null)
+  assert.equal(wakes().length, 2)
 })

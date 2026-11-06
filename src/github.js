@@ -104,12 +104,18 @@ export function makeGithub({ clientId, clientSecret = null, deviceFlow: deviceFl
   }
 
   async function fetchIdentity(token) {
-    const user = await call('GET', `${apiBase}/user`, { token })
+    let url = `${apiBase}/user/memberships/orgs?state=active&per_page=100`
+    // The first memberships page doesn't need /user, so the two overlap. /user
+    // is still read first, so its failure is the one reported; the catch only
+    // covers a page that fails while nothing is looking at it yet.
+    const userRead = call('GET', `${apiBase}/user`, { token })
+    const firstPage = call('GET', url, { token })
+    firstPage.catch(() => {})
+    const user = await userRead
     if (!user.json || !Number.isInteger(user.json.id) || typeof user.json.login !== 'string') throw new GithubError('bad_response', 'user shape')
     const scopes = new Set()
-    let url = `${apiBase}/user/memberships/orgs?state=active&per_page=100`
     for (let page = 0; url && page < 20; page++) {
-      const r = await call('GET', url, { token })
+      const r = await (page === 0 ? firstPage : call('GET', url, { token }))
       if (!Array.isArray(r.json)) throw new GithubError('bad_response', 'memberships shape')
       for (const m of r.json) {
         const login = m && m.organization && m.organization.login

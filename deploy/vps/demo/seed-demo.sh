@@ -27,8 +27,8 @@ cd "$REPO_DIR"
 curl -sS -o /dev/null "$BASE/" || {
   echo "journal not reachable on $BASE — start matron-demo-journal first" >&2; exit 1; }
 
-node bin/matron-admin.js user add demo --password "$DEMO_PASSWORD" \
-  || node bin/matron-admin.js user passwd demo --password "$DEMO_PASSWORD"
+printf %s "$DEMO_PASSWORD" | node bin/matron-admin.js user add demo --password-stdin \
+  || printf %s "$DEMO_PASSWORD" | node bin/matron-admin.js user passwd demo --password-stdin
 
 # `agent add` prints the token exactly once — capture it here.
 AGENT1=$(node bin/matron-admin.js agent add demo mac-studio | grep -o '[0-9a-f]\{64\}')

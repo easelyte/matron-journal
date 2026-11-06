@@ -26,6 +26,7 @@ import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
+import { handleFederationRoute } from './federation-http.js'
 import { handlePersonRoomRoute } from './person-rooms-http.js'
 import { sessionsSharedWith } from './person-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
@@ -151,7 +152,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, agentCommentLimiter = makeAgentCommentLimiter() }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, agentCommentLimiter = makeAgentCommentLimiter() }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -190,6 +191,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
+      if (await handleFederation(req, res, url)) return
       // /files is the File Explorer's namespace and is owner-authorized below;
       // static hosting (which runs before auth) must never answer for it.
       if (!isFilesPath(url.pathname) && await handleStatic(req, res, url)) return
@@ -237,7 +239,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // not 200, so an app that predates the code step shows a failed
         // sign-in rather than looking for a token that is not there.
         const enrolled = isTwoFactorEnabled(db, u.userId)
-        if (enrolled || twoFactorRequiredNow(db, twoFactorBox)) {
+        if (enrolled || twoFactorRequiredNow(db, twoFactorBox, u.userId)) {
           const purpose = enrolled ? 'verify' : 'enrol'
           const t = signInTickets.issue({ userId: u.userId, username, deviceName, purpose })
           if (!t) return json(res, 429, { error: 'rate_limited' })
@@ -630,9 +632,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants }, req, res, url, who)) return
+      if (await handleFederationRoute({ db, outbox: federationOutbox }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
-      if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
+      if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs, federationContacts, federationGrants }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
@@ -671,7 +674,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
           user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
-          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox) },
+          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox, who.userId) },
           github: githubAccountView(db, who.userId),
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
@@ -734,24 +737,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const { apns_token, environment } = body
         if (apns_token === null) {
           setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
-          return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
+          return json(res, 200, { ok: true })
         }
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
         setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
-        return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
-      }
-      if (req.method === 'PUT' && url.pathname === '/push/prefs') {
-        // Prefs live on the device row next to the APNs token they gate —
-        // same client-only surface as /push/register.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const body = await readBody(req)
-        for (const [k, v] of Object.entries(body)) {
-          if (!['attention', 'done', 'activity'].includes(k) || typeof v !== 'boolean') {
-            return json(res, 400, { error: 'bad_request' })
-          }
-        }
-        return json(res, 200, { ok: true, push_prefs: setPushPrefs(db, who.deviceId, body) })
+        return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/password') {
         // Self-service change, client devices only — an agent (the bridge)
@@ -812,7 +803,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // /devices (management, client-gated) this is deliberately open to
         // agent tokens, and deliberately NARROWER: agent devices only
         // (an agent still has no business enumerating its user's client
-        // devices), no cursor/lag/push_prefs, and only top-level
+        // devices), no cursor/lag, and only top-level
         // conversations (children are silenced sub-chats, never chat
         // targets). Same owner_user_id scoping as every other read.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))

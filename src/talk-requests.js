@@ -13,12 +13,12 @@
 // No session share is created: the guest's consent to this one room is the
 // share, and it lives and dies with the room.
 import { newId } from './items.js'
-import { requestContact, answerContact, isMutual, OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE } from './contacts.js'
-import { getMission } from './missions.js'
+import { requestContact, answerContact, isMutual, OWN_ASK_TTL_MS } from './contacts.js'
 import { isPrivateDevice } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import {
-  getPersonRoom, isGuestRoom, isFreshRoom, parkedPeopleAsks, inviteGuest, stillAllowed, isShareableSession, guestSees, endTalkContact, LIVE_ROOM_STATES,
+  getPersonRoom, isGuestRoom, inviteGuest, stillAllowed, isShareableSession, guestSees, endTalkContact, LIVE_SQL,
+  checkRoomFree, askMissionId,
 } from './person-rooms.js'
 
 // The guest's card waits a week: people take days.
@@ -32,7 +32,6 @@ export const LABEL_MAX = 40
 export const OWNER_TALK_ACTIONS = ['Send', 'Cancel']
 export const CHOICE = { new: 'New session', coordinator: 'My Coordinator', pick: 'Pick a session', decline: 'Decline' }
 
-const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
 const fail = (code) => { throw new Error(code) }
 const contactRow = (db, userId, peerUserId) =>
   db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(userId, peerUserId) ?? null
@@ -120,24 +119,8 @@ export function parkTalk(db, { ownerUserId, roomId, ownerDeviceId, ownerSender, 
     if (mine) fail('pending')
     if (isGuestRoom(db, roomId)) fail('room_busy')
     if (db.prepare(`SELECT 1 FROM person_rooms WHERE owner_room_id=? AND state IN ${LIVE_SQL}`).get(roomId)) fail('room_busy')
-    if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? AND guest_room_id IS NOT NULL').get(roomId)) fail('room_busy')
-    if (!isFreshRoom(db, { userId: ownerUserId, roomId, ownerSender })) fail('not_fresh')
-    const members = db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE convo_id=? AND state IN ('awaiting_user','invited','joined')").get(roomId).n
-    if (members > 0) fail('room_busy')
-    if (parkedPeopleAsks(db, ownerDeviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')
-    let missionId = null
-    if (missionRef != null) {
-      const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
-      if (!m) fail('no_mission')
-      // A mission needs an active grant to an existing contact — one that
-      // lets them read it: a hand-over's owner-level row stays active but
-      // confers nothing (the same rule as parkPersonRoom).
-      const g = own && isMutual(db, own)
-        ? db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(m.id, own.id)
-        : null
-      if (!g) fail('mission_not_shared')
-      missionId = m.id
-    }
+    checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSender })
+    const missionId = askMissionId(db, ownerUserId, missionRef, own)
     const contactId = own && isMutual(db, own) ? own.id : null
     const cur = db.prepare("SELECT id FROM person_rooms WHERE owner_room_id=? AND kind='talk' AND guest_user_id=?").get(roomId, peer.id)
     const id = cur?.id ?? newId('pr')

@@ -213,6 +213,21 @@ export function setTwoFactorRequired(db, on) {
     ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(on ? '1' : '0')
 }
 
+// Per-user exemption from that switch (users.two_factor_exempt), set only
+// by the operator from the shell. An exempt user without two-factor signs
+// in with their password while it is required; one who has set it up is
+// still asked for their code. A 2fa-reset leaves the exemption as it was.
+export function isTwoFactorExempt(db, userId) {
+  const row = db.prepare('SELECT two_factor_exempt FROM users WHERE id=?').get(userId)
+  return !!row && row.two_factor_exempt === 1
+}
+
+// True when the value changed.
+export function setTwoFactorExempt(db, userId, on) {
+  return db.prepare('UPDATE users SET two_factor_exempt=? WHERE id=? AND two_factor_exempt<>?')
+    .run(on ? 1 : 0, userId, on ? 1 : 0).changes > 0
+}
+
 // ---- Sign-in tickets ----------------------------------------------------
 
 // In-memory, like the pair and link stores: a restart forgets them and the

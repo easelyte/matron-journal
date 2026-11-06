@@ -8,9 +8,12 @@
 // between two rows that are both 'active'. Being on the same journal makes
 // nobody a contact (spec decision 8): the other person accepts once.
 //
-// Phase 1 writes same-journal rows only (peer_journal NULL, peer_user_id
-// set). The address columns are federation's; every query here that joins
-// two sides goes through peer_user_id.
+// Same-journal rows have peer_journal NULL and peer_user_id set; every
+// query here that joins two sides goes through peer_user_id. A contact on
+// another journal (src/federation-contacts.js) has peer_journal set to its
+// host, peer_user_id NULL and peer_journal_key the key pinned when the
+// invite was used: its other side lives on that journal, so peerRowOf is
+// null and removing or blocking it ends only this side here.
 import { newId } from './items.js'
 
 export const CONTACT_STATES = ['awaiting_user', 'pending_out', 'pending_in', 'active', 'blocked', 'declined', 'removed', 'expired']
@@ -40,6 +43,10 @@ export function contactRow(row) {
     state: row.state,
     requested_by: row.requested_by ?? null,
     origin_convo_id: row.origin_convo_id ?? null,
+    // A contact on another journal whose journal now serves a different key
+    // than the one pinned for it: nothing goes to or comes from it until
+    // the two exchange a fresh invite.
+    key_changed: keyChanged(row),
     created_at: row.created_at,
     updated_at: row.updated_at,
     accepted_at: row.accepted_at ?? null,
@@ -47,7 +54,16 @@ export function contactRow(row) {
   }
 }
 
-const rawById = (db, id) => db.prepare('SELECT * FROM contacts WHERE id=?').get(id)
+const keyChanged = (row) => !!row.peer_journal && (row.journal_state === 'key_changed' ||
+  (row.journal_key_now != null && row.peer_journal_key != null && row.journal_key_now !== row.peer_journal_key))
+// Every row this module hands out carries its journal's current key and
+// state (NULL for same-journal rows), for key_changed.
+const ROW = `SELECT c.*, p.key_pub AS journal_key_now, p.state AS journal_state FROM contacts c
+  LEFT JOIN fed_peers p ON p.host = c.peer_journal`
+const rawById = (db, id) => db.prepare(`${ROW} WHERE c.id=?`).get(id)
+// The caller's row for a contact on another journal, by name and host.
+export const remoteContactRaw = (db, userId, name, host) =>
+  db.prepare(`${ROW} WHERE c.user_id=? AND c.peer_user=? AND c.peer_journal=?`).get(userId, name, host) ?? null
 const rawBetween = (db, userId, peerUserId) =>
   db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(userId, peerUserId)
 const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get(id)?.name ?? null
@@ -57,7 +73,7 @@ const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get
 // empty, and a request to it or from it is the same answer as a name that
 // does not exist — so it can be neither found nor used to probe for names.
 // Contact rows made before the flag was set are left as they are.
-const isUnlisted = (db, userId) => !!db.prepare('SELECT unlisted FROM users WHERE id=?').get(userId)?.unlisted
+export const isUnlisted = (db, userId) => !!db.prepare('SELECT unlisted FROM users WHERE id=?').get(userId)?.unlisted
 
 // "Add contact" on the same journal lists the journal's users — names only
 // (spec decision 4), never the caller, never an unlisted account.
@@ -66,22 +82,25 @@ export function listJournalUsers(db, userId) {
   return db.prepare('SELECT name FROM users WHERE id<>? AND unlisted=0 ORDER BY name COLLATE NOCASE').all(userId).map((r) => ({ name: r.name }))
 }
 
-// By id (ct_…) or, for a same-journal peer, by name. Always the caller's
-// own row. A username may itself start with ct_, so a ct_ reference that is
-// not one of the caller's row ids is still tried as a name.
+// By id (ct_…), by address (`name@host`, a contact on another journal) or,
+// for a same-journal peer, by name. Always the caller's own row. A username
+// may itself start with ct_, so a ct_ reference that is not one of the
+// caller's row ids is still tried as a name. A user name never contains @.
 export function getContactRaw(db, userId, idOrName) {
   if (typeof idOrName !== 'string' || !idOrName) return null
   if (idOrName.startsWith('ct_')) {
     const row = rawById(db, idOrName)
     if (row && row.user_id === userId) return row
   }
-  return db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user=? AND peer_journal IS NULL').get(userId, idOrName) ?? null
+  const at = idOrName.indexOf('@')
+  if (at > 0) return remoteContactRaw(db, userId, idOrName.slice(0, at), idOrName.slice(at + 1).toLowerCase())
+  return db.prepare(`${ROW} WHERE c.user_id=? AND c.peer_user=? AND c.peer_journal IS NULL`).get(userId, idOrName) ?? null
 }
 
 export function listContacts(db, userId, { state = null } = {}) {
   const rows = state
-    ? db.prepare('SELECT * FROM contacts WHERE user_id=? AND state=? ORDER BY updated_at DESC').all(userId, state)
-    : db.prepare("SELECT * FROM contacts WHERE user_id=? AND state NOT IN ('removed','declined','expired') ORDER BY (state='active') DESC, updated_at DESC").all(userId)
+    ? db.prepare(`${ROW} WHERE c.user_id=? AND c.state=? ORDER BY c.updated_at DESC`).all(userId, state)
+    : db.prepare(`${ROW} WHERE c.user_id=? AND c.state NOT IN ('removed','declined','expired') ORDER BY (c.state='active') DESC, c.updated_at DESC`).all(userId)
   return rows.map(contactRow)
 }
 
@@ -96,10 +115,20 @@ export function isMutual(db, row) {
   return !!row && row.state === 'active' && peerRowOf(db, row)?.state === 'active'
 }
 
+// A contact on another journal that may be offered something: active here,
+// and pinned to the key that journal serves now (no key change since).
+// There is no row of theirs to check: their journal answers for them.
+export function isLiveRemote(db, row) {
+  if (!row?.peer_journal || row.state !== 'active') return false
+  const peer = db.prepare('SELECT key_pub, state FROM fed_peers WHERE host=?').get(row.peer_journal)
+  return !!peer && peer.state === 'active' && peer.key_pub === row.peer_journal_key
+}
+
 export function parkedAsks(db, deviceId) {
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner')) AS n`).get({ d: deviceId }).n
+    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner'))
+    + (SELECT COUNT(*) FROM fed_invite_asks WHERE origin_device_id=@d AND state='awaiting_user') AS n`).get({ d: deviceId }).n
 }
 
 function upsertOwn(db, { userId, peer, state, requestedBy, convoId, deviceId, now }) {
@@ -125,6 +154,17 @@ const setState = (db, id, state, now, extra = '') =>
 // hand-over (level owner, active) is a record of something done, not
 // access, and is left as it is.
 const LIVE_NOT_HANDED = `state IN ${LIVE_GRANT_STATES} AND NOT (level = 'owner' AND state = 'active')`
+// The incoming grants (fed_grants_in) a contact on another journal offered,
+// still live: ended as the contact ends. Rows as they stood, with the
+// owner's address.
+function endIncomingGrants(db, contactId, now) {
+  const rows = db.prepare("SELECT *, owner_name || '@' || peer_host AS owner_address FROM fed_grants_in WHERE contact_id=? AND state IN ('pending','active')").all(contactId)
+  if (rows.length) {
+    db.prepare("UPDATE fed_grants_in SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=? WHERE contact_id=? AND state IN ('pending','active')").run(now, now, contactId)
+  }
+  return rows
+}
+
 function revokeGrantsBetween(db, contactIds, now) {
   const ids = contactIds.filter(Boolean)
   if (!ids.length) return []
@@ -277,10 +317,13 @@ function end(db, { userId, contactId, to, now }) {
     const touchPeer = !!theirs && ['pending_in', 'pending_out', 'active'].includes(theirs.state)
     if (touchPeer) setState(db, theirs.id, 'removed', now, `, revoked_at=${Number(now)}`)
     const revokedGrants = revokeGrantsBetween(db, [own.id, theirs?.id], now)
+    // Shares a contact on another journal offered this user end with it
+    // (src/federation-grants.js); their journal hears of it by contact.remove.
+    const endedIncoming = own.peer_journal ? endIncomingGrants(db, own.id, now) : []
     return {
       contact: rawById(db, own.id), before: own,
       peer: touchPeer ? rawById(db, theirs.id) : null, peerBefore: touchPeer ? theirs : null,
-      revokedGrants,
+      revokedGrants, endedIncoming,
     }
   })()
 }

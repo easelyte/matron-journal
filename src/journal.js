@@ -9,6 +9,7 @@ import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
 import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
 import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
@@ -58,7 +59,7 @@ export const CONVO_ID_MAX_CHARS = 128
 // they come from, or send data to, ANOTHER PERSON, and only a tap on the
 // user's own device may answer them — no agent, the Coordinator included,
 // ever hears of one.
-const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'mission_handover', 'person_room', 'session_share'])
+const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'contact_invite', 'mission_share', 'mission_handover', 'person_room', 'session_share'])
 export const PEOPLE_EVENT_TYPE = 'people'
 
 export function isClientOnlyEvent(type, payload) {
@@ -582,6 +583,36 @@ export function eventsAfter(db, userId, cursor, limit = 500) {
   return db.prepare(
     'SELECT * FROM events WHERE user_id=? AND seq>? ORDER BY seq LIMIT ?'
   ).all(userId, cursor, limit).map(parseRow)
+}
+
+// The replay half of sync-scope.js's scopeCarries for a for_you hello: what
+// that socket would have carried since `cursor`, minus the viewed
+// conversations (a reconnecting app has no viewing set yet; it fetches an
+// open chat's gap over HTTP). Two indexed reads merged by seq rather than one
+// OR, so each side keeps its index: the marker types through
+// idx_events_for_you, the Coordinator conversation through idx_events_convo.
+// The Coordinator id is the user's own (coordinatorFor), so no user_id term:
+// with one, SQLite picks the (user_id, seq) key and walks every row.
+export function scopedEventsAfter(db, userId, cursor, coordinatorConvoId, limit = 500) {
+  const markers = db.prepare(
+    `SELECT * FROM events WHERE user_id=? AND seq>? AND type IN (${FOR_YOU_TYPES_SQL}) ORDER BY seq LIMIT ?`
+  ).all(userId, cursor, limit)
+  const coordinator = coordinatorConvoId == null ? [] : db.prepare(
+    `SELECT * FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND type NOT IN (${FOR_YOU_TYPES_SQL}) ORDER BY seq LIMIT ?`
+  ).all(coordinatorConvoId, cursor, limit)
+  return [...markers, ...coordinator].sort((a, b) => a.seq - b.seq).slice(0, limit).map(parseRow)
+}
+
+// How many events a for_you replay from `cursor` would send, counted up to
+// `cap` + 1 so the snapshot_required valve stops scanning early.
+export function scopedReplayCount(db, userId, cursor, coordinatorConvoId, cap) {
+  const markers = db.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE user_id=? AND seq>? AND type IN (${FOR_YOU_TYPES_SQL}) LIMIT ?)`
+  ).get(userId, cursor, cap + 1).n
+  if (coordinatorConvoId == null || markers > cap) return markers
+  return markers + db.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND type NOT IN (${FOR_YOU_TYPES_SQL}) LIMIT ?)`
+  ).get(coordinatorConvoId, cursor, cap + 1 - markers).n
 }
 
 export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 50 } = {}) {

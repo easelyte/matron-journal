@@ -94,7 +94,7 @@ async function enrol(s, token, body = {}) {
 
 test('enrolment: setup returns a secret and QR URI, enable needs a right code and returns ten recovery codes', async (t) => {
   const { s, token } = await setup(t)
-  assert.deepEqual((await s.http('/2fa', { token })).json, { enabled: false, enabled_at: null, recovery_codes_left: 0, required: false, available: true })
+  assert.deepEqual((await s.http('/2fa', { token })).json, { enabled: false, enabled_at: null, recovery_codes_left: 0, required: false, exempt: false, available: true })
 
   assert.equal((await s.http('/2fa/setup', { method: 'POST', token, body: { password: 'wrong' } })).status, 401)
   assert.equal((await s.http('/2fa/enable', { method: 'POST', token, body: { code: '000000' } })).status, 409, 'nothing pending yet')
@@ -385,4 +385,128 @@ test('a password reset by email drops sign-in tickets earned with the old passwo
   assert.equal((await s.http('/password/reset', { method: 'POST', body: { token: resetToken, new_password: 'brand-new-pw' } })).status, 200)
   const late = await s.http('/login/2fa', { method: 'POST', body: { ticket, code: codeFor(secret, 1) } })
   assert.equal(late.status, 401)
+})
+
+// ---- Exempt from the requirement ----------------------------------------
+// One account (a review or demo login, say) may keep signing in with a
+// password while two-factor is required for everyone else. The exemption
+// waives only the requirement, never a factor the user has set up.
+
+const login = (s, username, password, device_name = 'web') =>
+  s.http('/login', { method: 'POST', body: { username, password, device_name } })
+
+test('exempt: an exempt user without two-factor signs in with a password alone while it is required; others must enrol', async (t) => {
+  const { s, token } = await setup(t)
+  await createUser(s.db, 'demo-review', 'reviewpass')
+  await runAdmin(s.db, ['two-factor', 'require', 'on'])
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'on']), /demo-review is exempt/)
+
+  const demo = await login(s, 'demo-review', 'reviewpass')
+  assert.equal(demo.status, 200)
+  assert.ok(demo.json.token)
+  const other = await login(s, 'alice', 'hunter22')
+  assert.equal(other.status, 401)
+  assert.equal(other.json.error, 'two_factor_enrolment_required')
+
+  // What each of them is told about the requirement.
+  const demoState = (await s.http('/2fa', { token: demo.json.token })).json
+  assert.equal(demoState.required, false)
+  assert.equal(demoState.exempt, true)
+  assert.equal((await s.http('/me', { token: demo.json.token })).json.two_factor.required, false)
+  const aliceState = (await s.http('/2fa', { token })).json
+  assert.equal(aliceState.required, true)
+  assert.equal(aliceState.exempt, false)
+  assert.equal((await s.http('/me', { token })).json.two_factor.required, true)
+
+  // Off again: the requirement applies to them like everyone else.
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'off']), /no longer exempt/)
+  const again = await login(s, 'demo-review', 'reviewpass')
+  assert.equal(again.status, 401)
+  assert.equal(again.json.error, 'two_factor_enrolment_required')
+})
+
+test('exempt: a user who has set two-factor up is still asked for their code, and may turn it off while it is required', async (t) => {
+  const { s, token } = await setup(t)
+  const { secret, recoveryCodes } = await enrol(s, token)
+  await runAdmin(s.db, ['two-factor', 'require', 'on'])
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'alice', 'on']), /still asked for their code/)
+
+  const first = await login(s, 'alice', 'hunter22', 'phone')
+  assert.equal(first.status, 401)
+  assert.equal(first.json.error, 'two_factor_required')
+  const second = await s.http('/login/2fa', { method: 'POST', body: { ticket: first.json.two_factor_ticket, code: recoveryCodes[0] } })
+  assert.equal(second.status, 200)
+  assert.ok(second.json.token)
+
+  // The requirement does not hold them, so /2fa/disable is not refused.
+  const off = await s.http('/2fa/disable', { method: 'POST', token, body: { password: 'hunter22', code: codeFor(secret, 1) } })
+  assert.equal(off.status, 200)
+  assert.equal((await login(s, 'alice', 'hunter22')).status, 200)
+})
+
+test('exempt: a user who is not exempt still cannot turn two-factor off while it is required', async (t) => {
+  const { s, token } = await setup(t)
+  const { secret } = await enrol(s, token)
+  await createUser(s.db, 'demo-review', 'reviewpass')
+  await runAdmin(s.db, ['two-factor', 'require', 'on'])
+  await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'on'])
+  const off = await s.http('/2fa/disable', { method: 'POST', token, body: { password: 'hunter22', code: codeFor(secret) } })
+  assert.equal(off.status, 409)
+  assert.equal(off.json.error, 'two_factor_required')
+})
+
+test('exempt: the policy route still reports the journal-wide switch for an exempt admin', async (t) => {
+  const { s, token } = await setup(t)
+  s.db.prepare('UPDATE users SET is_admin=1').run()
+  await runAdmin(s.db, ['user', '2fa-exempt', 'alice', 'on'])
+  assert.deepEqual((await s.http('/2fa/policy', { method: 'PUT', token, body: { required: true } })).json, { required: true })
+  const list = await s.http('/users', { token })
+  assert.equal(list.json.users.find((u) => u.name === 'alice').two_factor_exempt, true)
+})
+
+test('exempt: matron-admin user 2fa-exempt on|off and two-factor status', async (t) => {
+  const { s, token } = await setup(t)
+  await enrol(s, token)
+  await createUser(s.db, 'bob', 'bobpass1')
+  await createUser(s.db, 'demo-review', 'reviewpass')
+  await runAdmin(s.db, ['two-factor', 'require', 'on'])
+
+  await assert.rejects(runAdmin(s.db, ['user', '2fa-exempt', 'nobody', 'on']), /no such user/)
+  await assert.rejects(runAdmin(s.db, ['user', '2fa-exempt', 'demo-review']), /usage/)
+  await assert.rejects(runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'yes']), /usage/)
+
+  let status = await runAdmin(s.db, ['two-factor', 'status'])
+  assert.match(status, /^exempt: none$/m)
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'on']), /sign in with their password alone/)
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'on']), /already exempt/)
+  status = await runAdmin(s.db, ['two-factor', 'status'])
+  assert.match(status, /^required for everyone: yes \(journal-wide switch; exempt users are not held to it\)/)
+  assert.match(await runAdmin(s.db, ['two-factor', 'require', 'on']), /now required: .*; 1 exempt user is not/)
+  assert.match(status, /^users: 3 \(on: 1, off: 2\), exempt: 1$/m)
+  assert.match(status, /^exempt: demo-review$/m)
+  assert.match(status, /^alice\ton \(10 recovery codes left\)$/m)
+  assert.match(status, /^bob\toff$/m)
+  assert.match(status, /^demo-review\toff, exempt$/m)
+
+  // Durable: it is a column on the user, read back from the database.
+  assert.equal(s.db.prepare("SELECT two_factor_exempt FROM users WHERE name='demo-review'").get().two_factor_exempt, 1)
+
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'off']), /no longer exempt/)
+  assert.match(await runAdmin(s.db, ['user', '2fa-exempt', 'demo-review', 'off']), /was not exempt/)
+  status = await runAdmin(s.db, ['two-factor', 'status'])
+  assert.doesNotMatch(status, /journal-wide switch/)
+  assert.doesNotMatch(await runAdmin(s.db, ['two-factor', 'require', 'on']), /exempt/)
+  assert.match(status, /^users: 3 \(on: 1, off: 2\), exempt: 0$/m)
+  assert.match(status, /^demo-review\toff$/m)
+})
+
+test('exempt: 2fa-reset turns the factor off and leaves the exemption as it was', async (t) => {
+  const { s, token } = await setup(t)
+  await enrol(s, token)
+  await runAdmin(s.db, ['two-factor', 'require', 'on'])
+  await runAdmin(s.db, ['user', '2fa-exempt', 'alice', 'on'])
+  assert.match(await runAdmin(s.db, ['user', '2fa-reset', 'alice']), /still exempt/)
+  // No factor and still exempt: the password alone signs in.
+  assert.equal((await login(s, 'alice', 'hunter22')).status, 200)
+  assert.match(await runAdmin(s.db, ['two-factor', 'status']), /^alice\toff, exempt$/m)
 })

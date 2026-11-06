@@ -15,6 +15,7 @@ import {
   listGrantedMissions, getGrantedMission, grantedMissionDetail,
 } from './missions.js'
 import { notifyGrantees } from './sharing-events.js'
+import { listReplicaMissions, getReplicaMission, replicaMissionDetail } from './federation-replica.js'
 import { getProject } from './projects.js'
 import { handoverInFlight } from './handover.js'
 import { hasActiveLink } from './mission-links.js'
@@ -191,7 +192,9 @@ function handleList(ctx, res, url, who) {
     // through the org rule, whose view is the wider one.
     const org = listSharedMissions(db, who.userId)
     const seen = new Set(org.map((m) => m.id))
-    json(res, 200, { missions: [...org, ...listGrantedMissions(db, who.userId).filter((m) => !seen.has(m.id))] })
+    // Then the copies of missions shared from other journals
+    // (src/federation-replica.js).
+    json(res, 200, { missions: [...org, ...listGrantedMissions(db, who.userId).filter((m) => !seen.has(m.id)), ...listReplicaMissions(db, who.userId)] })
     return true
   }
   json(res, 200, { missions: listMissions(db, who.userId, { state, since, excludePrivateOwned: filteredAgent(db, who) }) })
@@ -272,6 +275,8 @@ async function handleJoin(ctx, req, res, who, mission) {
   // its join succeed. The marker says what happened to this conversation.
   if (out.action) emitMissionMarker(ctx, who, { mission: out.mission, action: out.action, convoId: body.convo_id })
   fanRetitled(db, ctx.hub, out.retitled)
+  // The conversation's unfiled items came with it.
+  for (const id of out.repointed ?? []) notifyGrantees(ctx, out.mission.id, 'item', id)
   json(res, 200, { mission: out.mission })
   return true
 }
@@ -445,7 +450,7 @@ async function handleMilestoneCreate(ctx, req, res, who) {
       payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who), withTitle: out.markerWithTitle }),
     })
   } catch (err) { console.error('missions: milestone broadcast failed (row and marker already committed)', err) }
-  notifyGrantees({ db, hub }, out.mission.id, 'milestone')
+  notifyGrantees({ db, hub }, out.mission.id, 'milestone', out.milestone.id)
   json(res, 201, { milestone: out.milestone, mission: out.mission })
   return true
 }
@@ -513,7 +518,14 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   if (!mission) {
     const shared = getSharedMission(db, who.userId, idOrNum)
     const granted = shared ? null : getGrantedMission(db, who.userId, idOrNum)
-    if (!shared && !granted) return notFound(res)
+    if (!shared && !granted) {
+      // A copy of a mission shared from another journal: read-only.
+      const replica = getReplicaMission(db, who.userId, idOrNum)
+      if (!replica) return notFound(res)
+      if (!sub && req.method === 'GET') { json(res, 200, replicaMissionDetail(db, replica)); return true }
+      json(res, 403, { error: 'forbidden' })
+      return true
+    }
     if (!sub && req.method === 'GET') {
       json(res, 200, shared
         ? sharedMissionDetail(db, who.userId, shared, { subchats: url.searchParams.get('subchats') === '1' })

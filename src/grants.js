@@ -21,7 +21,7 @@
 import fs from 'node:fs'
 import { newId } from './items.js'
 import { ORIGIN_SIEVE } from './missions.js'
-import { getContactRaw, isMutual, parkedAsks, MAX_PARKED_PER_DEVICE, OWN_ASK_TTL_MS, LIVE_GRANT_STATES } from './contacts.js'
+import { getContactRaw, isMutual, isLiveRemote, parkedAsks, MAX_PARKED_PER_DEVICE, OWN_ASK_TTL_MS, LIVE_GRANT_STATES } from './contacts.js'
 import { applyHandover, checkHandoverAsk, checkHandoverStill, approvedSet, sameApprovedSet, subjectProject, HANDOVER_REFUSALS } from './handover.js'
 
 export const GRANT_LEVELS = ['read', 'contribute', 'owner']
@@ -110,7 +110,11 @@ export function sharePreview(db, missionId) {
 // active one. Returns {grant, existing}.
 function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, excludeMedia, keepLevel, by, convoId, deviceId, now }) {
   const cur = db.prepare('SELECT * FROM grants WHERE subject_kind=? AND subject_id=? AND contact_id=?').get(kind, subjectId, own.id)
-  if (cur && (cur.state === 'awaiting_owner' || cur.state === 'pending' || cur.pending_state)) fail('pending')
+  // The owner's own offer to a contact on another journal may be offered
+  // again while it waits: their answer may never have got back (their
+  // journal gives up on it after 7 days), and nothing else would end it.
+  const resend = cur?.state === 'pending' && !cur.pending_state && own.peer_journal && by !== 'agent'
+  if (cur && !resend && (cur.state === 'awaiting_owner' || cur.state === 'pending' || cur.pending_state)) fail('pending')
   // Asking for what the contact already has, or less, changes nothing.
   if (cur?.state === 'active' && RANK[level] <= RANK[cur.level]) return { grant: getGrantRaw(db, cur.id), existing: true }
   if (by === 'agent' && parkedAsks(db, deviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')
@@ -151,7 +155,10 @@ function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, exclud
 // mission_closed, not_contact, pending, too_many_asks.
 // Returns {grant, existing} — existing:true is an already-active grant at
 // that level or above, returned unchanged (sharing twice is not an error).
-export function shareMission(db, { ownerUserId, missionId, contact, level, brief = null, excludeMedia = null, keepLevel = null, by, convoId = null, deviceId = null, now = Date.now() }) {
+// `federate(what, grant)` queues what a grant for a contact on another
+// journal sends ('offer', 'revoke'), inside the same transaction
+// (src/federation-grants.js); null while federation is off.
+export function shareMission(db, { ownerUserId, missionId, contact, level, brief = null, excludeMedia = null, keepLevel = null, by, convoId = null, deviceId = null, federate = null, now = Date.now() }) {
   return db.transaction(() => {
     if (!GRANT_LEVELS.includes(level)) fail('bad_level')
     if (level === 'owner' && !brief) fail('no_brief')
@@ -162,8 +169,17 @@ export function shareMission(db, { ownerUserId, missionId, contact, level, brief
     if (!mission.shareable) fail('private_mission')
     if (level === 'owner') checkHandoverAsk(db, { kind: 'mission', id: mission.id, ownerUserId })
     const own = getContactRaw(db, ownerUserId, contact)
-    if (!own || !isMutual(db, own)) fail('not_contact')
-    return upsertAsk(db, { ownerUserId, kind: 'mission', subjectId: mission.id, own, level, brief: level === 'owner' ? brief : null, excludeMedia, keepLevel, by, convoId, deviceId, now })
+    if (!own) fail('not_contact')
+    if (own.peer_journal) {
+      // A contact on another journal: only a read share crosses so far, and
+      // only while this journal federates (`federate` sends the offer).
+      if (!isLiveRemote(db, own)) fail('not_contact')
+      if (level !== 'read') fail('level_unavailable')
+      if (!federate) fail('federation_off')
+    } else if (!isMutual(db, own)) fail('not_contact')
+    const out = upsertAsk(db, { ownerUserId, kind: 'mission', subjectId: mission.id, own, level, brief: level === 'owner' ? brief : null, excludeMedia, keepLevel, by, convoId, deviceId, now })
+    if (own.peer_journal && !out.existing && out.grant.state === 'pending') federate('offer', out.grant)
+    return out
   })()
 }
 
@@ -178,7 +194,10 @@ export function shareProject(db, { ownerUserId, projectId, contact, level, brief
     if (!subjectProject(db, ownerUserId, projectId)) fail('no_project')
     checkHandoverAsk(db, { kind: 'project', id: projectId, ownerUserId })
     const own = getContactRaw(db, ownerUserId, contact)
-    if (!own || !isMutual(db, own)) fail('not_contact')
+    if (!own) fail('not_contact')
+    // Hand-overs across journals are not built yet.
+    if (own.peer_journal) fail(isLiveRemote(db, own) ? 'level_unavailable' : 'not_contact')
+    if (!isMutual(db, own)) fail('not_contact')
     return upsertAsk(db, { ownerUserId, kind: 'project', subjectId: projectId, own, level, brief, excludeMedia, keepLevel, by, convoId, deviceId, now })
   })()
 }
@@ -238,7 +257,7 @@ function endAsk(db, g, ask, now) {
 // wrote, and is cleaned up here if the transaction rolls back.
 // `excludeMedia` and `keepLevel` (the owner's approval of a hand-over)
 // replace the ask's.
-export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepLevel, now = Date.now() }) {
+export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepLevel, federate = null, now = Date.now() }) {
   const files = []
   try {
     return db.transaction(() => {
@@ -260,7 +279,7 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepL
           if (ask.raise) dropRaise(db, g, now); else { setState(db, g.id, 'declined', now, `, answered_at=${Number(now)}`); forgetBrief(db, g.id) }
           return done('withdrawn')
         }
-        if (!isMutual(db, contact)) {
+        if (contact.peer_journal ? !isLiveRemote(db, contact) || !federate : !isMutual(db, contact)) {
           if (ask.raise) dropRaise(db, g, now)
           else { setState(db, g.id, 'revoked', now, `, revoked_by='contact_removed', revoked_at=${Number(now)}`); forgetBrief(db, g.id) }
           return done('unavailable')
@@ -278,6 +297,7 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepL
           db.prepare('UPDATE grants SET approved=? WHERE id=?').run(JSON.stringify(set), g.id)
         }
         setAsk(db, g, 'pending', now)
+        if (contact.peer_journal) federate('offer', getGrantRaw(db, g.id))
         return done('sent')
       }
       if (!isOwner && ask.state === 'pending') {
@@ -307,7 +327,7 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepL
 // Either side ends a grant that is, or may still become, live. For the
 // grantee a row still awaiting the OWNER's approval does not exist yet
 // (they have never been told of it): same null as an unknown id.
-export function revokeGrant(db, { userId, grantId, now = Date.now() }) {
+export function revokeGrant(db, { userId, grantId, federate = null, now = Date.now() }) {
   return db.transaction(() => {
     const g = getGrantRaw(db, grantId)
     if (!g || (g.owner_user_id !== userId && g.grantee_user_id !== userId)) return null
@@ -318,6 +338,8 @@ export function revokeGrant(db, { userId, grantId, now = Date.now() }) {
     if (g.level === 'owner' && g.state === 'active') fail('handed_over')
     setState(db, g.id, 'revoked', now, `, revoked_by='${isOwner ? 'owner' : 'grantee'}', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL`)
     if (askOf(g).state === 'awaiting_owner') forgetBrief(db, g.id)
+    // Their journal knows of every grant sent to it, and is told it ended.
+    if (g.grantee_journal && g.sent_at != null) federate?.('revoke', g)
     return { grant: getGrantRaw(db, g.id), before: g, by: isOwner ? 'owner' : 'grantee' }
   })()
 }
@@ -360,4 +382,54 @@ export { backfillGrantSent } from './db.js'
 
 export function setGrantItem(db, grantId, side, itemId) {
   db.prepare(`UPDATE grants SET ${side === 'owner' ? 'owner_item_id' : 'grantee_item_id'}=? WHERE id=?`).run(itemId, grantId)
+}
+
+// --- A grantee on another journal (src/federation-grants.js) -----------------
+
+// The owner's grant `grantId` given to the remote `address` (name@host),
+// pinned to `key`: the only grants a remote grantee can act on. null
+// otherwise.
+function remoteGrant(db, { ownerUserId, grantId, address, key }) {
+  const g = getGrantRaw(db, grantId)
+  if (!g || g.owner_user_id !== ownerUserId || !g.grantee_journal || g.subject_kind !== 'mission') return null
+  if (`${g.grantee_name}@${g.grantee_journal}` !== address) return null
+  const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(g.contact_id)
+  if (!contact || contact.peer_journal_key !== key || g.sent_at == null) return null
+  return { g, contact }
+}
+
+// An answer naming an earlier sending of a still-pending offer (`sent`, the
+// offer's sent_at as their journal last heard it) crossed the owner's offer
+// again: their journal has reopened the offer, so a decline or leave of the
+// earlier one is stale. An accept never is (their journal keeps it).
+const staleFor = (g, sent) => g.state === 'pending' && Number.isSafeInteger(sent) && sent !== g.sent_at
+
+// Their answer to an offer, arriving from their journal. Outcomes as
+// answerGrant ('accepted' | 'declined'); answering what is already so again,
+// or a stale decline, is 'same'. Errors: not_pending (withdrawn, ended, or
+// not theirs).
+export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, decision, sent = null, now = Date.now() }) {
+  return db.transaction(() => {
+    const hit = remoteGrant(db, { ownerUserId, grantId, address, key })
+    if (!hit) fail('not_pending')
+    const { g, contact } = hit
+    const done = (outcome) => ({ outcome, grant: getGrantRaw(db, g.id), before: g })
+    if (g.state === (decision === 'decline' ? 'declined' : 'active') && !g.pending_state) return done('same')
+    if (decision === 'decline' && staleFor(g, sent)) return done('same')
+    if (g.state !== 'pending' || !isLiveRemote(db, contact)) fail('not_pending')
+    if (decision === 'decline') setState(db, g.id, 'declined', now, `, answered_at=${Number(now)}`)
+    else setState(db, g.id, 'active', now, `, answered_at=${Number(now)}`)
+    return done(decision === 'decline' ? 'declined' : 'accepted')
+  })()
+}
+
+// They ended a share from their side. null = nothing live to end (the
+// answer is the same: it is over here too).
+export function leaveRemoteGrant(db, { ownerUserId, grantId, address, key, sent = null, now = Date.now() }) {
+  return db.transaction(() => {
+    const hit = remoteGrant(db, { ownerUserId, grantId, address, key })
+    if (!hit || !['pending', 'active'].includes(hit.g.state) || staleFor(hit.g, sent)) return null
+    setState(db, hit.g.id, 'revoked', now, `, revoked_by='grantee', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL`)
+    return { grant: getGrantRaw(db, hit.g.id), before: hit.g, by: 'grantee' }
+  })()
 }

@@ -16,15 +16,15 @@ import { parkInvite, answerParkedInvite, answerInvite, getParticipant } from '..
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
-  const out1 = await runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123'])
+  const out1 = await runAdmin(db, ['user', 'add', 'alice'], { env: { MATRON_PASSWORD: 'pw123' } })
   assert.match(out1, /user alice created/)
-  await assert.rejects(runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123']), /UNIQUE/)
+  await assert.rejects(runAdmin(db, ['user', 'add', 'alice'], { env: { MATRON_PASSWORD: 'pw123' } }), /UNIQUE/)
 
   const out2 = await runAdmin(db, ['agent', 'add', 'alice', 'box-2'])
   const token = out2.match(/token: ([0-9a-f]{64})/)[1]
   assert.equal(authToken(db, token).kind, 'agent')
 
-  const out3 = await runAdmin(db, ['user', 'passwd', 'alice', '--password', 'newpw'])
+  const out3 = await runAdmin(db, ['user', 'passwd', 'alice'], { env: { MATRON_PASSWORD: 'newpw' } })
   assert.match(out3, /password updated/)
 
   const status = await runAdmin(db, ['status'])
@@ -56,12 +56,19 @@ test('admin CLI: user add/passwd take the password off argv (--password-stdin, M
   assert.match(pwOut, /password updated for ann/)
   assert.ok(await login(db, { username: 'ann', password: 'rotated', deviceName: 'm3' }))
 
-  // precedence: --password-stdin wins over a --password flag on argv
-  const carolOut = await runAdmin(db, ['user', 'add', 'carol', '--password', 'FROM-ARGV', '--password-stdin'],
-    { readStdin: async () => 'FROM-STDIN' })
+  // precedence: --password-stdin wins over MATRON_PASSWORD
+  const carolOut = await runAdmin(db, ['user', 'add', 'carol', '--password-stdin'],
+    { readStdin: async () => 'FROM-STDIN', env: { MATRON_PASSWORD: 'FROM-ENV' } })
   assert.match(carolOut, /user carol created/)
   assert.ok(await login(db, { username: 'carol', password: 'FROM-STDIN', deviceName: 'm' }))
-  assert.equal(await login(db, { username: 'carol', password: 'FROM-ARGV', deviceName: 'm2' }), null)
+  assert.equal(await login(db, { username: 'carol', password: 'FROM-ENV', deviceName: 'm2' }), null)
+
+  // a password on argv is refused, even with another source present, and
+  // creates nothing
+  await assert.rejects(runAdmin(db, ['user', 'add', 'dave', '--password', 'pw']), /no longer accepted/)
+  await assert.rejects(runAdmin(db, ['user', 'add', 'dave', '--password', 'pw'], { env: { MATRON_PASSWORD: 'x' } }), /no longer accepted/)
+  await assert.rejects(runAdmin(db, ['user', 'passwd', 'ann', '--password', 'pw']), /no longer accepted/)
+  assert.equal(db.prepare("SELECT 1 FROM users WHERE name='dave'").get(), undefined)
 
   // no password source at all → usage (unchanged behavior)
   await assert.rejects(runAdmin(db, ['user', 'add', 'nopw']), /usage/i)
@@ -687,7 +694,7 @@ test('device list: shows the private flag and its pin state', async () => {
 
 test('admin CLI: user admin on|off flips users.is_admin; unknown user and bad value are usage errors', async () => {
   const db = openDb(':memory:')
-  await runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123456'])
+  await runAdmin(db, ['user', 'add', 'alice'], { env: { MATRON_PASSWORD: 'pw123456' } })
   assert.equal(db.prepare("SELECT is_admin FROM users WHERE name='alice'").get().is_admin, 0)
   assert.match(await runAdmin(db, ['user', 'admin', 'alice', 'on']), /alice is now a journal admin/)
   assert.equal(db.prepare("SELECT is_admin FROM users WHERE name='alice'").get().is_admin, 1)
@@ -700,7 +707,7 @@ test('admin CLI: user admin on|off flips users.is_admin; unknown user and bad va
 
 test('admin CLI: user unlisted on|off flips users.unlisted; unknown user and bad value are usage errors', async () => {
   const db = openDb(':memory:')
-  await runAdmin(db, ['user', 'add', 'applereview', '--password', 'pw123456'])
+  await runAdmin(db, ['user', 'add', 'applereview'], { env: { MATRON_PASSWORD: 'pw123456' } })
   const flagOf = () => db.prepare("SELECT unlisted FROM users WHERE name='applereview'").get().unlisted
   assert.equal(flagOf(), 0)
   assert.match(await runAdmin(db, ['user', 'unlisted', 'applereview', 'on']), /applereview is now unlisted/)
@@ -730,8 +737,8 @@ test('device consent: user-only sets the flag and device list shows it; any clea
 
 test('admin CLI: user email sets, normalises and clears the address; refuses a bad or taken one', async () => {
   const db = openDb(':memory:')
-  await runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123456'])
-  await runAdmin(db, ['user', 'add', 'bob', '--password', 'pw123456'])
+  await runAdmin(db, ['user', 'add', 'alice'], { env: { MATRON_PASSWORD: 'pw123456' } })
+  await runAdmin(db, ['user', 'add', 'bob'], { env: { MATRON_PASSWORD: 'pw123456' } })
   const emailOf = (n) => db.prepare('SELECT email FROM users WHERE name=?').get(n).email
   assert.match(await runAdmin(db, ['user', 'email', 'alice', ' alice@example.com ']), /alice's email is now alice@example\.com/)
   assert.equal(emailOf('alice'), 'alice@example.com')

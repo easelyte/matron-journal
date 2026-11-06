@@ -8,17 +8,13 @@
 // It has no agent, and no agent may read, write or adopt it. The guards
 // live where each path is decided — upsertConversation and agentTargetsFor
 // (journal.js), authorizeAgentWrite (auth.js), /snapshot and /roster
-// (http.js) — and all of them ask isSystemConvo. Looked up by its
-// `system` marker, never by id, so an agent upserting a guessable id first
-// gains nothing.
+// (http.js) — and each of them checks the row's `system` column itself.
+// Recognised by that marker, never by id, so an agent upserting a guessable
+// id first gains nothing.
 import { randomBytes } from 'node:crypto'
 
 export const PEOPLE_SYSTEM = 'people'
 export const PEOPLE_TITLE = 'People'
-
-export function isSystemConvo(db, convoId) {
-  return db.prepare('SELECT system FROM conversations WHERE id=?').get(convoId)?.system != null
-}
 
 export function peopleConvoId(db, userId) {
   return db.prepare('SELECT id FROM conversations WHERE owner_user_id=? AND system=?').get(userId, PEOPLE_SYSTEM)?.id ?? null

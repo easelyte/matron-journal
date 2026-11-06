@@ -24,17 +24,11 @@ export const TRANSFER_USER_QUOTA_BYTES_DEFAULT = 21474836480 // 20 GB per user
 // once (consent awaiting_user, phase open); the next create is refused.
 export const TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT = 50
 
-export const TRANSFER_STATES = Object.freeze({
-  consent: Object.freeze(['awaiting_user', 'approved', 'declined']),
-  upload: Object.freeze(['uploading', 'uploaded', 'failed']),
-  phase: Object.freeze(['open', 'released', 'delivered', 'expired', 'cancelled', 'failed', 'declined']),
-})
 // Phases still waiting to be collected: they accept state changes and can
 // expire. A delivered transfer is no longer live, but its bytes stay on
 // disk for TRANSFER_DELIVERED_GRACE_MS, so it keeps its quota reservation
 // until retention deletes them (reservedTransferBytes).
 export const LIVE_PHASES = Object.freeze(['open', 'released'])
-export const isTerminalPhase = (phase) => !LIVE_PHASES.includes(phase)
 
 // How long a delivered transfer can still be downloaded again (a receiver
 // that crashed between its verify and its own write), and when retention

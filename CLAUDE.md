@@ -32,6 +32,15 @@ It reports only a rule number and a location; fix the named places and push
 again. It cannot read images or videos: a new one only gets a warning, so
 check every screenshot by eye before adding it.
 
+Commit with the account's GitHub noreply address as `user.email`, and set it
+before the first commit on a new machine: git's default is built from the
+login and host name. The check fails a commit whose author, committer or
+co-author address is on a machine-local domain and, on a branch of this
+repository, any address that is not a noreply one.
+
+Keep agent scratch (pull request drafts, screenshots, plans) out of the tree.
+`.superpowers/` is ignored; nothing in it belongs in a commit.
+
 ## Running a local journal
 
 Start a local journal with `bin/matron-journal` (or `npm start`, which runs

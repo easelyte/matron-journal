@@ -31,10 +31,8 @@ import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
 
-export const SHARE_STATES = ['awaiting_user', 'active', 'declined', 'revoked', 'expired']
-export const ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined', 'declined', 'refused', 'withdrawn', 'left', 'expired']
 export const LIVE_ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined']
-const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
+export const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
 export const PERSON_SENDER_PREFIX = 'person:'
 
 const fail = (code) => { throw new Error(code) }
@@ -284,6 +282,37 @@ export function isFreshRoom(db, { userId, roomId, ownerSender }) {
   return (r.texts ?? 0) <= FRESH_TEXT_MAX && !(r.session_like > 0) && !(r.others > 0)
 }
 
+// The checks every ask to bring another person into a room makes once the
+// room's own live asks are ruled out (parkPersonRoom here, parkTalk in
+// talk-requests.js). Throws room_busy, not_fresh or too_many_asks.
+export function checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSender }) {
+  // A room that already had a twin is never re-used: its old twin must
+  // stay a twin (isGuestRoom), and a fresh room is one agent_chat_start
+  // away.
+  if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? AND guest_room_id IS NOT NULL').get(roomId)) fail('room_busy')
+  if (!isFreshRoom(db, { userId: ownerUserId, roomId, ownerSender })) fail('not_fresh')
+  // Exactly two agents: the guest consented to talking with this one
+  // session, not to whoever else the owner later adds.
+  const members = db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE convo_id=? AND state IN ('awaiting_user','invited','joined')").get(roomId).n
+  if (members > 0) fail('room_busy')
+  if (parkedPeopleAsks(db, ownerDeviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')
+}
+
+// The mission an ask attaches, or null when it names none. A mission needs
+// an active grant to a mutual contact — one that lets them read it: a
+// hand-over's owner-level row stays active but confers nothing. Throws
+// no_mission or mission_not_shared.
+export function askMissionId(db, ownerUserId, missionRef, contact) {
+  if (missionRef == null) return null
+  const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
+  if (!m) fail('no_mission')
+  const g = contact && isMutual(db, contact)
+    ? db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(m.id, contact.id)
+    : null
+  if (!g) fail('mission_not_shared')
+  return m.id
+}
+
 // The owner's agent asks to bring a contact's shared session into its room.
 // Throws: not_found (no such target, not a contact, session not shared —
 // one answer, so nothing is confirmed), room_busy (the room already has
@@ -305,24 +334,8 @@ export function parkPersonRoom(db, { ownerUserId, roomId, ownerDeviceId, ownerSe
     const live = db.prepare(`SELECT * FROM person_rooms WHERE owner_room_id=? AND state IN ${LIVE_SQL}`).all(roomId)
     if (live.some((l) => l.guest_device_id === targetDeviceId)) fail('pending')
     if (live.length) fail('room_busy')
-    // A room that already had a twin is never re-used: its old twin must
-    // stay a twin (isGuestRoom), and a fresh room is one agent_chat_start
-    // away.
-    if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? AND guest_room_id IS NOT NULL').get(roomId)) fail('room_busy')
-    if (!isFreshRoom(db, { userId: ownerUserId, roomId, ownerSender })) fail('not_fresh')
-    // Exactly two agents: the guest consented to talking with this one
-    // session, not to whoever else the owner later adds.
-    const members = db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE convo_id=? AND state IN ('awaiting_user','invited','joined')").get(roomId).n
-    if (members > 0) fail('room_busy')
-    if (parkedPeopleAsks(db, ownerDeviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')
-    let missionId = null
-    if (missionRef != null) {
-      const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
-      if (!m) fail('no_mission')
-      const g = db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(m.id, own.id)
-      if (!g) fail('mission_not_shared')
-      missionId = m.id
-    }
+    checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSender })
+    const missionId = askMissionId(db, ownerUserId, missionRef, own)
     const cur = db.prepare('SELECT id FROM person_rooms WHERE owner_room_id=? AND guest_device_id=?').get(roomId, targetDeviceId)
     const id = cur?.id ?? newId('pr')
     if (cur) {

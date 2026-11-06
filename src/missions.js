@@ -255,8 +255,10 @@ export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } 
 // caller's `ts`, not a fresh now() — one moment for the whole transaction)
 // or `GET /items?since=` and any client syncing on updated_at never learn
 // the item gained a mission after its conversation was created/joined.
+// Returns the ids it repointed.
 export function repointItems(db, userId, convoId, missionId, ts) {
-  db.prepare('UPDATE items SET mission_id=?, updated_at=? WHERE user_id=? AND origin_convo_id=? AND mission_id IS NULL').run(missionId, ts, userId, convoId)
+  return db.prepare('UPDATE items SET mission_id=?, updated_at=? WHERE user_id=? AND origin_convo_id=? AND mission_id IS NULL RETURNING id')
+    .all(missionId, ts, userId, convoId).map((r) => r.id)
 }
 
 // Returns the conversation row when attaching renamed it (convo-title.js).
@@ -525,11 +527,11 @@ export function joinMission(db, { userId, missionId, convoId, how = 'joined', ex
     const ts = now()
     activateLink(db, { missionId: m.id, convoId, userId, how, ts })
     db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=?').run(m.id, convoId, userId)
-    repointItems(db, userId, convoId, m.id, ts)
+    const repointed = repointItems(db, userId, convoId, m.id, ts)
     db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
     if (convo.mission_id && convo.mission_id !== m.id) db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, convo.mission_id)
     const renamed = recomputeConvoTitle(db, convoId)
-    return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: active ? 'current_changed' : 'joined', retitled: renamed ? [renamed] : [] }
+    return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: active ? 'current_changed' : 'joined', retitled: renamed ? [renamed] : [], repointed }
   })()
 }
 
@@ -871,6 +873,19 @@ export function getGrantedMission(db, viewerUserId, missionId) {
   if (typeof missionId !== 'string' || !missionId.startsWith('ms_')) return null
   return grantedMissionRow(db.prepare(`SELECT m.*, ${grantedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
     WHERE m.id = @id AND ${MISSION_GRANTED}`).get({ viewer: viewerUserId, id: missionId }))
+}
+
+// The same grantee view for a contact on another journal, where there is no
+// grantee user here to check the grant against (src/federation-replica.js
+// builds what crosses from it): the sieved mission row, every sieved
+// milestone, and the items left to items.js grantedItemsExport. The
+// caller has checked the grant.
+export function grantedMissionExport(db, missionId) {
+  const row = db.prepare(`SELECT m.*, ${grantedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE m.id = @id AND ${ORIGIN_SIEVE}`).get({ viewer: null, id: missionId })
+  if (!row) return null
+  const mission = grantedMissionRow(row)
+  return { mission, milestones: grantedMissionDetail(db, mission).milestones }
 }
 
 // Milestones as text: no conversation, seq or device — the jump target

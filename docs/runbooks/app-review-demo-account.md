@@ -20,8 +20,9 @@ Paths below assume the reference deployment (`/opt/matron-journal`, user
 ```
 # 1. Create the account (generate a strong password; it goes in
 #    App Store Connect → App Review Information, never in this repo)
+# The password is read from stdin, so it never appears on the command line.
 sudo -u matron env MATRON_DB=/opt/matron-journal/data/matron.db \
-  node bin/matron-admin.js user add applereview --password '<generated>'
+  node bin/matron-admin.js user add applereview --password-stdin
 
 # 2. Mint the agent device and store its token where the sandboxed unit
 #    can read it (ProtectHome=yes blocks /home)
@@ -60,7 +61,8 @@ afterwards (`matron-admin device list applereview` → `device revoke <id>`).
   message, or start a fresh account.
 - The canned reply can be changed without touching code: set
   `MATRON_DEMO_REPLY` in the unit and restart.
-- Password rotation: `matron-admin user passwd applereview --password <new>`,
+- Password rotation: `matron-admin user passwd applereview --password-stdin`
+  (type the new password, then Ctrl-D),
   then update App Store Connect. Apple rejects updates whose demo credentials
   no longer work.
 - The account's journal is append-only like any other; the demo conversation

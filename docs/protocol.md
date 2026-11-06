@@ -438,17 +438,9 @@ the machine-checkable version of this page.
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
-  missing/non-string `apns_token` (unless it's `null`). Response echoes the
-  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
-  /devices` echoes the same per-device `push_prefs` in its roster.
-- `PUT /push/prefs` (Bearer, client devices only — agents get 403
-  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
-  booleans — a partial merge, not a replace: only the given keys change, the
-  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
-  field or a non-boolean value for a known field. Response `{ok:true,
-  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
-  never set) are `{attention: true, done: true, activity: false}` — "buzz me
-  when the agent needs me or finishes; routine activity is opt-in."
+  missing/non-string `apns_token` (unless it's `null`). Response `{ok:true}`.
+  Which events push is decided by the user's synced notification settings
+  and the device's own level (`GET`/`PUT /notify`).
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -535,7 +527,7 @@ the machine-checkable version of this page.
   as `not_allowed` against the device and logged, and never goes upstream.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected, push_prefs, status?, defaults?}]}`. The
+  cursor, lag, last_seen_at, is_self, connected, status?, defaults?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
   `status` (agent devices, omitted until the box has reported) is the box's
   last capacity report — `{reported_at, activity?, limits?, disk?,
@@ -545,8 +537,7 @@ the machine-checkable version of this page.
   `defaults` (agent devices only, always present for them) is the box's
   stored defaults for new sessions, `{agent, model, effort}`, each null
   when unset — see *Box defaults*.
-  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
-  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
+  Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster. `connected` is whether the
   device has a live WebSocket right now — the "can I start a session on
@@ -563,8 +554,8 @@ the machine-checkable version of this page.
   (management, client devices only) this is deliberately open to agent
   tokens too, and deliberately narrower. `agents`:
   `[{device_id, name, created_at, last_seen_at, connected, defaults}]` — this user's
-  `kind='agent'` devices only (never client devices; no `cursor`/`lag`/
-  `push_prefs`); `connected` is the same live-WebSocket check `/devices`
+  `kind='agent'` devices only (never client devices; no `cursor`/`lag`);
+  `connected` is the same live-WebSocket check `/devices`
   uses; `defaults` is the box's stored `{agent, model, effort}` as on
   `GET /devices` (see *Box defaults*). `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
@@ -973,6 +964,28 @@ Rows from before the stamp carry neither, and don't count.
   older client that omits it is unaffected. The web client sends 500: it
   applies replayed rows one at a time, and past a few hundred rows a
   snapshot is far cheaper than the replay.
+- **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
+  and what a client that sends nothing gets) carries every event of every
+  conversation. `'for_you'` is for a phone that follows only the tracker:
+  its socket carries `item`, `mission`, `milestone`, `coordinator`,
+  `memory`, `routine`, `convo_meta` and `session_status` events from every
+  conversation, every event of the Coordinator conversation (following the
+  role when it moves), and every event of the conversations in its
+  `viewing` set. Everything else stays on the server; the app fetches a
+  conversation over `GET /convo/:id/messages` when it opens one. A client
+  that sends `sync` gets `hello_ok.sync` back, the scope it got, so it can
+  tell a journal that predates the field. Any other value is
+  `bad_request` (ref `hello`). Agents ignore the field.
+  - A `for_you` replay sends only what that scope carries (the viewed set
+    is empty during a replay), and the `snapshot_required` valve counts
+    those events rather than the whole gap. After the replay, and before
+    any live frame, the server sends `{kind:'control', op:'cursor', seq}`:
+    the head the replay reached. The client moves its cursor there, since
+    the last frame it was sent is usually well below the head.
+  - The scope is kept on the device row. A `for_you` phone with no socket
+    is woken only by `item`, `mission` and `milestone` events and the
+    Coordinator conversation's messages, and its wakes for a read on
+    another device share the same pacing.
   Client ops: send (type text, or file/image with a top-level blob_ref from a
   prior POST /media — payload mirrors the agent-publish media shape),
   prompt_reply, read_marker, ack, viewing.
@@ -3606,11 +3619,22 @@ can never replace an active secret. Existing sessions stay
 signed in. While it is required, `/2fa/disable` is 409
 `two_factor_required`.
 
+**Exempt users.** The operator can exempt an account from the requirement
+(`matron-admin user 2fa-exempt <name> on`, stored as
+`users.two_factor_exempt`; there is no HTTP route to set it). While the
+switch is on, an exempt user without two-factor signs in with their
+password alone (200 with a token), and `/2fa/disable` is not refused for
+them. The exemption waives the requirement only: an exempt user who has
+two-factor on still gets 401 `two_factor_required` and needs a code. For
+an exempt user, `GET /2fa` and `GET /me` report `required:false`;
+`PUT /2fa/policy` always answers with the journal-wide switch.
+`user 2fa-reset` leaves the exemption as it was.
+
 ### Settings (Bearer, client devices only; agents get 403)
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /2fa` | — | `{enabled, enabled_at, recovery_codes_left, required, available}` (`available`: the token key is set) |
+| `GET /2fa` | — | `{enabled, enabled_at, recovery_codes_left, required, exempt, available}` (`required`: it is required for this user, so false when `exempt`; `available`: the token key is set) |
 | `POST /2fa/setup` | `{password, code?}` — `code` (TOTP or recovery) only when two-factor is already on (moving to a new app) | `{secret, otpauth_uri, issuer, account}`. Starts a pending setup (15 minutes); an active secret stays in force until the new one is confirmed |
 | `POST /2fa/enable` | `{code, sign_out_others?}` | `{recovery_codes, signed_out}` — the codes are shown this once. `sign_out_others:true` revokes the user's other **client** devices (never agents). 409 `no_pending_setup`, 403 `bad_code` |
 | `POST /2fa/disable` | `{password, code}` | `{ok:true}`; 409 `not_enabled` / `two_factor_required` |
@@ -3629,8 +3653,11 @@ the host is the request's `X-Forwarded-Host` or `Host`, without a port.
 - `matron-admin user 2fa-reset <name>` — the lockout escape hatch: turns
   two-factor off for a user, who then signs in with their password (and
   sets it up again at once when it is required).
-- `matron-admin two-factor status` — each user on or off, and whether it is
-  required.
+- `matron-admin two-factor status` — the journal-wide switch, a count of
+  users on and off, the exempt users (counted and named separately), and
+  each user on or off (`, exempt` after an exempt one).
+- `matron-admin user 2fa-exempt <name> on|off` — exempt one account from
+  the requirement (above).
 - `matron-admin two-factor require on|off`.
 
 ## User settings
@@ -4454,7 +4481,7 @@ page needs no shell.
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /users` | — | `{users:[{id, name, email, is_admin, unlisted, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` is a boolean) |
+| `GET /users` | — | `{users:[{id, name, email, is_admin, unlisted, two_factor_exempt, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` and `two_factor_exempt` are booleans) |
 | `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
 | `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
 | `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
@@ -4550,7 +4577,11 @@ to read. Nothing is derived from being on the same journal.
 
 A contact is one row per side; anything is shared only while both rows are
 `active`. `address` is `user` on this journal and `user@journal` across
-journals (later).
+journals. A contact on another journal is made only by an invite link
+(see "Contacts across journals"); its other row lives on that journal.
+A contact on another journal can be offered a mission to read (see
+"Shares across journals"); contribute and hand-over shares, and rooms, are
+same-journal only for now (`409 level_unavailable` for a share).
 
 | State | Meaning |
 |---|---|
@@ -4565,7 +4596,7 @@ journals (later).
 GET    /contacts/users                    {users:[{name}]} — this journal's other listed users, names only
 GET    /contacts[?state=]                 {contacts:[contact]} — live rows unless a state is named
 POST   /contacts {user, convo_id?}        201 {contact, pending?:'peer'} | 202 {contact, pending:'owner'}
-GET    /contacts/:id                      :id is the row id (ct_…) or a same-journal user name
+GET    /contacts/:id                      :id is the row id (ct_…), a same-journal user name, or name@journal
 POST   /contacts/:id/answer {decision}    'approve' | 'decline' — client devices only
 DELETE /contacts/:id                      remove, or withdraw a request
 POST   /contacts/:id/block                POST /contacts/:id/unblock (client only)
@@ -4573,8 +4604,9 @@ GET    /contacts/:id/activity             {events:[…]} — the audit events na
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
-requested_by, origin_convo_id, created_at, updated_at, accepted_at,
-revoked_at}`.
+requested_by, origin_convo_id, key_changed, created_at, updated_at, accepted_at,
+revoked_at}`. `key_changed` is true for a contact on another journal whose
+journal now serves a different key than the one pinned for it.
 
 `POST /contacts` from a **client** is the user's own tap and goes straight
 to the other person. From an **agent** it needs `convo_id` (a conversation
@@ -5226,6 +5258,529 @@ Audit events (`people`, client-only): `room.offered`, `room.received`,
 `room.accepted`, `room.declined`, `room.joined`, `room.ended`, each with
 `room_link_id`, `person` and the reader's own `room_id`.
 
+## Federation (between journals)
+
+Not enabled yet. Users on different journals will add each other as
+contacts and share missions and rooms as users on one journal do. A user's
+address across journals is `name@host`, where `host` names their journal.
+Journals talk directly over HTTPS, and every request is a signed envelope.
+This section grows as each part ships. So far it covers the journal's
+identity (`src/federation-identity.js`), the envelope format
+(`src/federation-envelope.js`), the endpoint that receives envelopes
+(`src/federation-inbound.js`), the rules for calling another journal
+(`src/federation-client.js`), the outbox that delivers ops
+(`src/federation-outbox.js`) and contacts across journals
+(`src/federation-contacts.js`). The ops so far are `ping`,
+`contact.accept_invite` and `contact.remove`.
+
+### Journal identity
+
+Federation is off unless the operator turns it on. It needs all three of:
+
+| Variable | |
+|---|---|
+| `MATRON_FEDERATION` | `on` (default `off`) |
+| `MATRON_PUBLIC_URL` | the journal's https origin (`http` only for `localhost`). Its host, with the port if there is one, is the journal's name in every address: `name@host` |
+| `MATRON_TOKEN_KEY` | the private key is stored sealed under the token box in `journal_settings`, never in the clear |
+
+Two optional lists say which other journals may federate with this one:
+
+| Variable | |
+|---|---|
+| `MATRON_FEDERATION_ALLOW_JOURNALS` | comma-separated hosts. When set, only these journals |
+| `MATRON_FEDERATION_DENY_JOURNALS` | comma-separated hosts never allowed, even if also allowed |
+
+With no allow list, any journal a user exchanges an invite with may
+federate: the invite is the trust. A refused journal's envelopes are
+`403 peer_refused`, and its invite links are refused when opened.
+
+If any of the three required ones is missing, or the stored key does not open under the token
+key, federation stays off and the journal logs one line saying why.
+Otherwise it logs `federation: on as <host>, key <fingerprint>`.
+
+The Ed25519 key is made the first time the journal starts with federation
+on, and it is kept for good: there is no rotation. Back it up with the
+database. A journal whose key changes is a new journal to every peer, and
+its users exchange fresh invites. `matron-admin federation status` shows
+the switch as the current shell sees it, plus the public key, its
+fingerprint and when it was made.
+
+```
+GET /.well-known/matron-journal
+{ v: 1, journal: 'a.example', base_url: 'https://a.example',
+  key: { alg: 'ed25519', pub: <43 chars base64url>, id: <fingerprint> },
+  federation: { max_envelope: 1048576 } }
+```
+
+The document is public and cacheable (5 minutes), and carries no user data.
+It is `404` while federation is off, so a journal that never turned it on
+asserts nothing. `key.id` is the fingerprint (below). An invite link
+carries it, and a peer refuses a document whose key does not match.
+
+### Envelopes
+
+```
+{ v: 1, from: 'alice@a.example', to: 'bob@b.example', op, id, ts, body, sig }
+```
+
+| Field | |
+|---|---|
+| `v` | `1`. Any other value is `unsupported_version` |
+| `from`, `to` | addresses, `name@host`: a name of up to 64 characters `[A-Za-z0-9._-]` starting with a letter or digit, then a lower-case DNS host with an optional port |
+| `op` | the operation, lower-case dotted (`mission.event`) |
+| `id` | a ULID, given to the op once when it is queued and kept on every retry |
+| `ts` | milliseconds since the epoch, set afresh on every attempt |
+| `body` | an object |
+| `sig` | Ed25519 signature, base64url without padding (86 characters) |
+
+Exactly these eight fields, nothing else. An envelope is at most 1 MiB.
+Attachments never travel in one.
+
+**What is signed.** The ASCII bytes `matron-federation-v1\n`, followed by
+the RFC 8785 (JCS) serialisation of the envelope with `sig` removed. The
+prefix keeps a federation signature from being valid in any other context
+that uses the same key. The receiver verifies over the JCS form of the
+object it parsed, not over the bytes it received, so whitespace and key
+order on the wire do not matter.
+
+**Strict parsing.** Envelopes are parsed as I-JSON (RFC 7493), not with
+`JSON.parse`. Any of the following makes the envelope `malformed`:
+
+- bytes that are not valid UTF-8, or a byte-order mark;
+- anything outside the JSON grammar;
+- a duplicate key at any depth;
+- a lone surrogate, raw or escaped, or a Unicode noncharacter;
+- a number that is not finite;
+- an integer outside ±(2^53 − 1). Larger integers travel as strings;
+- nesting deeper than 64.
+
+**Freshness.** The signature is checked first, then `ts`. An attempt more
+than five minutes from the receiver's clock is `stale`, and the answer
+carries the receiver's clock. The window applies to the attempt, not to the
+op: a retry keeps its `id` and `body` and is signed again with a new `ts`,
+so an op that waited out a long outage is still accepted. A receiver tells
+a repeat of an op from a reused `id` by SHA-256 of the JCS form of
+`{op, body}`.
+
+**Keys.** A journal's public key is written as the raw 32 bytes in
+base64url (43 characters). Its fingerprint is the first 128 bits of SHA-256
+of those raw bytes in lower-case base32 (26 characters). People compare it
+in groups of four.
+
+### Receiving an op
+
+```
+POST /federation/v1      body: one envelope
+```
+
+The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
+
+1. `to` must name a user of this journal, on this journal's host.
+2. `from`'s host must be allowed by the operator's lists, and a journal
+   this one knows (`fed_peers`, `active`), and the key pinned for that
+   journal must verify `sig`.
+   **Discovery** is the one exception: `contact.accept_invite`, the answer
+   to an invite this journal minted, may come from a journal it has never
+   seen, or one whose pinned key no longer verifies. Only when the envelope
+   carries one of this journal's open invites for `to` (a lookup, no other
+   work) does the journal fetch the sender's well-known, through the rules
+   in "Calling another journal", and verify `sig` against the key it
+   serves. The op's own apply then pins that key. Any other envelope from
+   an unknown journal is `403 unknown_journal` before any work. If the
+   sender's well-known cannot be fetched, the answer is
+   `503 peer_unreachable`, which the sender retries.
+3. The attempt must be fresh.
+4. **Receipts.** In one transaction, the journal looks up a receipt for
+   (the peer's key, `id`). If one exists with the same SHA-256 of
+   `{op, body}`, the stored answer is returned and nothing is applied
+   again. If the hash differs, the answer is `409 id_reused`. With no
+   receipt, the op applies and its receipt is written in the same
+   transaction. Receipts are kept for 30 days, the receiver's whole replay
+   memory.
+
+A refusal writes no receipt, so a resend of the same op is judged again
+against the state at that time.
+
+| Status | `error` | Retry? |
+|---|---|---|
+| 200 | — `{ok: true, result}` | done |
+| 400 | `malformed`, `unsupported_version`, `unknown_op` | no |
+| 401 | `stale`, with `clock` (the receiver's ms) | yes, with a fresh `ts` |
+| 403 | `not_here`, `unknown_journal`, `peer_refused`, `bad_signature`, or the op's own refusal | no |
+| 404 | `not_found`: federation is off here | no |
+| 405 | only `POST` | no |
+| 409 | `id_reused` | no |
+| 413 | `too_large` | no |
+| 503 | `peer_unreachable`: discovery could not fetch the sender's well-known | yes |
+
+**Signed answers.** Every answer from step 1 on carries
+`matron-federation-sig`: Ed25519 by the receiving journal over the ASCII
+bytes `matron-federation-v1-response\n`, followed by the JCS form of
+`{id, status, body}`, where `id` is the op's id. A sender counts only a
+signed answer as an acknowledgement. An unsigned one (a proxy's error page,
+say) is judged by its status alone.
+
+`ping` (`body: {}`) answers `{pong: true, clock}`.
+
+### The outbox
+
+Every op a journal sends is queued first, and a worker delivers it every
+few seconds. The rules:
+
+- **One id per op.** The id is set when the op is queued. Every attempt
+  keeps that id and body, takes a fresh `ts`, and is signed again.
+- **Order.** Ops are delivered first in, first out per (peer, subject),
+  where the subject is a mission, room, contact or grant. An op waits
+  while an earlier one on its subject is queued or dead. Ops on other
+  subjects never wait.
+- **Retries.** 408, 429, 5xx, network errors, and any answer the peer did
+  not sign are retried. The backoff starts at 30 s and doubles up to 1 h,
+  jittered into the upper half of each step.
+- **Permanent refusals.** Any other 4xx is permanent, but only when the
+  peer signed it: an unsigned 4xx (a proxy's error page) is retried like
+  a 5xx. An unknown or blocked peer and a refused destination are also
+  permanent.
+- **Clock skew.** A signed `401 stale` is retried at once with a fresh
+  `ts`, and the skew it reports is logged. Skew that survives three
+  attempts is permanent, with an error that names the skew.
+- **Seven days.** An op not acknowledged within 7 days goes dead.
+- **Dead ops** are never dropped silently. The user gets one `notice` per
+  peer in their People conversation, and dead ops keep blocking their
+  subject until the user resends or discards them. A resend re-queues the
+  same ids with a fresh 7 days, so a peer that already applied one answers
+  from its receipt. Ops waiting behind them on the same subject, which were
+  never attempted, also get a fresh 7 days. A
+  resend is refused (counted in `too_old`) for an op queued more than 23
+  days earlier: its last attempt could otherwise fall after the peer has
+  pruned the op's 30-day receipt, and the peer would apply it twice.
+- **Checks before sending.** Before each attempt the sender checks its own
+  records again. An op whose grant or contact has ended here is cancelled
+  rather than sent, and an op for a journal the operator's lists now
+  refuse goes dead (`journal_not_allowed`).
+- **Acknowledgement.** An entry is marked sent, and its op's own records
+  updated, in one transaction, and only if the entry was still queued: an
+  answer to an entry cancelled while its request was out changes nothing.
+- **Urgent ops** (revocation, contact removal, block) go ahead of
+  everything queued for the peer. They do not wait behind earlier ops on
+  their own subject, and may cancel what is still waiting there.
+- **Limits.** A peer may have at most 10,000 waiting ops (queued or dead)
+  and 50 MiB of them. Past that, a new op for that peer fails at once
+  instead of the queue growing. Urgent ops are never refused for space.
+
+```
+GET  /federation/outbox[?state=dead|queued|sent|cancelled]   {entries:[{id, peer, op, subject, state, attempts, last_status, last_error, created_at, ended_at}]}
+POST /federation/outbox/resend  {peer}                       {resent, too_old}
+POST /federation/outbox/discard {peer}                       {discarded}
+```
+
+Client devices only (`403` to an agent). A client sees only its own
+user's entries, and never their bodies.
+
+### Calling another journal
+
+Every request a journal makes to another journal follows these rules:
+
+- `https` only, and no credentials in the URL.
+- The host is resolved once per request, and every address it resolves to
+  must be public. Refused: loopback, private (10/8, 172.16/12,
+  192.168/16), link-local and metadata (169.254/16, fe80::/10), CGNAT
+  (100.64/10), ULA (fc00::/7), multicast, documentation, benchmarking and
+  reserved ranges, and IPv4 written inside IPv6 (mapped, NAT64, 6to4).
+  `MATRON_FEDERATION_ALLOW_HOSTS` (comma-separated host names or
+  addresses) lets the operator allow a peer on a LAN or tailnet.
+- The connection goes to the checked address, while TLS still verifies
+  the certificate against the host name. A DNS answer that changes between
+  the check and the connect cannot redirect it.
+- Redirects are not followed.
+- 10 s to connect, 30 s in all. Response bodies are capped at 1 MiB.
+
+**A peer's well-known document** is accepted only if `journal` is the host
+it was fetched from, `base_url` is that host's origin, `key.alg` is
+`ed25519`, and `key.id` is the fingerprint of `key.pub`.
+
+### Contacts across journals
+
+Only an invite link makes a contact on another journal. Nobody can ask an
+address they typed: an invite is a capability its owner chose to hand out.
+
+```
+matron://contact?v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
+```
+
+`t` is 256 random bits (base64url, 43 characters). `fp` is the inviter's
+journal key fingerprint (26 characters, base32). A link with any other
+field, or one twice, is refused.
+
+```
+POST   /contacts/invites                 201 {invite, link} — the link is returned this once
+GET    /contacts/invites                 {invites:[invite]} — the last 30 days, newest first
+DELETE /contacts/invites/:id             {invite} — withdraw an open invite
+POST   /contacts/invites/open {link}     {inviter:{address, name, journal, fingerprint}, key_changed, contact}
+POST   /contacts/invites/accept {link}   202 {contact, pending:'peer'}
+```
+
+`invite`: `{id, state: open|used|expired|revoked, created_at, expires_at,
+used_at, used_by, revoked_at}`. Client devices only: an agent gets `403`
+on every one of these, and never sees a link, but for the one ask below.
+While federation is off they answer `409 blocked_by: federation_off`.
+
+**An agent's ask.** An agent may ask for an invite; it never gets one.
+
+```
+POST   /contacts/invites {convo_id}                 (agent) 202 {ask, pending:'user'}
+POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?}
+```
+
+`ask`: `{id, state: awaiting_user|approved|declined|expired, invite_id,
+origin_convo_id, created_at, updated_at}`. Nothing is minted by asking.
+The user gets a card (`permission_request`, kind `contact_invite`,
+client-only) in the asking conversation and its tracker mirror (consent
+`invite`, Approve / Decline). The answer route and a tap on the mirror do
+the same: `approve` mints the invite and returns `{invite, link}` in that
+answer, to the device that tapped, this once; the link is written to no
+event, item or comment, so no agent can read it. `decline` mints nothing.
+An ask unanswered for 24 h expires and its mirror closes as cancelled.
+One open ask per conversation (`409 blocked_by: pending`); open asks count
+toward the agent device's cap on parked asks, with its contact and share
+asks (`409 too_many_asks`). `400` without a conversation the agent may
+write to (`404` for one it may not). `503 unavailable` if the card could not be
+filed: nothing is kept, and the agent may ask again. An approve refused for
+`too_many_invites` leaves the ask waiting; one already answered is `409
+not_pending`, one past its 24 h `409 expired`.
+
+**The inviter's journal** keeps only the SHA-256 of the token. An invite is
+single use and lasts 7 days; a user may have 20 open at once
+(`409 too_many_invites`). An unlisted account cannot mint one (`403`).
+
+**Opening a link** (`open`) changes nothing for the user and sends nothing.
+The journal fetches the inviter's journal's well-known and refuses a link
+whose `fp` is not that document's key (`409 fingerprint_mismatch`), so the
+link itself authenticates the key and there is no trust on first use.
+Also `400` for a link it cannot read, and `409 blocked_by`: `own_journal`,
+`journal_not_allowed` (the operator's lists), `journal_blocked`. `502`
+`unreachable` or `bad_journal` when the well-known could not be fetched or
+is not a journal's identity. `fingerprint` comes grouped in fours, for
+people comparing it. `contact` is the user's existing live row for that
+address, if any.
+
+**Accepting** (`accept`) is the user's consent. The journal makes the same
+checks, pins the inviter's journal key, writes the user's row as
+`pending_out`, and queues `contact.accept_invite`. Also `409 blocked_by`:
+`already_contact`, `pending`, `blocked`, `too_many_contacts` (200 live
+contacts on other journals). The row turns `active` when the inviter's
+journal acknowledges, and only under the key the user consented to: if
+another key is pinned for that journal while the answer waits, the answer
+ends instead. If it is refused, cannot be delivered for 7 days, or ends
+that way, the row goes `expired`, the user gets a notice saying why, and
+nothing is left to resend: a new link is needed. A live contact on an old
+key that accepts a fresh invite (a reconnect) keeps its row as it was
+until the answer is acknowledged; a failed reconnect hides nothing.
+
+`contact.accept_invite`, body `{token, display_name}`. The inviter's
+journal admits it through discovery (above). In the transaction that
+writes the receipt it checks the invite again, pins the sender's key,
+writes the inviter's row `active`, and marks the invite used. The invite
+must be open. A spent one is accepted again only as a retry of the same
+answer: from the address that used it, while the contact it made is still
+`active` and signed by the key that contact is pinned to. Once that
+contact has ended, a spent link is spent, and it never restores a removed
+contact. Minting the invite was the inviter's
+consent, so the inviter gets a notice, not a card. The answer is
+`{user, display_name}`. Refusals: `403 invite_invalid` (used by someone
+else, expired, withdrawn, or the inviter has blocked that address: one
+answer for all four), `403 too_many_contacts`, `400 malformed`.
+
+**Removing or blocking** a contact on another journal ends it here at once,
+with every grant between the two, and queues `contact.remove` (body `{}`)
+in the same transaction, urgent, cancelling anything still queued for that
+contact. It goes under whatever key that journal is pinned with now: a
+removal only takes access away. One that cannot be delivered gives the
+user a notice that the other side may still see them as a contact, and
+does not hold up a later invite answer between the same two people. A block
+travels as a removal: the other person is told only that the contact
+ended. The block stays here and refuses every later invite answer from
+that address. On arrival `contact.remove` ends the receiver's row for the
+sender's address, if it is live and pinned to the sender's key. Otherwise
+it does nothing, and the answer is the same.
+
+**A changed key.** When a well-known fetched for a known journal serves a
+different key, that journal is marked `key_changed`: nothing is sent to or
+accepted from it, every contact pinned to its old key reads
+`key_changed: true`, and each user with such a contact gets one notice.
+There is no rotation. Accepting a fresh invite from that journal pins its
+new key for that contact.
+
+### Shares across journals
+
+A mission can be shared **read-only** with a contact on another journal.
+The owner asks exactly as for any contact (`POST /missions/:id/shares
+{contact: 'bob@b.example', level: 'read'}`), and an agent's ask parks for
+the owner's tap as before. `level` `contribute` or `owner`, and any
+project share, are `409 level_unavailable`; a contact whose journal changed
+its key is `409 not_contact`; with federation off, `409 federation_off`.
+
+The owner's journal keeps the grant in its own list (`direction: 'out'`,
+`grantee.address` the address). The grantee's journal keeps the grant it
+was offered under its own id, `fg_…`, and lists it with the user's other
+incoming grants:
+
+```
+GET    /grants                       incoming ones carry owner.address, mission {num, title}; ids fg_…
+GET    /grants/:fg                   {grant}
+POST   /grants/:fg/answer {decision} (client) {grant} — approve | decline
+DELETE /grants/:fg                   {grant} — leave the share
+```
+
+The grantee answers on the same card as for any share (`permission_request`
+kind `mission_share`, `grant_id` the `fg_` id, `owner.address`) and its
+tracker mirror (Accept / Decline), so today's apps answer it unchanged. An
+incoming grant's `subject_id` and `mission.id` are `null`: the mission
+lives on the owner's journal.
+
+Three ops carry a grant, and `mission.snapshot` and `mission.event`
+(below) what it shares, all on the subject `grant:<owner's gr_ id>`:
+
+- `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
+  mission: {num, title}, preview: {milestones, items, comments,
+  attachments}}`, sent
+  when the ask is sent (a client's ask at once, an agent's on the owner's
+  approval). The receiver needs a live contact for the sender under the key
+  that signed (`403 not_contact`). A grant it already holds live is the
+  same answer; one that ended is offered again. Refused or undelivered for
+  7 days, the owner's grant goes `expired` and the owner gets a notice.
+- `grant.answer`, grantee to owner, body `{grant, decision}`. The
+  grantee's row moves at the tap; the owner's grant moves when the answer
+  applies, and only while it is still `pending` (`409 not_pending`
+  otherwise). An accept that is refused or undelivered ends the
+  grantee's row and gives them a notice. The owner's journal hears
+  nothing then, so while its grant is `pending` the owner (a client, not
+  an agent) may offer it again rather than get `409 pending`: the same
+  grant is sent again, and a grantee holding it live just keeps it.
+  `sent` is the offer's `sent_at`, new with each sending; the grantee's
+  journal keeps the latest it heard (an offer no newer is the same answer
+  and reopens nothing) and names it in its `grant.answer` and
+  `grant.revoke` (`sent`). A decline or leave naming an earlier sending of
+  a grant that is still `pending` crossed the offer again, which reopened
+  it on the grantee's journal: it changes nothing (the same answer).
+- `grant.revoke`, either way, body `{grant}`: urgent, and it cancels
+  whatever is still queued for the grant. The owner's withdrawal ends the
+  grantee's row (its card closes if still open); the grantee's ends the
+  owner's grant (`revoked_by: 'grantee'`). Ending what is already over is
+  the same answer.
+
+Ending the contact ends every grant between the two on both journals, by
+`contact.remove`. Each side writes its own People log lines, naming the
+other person by address.
+
+**What the share lets the grantee read.** When the owner's journal applies
+an accept, it sends the mission in the same transaction as
+`mission.snapshot` pages, on the grant's subject (so a later
+`grant.revoke` cancels any still waiting):
+
+```
+{grant, snap, page, pages, mission?, milestones: [...], items: [...]}
+```
+
+`snap` (`sn_…`) names one snapshot, `pages` its page count (at most 1000),
+and `mission` is on page 0 only. Each page is at most 512 KiB. Every record
+is its whole current state, built from the grantee view a contact on the
+owner's journal reads (the private-box and owner-only sieves, no consent
+mirrors, no conversation, device, box, seq or project), and only these
+fields cross:
+
+- mission: `num, title, name, body, state, status, status_by,
+  status_updated_at, close_summary, closed_by, created_by, created_at,
+  updated_at, closed_at`
+- milestone: `ref, num, kind, title, body, created_by, created_at,
+  contributor?`
+- item: `ref, num, kind, state, resolution, awaiting, title, body,
+  created_by, created_at, updated_at, closed_at, labels, links: [{url,
+  title?}], comment_count, last_comment_at, contributor?, comments,
+  comments_truncated?`, with at most 5,000 milestones and 5,000 items, the
+  newest
+- comment: `ref, author, kind, body, created_at, withdrawn?, from?, to?,
+  contributor?` (`from`/`to` `{state, resolution, awaiting}` on a status
+  comment), at most 192 KiB of thread per item, the newest
+
+Attachments do not cross yet. `ref` is the owner journal's id.
+
+The grantee's journal refuses a page for a grant that is not active there
+(`409 not_active`) and otherwise keeps a copy. Page 0 starts loading
+`snap` and a page of any other snapshot is ignored. Pages are held, not
+applied, until the last one arrives; the whole snapshot is then applied
+at once, and every record it did not carry is dropped. Pages must arrive
+in order: one that arrives with a page missing before it (refused, and
+dropped from the owner's outbox) gives that snapshot up, the held pages
+are discarded, and the copy stays as the last whole snapshot left it.
+Peer text is checked on arrival:
+one-line fields are flattened, bodies keep their lines without other
+control characters, unknown enum values fall back (`kind` to `task` or
+`progress`, `state` to `open`, `author` to `agent`), only http(s) links are
+kept, and anything over the caps above is cut. A page that is not
+well-formed is `400 malformed`.
+
+The copy gets ids of its own on the grantee's journal (`ms_…`, `it_…`,
+`ml_…`, `ic_…`), and the mission keeps its id across snapshots and across
+the share ending and being accepted again. It is served, once its first
+snapshot is whole, from the routes a same-journal grantee reads:
+
+```
+GET /missions?scope=shared        listed after the shares from this journal
+GET /missions/:id                 {mission, milestones, items, conversations: []}
+GET /items?scope=shared           merged into the same list, filters and cursor
+GET /items/:id                    {item, comments}
+GET /lookup?user=alice@a.example&num=N   the mission or one of its items
+```
+
+Each row reads as a grantee's would (`shared_via: 'grant'`,
+`origin_convo_id: ''`, `origin_device_id: 0`, no actions), with `owner
+{user_id: 0, name: <address>, address}` and `grant {id: <fg_ id>, level}`.
+Every other method on them is `403`. The apps get `shared` frames as for a
+share on one journal: `mission_added` when the first snapshot is whole,
+`mission_changed` for a later one (`what: 'snapshot'`) or a
+`mission.event` (`what` its `kind`), and
+`mission_removed` when the share ends. The copy is deleted the moment the
+grant stops being active on the grantee's journal, whichever way it ended.
+
+A snapshot the grantee's journal refuses or never takes leaves the share
+standing; the owner gets one notice for it ("Couldn't send mission #N to
+bob@b.example"), except when the refusal is `not_active` (the share has
+ended there, and its revoke is on the way).
+
+**Live changes.** After the snapshot, each write on the mission sends a
+`mission.event` to every contact on another journal it is shared with,
+on the same subject, so it applies after the snapshot it follows:
+
+```
+{grant, sent, kind: 'mission'|'milestone'|'item', ref?, record}
+```
+
+`record` is the one record the write changed, its whole state as the
+snapshot would carry it (the same fields): the mission's own fields for
+`mission`, the milestone or item named by `ref` (its `ml_…` or `it_…` id
+on the owner's journal) otherwise. An item that left the mission, or
+moved to another one, crosses as `record: null`, and the grantee drops
+it. A record the grantee view never shows (an owner-only item, an item or
+milestone from a private box) sends nothing, so not even its id crosses.
+Items a conversation brings along when it joins the mission each send
+one. Before an event is sent, the owner's journal checks again that the
+grantee view still shows its record (a box can turn private while it
+waits). `sent` is the grant's offer `sent_at`: an event naming an earlier
+offer of the same grant, one that ended and was offered again, is
+dropped. The grantee's journal applies an event only to a whole copy: one
+that arrives before the first snapshot is whole is dropped, and the next
+snapshot carries its record. After a later snapshot was given up on,
+events apply to the last whole copy; each carries a record's whole state,
+so the copy only moves forward. A comment keeps its local id across
+updates of its item. Over 5,000 of a kind, the oldest goes, as a snapshot
+keeps the newest.
+
+A `mission.event` is checked on arrival like a snapshot page (`400
+malformed`, `409 not_active`). One that dies leaves the share standing;
+the owner gets a notice ("Couldn't update mission #N for bob@b.example"),
+at most one a day per share, and the same when the outbox is too full to
+queue one.
+
 ## Device privacy
 
 A per-device flag that makes an agent device — and what it manages — invisible
@@ -5720,14 +6275,26 @@ report that one message as seen (read state, op `seen`). The push relay
 (`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
 `seq`. A client must treat a missing `seq` as "no tap receipt".
 
+**Background wakes.** A new event also sends a silent background push
+(`content-available`, priority 5, no alert) to each of the user's push devices
+that has no live socket and hasn't reached that event, at most once per device
+every 20 minutes. It lets the app catch up while it isn't on screen. Any event
+type can trigger it, and the notification settings don't apply, since it
+carries no content. So where this document says an event never pushes, that
+means no alert. Subagent child conversations send none.
+
+A `read_marker` also sends a background push, which keeps the badge right on the
+user's other devices. It goes to each of them whether connected or not, and
+isn't limited to one per interval, but it restarts that device's interval.
+
 After a journal event fans out to a user's connections, the push pipeline
 considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
   conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
-  or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
-  event's category — `wake` background pushes are never prefs-filtered.
+  or when the user's notification settings or the device's level leave the
+  event out — `wake` background pushes are never filtered.
 - `prompt` / `permission_request` push immediately at priority 10
   (category `attention`).
 - `session_status` pushes on the turn-finished TRANSITION, not the new

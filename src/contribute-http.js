@@ -83,13 +83,15 @@ const grantedComment = (c) => ({ ...c, device_id: 0, device_name: null, convo_id
 function toOwner(ctx, { contributor, item, action, comment = null }) {
   const { db, hub, pushPipeline } = ctx
   const owner = item.user_id
-  const ownerItem = db.prepare('SELECT origin_convo_id FROM items WHERE id=?').get(item.id)
-  const convoId = ownerItem?.origin_convo_id
-  if (!convoId) return
-  const sender = personSender(contributor.name)
   // The owner-side row, decorated for the owner (contributor, never the
   // contributor's conversation).
   const full = db.prepare('SELECT i.* FROM items i WHERE i.id=?').get(item.id)
+  if (!full) return
+  // Grantees follow the write whether or not its marker lands.
+  notifyGrantees(ctx, full.mission_id, 'item', full.id)
+  const convoId = full.origin_convo_id
+  if (!convoId) return
+  const sender = personSender(contributor.name)
   const payload = { ...itemMarkerPayload({ item: { ...full, actions: JSON.parse(full.actions ?? '[]') }, action, by: contributor.via, comment }), person: { name: contributor.name, via: contributor.via }, mission_id: full.mission_id }
   let r
   try {
@@ -102,7 +104,6 @@ function toOwner(ctx, { contributor, item, action, comment = null }) {
     try { requestTurn(db, item.id) } catch (err) { console.error('contribute: turn request stamp failed', err) }
     wakeConvoAgent(ctx, owner, convoId)
   }
-  notifyGrantees(ctx, full.mission_id, 'item')
 }
 
 // The owner (or one of the owner's agents) wrote on an item a contributor
@@ -159,7 +160,7 @@ export function handleContributedMilestone(ctx, res, who, body, { writableConvo 
     if (out.peopleCreated) appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.convoId, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } })
     broadcastAppended(db, hub, { userId: mission.user_id, convoId: out.convoId, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(out.milestone) })
   } catch (err) { console.error('contribute: milestone broadcast failed (row and marker already committed)', err) }
-  notifyGrantees(ctx, mission.id, 'milestone')
+  notifyGrantees(ctx, mission.id, 'milestone', out.milestone.id)
   const { convo_id: _c, seq: _s, device_id: _d, ...text } = milestoneRow(out.milestone)
   json(res, 201, { milestone: text, mission: getGrantedMission(db, who.userId, mission.id) })
   return true

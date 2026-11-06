@@ -14,9 +14,12 @@ import { getMission, getSharedMission, getGrantedMission } from './missions.js'
 import { resolveProject } from './projects.js'
 import { canReadConvo } from './visibility.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
+import { lookupReplica } from './federation-replica.js'
+
+// A name, or the address name@host of someone on another journal.
+const ADDRESS_MAX = 324
 
 const NAME_MAX = 64
-
 // The mission a caller may read, under the same rule its own GET applies.
 function readableMission(db, who, own, missionId) {
   if (own) return getMission(db, who.userId, missionId, { excludePrivateOwned: filteredAgent(db, who) })
@@ -27,6 +30,12 @@ function readableMission(db, who, own, missionId) {
 // visibility check returned, so a client can label the result without a
 // second request.
 function resolve(db, who, ownerName, num) {
+  // Someone on another journal: a mission they share with the caller, or
+  // an item on it, from the caller's copy (src/federation-replica.js).
+  if (ownerName.includes('@')) {
+    const hit = lookupReplica(db, who.userId, ownerName, num)
+    return hit ? { ...hit, owner: { id: 0, name: ownerName } } : null
+  }
   const owner = db.prepare('SELECT id, name FROM users WHERE name=?').get(ownerName)
   if (!owner) return null
   const own = owner.id === who.userId
@@ -77,7 +86,7 @@ export function handleLookupRoute(ctx, req, res, url, who) {
     if (!m || !/application\/json/.test(req.headers.accept || '')) return false
     try { user = decodeURIComponent(m[1]); numRaw = decodeURIComponent(m[2]) } catch { return badRequest(res) }
   }
-  if (typeof user !== 'string' || !user || user.length > NAME_MAX || numRaw == null) return badRequest(res)
+  if (typeof user !== 'string' || !user || user.length > (user.includes('@') ? ADDRESS_MAX : NAME_MAX) || numRaw == null) return badRequest(res)
   const num = Number(numRaw)
   if (!Number.isInteger(num) || num < 1) return badRequest(res)
   const hit = resolve(db, who, user, num)

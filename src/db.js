@@ -5,6 +5,7 @@ import { imageSizeFromFile } from './image-size.js'
 import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 import { backfillDefaultProjects } from './default-project.js'
 import { installSearchDocs } from './search-docs.js'
+import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -755,6 +756,217 @@ CREATE TABLE IF NOT EXISTS journal_settings(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Federation (src/federation-inbound.js): the other journals this one
+-- knows, by host, with the key pinned for each. state 'active' accepts
+-- envelopes; 'blocked' (the operator's) and 'key_changed' (its well-known
+-- began serving another key) refuse them.
+CREATE TABLE IF NOT EXISTS fed_peers(
+  host        TEXT PRIMARY KEY,
+  base_url    TEXT NOT NULL,
+  key_pub     TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','blocked','key_changed')),
+  first_seen  INTEGER NOT NULL,
+  last_ok_at  INTEGER,
+  last_error  TEXT
+);
+-- Contact invites across journals (src/federation-contacts.js): one row per
+-- link a user minted. Only the SHA-256 of the 256-bit token is kept, so a
+-- link is shown once, when it is made. Single use, 7 days; used_by_address
+-- is the name@host that used it.
+CREATE TABLE IF NOT EXISTS fed_invites(
+  id              TEXT PRIMARY KEY,
+  token_hash      TEXT NOT NULL UNIQUE,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  created_at      INTEGER NOT NULL,
+  expires_at      INTEGER NOT NULL,
+  used_at         INTEGER,
+  used_by_address TEXT,
+  revoked_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_fed_invites_user ON fed_invites(user_id, created_at);
+-- A mission share offered to a user here by a contact on another journal
+-- (src/federation-grants.js): the grantee's side of a grant whose owner,
+-- and whose grants row, live on that journal (peer_grant_ref is its id).
+CREATE TABLE IF NOT EXISTS fed_grants_in(
+  id              TEXT PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  contact_id      TEXT NOT NULL,
+  peer_host       TEXT NOT NULL,
+  peer_grant_ref  TEXT NOT NULL,
+  owner_name      TEXT NOT NULL,
+  level           TEXT NOT NULL,
+  state           TEXT NOT NULL CHECK(state IN ('pending','active','declined','revoked')),
+  mission_title   TEXT NOT NULL,
+  mission_num     INTEGER NOT NULL,
+  preview         TEXT,
+  offer_sent      INTEGER,
+  item_id         TEXT,
+  revoked_by      TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  answered_at     INTEGER,
+  revoked_at      INTEGER,
+  UNIQUE(peer_host, peer_grant_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_user ON fed_grants_in(user_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_contact ON fed_grants_in(contact_id);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_item ON fed_grants_in(item_id);
+-- The grantee's read-only copy of a mission shared from another journal
+-- (src/federation-replica.js), one per fed_grants_in row: the mission, its
+-- milestones and its items (each with its thread, as JSON). Every row has
+-- an id of its own here; ref is the owner journal's. seen_snap is the
+-- snapshot that last carried the row: the last page of a snapshot drops
+-- the rows it did not carry. Pages wait in fed_replica_pages until the
+-- last is in, and must arrive in order; a gap gives that snapshot up and
+-- the copy stays as it was. Served only while the grant is active, and
+-- deleted the moment it is not (the trigger below).
+CREATE TABLE IF NOT EXISTS fed_replica_missions(
+  id                 TEXT PRIMARY KEY,
+  fg_id              TEXT NOT NULL UNIQUE,
+  user_id            INTEGER NOT NULL REFERENCES users(id),
+  num                INTEGER NOT NULL,
+  title              TEXT NOT NULL,
+  name               TEXT,
+  body               TEXT,
+  state              TEXT NOT NULL,
+  status             TEXT,
+  status_by          TEXT,
+  status_updated_at  INTEGER,
+  close_summary      TEXT,
+  closed_by          TEXT,
+  created_by         TEXT,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  closed_at          INTEGER,
+  applied_snap       TEXT,
+  complete           INTEGER NOT NULL DEFAULT 0,
+  received_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fed_replica_missions_user ON fed_replica_missions(user_id);
+CREATE TABLE IF NOT EXISTS fed_replica_milestones(
+  id                TEXT PRIMARY KEY,
+  fg_id             TEXT NOT NULL,
+  ref               TEXT NOT NULL,
+  num               INTEGER NOT NULL,
+  kind              TEXT NOT NULL,
+  title             TEXT NOT NULL,
+  body              TEXT,
+  created_by        TEXT,
+  created_at        INTEGER NOT NULL,
+  contributor_name  TEXT,
+  contributor_via   TEXT,
+  seen_snap         TEXT,
+  UNIQUE(fg_id, ref)
+);
+CREATE TABLE IF NOT EXISTS fed_replica_items(
+  id                  TEXT PRIMARY KEY,
+  fg_id               TEXT NOT NULL,
+  user_id             INTEGER NOT NULL REFERENCES users(id),
+  ref                 TEXT NOT NULL,
+  num                 INTEGER NOT NULL,
+  kind                TEXT NOT NULL,
+  state               TEXT NOT NULL,
+  resolution          TEXT,
+  awaiting            TEXT,
+  title               TEXT NOT NULL,
+  body                TEXT NOT NULL,
+  created_by          TEXT,
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  closed_at           INTEGER,
+  labels              TEXT NOT NULL,
+  links               TEXT NOT NULL,
+  comment_count       INTEGER NOT NULL,
+  last_comment_at     INTEGER,
+  contributor_name    TEXT,
+  contributor_via     TEXT,
+  comments            TEXT NOT NULL,
+  comments_truncated  INTEGER NOT NULL DEFAULT 0,
+  seen_snap           TEXT,
+  UNIQUE(fg_id, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_replica_items_user ON fed_replica_items(user_id, updated_at);
+CREATE TABLE IF NOT EXISTS fed_replica_pages(
+  fg_id        TEXT NOT NULL,
+  snap         TEXT NOT NULL,
+  page         INTEGER NOT NULL,
+  body         TEXT NOT NULL,
+  received_at  INTEGER NOT NULL,
+  PRIMARY KEY(fg_id, page)
+);
+CREATE TRIGGER IF NOT EXISTS fed_replica_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
+  DELETE FROM fed_replica_pages WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_items WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_milestones WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_missions WHERE fg_id = NEW.id;
+END;
+-- An agent's ask for an invite link (src/federation-invite-asks.js): parked
+-- for the user's tap, which alone mints the invite (invite_id once approved).
+CREATE TABLE IF NOT EXISTS fed_invite_asks(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  state            TEXT NOT NULL,
+  origin_convo_id  TEXT NOT NULL,
+  origin_device_id INTEGER NOT NULL,
+  item_id          TEXT,
+  invite_id        TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fed_invite_asks_device ON fed_invite_asks(origin_device_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_invite_asks_item ON fed_invite_asks(item_id);
+-- One row per op a peer's envelope applied here: the receiver's whole replay
+-- memory (30 days). hash is SHA-256 of the JCS form of {op, body}; status
+-- and response are what was answered, returned again for a repeat.
+CREATE TABLE IF NOT EXISTS fed_receipts(
+  peer_key    TEXT NOT NULL,
+  id          TEXT NOT NULL,
+  hash        TEXT NOT NULL,
+  status      INTEGER NOT NULL,
+  response    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(peer_key, id)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_receipts_created ON fed_receipts(created_at);
+-- The outbox (src/federation-outbox.js): every op this journal sends to
+-- another one, kept until the peer acknowledges it or the sender gives up.
+-- id is the op's ULID, fixed when it is queued and kept on every attempt.
+-- Delivery is FIFO per (peer_host, subject) by seq: an entry is not sent
+-- while an earlier one on its subject is queued or dead. urgent entries
+-- (revocations) go ahead of everything else for that peer. user_id is the
+-- user an undelivered op is reported to (NULL: the journal's own).
+--   queued     waiting for its next attempt (next_at)
+--   sent       acknowledged by a signed 2xx
+--   dead       a permanent refusal, or 7 days without an acknowledgement:
+--              blocks its subject until resent or discarded
+--   cancelled  ended here before it was delivered
+CREATE TABLE IF NOT EXISTS fed_outbox(
+  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+  id            TEXT NOT NULL UNIQUE,
+  user_id       INTEGER REFERENCES users(id),
+  peer_host     TEXT NOT NULL,
+  from_addr     TEXT NOT NULL,
+  to_addr       TEXT NOT NULL,
+  subject       TEXT NOT NULL,
+  op            TEXT NOT NULL,
+  body          TEXT NOT NULL,
+  urgent        INTEGER NOT NULL DEFAULT 0,
+  state         TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','sent','dead','cancelled')),
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  skew_attempts INTEGER NOT NULL DEFAULT 0,
+  next_at       INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  last_status   INTEGER,
+  last_error    TEXT,
+  notified      INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  acked_at      INTEGER,
+  ended_at      INTEGER,
+  meta          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_due ON fed_outbox(state, next_at);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_subject ON fed_outbox(peer_host, subject, state, seq);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_user ON fed_outbox(user_id, peer_host, state);
 -- Agent-to-agent file transfers (src/transfers.js): one row per file a
 -- session sends into a room. Three axes: consent (the user's card), upload
 -- (the sender's chunks) and phase (where the file is in its life; every
@@ -922,10 +1134,9 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'apns_env')) {
     db.exec('ALTER TABLE devices ADD COLUMN apns_env TEXT')
   }
-  // Per-device notification prefs (spec: push relay + notification settings).
-  // JSON {"attention":bool,"done":bool,"activity":bool}; NULL (every device
-  // predating this column) means all-on. Same in-place ALTER pattern as
-  // apns_env above.
+  // Retired per-device notification prefs. Nothing reads or writes the
+  // column any more (the user's synced settings and the device's push_level
+  // replaced it); it is still added so every database has the same shape.
   if (!deviceCols.some((c) => c.name === 'push_prefs')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_prefs TEXT')
   }
@@ -1775,6 +1986,14 @@ export function openDb(path) {
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
   }
+  // A client's sync scope as its last hello named it (src/sync-scope.js):
+  // NULL = everything, 'for_you' = the tracker and the chats it opens.
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'sync_scope')) {
+    db.exec('ALTER TABLE devices ADD COLUMN sync_scope TEXT')
+  }
+  // A for_you replay (src/sync-scope.js) reads only these rows, a small share
+  // of the table, so it never walks the conversation content in between.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) WHERE type IN (${FOR_YOU_TYPES_SQL})`)
   // Per-box defaults for new sessions (matron-bridge docs/specs/box-defaults.md,
   // src/box-defaults.js): the agent, model and effort a session started on
   // this box gets when nobody names one. Agent devices only; NULL = the
@@ -2027,6 +2246,14 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'email')) {
     db.exec('ALTER TABLE users ADD COLUMN email TEXT')
   }
+  // Exempt from "two-factor required for everyone" (src/two-factor.js):
+  // such an account, without two-factor of its own, still signs in with
+  // its password while two-factor is required. It waives the requirement
+  // only, never a factor the user has set up. Set from the shell with
+  // `matron-admin user 2fa-exempt <name> on`. Default 0.
+  if (!userCols.some((c) => c.name === 'two_factor_exempt')) {
+    db.exec('ALTER TABLE users ADD COLUMN two_factor_exempt INTEGER NOT NULL DEFAULT 0')
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
     CREATE TABLE IF NOT EXISTS password_resets(
@@ -2129,6 +2356,12 @@ export function openDb(path) {
   addCols('items', [['contributor_user_id', 'INTEGER'], ['contributor_convo_id', 'TEXT'], ['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('milestones', [['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('missions', [['status_contributor', 'TEXT']])
+  // Federation outbox: the op's local-only context for its hooks (never
+  // sent), e.g. the key the user consented to for an invite answer.
+  addCols('fed_outbox', [['meta', 'TEXT']])
+  // A grant's replica keeps one local mission id across snapshots, and
+  // across an end and a fresh accept (src/federation-replica.js).
+  addCols('fed_grants_in', [['replica_mission_id', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
@@ -2227,45 +2460,6 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
   db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
 }
 
-// Notification prefs, per device (that's where the APNs token lives too).
-// Default: attention and done on, activity off — "buzz me when the agent
-// needs me or finishes; routine activity is opt-in." NULL / unparseable /
-// non-object all fall back to that default wholesale: a corrupt row must
-// fail open on attention/done (the two that matter most), not silence
-// every push. Per key, an explicit boolean in the stored JSON always wins
-// in either direction (on or off); anything else for that key falls back
-// to its default.
-export function parsePushPrefs(text) {
-  const prefs = { attention: true, done: true, activity: false }
-  if (!text) return prefs
-  let parsed
-  try { parsed = JSON.parse(text) } catch { return prefs }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return prefs
-  for (const k of Object.keys(prefs)) {
-    if (typeof parsed[k] === 'boolean') prefs[k] = parsed[k]
-  }
-  return prefs
-}
-
-// Partial update: only boolean fields in `partial` override the stored
-// state; everything else keeps its current value. Always writes the full
-// three-key shape so a stored row never depends on merge-at-read.
-export function setPushPrefs(db, deviceId, partial) {
-  const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
-  const merged = parsePushPrefs(row ? row.push_prefs : null)
-  for (const k of Object.keys(merged)) {
-    if (typeof partial[k] === 'boolean') merged[k] = partial[k]
-  }
-  db.prepare('UPDATE devices SET push_prefs=? WHERE id=?').run(JSON.stringify(merged), deviceId)
-  return merged
-}
-
-// Read the current push prefs for a device (the read half of the setPushPrefs pair).
-export function getPushPrefs(db, deviceId) {
-  const row = db.prepare('SELECT push_prefs FROM devices WHERE id=?').get(deviceId)
-  return parsePushPrefs(row ? row.push_prefs : null)
-}
-
 // Called by the push pipeline on a 410 Unregistered response — the token is
 // dead, so stop trying it rather than retrying forever (sygnal lesson).
 export function pruneApnsToken(db, deviceId) {
@@ -2276,8 +2470,14 @@ export function pruneApnsToken(db, deviceId) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_prefs, push_level FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
+}
+
+// Records the sync scope a client's hello named. Written only when it
+// changes, since every reconnect sends it.
+export function setDeviceSyncScope(db, deviceId, scope) {
+  db.prepare('UPDATE devices SET sync_scope=? WHERE id=? AND sync_scope IS NOT ?').run(scope, deviceId, scope)
 }
 
 // The unread badge = SUM(unread_count) over the owner's conversations.
@@ -2292,8 +2492,8 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").

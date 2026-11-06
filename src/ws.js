@@ -3,9 +3,10 @@ import { WebSocketServer } from 'ws'
 import { appendAgentIdempotent } from './agent-idem.js'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
+import { parseSyncScope } from './sync-scope.js'
 import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
-import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
+import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -15,8 +16,9 @@ import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconc
 import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
 import { answerSpawnAsk } from './consent-answer.js'
 import { expireContactAsks } from './contacts.js'
+import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
-import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
+import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
@@ -475,6 +477,7 @@ export function attachWs({
       try {
         for (const row of expireContactAsks(db)) onContactAskExpired({ db, hub }, row)
         for (const row of expireGrantAsks(db)) onGrantAskExpired({ db, hub }, row)
+        for (const row of expireInviteAsks(db)) onInviteAskExpired({ db, hub }, row)
         // Room asks, session or talk (the owner's 24 h, a talk guest's week).
         sweepTalkAsks({ db, hub, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
         for (const row of expireSessionShareAsks(db)) onShareAnswered({ db, hub }, null, { outcome: 'expired', share: { ...row, state: 'expired' }, before: row })
@@ -596,13 +599,25 @@ export function attachWs({
           // Absent field = asserts visible: an unpinned flag follows the env
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
+          // Optional client sync scope (src/sync-scope.js). Same reject shape
+          // as a bad cursor. Agents' delivery is already scoped by
+          // membership, so they ignore it.
+          const syncScope = parseSyncScope(msg.sync)
+          if (syncScope === undefined) {
+            ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
+            ws.close()
+            return
+          }
           // conn is assigned here, before replay/registration complete below. If another
           // message arrives while the replay loop is yielded (see setImmediate below),
           // it will be dispatched to handleOp before hub.register(conn) runs. That's safe
           // for every op handled today: any journal append it triggers gets a seq greater
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
-          conn = { ws, ...who, viewingConvoIds: new Set() }
+          conn = { ws, ...who, viewingConvoIds: new Set(), syncScope: who.kind === 'client' ? syncScope : null }
+          // Kept on the device row for the push pipeline's wakes, which
+          // decide for devices that have no socket.
+          if (who.kind === 'client') setDeviceSyncScope(db, who.deviceId, conn.syncScope)
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           // Set when the replay below yields: a pin change made meanwhile sent
           // its `pins` frame to registered sockets only, and pins are not
@@ -621,6 +636,9 @@ export function attachWs({
           // ordinary agent never learns a private-owned conversation's id.
           // applyBridgePrivate ran above, so the flag is already current.
           const coordinator = coordinatorFor(db, who.userId, { excludePrivateOwned: who.kind === 'agent' && !isPrivateDevice(db, who.deviceId) })
+          // A for_you socket carries every event of the Coordinator
+          // conversation; hub.broadcastJournal keeps this current after.
+          conn.coordinatorConvoId = coordinator
           // pins (src/pins.js): a client's sidebar entries, so a reconnecting
           // app catches up on changes made elsewhere while it was offline.
           // box_defaults (src/box-defaults.js): an agent's own defaults for
@@ -637,6 +655,10 @@ export function attachWs({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
             ...(who.kind === 'client' ? { pins: listPins(db, who.userId) } : {}),
+            // sync: the scope this socket got, for a client that named one, so
+            // an app can tell a journal that honours `hello.sync` from one
+            // that predates it.
+            ...(who.kind === 'client' && msg.sync != null ? { sync: conn.syncScope ?? 'everything' } : {}),
             ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
           }))
@@ -647,12 +669,17 @@ export function attachWs({
             // is never registered (no live traffic for this abandoned attempt).
             // A client may LOWER the valve for its own connection with an optional
             // hello `max_replay` (non-negative integer; anything else is ignored,
-            // not rejected — it is an additive field). A client that applies rows
-            // one by one knows its own replay cost; the web client asks for a
-            // snapshot past a few hundred rows instead of receiving tens of
-            // thousands of frames. It can never raise the server's limit.
+            // not rejected — it is an additive field). It can never raise the
+            // server's limit.
             const clientMax = Number.isInteger(msg.max_replay) && msg.max_replay >= 0 ? msg.max_replay : Infinity
-            if (headSeq - msg.cursor > Math.min(maxReplay, clientMax)) {
+            const valve = Math.min(maxReplay, clientMax)
+            // A for_you replay is measured by what it would send, not by the
+            // whole journal's gap: most of that gap is never sent to it.
+            const scoped = conn.syncScope === 'for_you'
+            const gap = scoped
+              ? scopedReplayCount(db, who.userId, msg.cursor, conn.coordinatorConvoId, valve)
+              : headSeq - msg.cursor
+            if (gap > valve) {
               ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
               ws.close(4009)
               return
@@ -675,7 +702,14 @@ export function attachWs({
               return d
             }
             for (;;) {
-              const batch = eventsAfter(db, who.userId, cursor, 500)
+              // Re-read per batch: the role can move while the loop yields,
+              // and this socket is not registered yet, so hub.broadcastJournal
+              // cannot tell it. Replayed `coordinator` frames are history; the
+              // current holder is what a for_you socket follows.
+              if (scoped) conn.coordinatorConvoId = coordinatorFor(db, who.userId)
+              const batch = scoped
+                ? scopedEventsAfter(db, who.userId, cursor, conn.coordinatorConvoId, 500)
+                : eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
                 if (decisionCache && !replaysTo(e.convo_id)) continue
                 // Client-only events (the agent-chat approval card) never
@@ -730,6 +764,14 @@ export function attachWs({
           // the loop above) closes that window. Both checks are synchronous with
           // register, so 'close' cannot interleave between check and register.
           if (conn.closed) return
+          // A for_you replay skips most seqs, so its last frame is not the
+          // head. This frame moves the app's cursor to the head the replay
+          // reached. Sent in the same synchronous tail as register, so no
+          // event can land between the two.
+          if (conn.syncScope && msg.cursor != null) {
+            const reached = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
+            ws.send(JSON.stringify({ kind: 'control', op: 'cursor', seq: reached ? reached.seq : 0 }))
+          }
           hub.register(conn)
           conn.registered = true
           // Host-vitals paint-on-connect: a fresh client gets the last host
@@ -2441,7 +2483,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // republished release runs it again, a no-op once it is done.
         if (msg.type === 'prompt_reply') {
           try {
-            withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
+            const withdrawn = withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
+            // A shared mission's grantees lose its words too.
+            const it = withdrawn && db.prepare('SELECT i.id, i.mission_id, i.consent, i.private FROM item_comments c JOIN items i ON i.id = c.item_id WHERE c.id=?').get(withdrawn)
+            if (it?.mission_id && it.consent == null && !it.private) notifyGrantees({ db, hub }, it.mission_id, 'item', it.id)
           } catch (err) {
             console.error('ws: withdrawing a cancelled item reply failed', err)
           }

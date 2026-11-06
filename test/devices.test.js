@@ -27,7 +27,7 @@ test('GET /devices lists only the caller user devices, marks is_self, gates agen
   // roster shape: exactly these keys, no token_hash/user_id leakage; an
   // agent box adds its defaults for new sessions (src/box-defaults.js)
   assert.deepEqual(Object.keys(agentRow).sort(),
-    ['connected', 'created_at', 'cursor', 'defaults', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name', 'push_prefs', 'tag_char'])
+    ['connected', 'created_at', 'cursor', 'defaults', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name', 'tag_char'])
 
   // agent bearers are gated like /password: 403 forbidden
   const asAgent = await s.http('/devices', { token: agent.token })

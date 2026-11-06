@@ -6,7 +6,6 @@ import { parseQuery, matchExact, matchAll, matchAny } from './search-query.js'
 import { docVisibilitySql, missionOk } from './search-docs.js'
 import { ORIGIN_SIEVE } from './missions.js'
 
-export const TIERS = ['number', 'exact','words', 'stemmed', 'similar', 'some_words']
 const KINDS = ['mission', 'item', 'memory', 'project']
 const THIN = 5 // fewer strict results than this → some_words tier runs
 const MAX_PAGES = 4 // per tier; see runTier

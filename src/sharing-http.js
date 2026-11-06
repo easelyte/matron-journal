@@ -8,6 +8,8 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
+//   /contacts/invites…                      contacts on other journals, and an agent's ask for an
+//                                           invite link (src/federation-contacts-http.js)
 //   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
 //   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}
@@ -45,6 +47,9 @@ import { getItem } from './items.js'
 import { USERNAME_RE } from './users-http.js'
 import { revokeSharesBetween } from './person-rooms.js'
 import { onContactEndedRooms, onGrantEndedRooms, onShareEnded } from './person-rooms-events.js'
+import { handleInviteRoute } from './federation-contacts-http.js'
+import { listIncoming, getIncoming, incomingRow } from './federation-grants.js'
+import { applyInviteAnswer } from './federation-invite-asks.js'
 
 // Phase 2's share of a contact ending: every room between the two people
 // ends on both sides, and every session either one shared with the other
@@ -60,11 +65,20 @@ function endPeopleRooms(ctx, out) {
   }
 }
 
+// Removing or blocking, and for a contact on another journal the message
+// that tells its journal, in one transaction: the ending never commits
+// without the message that carries it.
+const endContact = (ctx, end) => ctx.db.transaction(() => {
+  const out = end()
+  if (out) ctx.federationContacts?.queueEnd(out)
+  return out
+})()
+
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const blocked = (res, by, extra = {}) => conflict(res, { blocked_by: by, ...extra })
 const CONTACT_CONFLICTS = new Set(['already_contact', 'pending', 'pending_in', 'blocked', 'too_many_asks', 'not_pending', 'not_active', 'not_blocked'])
 const GRANT_CONFLICTS = new Set(['not_contact', 'level_unavailable', 'private_mission', 'pending', 'too_many_asks', 'not_pending', 'not_active',
-  'handed_over', 'mission_closed', 'project_closed', 'empty_project', 'handover_changed'])
+  'handed_over', 'mission_closed', 'project_closed', 'empty_project', 'handover_changed', 'federation_off'])
 
 // The conversation an agent's ask is parked in — where its card goes. Same
 // gate as every other agent-authored append. A client names none.
@@ -129,13 +143,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
     if (req.method === 'GET') { json(res, 200, { contact: contactRow(own) }); return true }
     if (req.method === 'DELETE') {
       let out
-      try { out = removeContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+      try { out = endContact(ctx, () => removeContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
         if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
         throw err
       }
       if (!out) return notFound(res)
       onContactEnded(ctx, who, out, 'removed')
       endPeopleRooms(ctx, out)
+      ctx.federationContacts?.kick()
       json(res, 200, { contact: contactRow(out.contact) })
       return true
     }
@@ -160,13 +175,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
   }
   if (sub === 'block') {
     let out
-    try { out = blockContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+    try { out = endContact(ctx, () => blockContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
       if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
       throw err
     }
     if (!out) return notFound(res)
     onContactEnded(ctx, who, out, 'blocked')
     endPeopleRooms(ctx, out)
+    ctx.federationContacts?.kick()
     json(res, 200, { contact: contactRow(out.contact) })
     return true
   }
@@ -205,7 +221,8 @@ function contactActivity(db, userId, contactId) {
 async function handleShareCreate(ctx, req, res, who, subject) {
   const { db } = ctx
   const body = await readBody(req)
-  if (typeof body.contact !== 'string' || !body.contact || body.contact.length > 128) return badRequest(res)
+  // A contact id or name, or the address (name@host) of one on another journal.
+  if (typeof body.contact !== 'string' || !body.contact || body.contact.length > 324) return badRequest(res)
   const level = body.level ?? 'read'
   if (!GRANT_LEVELS.includes(level)) return badRequest(res)
   let brief = null
@@ -227,7 +244,7 @@ async function handleShareCreate(ctx, req, res, who, subject) {
   try {
     out = subject.kind === 'project'
       ? shareProject(db, { ...args, projectId: subject.row.id })
-      : shareMission(db, { ...args, missionId: subject.row.id })
+      : shareMission(db, { ...args, missionId: subject.row.id, federate: ctx.federationGrants?.federate ?? null })
   } catch (err) {
     if (err.message === 'no_mission' || err.message === 'no_project') return notFound(res)
     if (err.message === 'no_brief') return badRequest(res)
@@ -235,6 +252,7 @@ async function handleShareCreate(ctx, req, res, who, subject) {
     throw err
   }
   if (out.existing) { json(res, 200, { grant: grantRow(out.grant, who.userId), existing: true }); return true }
+  ctx.federationGrants?.kick()
   const parked = (out.grant.pending_state ?? out.grant.state) === 'awaiting_owner'
   onGrantOutcome(ctx, who, { outcome: parked ? 'parked' : 'sent', grant: out.grant })
   json(res, parked ? 202 : 201, { grant: grantRow(out.grant, who.userId), pending: parked ? 'owner' : 'peer' })
@@ -249,7 +267,7 @@ export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, ke
   const { db } = ctx
   let out
   try {
-    out = answerGrant(db, { userId: who.userId, grantId, decision, excludeMedia, keepLevel })
+    out = answerGrant(db, { userId: who.userId, grantId, decision, excludeMedia, keepLevel, federate: ctx.federationGrants?.federate ?? null })
   } catch (err) {
     if (GRANT_CONFLICTS.has(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
     // The subject of a hand-over was deleted under the ask: nothing to take over.
@@ -257,6 +275,7 @@ export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, ke
     throw err
   }
   if (!out) return { status: 404, body: { error: 'not_found' } }
+  ctx.federationGrants?.kick()
   const closed = onGrantOutcome(ctx, who, out)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   if (out.outcome === 'unavailable') return { status: 409, body: { error: 'conflict', blocked_by: 'not_contact' }, closed }
@@ -275,6 +294,44 @@ function startSessionOf(v) {
   return { device_id: v.device_id, ...(v.workdir !== undefined ? { workdir: v.workdir } : {}) }
 }
 
+// A share offered by a contact on another journal (src/federation-grants.js):
+// the grantee reads it, answers it (client only) or leaves it.
+async function handleIncomingGrant(ctx, req, res, who, id, sub) {
+  const row = getIncoming(ctx.db, who.userId, id)
+  if (!row) return notFound(res)
+  if (!sub) {
+    if (req.method === 'GET') { json(res, 200, { grant: incomingRow(row) }); return true }
+    if (req.method !== 'DELETE') return false
+    if (!ctx.federationGrants) return blocked(res, 'federation_off')
+    let out
+    try { out = ctx.federationGrants.leave(who.userId, id) } catch (err) {
+      if (err.message === 'not_active') return blocked(res, 'not_active')
+      throw err
+    }
+    if (!out) return notFound(res)
+    json(res, 200, { grant: incomingRow(out.row) })
+    return true
+  }
+  if (req.method !== 'POST') return false
+  if (who.kind !== 'client') return forbidden(res)
+  const body = await readBody(req)
+  if (!DECISIONS.includes(body.decision)) return badRequest(res)
+  const r = applyIncomingAnswer(ctx, who, id, body.decision)
+  json(res, r.status, r.body)
+  return true
+}
+
+function applyIncomingAnswer(ctx, who, id, decision) {
+  if (!ctx.federationGrants) return { status: 409, body: { error: 'conflict', blocked_by: 'federation_off' } }
+  let out
+  try { out = ctx.federationGrants.answer(who.userId, id, decision, who.deviceId) } catch (err) {
+    if (err.message === 'not_pending') return { status: 409, body: { error: 'conflict', blocked_by: 'not_pending' } }
+    throw err
+  }
+  if (!out) return { status: 404, body: { error: 'not_found' } }
+  return { status: 200, body: { grant: incomingRow(out.row) }, closed: out.closed }
+}
+
 async function handleGrantRoute(ctx, req, res, url, who) {
   const { db } = ctx
   const path = url.pathname
@@ -284,13 +341,16 @@ async function handleGrantRoute(ctx, req, res, url, who) {
     if (direction != null && direction !== 'in' && direction !== 'out') return badRequest(res)
     const state = url.searchParams.get('state')
     if (state != null && !GRANT_STATES.includes(state)) return badRequest(res)
-    json(res, 200, { grants: listGrants(db, who.userId, { direction, state }) })
+    // With the shares offered by contacts on other journals (fg_ ids).
+    const incoming = direction === 'out' ? [] : listIncoming(db, who.userId, { state })
+    json(res, 200, { grants: [...listGrants(db, who.userId, { direction, state }), ...incoming] })
     return true
   }
   const m = path.match(/^\/grants\/([^/]+)(?:\/(answer))?$/)
   if (!m) return false
   let id
   try { id = decodeURIComponent(m[1]) } catch { return badRequest(res) }
+  if (id.startsWith('fg_')) return handleIncomingGrant(ctx, req, res, who, id, m[2])
   // Not a party — or the grantee of a row never sent to them: an ask its
   // owner has not approved yet, or one that ended before they did — is the
   // same 404 as an unknown id.
@@ -301,11 +361,12 @@ async function handleGrantRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') { json(res, 200, { grant: grantRow(g, who.userId) }); return true }
     if (req.method === 'DELETE') {
       let out
-      try { out = revokeGrant(db, { userId: who.userId, grantId: g.id }) } catch (err) {
+      try { out = revokeGrant(db, { userId: who.userId, grantId: g.id, federate: ctx.federationGrants?.federate ?? null }) } catch (err) {
         if (GRANT_CONFLICTS.has(err.message)) return blocked(res, err.message)
         throw err
       }
       if (!out) return notFound(res)
+      ctx.federationGrants?.kick()
       onGrantRevoked(ctx, out.before, out.by, who)
       if (out.before.subject_kind === 'mission') onGrantEndedRooms(ctx, out.before.subject_id, out.before.contact_id)
       json(res, 200, { grant: grantRow(out.grant, who.userId) })
@@ -383,21 +444,26 @@ export function handleConsentTap(ctx, res, who, item, action, replyTo = null) {
   if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
   const decision = action === 'Decline' ? 'decline' : 'approve'
   let r
-  if (item.consent === 'contact') {
+  if (item.consent === 'invite') {
+    const row = db.prepare('SELECT id FROM fed_invite_asks WHERE user_id=? AND item_id=?').get(who.userId, item.id)
+    if (!row) return conflict(res)
+    r = applyInviteAnswer(ctx, who, row.id, decision)
+  } else if (item.consent === 'contact') {
     const row = db.prepare('SELECT id FROM contacts WHERE user_id=? AND item_id=?').get(who.userId, item.id)
     if (!row) return conflict(res)
     r = applyContactAnswer(ctx, who, row.id, decision)
   } else {
     const row = db.prepare('SELECT id FROM grants WHERE owner_item_id=? OR grantee_item_id=?').get(item.id, item.id)
-    if (!row) return conflict(res)
-    r = applyGrantAnswer(ctx, who, row.id, decision)
+    const incoming = row ? null : db.prepare('SELECT id FROM fed_grants_in WHERE user_id=? AND item_id=?').get(who.userId, item.id)
+    if (!row && !incoming) return conflict(res)
+    r = row ? applyGrantAnswer(ctx, who, row.id, decision) : applyIncomingAnswer(ctx, who, incoming.id, decision)
   }
   if (r.status !== 200) { json(res, r.status, r.body); return true }
   json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, comment: r.closed?.comment ?? null, ...r.body })
   return true
 }
 
-export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'share' || item?.consent === 'handover'
+export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'invite' || item?.consent === 'share' || item?.consent === 'handover'
 
 export async function handleSharingRoute(ctx, req, res, url, who) {
   const { db } = ctx
@@ -441,6 +507,7 @@ export async function handleSharingRoute(ctx, req, res, url, who) {
     if (req.method === 'POST') return handleContactRequest(ctx, req, res, who)
     return false
   }
+  if (path === '/contacts/invites' || path.startsWith('/contacts/invites/')) return handleInviteRoute(ctx, req, res, url, who)
   if (path === '/contacts/users') {
     if (req.method !== 'GET') return false
     json(res, 200, { users: listJournalUsers(db, who.userId) })

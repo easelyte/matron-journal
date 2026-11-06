@@ -19,7 +19,7 @@ import { verifyUserPassword, createClientDevice } from './auth.js'
 import { isAdmin } from './users-http.js'
 import {
   twoFactorState, isTwoFactorEnabled, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
-  regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, otpauthUri,
+  regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, otpauthUri,
 } from './two-factor.js'
 
 const ISSUER = 'Matron'
@@ -47,7 +47,17 @@ const unavailable = (res) => json(res, 503, { error: 'two_factor_unavailable' })
 
 // Two-factor can only be required when it can be set up: without the token
 // box key nobody could enrol, and requiring it would lock everyone out.
-export const twoFactorRequiredNow = (db, tokenBox) => tokenBox.enabled && isTwoFactorRequired(db)
+// This is the journal-wide switch; what holds one user is below.
+export const twoFactorPolicyNow = (db, tokenBox) => tokenBox.enabled && isTwoFactorRequired(db)
+
+// Whether the requirement holds this user: the switch is on and the
+// operator has not exempted them (users.two_factor_exempt). An exempt user
+// who has set two-factor up is still asked for their code at sign-in; this
+// only says whether they must have it.
+export function twoFactorRequiredNow(db, tokenBox, userId) {
+  if (!Number.isInteger(userId)) throw new TypeError('twoFactorRequiredNow needs a user id')
+  return twoFactorPolicyNow(db, tokenBox) && !isTwoFactorExempt(db, userId)
+}
 
 // The /login/2fa* routes. Returns true when it handled the request.
 export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) {
@@ -164,7 +174,8 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     const s = twoFactorState(db, who.userId)
     json(res, 200, {
       enabled: s.enabled, enabled_at: s.enabledAt, recovery_codes_left: s.recoveryCodesLeft,
-      required: twoFactorRequiredNow(db, tokenBox), available: tokenBox.enabled,
+      required: twoFactorRequiredNow(db, tokenBox, who.userId), exempt: isTwoFactorExempt(db, who.userId),
+      available: tokenBox.enabled,
     })
     return true
   }
@@ -211,7 +222,7 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
   if (path === '/2fa/disable' && req.method === 'POST') {
     const { password, code } = await readBody(req)
     if (!twoFactorState(db, who.userId).enabled) { json(res, 409, { error: 'not_enabled' }); return true }
-    if (twoFactorRequiredNow(db, tokenBox)) { json(res, 409, { error: 'two_factor_required' }); return true }
+    if (twoFactorRequiredNow(db, tokenBox, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return true }
     if (!(await confirmIdentity(ctx, res, who, { password, code, needCode: true }))) return true
     disableTwoFactor(db, who.userId)
     json(res, 200, { ok: true })
@@ -232,7 +243,7 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     if (typeof required !== 'boolean') { json(res, 400, { error: 'bad_request' }); return true }
     if (required && !tokenBox.enabled) { unavailable(res); return true }
     setTwoFactorRequired(db, required)
-    json(res, 200, { required: twoFactorRequiredNow(db, tokenBox) })
+    json(res, 200, { required: twoFactorPolicyNow(db, tokenBox) })
     return true
   }
 

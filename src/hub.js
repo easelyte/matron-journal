@@ -1,3 +1,5 @@
+import { scopeCarries, noteCoordinator } from './sync-scope.js'
+
 const byteLen = (s) => Buffer.byteLength(s, 'utf8')
 
 // Backpressure bound for host_vitals fan-out (broadcastVitals). A client
@@ -132,9 +134,17 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     // convo-less frames keep the old broadcast-to-everyone behavior. The
     // caller (ws.js fanOut / hello replay) computes the set: recorded
     // owner + joined participants.
+    //
+    // A client connection with a for_you sync scope (src/sync-scope.js)
+    // receives only the frames that scope carries. It follows the
+    // Coordinator role first, so the role's own frames reach it either way.
     broadcastJournal(userId, frame, agentTargets = null) {
       for (const c of byUser.get(userId) || []) {
         if (!agentMayReceive(c, agentTargets)) continue
+        if (c.syncScope) {
+          noteCoordinator(c, frame)
+          if (!scopeCarries(c, frame)) continue
+        }
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
       }
     },

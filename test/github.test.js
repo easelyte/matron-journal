@@ -93,6 +93,36 @@ test('fetchIdentity: 401/403 is unauthorized, a network failure is unreachable, 
   await assert.rejects(gJunk.fetchIdentity('t'), (e) => e instanceof GithubError && e.code === 'bad_response')
 })
 
+test('fetchIdentity: /user and the first memberships page overlap; /user failing is still the error reported', async () => {
+  let finishUser
+  let finishMemberships
+  const seen = []
+  const g = makeGithub({ clientId: 'abc', fetchImpl: fakeFetch({
+    'GET https://api.github.com/user/memberships/orgs': () => { seen.push('memberships'); return new Promise((resolve) => { finishMemberships = resolve }) },
+    'GET https://api.github.com/user': () => { seen.push('user'); return new Promise((resolve) => { finishUser = resolve }) },
+  }).fetchImpl })
+  const run = g.fetchIdentity('t')
+  await new Promise((r) => setImmediate(r))
+  assert.deepEqual(seen.sort(), ['memberships', 'user'])
+  finishMemberships({ json: [] })
+  finishUser({ json: { id: 1, login: 'x' } })
+  assert.deepEqual(await run, { github_id: 1, login: 'x', scopes: [] })
+
+  const both = makeGithub({ clientId: 'abc', fetchImpl: fakeFetch({
+    'GET https://api.github.com/user/memberships/orgs': async () => { throw new Error('ECONNRESET') },
+    'GET https://api.github.com/user': async () => ({ status: 401, json: {} }),
+  }).fetchImpl })
+  await assert.rejects(both.fetchIdentity('t'), (e) => e instanceof GithubError && e.code === 'unauthorized')
+})
+
+test('fetchIdentity: a first memberships page failure is reported even when /user succeeds', async () => {
+  const g = makeGithub({ clientId: 'abc', fetchImpl: fakeFetch({
+    'GET https://api.github.com/user/memberships/orgs': async () => { throw new Error('ECONNRESET') },
+    'GET https://api.github.com/user': async () => ({ json: { id: 1, login: 'x' } }),
+  }).fetchImpl })
+  await assert.rejects(g.fetchIdentity('t'), (e) => e instanceof GithubError && e.code === 'unreachable')
+})
+
 test('GHES host: login and api URLs follow the configured host', async () => {
   const { fetchImpl, calls } = fakeFetch({
     'POST https://ghe.example.com/login/device/code': async () => ({ json: { device_code: 'd', user_code: 'u', verification_uri: 'v', interval: 5, expires_in: 9 } }),

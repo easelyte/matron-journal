@@ -13,7 +13,7 @@
 //     tick tries again (nothing is recorded).
 // Also prunes raised-flags and nudge records older than 30 days.
 import { listUnseen, pruneFlags } from './seen.js'
-import { getCoordinatorConvoId } from './coordinator.js'
+import { coordinatorDevice } from './consent.js'
 import { isPrivateDevice } from './db.js'
 
 export const UNSEEN_NUDGE_INTERVAL_MS = 10 * 60000
@@ -30,13 +30,6 @@ export function inNudgeHours(now) {
   return h >= HOURS.from && h < HOURS.to
 }
 
-function coordinatorOf(db, userId) {
-  const convoId = getCoordinatorConvoId(db, userId)
-  if (!convoId) return null
-  const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
-  return row?.agent_device_id != null ? { convoId, deviceId: row.agent_device_id } : null
-}
-
 const online = (hub, userId, deviceId) =>
   hub.connsOf(userId).some((c) => c.deviceId === deviceId && c.ws.readyState === 1)
 
@@ -51,7 +44,7 @@ export function runUnseenNudge({ db, hub }, now = Date.now()) {
   const users = db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL').all()
   for (const { user_id: userId } of users) {
     try {
-      const coord = coordinatorOf(db, userId)
+      const coord = coordinatorDevice(db, userId)
       if (!coord || !online(hub, userId, coord.deviceId)) continue
       const prev = db.prepare('SELECT last_at FROM unseen_nudges WHERE user_id=?').get(userId)
       if (prev && now - prev.last_at < NUDGE_GAP_MS) continue
