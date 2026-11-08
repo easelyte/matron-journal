@@ -79,12 +79,10 @@ test('declining, and either side ending it', async (t) => {
   assert.equal((await w.phones.bob(`/grants/${fg3.id}`, { method: 'DELETE' })).json.blocked_by, 'not_active')
 })
 
-test('only read crosses; an agent asks and the owner approves; the grantee answers only from a client', async (t) => {
+test('a hand-over does not cross; an agent asks and the owner approves; the grantee answers only from a client', async (t) => {
   const w = await world(t)
-  for (const level of ['contribute', 'owner']) {
-    const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level, ...(level === 'owner' ? { brief: 'All yours.' } : {}) }))
-    assert.deepEqual([r.status, r.json.blocked_by], [409, 'level_unavailable'], level)
-  }
+  const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'owner', brief: 'All yours.' }))
+  assert.deepEqual([r.status, r.json.blocked_by], [409, 'level_unavailable'])
   const asked = await w.aliceBox(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read', convo_id: 'work' }))
   assert.equal(asked.status, 202)
   assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE op='grant.offer'").get().n, 0, 'nothing leaves before the owner approves')

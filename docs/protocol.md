@@ -4558,7 +4558,7 @@ The app-link files are served unauthenticated from env and are
 
 | Route | Env | Body |
 |---|---|---|
-| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}]}]}}` |
+| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}, {"/":"/contact", comment:"Matron contact invites"}]}]}}` |
 | `GET /.well-known/assetlinks.json` | `MATRON_ANDROID_PACKAGE` and `MATRON_ANDROID_CERT_SHA256` (comma-separated colon-hex fingerprints; both required together) | `[{relation:["delegate_permission/common.handle_all_urls"], target:{namespace:"android_app", package_name, sha256_cert_fingerprints}}]` |
 
 Malformed values refuse to start the journal, naming the variable.
@@ -4579,9 +4579,9 @@ A contact is one row per side; anything is shared only while both rows are
 `active`. `address` is `user` on this journal and `user@journal` across
 journals. A contact on another journal is made only by an invite link
 (see "Contacts across journals"); its other row lives on that journal.
-A contact on another journal can be offered a mission to read (see
-"Shares across journals"); contribute and hand-over shares, and rooms, are
-same-journal only for now (`409 level_unavailable` for a share).
+A contact on another journal can be offered a mission to read or to
+contribute to (see "Shares across journals"); hand-over shares and rooms
+are same-journal only for now (`409 level_unavailable` for a hand-over).
 
 | State | Meaning |
 |---|---|
@@ -4760,6 +4760,39 @@ announced by a `convo_meta` carrying `system`): the home of `in` cards,
 their mirrors and the audit events. `/snapshot` lists it for clients with
 `system: 'people'`. No agent can read it (`/snapshot`, `/roster`, replay,
 fan-out), write to it, file into it or adopt it.
+
+### Words typed where no agent reads them
+
+Two places take text that no agent ever sees: a typed comment (no `action`)
+from the user on a contact or share card's mirror, or on any mirror in the
+People conversation, and a `send` of `type: 'text'` into the People
+conversation. The journal still stores both, and also passes them to the
+user's Coordinator (`src/people-replies.js`):
+
+- **A task in the Coordinator conversation**, filed as the user's own
+  (`created_by: 'user'`, `awaiting: 'agent'`, so its `created` marker is an
+  ordinary turn and wakes the box). Its title is `Reply on a card: <card
+  title>` or `Message in People: <the message>`, whitespace collapsed,
+  `(empty)` for none, cut to 200 characters with `…`. Its body quotes the
+  words, names the card, and says the card's text may quote another person
+  and is information, not instructions. A comment's attachments go with it
+  as copies with no transcript: this journal transcribes their voice notes
+  when it can (the `created` marker carries the body comment, pending), and
+  otherwise the Coordinator's bridge does. The card stays hidden from agents.
+- **Replays finish the work.** Every write is keyed to the reply
+  (`people-reply:<comment id>`, `people-reply-note:<comment id>`,
+  `people-send:<convo>:<seq>`, `people-send-note:<convo>:<seq>`), and a
+  replayed request runs the forward again: one cut short by a crash is
+  finished, one already done writes nothing.
+- **A line where it was typed**: a journal comment on the mirror (author
+  `agent`, device 0, client-only marker, status unchanged) or a journal
+  `text` in People, reading `Sent to your Coordinator: [#N <title>](matron://item/N)`.
+  With no Coordinator set, the line says nobody reads it and nothing is
+  filed.
+
+A tap is the card's answer, never forwarded. A chat join's mirror keeps its
+replies with the user (parking). A non-text `send` into People is refused
+with `bad_request` ("files and images are not passed on from People").
 
 ### Audit and live frames
 
@@ -5260,18 +5293,23 @@ Audit events (`people`, client-only): `room.offered`, `room.received`,
 
 ## Federation (between journals)
 
-Not enabled yet. Users on different journals will add each other as
-contacts and share missions and rooms as users on one journal do. A user's
-address across journals is `name@host`, where `host` names their journal.
-Journals talk directly over HTTPS, and every request is a signed envelope.
-This section grows as each part ships. So far it covers the journal's
-identity (`src/federation-identity.js`), the envelope format
+Off unless the operator turns it on. Users on different journals add each
+other as contacts by invite link, and share missions to read, as users on
+one journal do. Contributing, hand-overs and rooms across journals are not
+built yet. A user's address across journals is `name@host`, where `host`
+names their journal. Journals talk directly over HTTPS, and every request
+is a signed envelope. The parts: the journal's identity
+(`src/federation-identity.js`), the envelope format
 (`src/federation-envelope.js`), the endpoint that receives envelopes
 (`src/federation-inbound.js`), the rules for calling another journal
 (`src/federation-client.js`), the outbox that delivers ops
-(`src/federation-outbox.js`) and contacts across journals
-(`src/federation-contacts.js`). The ops so far are `ping`,
-`contact.accept_invite` and `contact.remove`.
+(`src/federation-outbox.js`), contacts across journals
+(`src/federation-contacts.js`), shares across journals
+(`src/federation-grants.js`, `src/federation-replica.js`) and their
+attachments (`src/federation-media.js`).
+
+Running it (turning it on, the allow list, checking a fingerprint, the
+kill switch, dead deliveries) is in `docs/federation-runbook.md`.
 
 ### Journal identity
 
@@ -5375,7 +5413,26 @@ POST /federation/v1      body: one envelope
 
 The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
 
-1. `to` must name a user of this journal, on this journal's host.
+0. **Limits.** Before anything but the parse and, for a journal this one
+   knows, the signature check, each request takes a token. A journal whose
+   pinned key verified a fresh envelope addressed to this journal draws on
+   a bucket of its own (burst 60, then one a second). Every other caller
+   draws on one bucket they all share (burst 60, then five a second): an
+   unknown journal, a bad signature, an invite answer before discovery, a
+   stale envelope, or one addressed to another journal. So neither naming
+   another journal's host nor replaying an envelope it sent elsewhere
+   drains anything of that journal's. With the bucket empty the answer is
+   an unsigned `429 rate_limited` with `Retry-After`, which the sender's
+   outbox retries. `GET /federation/v1/media` draws on the same shared
+   bucket for strangers, and on a separate bucket per peer for its
+   attachments. A journal pulling an attachment that meets `429` waits as
+   asked (at most 2 s) and tries once more. If it is still limited, the
+   reader gets `503 peer_busy` with `Retry-After`.
+1. `to` must be on this journal's host (`403 not_here`). Whether it names
+   a user here is asked only once the sender is known (after step 2, or
+   after discovery). A refusal before that never depends on the name in
+   `to`, so a stranger cannot probe for user names, unlisted ones
+   included.
 2. `from`'s host must be allowed by the operator's lists, and a journal
    this one knows (`fed_peers`, `active`), and the key pinned for that
    journal must verify `sig`.
@@ -5411,6 +5468,7 @@ against the state at that time.
 | 405 | only `POST` | no |
 | 409 | `id_reused` | no |
 | 413 | `too_large` | no |
+| 429 | `rate_limited` (unsigned) | yes |
 | 503 | `peer_unreachable`: discovery could not fetch the sender's well-known | yes |
 
 **Signed answers.** Every answer from step 1 on carries
@@ -5504,15 +5562,38 @@ Only an invite link makes a contact on another journal. Nobody can ask an
 address they typed: an invite is a capability its owner chose to hand out.
 
 ```
+https://<journal host>/contact#v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
 matron://contact?v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
 ```
 
+Both forms carry the same fields and open the same invite. The https form
+(`web_link`) is the one to share: chat apps and mail make it tappable. Its
+fields are all in the fragment, so the token never reaches a server or its
+logs, and its host must be `j`. The `matron://` form (`link`) is what apps
+from before the https form share; every journal and app accepts both.
+
 `t` is 256 random bits (base64url, 43 characters). `fp` is the inviter's
 journal key fingerprint (26 characters, base32). A link with any other
-field, or one twice, is refused.
+field, or one twice, is refused. So is an https link anywhere but
+`/contact`, with a query, user info, or a host that is not `j`.
+
+**`GET /contact`** on the inviter's journal is the page that an https link opens
+where no Matron app claims it. It is the same static page for every invite,
+served only while federation is on (`404` otherwise), `cache-control:
+no-store`, `referrer-policy: no-referrer`, not frameable, under a CSP that
+allows only its own inline script and style. Its script reads the fragment
+in the browser and, if the link is well-formed and names this journal,
+it shows who is asking and the fingerprint, with **Open in Matron** (the
+`matron://` form, built from the checked fields, only on a tap), **Copy
+link**, and how to paste it in. It makes no request and links nowhere
+else. The app-link files claim `/contact` too, so an installed app opens
+the https link directly, where the journal serves them
+(`MATRON_APPLE_APP_IDS`, `MATRON_ANDROID_PACKAGE` and
+`MATRON_ANDROID_CERT_SHA256`, below) and the app declares that host.
+Without them the link opens this page, and **Open in Matron** hands it on.
 
 ```
-POST   /contacts/invites                 201 {invite, link} — the link is returned this once
+POST   /contacts/invites                 201 {invite, link, web_link} — the link is returned this once, in both forms
 GET    /contacts/invites                 {invites:[invite]} — the last 30 days, newest first
 DELETE /contacts/invites/:id             {invite} — withdraw an open invite
 POST   /contacts/invites/open {link}     {inviter:{address, name, journal, fingerprint}, key_changed, contact}
@@ -5528,7 +5609,7 @@ While federation is off they answer `409 blocked_by: federation_off`.
 
 ```
 POST   /contacts/invites {convo_id}                 (agent) 202 {ask, pending:'user'}
-POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?}
+POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?, web_link?}
 ```
 
 `ask`: `{id, state: awaiting_user|approved|declined|expired, invite_id,
@@ -5536,7 +5617,7 @@ origin_convo_id, created_at, updated_at}`. Nothing is minted by asking.
 The user gets a card (`permission_request`, kind `contact_invite`,
 client-only) in the asking conversation and its tracker mirror (consent
 `invite`, Approve / Decline). The answer route and a tap on the mirror do
-the same: `approve` mints the invite and returns `{invite, link}` in that
+the same: `approve` mints the invite and returns `{invite, link, web_link}` in that
 answer, to the device that tapped, this once; the link is written to no
 event, item or comment, so no agent can read it. `decline` mints nothing.
 An ask unanswered for 24 h expires and its mirror closes as cancelled.
@@ -5612,12 +5693,17 @@ new key for that contact.
 
 ### Shares across journals
 
-A mission can be shared **read-only** with a contact on another journal.
-The owner asks exactly as for any contact (`POST /missions/:id/shares
-{contact: 'bob@b.example', level: 'read'}`), and an agent's ask parks for
-the owner's tap as before. `level` `contribute` or `owner`, and any
-project share, are `409 level_unavailable`; a contact whose journal changed
-its key is `409 not_contact`; with federation off, `409 federation_off`.
+A mission can be shared **read-only** or **to contribute to** with a
+contact on another journal. The owner asks exactly as for any contact
+(`POST /missions/:id/shares {contact: 'bob@b.example', level: 'read' |
+'contribute'}`), and an agent's ask parks for the owner's tap as before.
+`level` `owner`, and any project share, are `409 level_unavailable`; a
+contact whose journal changed its key is `409 not_contact`; with federation
+off, `409 federation_off`. An active read share asked for at `contribute`
+is a **raise**, as on one journal: the share stays read-only while the
+raise waits on the same two yeses, and only the grantee's accept raises
+it. What a contributor on another journal writes is carried by
+`mission.write` (see "Contributors across journals").
 
 The owner's journal keeps the grant in its own list (`direction: 'out'`,
 `grantee.address` the address). The grantee's journal keeps the grant it
@@ -5640,14 +5726,30 @@ lives on the owner's journal.
 Three ops carry a grant, and `mission.snapshot` and `mission.event`
 (below) what it shares, all on the subject `grant:<owner's gr_ id>`:
 
-- `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
-  mission: {num, title}, preview: {milestones, items, comments,
-  attachments}}`, sent
+- `grant.offer`, owner to grantee, body `{grant, level: 'read' |
+  'contribute', sent, mission: {num, title}, preview: {milestones, items,
+  comments, attachments}, raise?: {sent}}`, sent
   when the ask is sent (a client's ask at once, an agent's on the owner's
   approval). The receiver needs a live contact for the sender under the key
   that signed (`403 not_contact`). A grant it already holds live is the
-  same answer; one that ended is offered again. Refused or undelivered for
+  same answer; one that ended is offered again. A grantee with
+  `MAX_PENDING_OFFERS` (10) offers from that contact already waiting on
+  their tap refuses another, `409 too_many_offers`: each offer is a card.
+  Refused or undelivered for
   7 days, the owner's grant goes `expired` and the owner gets a notice.
+- **A raise** is a `grant.offer` with `raise: {sent}` (the owner's
+  `pending_at`) for a share the grantee holds active. It raises one card
+  and tracker mirror ("invites you to contribute to a mission you read",
+  card payload `raise: true, from_level`), and the grantee's incoming grant
+  shows `pending_level` / `pending_state: 'pending'` meanwhile. One no newer
+  than the last heard, or for the level the share already has, changes
+  nothing; a share not active there is not raised. The answer is
+  `grant.answer {grant, decision, raise: <level>}`: an accept raises both
+  sides, a decline leaves the share as it was. An accept the owner's
+  journal refuses (`409 not_pending`, the share ended or the raise was
+  answered meanwhile) or that never gets there puts the grantee's share
+  back at its old level, with a notice; a raise the grantee's journal
+  refuses or never gets drops on the owner's side, with a notice.
 - `grant.answer`, grantee to owner, body `{grant, decision}`. The
   grantee's row moves at the tap; the owner's grant moves when the answer
   applies, and only while it is still `pending` (`409 not_pending`
@@ -5682,7 +5784,7 @@ an accept, it sends the mission in the same transaction as
 ```
 
 `snap` (`sn_…`) names one snapshot, `pages` its page count (at most 1000),
-and `mission` is on page 0 only. Each page is at most 512 KiB. Every record
+and `mission` is on page 0 only (`null` there for a withheld snapshot, below). Each page is at most 512 KiB. Every record
 is its whole current state, built from the grantee view a contact on the
 owner's journal reads (the private-box and owner-only sieves, no consent
 mirrors, no conversation, device, box, seq or project), and only these
@@ -5695,14 +5797,19 @@ fields cross:
   contributor?`
 - item: `ref, num, kind, state, resolution, awaiting, title, body,
   created_by, created_at, updated_at, closed_at, labels, links: [{url,
-  title?}], comment_count, last_comment_at, contributor?, comments,
-  comments_truncated?`, with at most 5,000 milestones and 5,000 items, the
+  title?}], comment_count, last_comment_at, contributor?, attachments?
+  (the description's own), comments, comments_truncated?`, with at most
+  5,000 milestones and 5,000 items, the
   newest
-- comment: `ref, author, kind, body, created_at, withdrawn?, from?, to?,
-  contributor?` (`from`/`to` `{state, resolution, awaiting}` on a status
-  comment), at most 192 KiB of thread per item, the newest
+- comment: `ref, author, kind, body, created_at, attachments?, withdrawn?,
+  from?, to?, contributor?` (`from`/`to` `{state, resolution, awaiting}`
+  on a status comment), at most 192 KiB of thread per item, the newest
+- attachment: `media, name, mime, size, sha256, width?, height?,
+  transcript?`, at most 20 per comment; `media` is the owner journal's
+  blob id. A withdrawn reply carries none.
 
-Attachments do not cross yet. `ref` is the owner journal's id.
+`ref` is the owner journal's id. An attachment crosses as this record
+only; its bytes are pulled (below).
 
 The grantee's journal refuses a page for a grant that is not active there
 (`409 not_active`) and otherwise keeps a copy. Page 0 starts loading
@@ -5718,6 +5825,18 @@ control characters, unknown enum values fall back (`kind` to `task` or
 `progress`, `state` to `open`, `author` to `agent`), only http(s) links are
 kept, and anything over the caps above is cut. A page that is not
 well-formed is `400 malformed`.
+
+**Room.** The owner's journal decides what crosses, so the grantee's
+journal bounds what it keeps. An item record over twice the 192 KiB an
+owner's journal fits each item to is refused `413 too_large`. One share's
+copy, with the pages of a snapshot still loading, holds at most 64 MiB of
+text; an event that would take it past that is refused `413 replica_full`
+and changes nothing. A snapshot page with no room (either reason) gives
+that whole snapshot up: its staged pages are dropped, the copy stays as
+the last whole snapshot left it, and the page is answered `200 {ok,
+result: {refused: 'replica_full' | 'too_large'}}`, so the owner's journal
+sends no more of it. The owner is told either way that the copy over there
+may be behind.
 
 The copy gets ids of its own on the grantee's journal (`ms_…`, `it_…`,
 `ml_…`, `ic_…`), and the mission keeps its id across snapshots and across
@@ -5775,11 +5894,254 @@ so the copy only moves forward. A comment keeps its local id across
 updates of its item. Over 5,000 of a kind, the oldest goes, as a snapshot
 keeps the newest.
 
+**A box turns private.** When any device's private flag changes, either
+way (the bridge's hello, or `matron-admin device private` from another
+process), the owner's journal queues a fresh snapshot of every mission it
+shares with a contact on another journal. The outbox sends it at the
+start of its next pass (every few seconds). Records the grantee view no
+longer shows, such as items and milestones from a box that is now
+private, are then dropped from the copy over there. They come back with
+the next snapshot after the box is ordinary again.
+
+A mission the grant can no longer show at all, because its own origin
+box is now private, goes as a **withheld** snapshot: one page with
+`mission: null` and no records.
+
+```
+{grant, snap, page: 0, pages: 1, mission: null, milestones: [], items: []}
+```
+
+The grantee's journal drops the whole copy, records and all, and its
+apps get `mission_removed`. The share stays active, and the next whole
+snapshot brings the copy back under the same id. A withheld page with
+more than one page or with any record is `400 malformed`.
+
 A `mission.event` is checked on arrival like a snapshot page (`400
-malformed`, `409 not_active`). One that dies leaves the share standing;
+malformed`, `409 not_active`), and refused `413 too_large` or `413
+replica_full` when there is no room for it. One that dies leaves the share standing;
 the owner gets a notice ("Couldn't update mission #N for bob@b.example"),
 at most one a day per share, and the same when the outbox is too full to
 queue one.
+
+**Attachments.** The grantee's journal gives each attachment of its copy
+an id of its own, in the shape of a blob id, so the apps read it as any
+attachment: `GET /media/:id` (same headers as a blob). The first read
+pulls the bytes from the owner's journal with a signed `media.fetch`:
+
+```
+GET /federation/v1/media
+Matron-Federation: <base64url of the envelope's JSON>
+  {v: 1, from: <grantee>, to: <owner>, op: 'media.fetch', id, ts,
+   body: {grant: <owner's gr_ id>, media: <owner's blob id>}, sig}
+```
+
+The owner's journal checks the envelope as for an op (`400 malformed`,
+`401 stale`, `403` for an unknown or refused journal or a bad
+signature). It then checks that the grant is active, is given to `from`
+under the key that signed, and is from `to` (`403 not_shared`
+otherwise). Last, it checks that the blob is attached to a comment the
+grant's grantee view shows (`404 not_found` otherwise): never a consent
+mirror, an owner-only item, an item from a private box, or a withdrawn
+reply. It answers with the bytes and `Matron-Media-SHA256`. There is no
+receipt: the pull changes nothing.
+
+The attachment record carries the blob's own size and SHA-256, never the
+size a client wrote on the attachment. The grantee's journal keeps the
+bytes only if both match. They count in the grantee's media quota (`413
+quota_exceeded` when it is full, `413 too_large` past
+`MATRON_MEDIA_MAX_BYTES`), and later reads are served from the kept copy.
+Pulls of different files running at once count against the quota
+together. When the user is over the quota, the media reaper drops kept
+copies first, the least recently pulled first: the next read pulls them
+again. A later record naming other bytes for the same media (a different
+SHA-256 or size) drops the kept copy, and the next read pulls the new
+bytes.
+An attachment reads only while the share and its contact are active and
+the copy still shows it; otherwise it is `404`. A pull that fails is
+`502 peer_unreachable`, and the next read tries again. Kept bytes of a
+share that has ended there, or of an attachment the copy no longer shows,
+are deleted by an hourly sweep.
+
+### Contributors across journals
+
+A contact on another journal holding a share at `contribute` writes into
+the owner's mission from their own journal, through the copy they read
+(the replica's ids), with the same routes and the same limits as a
+contributor on one journal (see *Contributors*):
+
+```
+POST  /milestones {mission: <copy's ms_ id>, kind, title, body?}
+POST  /items {mission: <copy's ms_ id>, kind: task|question|decision, title, body?, labels?, links?, convo_id?}
+POST  /items/:copy's it_ id/comments {body}
+POST  /items/:copy's it_ id/close {resolution, comment?}
+POST  /items/:copy's it_ id/reopen {comment?}
+PATCH /missions/:copy's ms_ id {status}
+```
+
+Each is checked on the contributor's journal (the share active there at
+`contribute`, else `403`; a closed mission `409 blocked_by: 'closed'`;
+the fields as on one journal, `400`; no buttons, files or other fields,
+`403`/`400`), then queued and answered `202 {queued: true, write: {id,
+kind}, mission, note}`: the write is not in the copy yet. It appears there
+once the owner's journal has written it and its `mission.event` comes
+back. An agent filing an item names its conversation (`convo_id`), as on
+one journal: that is where the owner's replies go. With too much already
+waiting for that journal, `503 outbox_full` (nothing was queued).
+
+Two ops carry it, on the grant's subject (`grant:<owner's gr_ id>`), so
+they keep their order with the grant's other ops and a revoke cancels
+what waits:
+
+- `mission.write`, contributor to owner, body `{grant, kind: milestone |
+  item | comment | close | reopen | status, via: user | agent, item?,
+  fields}` (`item` the owner's `it_` id, for the three item writes;
+  `fields` the route's, as above). Before each attempt the contributor's
+  journal checks the share still lets them contribute (otherwise the write
+  is dropped quietly). The owner's journal checks the fields again and,
+  when it applies, that the grant is still active at `contribute` for that
+  address and key, the mission open and still shareable, and the item one
+  the grantee view shows. It then writes exactly what a contributor on one
+  journal would: in the owner's numbering, attributed `contributor {name:
+  <address>, via}`, with the same markers (sender `person:<address>`) and
+  turns for the owner's agents, and the grant's own `mission.event`s back
+  to every grantee. It answers `{kind, ref, num}`, the owner-side record.
+  Refusals: `400 malformed`, `403 not_contact | read_only`, `404 no_item`,
+  `409 not_active | closed | conflict` (an item already closed, or open).
+  A write refused or undelivered gives the contributor a notice ("Couldn't
+  add your milestone to mission …").
+- `item.reply_notice`, owner to contributor, body `{grant, item, action:
+  commented | closed | reopened, via, comment?}`, after the owner (or an
+  owner's agent) writes on an item the contributor filed. The owner-side
+  item keeps only the grant it came through (`contributor_grant_id`); the
+  filing conversation stays on the contributor's journal
+  (`fed_contrib_items`, keyed by the owner's item id, recorded when the
+  write's answer names it) and is never sent. That journal hands the reply
+  to the filing conversation as on one journal: an `item` marker with
+  sender `person:<owner address>`, `person {name, via}`, `shared_by
+  {user_id: 0, name: <owner address>}` and `mission_id`, from its own copy
+  of the item (the reply's `mission.event` goes first on the same
+  subject), and wakes its box. An item filed from a phone has nowhere to
+  go, and nothing is told.
+
+### Rooms across journals
+
+A talk request (see *Rooms between people*) can go to a contact on another
+journal: the agent's `agent_invite` names them by address,
+`target_person: "bob@b.example"` (an address up to 324 characters). Only
+an existing contact on another journal can be asked (a live contact,
+pinned to the key their journal serves): there is no contact-by-talk
+across journals, and anyone else is `not_found`. With federation off the
+ask is `conflict federation_off`. The room checks are the same as on one
+journal (a fresh room, just the two agents, the parked-asks cap, an
+attached mission already shared with them at `read` or `contribute`), and
+so are the two taps: the owner's **Send** or **Cancel** on their agent's
+ask, then the guest's choice of where their side talks (**New session**,
+**My Coordinator**, **Pick a session**, or **Decline**), each on a
+client-only card and mirror (`consent: 'room'`, `remote: true` on the
+card). Neither person's Coordinator can tap either.
+
+Each journal keeps its own half of the room (`fed_rooms`): the owner's
+journal the asking room, the guest's journal the room it creates when the
+guest chooses. That room has no agent of its own: the guest's agent is
+invited into it by the journal (`from_device_id: 0`), and the invite frame
+names the other side as `person {name: <address>}`. Neither journal learns
+the other side's rooms, devices or sessions. Four ops carry it, all on the
+subject `room:<owner journal's fr_ id>`, so each side's ops arrive in
+order:
+
+- `room.invite`, owner to guest, body `{room, topic, justification,
+  mission?: {grant}}` (`grant` the owner's `gr_` id, which the guest's
+  journal maps to its copy of the mission). Refusals: `400 malformed`,
+  `403 not_contact`, `429 too_many_asks` (five of that contact's talk
+  requests already waiting on this user).
+- `room.answer`, guest to owner, body `{room, outcome}`: `accepted`,
+  `declined` or `expired` (the guest person, after their week), then
+  `joined`, `agent_declined` or `agent_expired` (their agent's answer to
+  its invite). The owner's agent hears `accepted`, then `joined`, as a
+  same-journal owner hears the guest accept and then the guest's agent
+  join (`invite answer accept: true`); any refusal as `invite answer
+  accept: false` with `reason: refused` or `expired`. A late or repeated
+  answer to a room that moved on changes nothing. On `accepted` the
+  owner's journal sends what its room said so far (at most 50 messages,
+  the room being fresh), so the guest's agent finds it on joining.
+- `room.message`, either way, body `{room, n, body, via}`: a text
+  message, `n` the sender's own event seq (the receiver's idempotency
+  key), cut at 16,000 characters. It lands in the other side's room with
+  sender `person:<address>` and payload `{body, person: {name: <address>},
+  via}`, exactly a copy on one journal, so the bridge starts the same
+  restricted turn. Files and images do not cross (`publish` refuses them
+  in either room).
+- `room.end`, either way, body `{room, by}`: `owner_agent` or
+  `owner_user` from the owner's side, `guest_agent` or `guest_user` from
+  the guest's. Either agent leaving (`agent_leave`) or either person
+  ending it (`DELETE /person-rooms/:id`) ends both halves.
+
+Removing or blocking the contact ends every room with them on both
+journals: each journal ends its own half when its contact ends. An op that
+cannot be delivered (the other journal refused it, or could not be reached
+for 7 days) ends the room on the sending side with a notice, "Room with
+`<address>` ended"; a journal that does not know these ops yet answers
+`400 unknown_op`, and the notice says it "does not take rooms with other
+journals yet".
+
+`GET /person-rooms?room_id=` answers for either half as for a room on one
+journal, with `person` the other side's address, `kind: 'talk'`, `remote:
+true` and `mission` the attached mission as this side reads it: the
+owner's own (while it is still shared with them), or on the guest's side
+their copy (`owner` the owner's address, `level` the share's). `GET
+/person-rooms` lists both kinds. `POST /person-rooms/:id/answer` takes the
+same bodies as a talk request's.
+
+#### Session shares across journals
+
+A session can be shared with a contact on another journal exactly as with
+one on the same journal: `POST /session-shares {convo_id, contact}` with
+`contact` their address (`bob@b.example`), the same rules, the same card
+for an agent's ask (it says the title goes to their journal), the same
+`DELETE`. The contact must be live (`409 not_contact` otherwise). While the
+share is active, the sharer's journal tells theirs, on the subject
+`share:<ss_ id>`:
+
+- `session.share`, sharer to contact, body `{share, title}`: `share` the
+  sharer's `ss_` id, `title` the session's title (at most 200 characters).
+  Sent when the share becomes active and again whenever the session's title
+  changes (the sweep compares it with the last title sent). A session that
+  can no longer be shared (its box made private) is withdrawn the same way,
+  and offered again if it can be shared again.
+- `session.unshare`, sharer to contact, body `{share}`: the share was
+  revoked. Rooms already open with the session stand, as on one journal.
+
+Removing or blocking the contact drops every share between the two on
+both journals, with nothing sent. A journal that does not know these ops
+answers `400 unknown_op`, and the sharer gets one notice saying the contact
+cannot see the shared session yet.
+
+The contact's journal lists what it was sent (`fed_sessions_in`) on `GET
+/roster`, under `people` with the sharer's address:
+
+```
+{person: "alice@a.example", sessions: [{convo_id: "fs_…", title, agent_device_id: null, session_state: null, created_at, remote: true}]}
+```
+
+`convo_id` is that journal's own id for the share. Nothing else of the
+sharer's crosses: no conversation id, device, box or state.
+
+To ask for a room with it, an agent sends a talk request naming both:
+
+```
+agent_invite {room_id, target_person: "alice@a.example", target_convo_id: "fs_…", from_convo_id?, topic?, justification, mission?}
+```
+
+An `fs_` id that is not an active share from that contact is `not_found`.
+Everything else is a talk request across journals (above): the owner's
+**Send** or **Cancel**, then `room.invite` carries `session: <ss_ id>`. The
+sharer's journal refuses it with `409 not_shared` when that share is no
+longer active to this contact (the asking side's room ends with a notice).
+Otherwise the sharer gets the card for that session, **Accept** or
+**Decline**, instead of the choice of where to talk. **Accept** invites the
+session's own agent (`target_convo_id` its conversation); if the share has
+ended since the ask arrived, **Accept** declines it instead. The rest — the
+answers, the messages, the end — is the same as any room across journals.
 
 ## Device privacy
 

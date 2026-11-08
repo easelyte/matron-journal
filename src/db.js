@@ -675,6 +675,7 @@ CREATE TABLE IF NOT EXISTS session_shares(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   revoked_at       INTEGER,
+  fed_title        TEXT,
   UNIQUE(convo_id, contact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_session_shares_contact ON session_shares(contact_id, state);
@@ -894,12 +895,100 @@ CREATE TABLE IF NOT EXISTS fed_replica_pages(
   received_at  INTEGER NOT NULL,
   PRIMARY KEY(fg_id, page)
 );
+-- An attachment of a copy (src/federation-media.js): one row per attachment
+-- the copy's threads name, with an id of its own in the shape of a blob id
+-- (GET /media/:id reads it). ref is the owner journal's blob id. The bytes
+-- are pulled on first read into disk_path, and count in the user's media
+-- quota (userBlobBytes). Rows of a share no longer active here, and their
+-- files, go in purgeReplicaMedia's sweep.
+CREATE TABLE IF NOT EXISTS fed_media(
+  id          TEXT PRIMARY KEY,
+  fg_id       TEXT NOT NULL,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  ref         TEXT NOT NULL,
+  mime        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  sha256      TEXT NOT NULL,
+  disk_path   TEXT,
+  fetched_at  INTEGER,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(fg_id, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_media_user ON fed_media(user_id);
 CREATE TRIGGER IF NOT EXISTS fed_replica_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
   DELETE FROM fed_replica_pages WHERE fg_id = NEW.id;
   DELETE FROM fed_replica_items WHERE fg_id = NEW.id;
   DELETE FROM fed_replica_milestones WHERE fg_id = NEW.id;
   DELETE FROM fed_replica_missions WHERE fg_id = NEW.id;
 END;
+-- Items this user filed into a mission shared from another journal
+-- (src/federation-contribute.js): the owner's item id (ref) and the
+-- conversation that filed it, where the owner's replies go. Kept here only,
+-- never sent; gone with the share.
+CREATE TABLE IF NOT EXISTS fed_contrib_items(
+  fg_id       TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  convo_id    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(fg_id, ref)
+);
+CREATE TRIGGER IF NOT EXISTS fed_contrib_items_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
+  DELETE FROM fed_contrib_items WHERE fg_id = NEW.id;
+END;
+-- One journal's half of a room between this user's agent and the agent of a
+-- contact on another journal (src/federation-rooms.js). role 'owner': the
+-- asking side, ref = id, room_id the asker's room. role 'guest': the side
+-- that was asked, ref = the owner journal's id, room_id the room created
+-- here when the guest chose where to talk. The other side's room, devices
+-- and sessions are never known here.
+CREATE TABLE IF NOT EXISTS fed_rooms(
+  id            TEXT PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  role          TEXT NOT NULL CHECK(role IN ('owner','guest')),
+  contact_id    TEXT NOT NULL,
+  peer_host     TEXT NOT NULL,
+  peer_name     TEXT NOT NULL,
+  ref           TEXT NOT NULL,
+  room_id       TEXT,
+  device_id     INTEGER,
+  convo_id      TEXT,
+  mission_id    TEXT,
+  grant_ref     TEXT,
+  session_ref   TEXT,
+  state         TEXT NOT NULL CHECK(state IN
+                  ('awaiting_owner','awaiting_guest','starting','invited','joined','declined','refused','withdrawn','left','expired')),
+  topic         TEXT NOT NULL DEFAULT '',
+  justification TEXT NOT NULL DEFAULT '',
+  item_id       TEXT,
+  ended_by      TEXT,
+  pick_options  TEXT,
+  spawn_id      TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  answered_at   INTEGER,
+  sent_at       INTEGER,
+  UNIQUE(role, peer_host, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_room ON fed_rooms(room_id);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_contact ON fed_rooms(contact_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_item ON fed_rooms(item_id);
+-- Sessions a contact on another journal shares with this user
+-- (src/federation-rooms.js, session.share): the title they chose to show and
+-- their share's id, which a talk request names. Never a box or device.
+CREATE TABLE IF NOT EXISTS fed_sessions_in(
+  id          TEXT PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  contact_id  TEXT NOT NULL,
+  peer_host   TEXT NOT NULL,
+  peer_name   TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  title       TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL CHECK(state IN ('active','ended')),
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE(user_id, peer_host, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_sessions_in_contact ON fed_sessions_in(contact_id, state);
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(
@@ -1029,6 +1118,24 @@ function ensurePrivateTombstones(db) {
     WHEN EXISTS (SELECT 1 FROM revoked_private_devices WHERE id = NEW.id)
     BEGIN
       SELECT RAISE(ABORT, 'device id belongs to a revoked private device');
+    END`)
+  // A device's private flag changed (the bridge's hello, or matron-admin
+  // from another process): what crossed to other journals may no longer be
+  // what their copies should show, either way. Every mission shared with a
+  // contact on another journal is queued for a fresh snapshot here, and the
+  // outbox's next pass sends it (federation-grants.js resnapshot), so a
+  // record from a box that turned private leaves the copy over there.
+  db.exec(`CREATE TABLE IF NOT EXISTS fed_resnapshot(
+    grant_id   TEXT PRIMARY KEY,
+    queued_at  INTEGER NOT NULL
+  )`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_private_resnapshot AFTER UPDATE OF private ON devices
+    WHEN COALESCE(OLD.private, 0) <> COALESCE(NEW.private, 0)
+    BEGIN
+      INSERT OR IGNORE INTO fed_resnapshot(grant_id, queued_at)
+        SELECT g.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        FROM grants g JOIN contacts oc ON oc.id = g.contact_id AND oc.state = 'active' AND oc.peer_journal IS NOT NULL
+        WHERE g.subject_kind = 'mission' AND g.state = 'active' AND g.level <> 'owner';
     END`)
   db.exec(`CREATE VIEW IF NOT EXISTS private_devices AS
     SELECT id FROM devices WHERE private = 1
@@ -1849,6 +1956,11 @@ export function openDb(path) {
   rebuildItemsForNotice(db)
   // Talk requests: person_rooms rows aimed at a person, not a session.
   migratePersonRoomsForTalk(db)
+  // Session shares across journals (src/federation-rooms.js): a room's
+  // shared session (fed_rooms.session_ref), and the title last sent for a
+  // share with a contact on another journal (session_shares.fed_title).
+  if (!db.prepare('PRAGMA table_info(fed_rooms)').all().some((c) => c.name === 'session_ref')) db.exec('ALTER TABLE fed_rooms ADD COLUMN session_ref TEXT')
+  if (!db.prepare('PRAGMA table_info(session_shares)').all().some((c) => c.name === 'fed_title')) db.exec('ALTER TABLE session_shares ADD COLUMN fed_title TEXT')
   // Item handover (mission: hand a tracker item from one session to another).
   // An item's origin_convo_id / origin_device_id is its OWNER: every reply,
   // tap, wake and transcript follows it, and a handover moves it. The
@@ -2362,6 +2474,14 @@ export function openDb(path) {
   // A grant's replica keeps one local mission id across snapshots, and
   // across an end and a fresh accept (src/federation-replica.js).
   addCols('fed_grants_in', [['replica_mission_id', 'TEXT']])
+  // A raise of an active share across journals (read → contribute) waiting
+  // on the grantee's tap: the level asked for, and the owner's pending_at
+  // that names this sending of it (src/federation-grants.js).
+  addCols('fed_grants_in', [['pending_level', 'TEXT'], ['raise_sent', 'INTEGER']])
+  // An item a contributor on another journal filed: the owner's grant it
+  // came through, so the owner's replies reach them (src/federation-contribute.js).
+  addCols('items', [['contributor_grant_id', 'TEXT']])
+  addCols('fed_replica_items', [['attachments', "TEXT NOT NULL DEFAULT '[]'"]])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
@@ -2436,8 +2556,11 @@ export function getBlob(db, id) {
 // the user owns, including retention-offloaded tool_output payloads, since
 // they consume the same disk. COALESCE so a user with no blobs reads 0, not
 // NULL.
+// Attachments pulled for the user's copies of missions shared from other
+// journals (fed_media) count too: they are on this disk.
 export function userBlobBytes(db, userId) {
-  return db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM blobs WHERE owner_user_id=?').get(userId).bytes
+  return db.prepare(`SELECT (SELECT COALESCE(SUM(size),0) FROM blobs WHERE owner_user_id=@u)
+    + (SELECT COALESCE(SUM(size),0) FROM fed_media WHERE user_id=@u AND disk_path IS NOT NULL) AS bytes`).get({ u: userId }).bytes
 }
 
 // `apnsToken: null` unregisters (both columns cleared together — a token

@@ -394,13 +394,15 @@ function backfillTwin(ctx, l) {
 
 export function shareAsk(ctx, share, who) {
   const { db } = ctx
-  const contact = db.prepare('SELECT peer_user FROM contacts WHERE id=?').get(share.contact_id)
-  const to = t(contact?.peer_user ?? '')
+  const contact = db.prepare('SELECT peer_user, peer_journal FROM contacts WHERE id=?').get(share.contact_id)
+  // A contact on another journal is named by address.
+  const name = contact ? (contact.peer_journal ? `${contact.peer_user}@${contact.peer_journal}` : contact.peer_user) : ''
+  const to = t(name)
   const title = t(sessionTitle(db, share.convo_id), 80)
   safely('share card', () => {
     card(ctx, {
       userId: share.user_id, convoId: share.convo_id, sender: `agent:${who.name}`,
-      payload: { kind: SESSION_SHARE_CARD_KIND, direction: 'out', session_share_id: share.id, person: { name: contact?.peer_user ?? '' }, session_title: sanitizePeerText(sessionTitle(db, share.convo_id), TITLE_CAP), from_device_id: who.deviceId, from_name: sanitizePeerText(who.name, 80) },
+      payload: { kind: SESSION_SHARE_CARD_KIND, direction: 'out', session_share_id: share.id, person: { name }, session_title: sanitizePeerText(sessionTitle(db, share.convo_id), TITLE_CAP), from_device_id: who.deviceId, from_name: sanitizePeerText(who.name, 80) },
     })
     const item = fileMirror(ctx, {
       userId: share.user_id, convoId: share.convo_id, deviceId: who.deviceId, sender: `agent:${who.name}`, consent: 'session',
@@ -410,6 +412,7 @@ export function shareAsk(ctx, share, who) {
         '',
         `- **What ${to}'s agents see:** this session's title on their roster, under your name. Never the box, its other sessions, or anything in them.`,
         `- **What it allows:** ${to}'s agents can ask for a room with this session. Each room still needs your approval and ${to}'s.`,
+        ...(contact?.peer_journal ? [`- ${to} is on another Matron journal: the session's title goes to ${t(contact.peer_journal)}.`] : []),
         '- You or this agent can stop sharing it at any time.',
         '',
         '**To answer:** tap **Approve** or **Decline**. Unanswered, the request expires 24 h after it was made.',

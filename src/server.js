@@ -33,9 +33,13 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
-import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeContactPage } from './contact-page.js'
+import { makeFederationHandler, makeFederationLimiter, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federation-media.js'
 import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
+import { makeContributeFederation } from './federation-contribute.js'
+import { makeRoomFederation } from './federation-rooms.js'
 import { makeOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
@@ -607,7 +611,7 @@ export function startServer({
   // Federation between journals (src/federation-identity.js): the test
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
-  federationEnv, federationOps, federationClient,
+  federationEnv, federationOps, federationClient, federationLimits,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -908,7 +912,8 @@ export function startServer({
     allowJournals: process.env.MATRON_FEDERATION_ALLOW_JOURNALS, denyJournals: process.env.MATRON_FEDERATION_DENY_JOURNALS,
   })
   const handleFederationWellKnown = makeFederationWellKnown(federation)
-  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
+  const handleContactPage = makeContactPage(federation)
+  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleContactPage(req, res, url) || handleAppWellKnown(req, res, url)
   // The outbound client (src/federation-client.js): `federationClient` is
   // its test seam. Contacts across journals (src/federation-contacts.js)
   // register their ops with both ends.
@@ -918,18 +923,35 @@ export function startServer({
     : null
   // Mission shares with contacts on other journals (src/federation-grants.js).
   const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
+  // What a contributor on another journal writes, and the owner's replies
+  // (src/federation-contribute.js).
+  const federationContribute = federation.enabled ? makeContributeFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
+  // Rooms with contacts on other journals (src/federation-rooms.js).
+  const federationRooms = federation.enabled ? makeRoomFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
-  const handleFederation = makeFederationHandler({
-    db, federation, client: federationClientInUse,
-    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
+  // One set of abuse limits for both federation routes (federationLimits
+  // is the test seam).
+  const federationLimiter = makeFederationLimiter(federationLimits ?? {})
+  const handleFederationOps = makeFederationHandler({
+    db, federation, client: federationClientInUse, limiter: federationLimiter,
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationContribute?.inbound ?? {}), ...(federationRooms?.inbound ?? {}), ...(federationOps ?? {}) },
   })
+  // Attachments of read shares (src/federation-media.js): the owner's
+  // signed pull, and the grantee's pull-through copy behind GET /media/:id.
+  const handleFederationMedia = makeMediaHandler({ db, federation, limiter: federationLimiter })
+  const handleFederation = async (req, res, url) => (await handleFederationMedia(req, res, url)) || handleFederationOps(req, res, url)
+  const federationMedia = federation.enabled
+    ? makeReplicaMedia({ db, federation, client: federationClientInUse, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes, quotaBytes: resolvedMediaUserQuotaBytes })
+    : null
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound } })
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound, ...federationContribute.outbound, ...federationRooms.outbound }, beforePass: () => federationGrants.resnapshot() })
     : null
   federationContacts?.setOutbox(federationOutbox)
   federationGrants?.setOutbox(federationOutbox)
+  federationContribute?.setOutbox(federationOutbox)
+  federationRooms?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -963,7 +985,7 @@ export function startServer({
     fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
     fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
     fileOwnerUserId: resolvedFileOwnerUserId,
-    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   })))
   const wss = attachWs({
@@ -1003,6 +1025,7 @@ export function startServer({
       if (federation.enabled) {
         receiptPruneInterval = setInterval(() => {
           try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
+          try { purgeReplicaMedia(db) } catch (err) { console.error('federation: media purge failed', err) }
         }, 3600_000)
         receiptPruneInterval.unref()
         federationOutbox.start()
@@ -1120,6 +1143,8 @@ export function startServer({
         federationOutbox,
         federationContacts,
         federationGrants,
+        federationMedia,
+        federation,
         // close({ closeCode, closeReason, graceMs }): with a closeCode every
         // open websocket first gets a close frame carrying it, so a client
         // can tell a restart from a network drop, and up to graceMs to

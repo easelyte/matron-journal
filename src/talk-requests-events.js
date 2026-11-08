@@ -103,7 +103,7 @@ function guestTalkAsk(ctx, l) {
 
 // A journal question on the guest's mirror, with its own buttons (the
 // comment-actions contract): the tap comes back with `reply_to`.
-function guestQuestion(ctx, l, body, actions) {
+export function guestQuestion(ctx, l, body, actions) {
   const { db, hub } = ctx
   return safely('talk follow-up', () => {
     const out = addComment(db, { userId: l.guest_user_id, itemId: l.guest_item_id, author: 'agent', deviceId: 0, body, actions, keepStatus: true })
@@ -209,6 +209,26 @@ export function onTalkGuestOutcome(ctx, who, out) {
 // an empty workdir. The seam is `ctx.broker`; without one the start fails
 // like any other.
 export async function startTalkSession(ctx, l, target, spawnId, who) {
+  const { db } = ctx
+  const { convoId, code } = await issueTalkStart(ctx, l, target)
+  if (convoId) {
+    const done = safely('talk start complete', () => completeTalkStart(db, { linkId: l.id, spawnId, deviceId: target.deviceId, convoId }))
+    if (done?.outcome === 'start_failed') {
+      offerAgain(ctx, done.link, "Couldn't start a session: bad_start_reply. Pick another option.")
+      return 'failed'
+    }
+    if (done) { onTalkGuestOutcome(ctx, who, done); return 'started' }
+    return 'stale'
+  }
+  const back = failTalkStart(db, { linkId: l.id, spawnId })
+  if (back) offerAgain(ctx, back, `Couldn't start a session: ${code}. Pick another option.`)
+  return 'failed'
+}
+
+// The start itself, for a talk on one journal or across two (src/
+// federation-rooms.js): `l` needs guest_user_id, owner_name and topic.
+// → {convoId} on success (the conversation row exists), else {code}.
+export async function issueTalkStart(ctx, l, target) {
   const { db, hub, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0 } = ctx
   let code = null
   let convoId = null
@@ -229,24 +249,14 @@ export async function startTalkSession(ctx, l, target, spawnId, who) {
     console.error('talk request: start threw', err)
     code = 'internal'
   }
-  if (convoId) {
-    // The child's bridge normally announces its conversation itself; until
-    // it does, the journal knows it as the talk's session on that box.
-    safely('talk session row', () => {
-      const cur = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
-      if (!cur) upsertConversation(db, { id: convoId, ownerUserId: l.guest_user_id, title: talkSessionTitle(l), agentDeviceId: target.deviceId })
-    })
-    const done = safely('talk start complete', () => completeTalkStart(db, { linkId: l.id, spawnId, deviceId: target.deviceId, convoId }))
-    if (done?.outcome === 'start_failed') {
-      offerAgain(ctx, done.link, "Couldn't start a session: bad_start_reply. Pick another option.")
-      return 'failed'
-    }
-    if (done) { onTalkGuestOutcome(ctx, who, done); return 'started' }
-    return 'stale'
-  }
-  const back = failTalkStart(db, { linkId: l.id, spawnId })
-  if (back) offerAgain(ctx, back, `Couldn't start a session: ${code}. Pick another option.`)
-  return 'failed'
+  if (!convoId) return { convoId: null, code }
+  // The child's bridge normally announces its conversation itself; until
+  // it does, the journal knows it as the talk's session on that box.
+  safely('talk session row', () => {
+    const cur = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
+    if (!cur) upsertConversation(db, { id: convoId, ownerUserId: l.guest_user_id, title: talkSessionTitle(l), agentDeviceId: target.deviceId })
+  })
+  return { convoId, code: null }
 }
 
 // Back to the guest's choice, without New session.

@@ -20,8 +20,10 @@
 // Never: renaming, closing or re-sharing the mission, moving, reranking or
 // editing items, action buttons (offering or tapping), attachments, and
 // consent mirrors (which a grantee cannot even see).
-import { createItem, insertComment, closeItem, reopenItem, nextNum, newId } from './items.js'
-import { updateMission, getGrantedMission } from './missions.js'
+import { createItem, insertComment, closeItem, reopenItem, nextNum, newId, grantedItemsExport } from './items.js'
+import { updateMission, getGrantedMission, ORIGIN_SIEVE } from './missions.js'
+import { getGrantRaw } from './grants.js'
+import { isLiveRemote } from './contacts.js'
 import { missionAccess } from './visibility.js'
 import { ensurePeopleConvo } from './people-convo.js'
 
@@ -29,6 +31,10 @@ export const CONTRIBUTE_KINDS = ['task', 'question', 'decision']
 
 const fail = (code) => { throw new Error(code) }
 
+// A contributor on another journal (src/federation-contribute.js) is
+// {userId: null, name: <their address>, via, grantId: <the owner's gr_ id>}:
+// every check below then reads that grant, not a user here.
+//
 // Who is writing, as the owner reads it.
 export const contributorOf = (db, who) => ({
   userId: who.userId,
@@ -54,6 +60,28 @@ export function contributableMission(db, viewerUserId, missionId) {
   return m
 }
 
+// The owner's mission row, when the remote grant `grantId` lets its grantee
+// contribute to it: active, at contribute, with a live contact, on a
+// mission still shareable. Throws read_only for a read grant; null when the
+// grant does not stand.
+export function remoteContributableMission(db, grantId, missionId = null) {
+  const g = getGrantRaw(db, grantId)
+  if (!g || !g.grantee_journal || g.subject_kind !== 'mission' || g.state !== 'active') return null
+  if (missionId != null && g.subject_id !== missionId) return null
+  const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(g.contact_id)
+  if (!contact || !isLiveRemote(db, contact)) return null
+  const m = db.prepare(`SELECT m.*, (${ORIGIN_SIEVE}) AS shareable FROM missions m WHERE m.id=? AND m.user_id=?`).get(g.subject_id, g.owner_user_id)
+  if (!m || !m.shareable) return null
+  if (g.level !== 'contribute') fail('read_only')
+  delete m.shareable
+  return m
+}
+
+// Either kind of contributor's mission, as above.
+const missionOf = (db, contributor, missionId) => (contributor.grantId
+  ? remoteContributableMission(db, contributor.grantId, missionId)
+  : contributableMission(db, contributor.userId, missionId))
+
 const openMission = (m) => { if (m.state !== 'open') fail('closed') }
 
 // The mission row as it is NOW, for a write inside its own transaction: the
@@ -62,7 +90,7 @@ const openMission = (m) => { if (m.state !== 'open') fail('closed') }
 // no longer may; the fresh row otherwise, so the write sees current state.
 function stillContributesTo(db, contributor, mission) {
   let m
-  try { m = contributableMission(db, contributor.userId, mission.id) } catch { m = null }
+  try { m = missionOf(db, contributor, mission.id) } catch { m = null }
   if (!m) fail('gone')
   openMission(m)
   return m
@@ -97,8 +125,8 @@ export function contributeItem(db, { mission, contributor, replyConvoId = null, 
     const { item } = createItem(db, {
       userId: mission.user_id, kind, title, body, labels, links, originConvoId: people.id, originDeviceId: 0, createdBy: 'agent', now,
     })
-    db.prepare(`UPDATE items SET mission_id=?, contributor_user_id=?, contributor_convo_id=?, contributor_name=?, contributor_via=? WHERE id=?`)
-      .run(mission.id, contributor.userId, replyConvoId, contributor.name, contributor.via, item.id)
+    db.prepare(`UPDATE items SET mission_id=?, contributor_user_id=?, contributor_convo_id=?, contributor_name=?, contributor_via=?, contributor_grant_id=? WHERE id=?`)
+      .run(mission.id, contributor.userId, replyConvoId, contributor.name, contributor.via, contributor.grantId ?? null, item.id)
     return { itemId: item.id, peopleConvo: people }
   })()
 }
@@ -113,10 +141,25 @@ export function contributableItem(db, viewerUserId, itemId) {
   try { return contributableMission(db, viewerUserId, it.mission_id) ? it : null } catch { return null }
 }
 
+// The owner-side item a contributor on another journal may write to: on
+// the grant's mission, and one the grantee view of it shows (what their
+// copy holds). null otherwise.
+export function remoteContributableItem(db, grantId, itemId) {
+  const it = typeof itemId === 'string' ? db.prepare('SELECT * FROM items WHERE id=?').get(itemId) : null
+  if (!it || it.consent != null || it.private || !it.mission_id) return null
+  let m
+  try { m = remoteContributableMission(db, grantId, it.mission_id) } catch { return null }
+  if (!m) return null
+  return grantedItemsExport(db, m.id, { limit: 1, only: it.id }).length ? it : null
+}
+
 // The writes below re-check, inside their own transaction, that the writer
 // still contributes: the route checked before reading the body, and a share
 // may have ended while it arrived. Error('gone') if not.
-const stillContributes = (db, contributor, item) => { if (!contributableItem(db, contributor.userId, item.id)) fail('gone') }
+const stillContributes = (db, contributor, item) => {
+  const ok = contributor.grantId ? remoteContributableItem(db, contributor.grantId, item.id) : contributableItem(db, contributor.userId, item.id)
+  if (!ok) fail('gone')
+}
 
 // A comment: words only — no buttons, no taps, no files. It does not move
 // the item's status (the owner's turn hears it either way).
@@ -148,7 +191,7 @@ export function contributeReopen(db, { item, contributor, comment = '', now = Da
 export function contributeStatus(db, { mission, contributor, status }) {
   return db.transaction(() => {
     let still = null
-    try { still = contributableMission(db, contributor.userId, mission.id) } catch { /* read only now */ }
+    try { still = missionOf(db, contributor, mission.id) } catch { /* read only now */ }
     if (!still) fail('gone')
     return updateMission(db, {
       userId: mission.user_id, missionId: mission.id, fields: { status },

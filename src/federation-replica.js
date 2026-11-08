@@ -26,6 +26,7 @@ import { enqueue } from './federation-outbox.js'
 import { grantedMissionExport, activityOf } from './missions.js'
 import { grantedItemsExport } from './items.js'
 import { sanitizePeerText } from './peer-text.js'
+import { localMedia, isMediaRef } from './federation-media.js'
 
 export const SNAPSHOT_OP = 'mission.snapshot'
 export const EVENT_OP = 'mission.event'
@@ -39,6 +40,15 @@ export const ITEM_BYTES = 192 * 1024
 export const MAX_RECORDS = 5000
 const MAX_PAGES = 1000
 const MAX_COMMENTS = 1000
+// What one share's copy may hold here, its staged snapshot pages included,
+// in bytes of stored text: the owner's journal decides what crosses, so
+// without this one accepted share could fill this journal's disk. Past it
+// a page or event is refused `replica_full` and the owner is told the copy
+// may be behind.
+export const REPLICA_BYTES_MAX = 64 * 1024 * 1024
+// One item record as it arrives: the owner's journal fits each to
+// ITEM_BYTES; twice that leaves room for its other fields.
+export const ITEM_RECORD_MAX = 2 * ITEM_BYTES
 
 const TITLE_CAP = 200
 const NAME_CAP = 40
@@ -49,6 +59,8 @@ const LABELS_MAX = 50
 const LINKS_MAX = 50
 const URL_CAP = 2048
 const PERSON_CAP = 324
+const ATTACHMENTS_MAX = 20
+const NAME_MAX = 255
 
 const fail = (code) => { throw new Error(code) }
 const bytes = (v) => Buffer.byteLength(JSON.stringify(v))
@@ -74,19 +86,37 @@ export function wireMilestone(l) {
   }
 }
 
-function wireComment(c) {
+// The blobs a thread names, as the owner's journal holds them: an
+// attachment crosses with the blob's own size and sha256 (the grantee's
+// journal checks the bytes it pulls against both, so the size a client
+// wrote on the attachment never counts) and only when its blob is here.
+export const blobsOf = (db) => (id) => db.prepare('SELECT size, sha256, width, height FROM blobs WHERE id=?').get(id) ?? null
+
+function wireAttachment(a, blobOf) {
+  const b = typeof a?.blob_ref === 'string' ? blobOf(a.blob_ref) : null
+  if (!b) return null
+  return {
+    media: a.blob_ref, name: typeof a.name === 'string' ? a.name : '', mime: a.mime, size: b.size, sha256: b.sha256,
+    ...(b.width > 0 && b.height > 0 ? { width: b.width, height: b.height } : {}),
+    ...(typeof a.transcript === 'string' ? { transcript: a.transcript } : {}),
+  }
+}
+
+function wireComment(c, blobOf) {
   const meta = c.meta && typeof c.meta === 'object' ? c.meta : {}
+  const attachments = c.withdrawn ? [] : (Array.isArray(c.attachments) ? c.attachments : []).map((a) => wireAttachment(a, blobOf)).filter(Boolean)
   return {
     ref: c.id, author: c.author, kind: c.kind, body: c.body ?? '', created_at: c.created_at,
+    ...(attachments.length ? { attachments } : {}),
     ...(c.withdrawn ? { withdrawn: true } : {}),
     ...(c.kind === 'status' && meta.from ? { from: statusOf(meta.from), to: statusOf(meta.to) } : {}),
     ...(meta.contributor ? { contributor: contributorOf(meta.contributor) } : {}),
   }
 }
 
-// Attachments cross in a later stage (media.fetch): until then an item and
-// its comments cross without them.
-export function wireItem({ item, comments }) {
+// An attachment crosses as a record of it (wireAttachment); its bytes are
+// pulled with media.fetch (src/federation-media.js).
+export function wireItem({ item, comments }, blobOf) {
   const out = {
     ref: item.id, num: item.num, kind: item.kind, state: item.state, resolution: item.resolution ?? null, awaiting: item.awaiting ?? null,
     title: item.title, body: item.body ?? '', created_by: item.created_by ?? null,
@@ -97,11 +127,15 @@ export function wireItem({ item, comments }) {
     ...(item.contributor ? { contributor: contributorOf(item.contributor) } : {}),
     comments: [],
   }
+  // The description's own attachments (they ride on the item's body
+  // comment, which the thread does not list).
+  const attachments = (Array.isArray(item.attachments) ? item.attachments : []).map((a) => wireAttachment(a, blobOf)).filter(Boolean)
+  if (attachments.length) out.attachments = attachments
   // The newest comments that fit, oldest first as a thread reads.
   let room = ITEM_BYTES - bytes(out)
   const kept = []
   for (const c of comments.slice(-MAX_COMMENTS).reverse()) {
-    const w = wireComment(c)
+    const w = wireComment(c, blobOf)
     const n = bytes(w) + 1
     if (n > room) break
     room -= n
@@ -119,7 +153,7 @@ export function snapshotPages(db, g, snap) {
   if (!view) return null
   const records = [
     ...view.milestones.slice(0, MAX_RECORDS).map((l) => ['milestones', wireMilestone(l)]),
-    ...grantedItemsExport(db, g.subject_id, { limit: MAX_RECORDS }).map((x) => ['items', wireItem(x)]),
+    ...grantedItemsExport(db, g.subject_id, { limit: MAX_RECORDS }).map((x) => ['items', wireItem(x, blobsOf(db))]),
   ]
   const fresh = () => ({ milestones: [], items: [] })
   const pages = [{ mission: wireMission(view.mission), ...fresh() }]
@@ -136,10 +170,12 @@ export function snapshotPages(db, g, snap) {
 // Queues a snapshot of grant `g` to its grantee, inside the caller's
 // transaction, all its pages or none. Returns the number of pages, 0 when
 // there was nothing to send. Throws outbox_full like enqueue.
+// A mission the grant can no longer show (its origin box turned private)
+// goes as one page with `mission: null`: the copy over there is dropped,
+// and the share stands for when it can show it again.
 export function sendSnapshot(db, g, { from, to, now }) {
   const snap = newId('sn')
-  const pages = snapshotPages(db, g, snap)
-  if (!pages) return 0
+  const pages = snapshotPages(db, g, snap) ?? [{ grant: g.id, snap, page: 0, pages: 1, mission: null, milestones: [], items: [] }]
   db.transaction(() => {
     for (const body of pages) enqueue(db, { userId: g.owner_user_id, from, to, op: SNAPSHOT_OP, body, subject: `grant:${g.id}`, urgent: false, now })
   })()
@@ -164,7 +200,7 @@ export function eventBody(db, g, kind, ref = null) {
   }
   if (kind !== 'item') return null
   const [x] = grantedItemsExport(db, g.subject_id, { limit: 1, only: ref })
-  if (x) return { ...at, ref, record: wireItem(x) }
+  if (x) return { ...at, ref, record: wireItem(x, blobsOf(db)) }
   const hidden = db.prepare(`SELECT 1 FROM items i WHERE i.id = ? AND (i.consent IS NOT NULL OR i.private = 1
     OR EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id))`).get(ref)
   return hidden ? null : { ...at, ref, record: null }
@@ -230,7 +266,26 @@ function readComment(c) {
   return {
     id: newId('ic'), ref: c.ref, author: oneOf(c.author, BY, 'agent'), kind, body: c.withdrawn ? '' : peerBody(c.body), created_at: time(c.created_at) ?? 0,
     meta: Object.keys(meta).length ? meta : null, ...(c.withdrawn ? { withdrawn: true } : {}),
+    attachments: c.withdrawn ? [] : readAttachments(c.attachments),
   }
+}
+
+// What an attachment record may carry. One that is not whole is dropped,
+// not refused: the rest of the thread still reads.
+const SHA = /^[0-9a-f]{64}$/
+function readAttachments(v) {
+  if (!Array.isArray(v)) return []
+  const out = []
+  for (const a of v.slice(0, ATTACHMENTS_MAX)) {
+    if (!a || typeof a !== 'object' || !isMediaRef(a.media) || typeof a.mime !== 'string' || a.mime.length > 128
+      || !Number.isSafeInteger(a.size) || a.size < 0 || typeof a.sha256 !== 'string' || !SHA.test(a.sha256)) continue
+    const dims = Number.isSafeInteger(a.width) && Number.isSafeInteger(a.height) && a.width > 0 && a.height > 0 ? { width: a.width, height: a.height } : {}
+    out.push({
+      media: a.media, name: line(typeof a.name === 'string' ? a.name : '', NAME_MAX), mime: a.mime, size: a.size, sha256: a.sha256, ...dims,
+      ...(typeof a.transcript === 'string' ? { transcript: peerBody(a.transcript) } : {}),
+    })
+  }
+  return out
 }
 
 function readLinks(v) {
@@ -248,9 +303,11 @@ function readLinks(v) {
 
 function readItem(i) {
   if (!i || typeof i !== 'object' || typeof i.ref !== 'string' || !IT_REF.test(i.ref)) fail('malformed')
+  if (bytes(i) > ITEM_RECORD_MAX) fail('too_large')
   const comments = Array.isArray(i.comments) ? i.comments.slice(-MAX_COMMENTS).map(readComment) : []
   const c = contributor(i.contributor)
   return {
+    attachments: readAttachments(i.attachments),
     ref: i.ref, num: num(i.num), kind: oneOf(i.kind, ['task', 'question', 'decision', 'notice'], 'task'),
     state: oneOf(i.state, STATES, 'open'), resolution: oneOf(i.resolution, RESOLUTIONS), awaiting: oneOf(i.awaiting, BY),
     title: line(i.title, TITLE_CAP) || 'Untitled', body: peerBody(i.body), created_by: oneOf(i.created_by, BY),
@@ -279,31 +336,77 @@ function putItem(d, incoming, i, snap) {
     const ids = new Map(parse(was.comments, []).map((c) => [c.ref, c.id]))
     i = { ...i, comments: i.comments.map((c) => (ids.has(c.ref) ? { ...c, id: ids.get(c.ref) } : c)) }
   }
+  // Each attachment as the apps read one here: a local media id (GET
+  // /media/:id pulls its bytes the first time).
+  const local = (list) => (list ?? []).map((a) => {
+    const { media: _m, sha256: _s, ...rest } = a
+    return { blob_ref: localMedia(d, incoming, a), ...rest }
+  })
+  i = { ...i, attachments: local(i.attachments), comments: i.comments.map((c) => ({ ...c, attachments: local(c.attachments) })) }
   d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
-    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
+    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap, attachments)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET attachments=excluded.attachments, num=excluded.num, kind=excluded.kind, state=excluded.state,
     resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
     created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
     comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
     contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
     .run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
       i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
-      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
+      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap, JSON.stringify(i.attachments))
 }
 
 const SNAP = /^sn_[A-Za-z0-9_-]{1,64}$/
 
+// The bytes of text a share's copy holds here: its records, and the pages of
+// a snapshot still loading.
+export function replicaBytes(d, fgId) {
+  return d.prepare(`SELECT
+      COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + COALESCE(LENGTH(CAST(body AS BLOB)), 0)) FROM fed_replica_milestones WHERE fg_id = @fg), 0)
+    + COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(body AS BLOB)) + LENGTH(CAST(labels AS BLOB)) + LENGTH(CAST(links AS BLOB))
+        + LENGTH(CAST(comments AS BLOB)) + LENGTH(CAST(attachments AS BLOB))) FROM fed_replica_items WHERE fg_id = @fg), 0)
+    + COALESCE((SELECT SUM(LENGTH(CAST(body AS BLOB))) FROM fed_replica_pages WHERE fg_id = @fg), 0) AS n`).get({ fg: fgId }).n
+}
+const withinBudget = (d, fgId, max) => { if (replicaBytes(d, fgId) > max) fail('replica_full') }
+
 // One page, inside the inbound transaction. `incoming` the grantee's live
-// fed_grants_in row. → {done: 'added'|'changed'|null, missionId}
-export function applySnapshotPage(d, incoming, body, now) {
+// fed_grants_in row. → {done: 'added'|'changed'|null, missionId, refused?}
+//
+// A page this journal has no room for (`replica_full`, `too_large`) gives
+// the whole snapshot up: its staged pages go, the copy stays as the last
+// whole snapshot left it, and the answer says `refused` rather than
+// failing, so that giving up commits (a refusal would roll it back and
+// leave the earlier pages waiting on a last page that never comes).
+export function applySnapshotPage(d, incoming, body, now, opts = {}) {
+  try {
+    // Nested: a savepoint inside the inbound transaction.
+    return d.transaction(() => applyPage(d, incoming, body, now, opts))()
+  } catch (err) {
+    if (err.message !== 'replica_full' && err.message !== 'too_large') throw err
+    // Only the snapshot this page belongs to (a page 0 starts its own): a
+    // page of one already replaced gives up nothing that is loading now.
+    const loading = d.prepare('SELECT snap FROM fed_replica_pages WHERE fg_id=? LIMIT 1').get(incoming.id)?.snap ?? null
+    if (body?.page === 0 || (loading !== null && loading === body?.snap)) d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+    return { done: null, missionId: d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null, refused: err.message }
+  }
+}
+
+function applyPage(d, incoming, body, now, { maxBytes = REPLICA_BYTES_MAX } = {}) {
   const { snap, page, pages } = body
   if (typeof snap !== 'string' || !SNAP.test(snap) || !Number.isSafeInteger(pages) || pages < 1 || pages > MAX_PAGES
     || !Number.isSafeInteger(page) || page < 0 || page >= pages) fail('malformed')
   if (!Array.isArray(body.milestones ?? []) || !Array.isArray(body.items ?? [])) fail('malformed')
+  const repId = () => d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null
+  // Withheld: the owner's journal can no longer show this mission. The copy
+  // goes, records and all; the share stands.
+  if (page === 0 && body.mission === null) {
+    if (pages !== 1 || (body.milestones ?? []).length || (body.items ?? []).length) fail('malformed')
+    const rep = d.prepare('SELECT id, complete FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
+    for (const t of ['fed_replica_pages', 'fed_replica_items', 'fed_replica_milestones', 'fed_replica_missions']) d.prepare(`DELETE FROM ${t} WHERE fg_id=?`).run(incoming.id)
+    return { done: rep?.complete ? 'withheld' : null, missionId: rep?.id ?? null }
+  }
   const milestones = (body.milestones ?? []).map(readMilestone)
   const items = (body.items ?? []).map(readItem)
   const mission = page === 0 ? readMission(body.mission) : null
-  const repId = () => d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null
   // Pages wait in fed_replica_pages, already read, until the last one is
   // in: only a whole snapshot touches the copy.
   if (page === 0) {
@@ -324,6 +427,7 @@ export function applySnapshotPage(d, incoming, body, now) {
   if (page < pages - 1) {
     d.prepare('INSERT INTO fed_replica_pages(fg_id, snap, page, body, received_at) VALUES(?,?,?,?,?)')
       .run(incoming.id, snap, page, JSON.stringify({ mission, milestones, items }), now)
+    withinBudget(d, incoming.id, maxBytes)
     return { done: null, missionId: repId() }
   }
   // The last page: apply the whole snapshot.
@@ -350,6 +454,7 @@ export function applySnapshotPage(d, incoming, body, now) {
   // Whatever this snapshot did not carry is gone.
   d.prepare('DELETE FROM fed_replica_milestones WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
   d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
+  withinBudget(d, incoming.id, maxBytes)
   return { done: rep?.complete ? 'changed' : 'added', missionId: id }
 }
 
@@ -358,7 +463,7 @@ export function applySnapshotPage(d, incoming, body, now) {
 // dropped, and the next snapshot carries its record anyway. After a later
 // snapshot was given up on, events apply to the last whole one: each is a
 // record's whole state, so the copy only moves forward. → {kind, missionId} when it changed the copy, else null.
-export function applyEvent(d, incoming, body) {
+export function applyEvent(d, incoming, body, { maxBytes = REPLICA_BYTES_MAX } = {}) {
   const { kind, ref = null, record, sent } = body
   if (!EVENT_KINDS.includes(kind) || record === undefined || !Number.isSafeInteger(sent)) fail('malformed')
   if (kind === 'milestone' && (typeof ref !== 'string' || !MS_REF.test(ref) || record === null)) fail('malformed')
@@ -385,6 +490,7 @@ export function applyEvent(d, incoming, body) {
   } else {
     d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND ref=?').run(incoming.id, ref)
   }
+  if (r) withinBudget(d, incoming.id, maxBytes)
   return { kind, missionId: rep.id }
 }
 
@@ -445,14 +551,16 @@ export function replicaMissionDetail(d, mission) {
 const ITEMS = `SELECT r.*, m.id AS mission_id, m.num AS mission_num, g.owner_name || '@' || g.peer_host AS owner_address
   FROM fed_replica_items r JOIN fed_replica_missions m ON m.fg_id = r.fg_id AND m.complete = 1 ${LIVE}`
 
+const IMAGE = (a) => typeof a?.mime === 'string' && a.mime.startsWith('image/')
+
 function itemOut(r) {
   return {
     id: r.id, user_id: 0, num: r.num, kind: r.kind, state: r.state, resolution: r.resolution, awaiting: r.awaiting, rank: 0,
     title: r.title, body: r.body, supersedes: null, origin_convo_id: '', origin_device_id: 0, created_by: r.created_by,
     created_at: r.created_at, updated_at: r.updated_at, closed_at: r.closed_at, mission_id: r.mission_id, consent: null, chosen_action: null,
     private: false, filed_convo_id: null, device_name: null, comment_count: r.comment_count, last_comment_at: r.last_comment_at,
-    last_user_input_at: null, has_image: false, mission_num: r.mission_num, origin_convo_title: null, handover: null, repo: null,
-    labels: parse(r.labels, []), links: parse(r.links, []), attachments: [], actions: [],
+    last_user_input_at: null, has_image: parse(r.attachments, []).some(IMAGE) || parse(r.comments, []).some((c) => (c.attachments ?? []).some(IMAGE)), mission_num: r.mission_num, origin_convo_title: null, handover: null, repo: null,
+    labels: parse(r.labels, []), links: parse(r.links, []), attachments: parse(r.attachments, []), actions: [],
     ...(r.contributor_name ? { contributor: { name: r.contributor_name, via: r.contributor_via ?? 'agent' } } : {}),
     owner: ownerOf(r.owner_address), shared_via: 'grant',
   }
@@ -461,7 +569,7 @@ function itemOut(r) {
 function commentsOut(r) {
   return parse(r.comments, []).map((c) => ({
     id: c.id, item_id: r.id, author: c.author, device_id: 0, kind: c.kind, body: c.body, created_at: c.created_at,
-    chosen_action: null, convo_id: null, device_name: null, convo_title: null, attachments: [], meta: c.meta ?? null,
+    chosen_action: null, convo_id: null, device_name: null, convo_title: null, attachments: c.attachments ?? [], meta: c.meta ?? null,
     action: null, reply_to: null, actions: [], ...(c.withdrawn ? { withdrawn: true } : {}),
   }))
 }

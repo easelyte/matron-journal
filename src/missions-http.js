@@ -389,6 +389,13 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   // the caller may contribute to (src/contribute-http.js).
   if (typeof body.mission === 'string' && body.mission.startsWith('ms_') && !visibleMission(db, who, body.mission)
       && !db.prepare('SELECT 1 FROM missions WHERE id=? AND user_id=?').get(body.mission, who.userId)) {
+    // A mission shared from another journal (its copy here): the milestone
+    // goes to that journal (src/federation-contribute.js).
+    const copy = getReplicaMission(db, who.userId, body.mission)
+    if (copy) {
+      if (!ctx.federationContribute) { json(res, 403, { error: 'forbidden' }); return true }
+      return ctx.federationContribute.routes.handleMilestone(res, who, body, copy)
+    }
     return handleContributedMilestone(ctx, res, who, body, { writableConvo })
   }
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
@@ -523,6 +530,8 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
       const replica = getReplicaMission(db, who.userId, idOrNum)
       if (!replica) return notFound(res)
       if (!sub && req.method === 'GET') { json(res, 200, replicaMissionDetail(db, replica)); return true }
+      // A contributor sets its status through the owner's journal.
+      if (!sub && req.method === 'PATCH' && ctx.federationContribute) return ctx.federationContribute.routes.handleMissionPatch(res, who, await readBody(req), replica)
       json(res, 403, { error: 'forbidden' })
       return true
     }

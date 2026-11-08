@@ -193,7 +193,7 @@ test('peer text is kept to what the protocol allows', async (t) => {
   const i = w.b.db.prepare('SELECT * FROM fed_replica_items').get()
   assert.deepEqual([i.title, i.kind, JSON.parse(i.labels), JSON.parse(i.links)], ['**bold** title', 'task', ['a', 'b'.repeat(40)], [{ url: 'https://example.com' }]])
   assert.equal(JSON.parse(i.comments)[0].author, 'agent')
-  for (const bad of [{ snap: 'nope' }, { page: 1 }, { pages: 0 }, { mission: null }, { items: [{ ref: 'gr_1', num: 1 }] }, { milestones: [{ ref: 'ml_1', num: 0 }] }]) {
+  for (const bad of [{ snap: 'nope' }, { page: 1 }, { pages: 0 }, { mission: 'x' }, { mission: null, pages: 2 }, { mission: null, milestones: [{ ref: 'ml_1', num: 1, kind: 'progress', title: 't' }] }, { items: [{ ref: 'gr_1', num: 1 }] }, { milestones: [{ ref: 'ml_1', num: 0 }] }]) {
     assert.throws(() => applySnapshotPage(w.b.db, r, page(bad), Date.now()), /malformed/, JSON.stringify(bad))
   }
 })

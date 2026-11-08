@@ -158,7 +158,7 @@ export function rowToItem(row) {
     owner_turn_started_at: turnStartedAt, owner_turn_ended_at: turnEndedAt,
     // Internal: where a contributor's replies go (src/contribute.js), never
     // on the wire — least of all to the owner.
-    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId,
+    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId, contributor_grant_id: _contributorGrantId,
     contributor_name: contributorName, contributor_via: contributorVia,
     ...rest
   } = row
@@ -626,8 +626,14 @@ export function listItems(db, userId, {
 // the viewer's own. Ordered newest-updated first; the cursor is
 // [updated_at, id] — item ids are random, so unlike `num` they are unique
 // across users.
+// The thread counts another person sees: without what an agent on a private
+// box wrote, which listSharedComments drops from the thread itself.
+const SHARED_COMMENT = `FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment'
+    AND NOT (c.author = 'agent' AND EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = c.device_id))`
 const OWNER_DECORATE = `
   cv.repo AS repo,
+  (SELECT COUNT(*) ${SHARED_COMMENT}) AS shared_comment_count,
+  (SELECT MAX(c.created_at) ${SHARED_COMMENT}) AS shared_last_comment_at,
   json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
 
 // The grant rule for an item (spec 2026-10-02 matron-to-matron sharing): it
@@ -656,8 +662,8 @@ const ORG_SHARED = `(cv.id IS NOT NULL AND ${sharedConvoSql('cv')})`
 // two origin fields the apps' item model requires.
 function rowToSharedItem(row) {
   if (!row) return null
-  const { owner_json: ownerJson, org_shared: orgShared, ...rest } = row
-  const item = rowToItem(rest)
+  const { owner_json: ownerJson, org_shared: orgShared, shared_comment_count: count, shared_last_comment_at: lastAt, ...rest } = row
+  const item = rowToItem({ ...rest, comment_count: count, last_comment_at: lastAt })
   item.owner = parseJson(ownerJson, null)
   // Item handover (src/item-handover.js) names conversations that need not
   // pass the sharing rule themselves, and the filing box is the user's own:
@@ -684,9 +690,14 @@ export function listGrantedComments(db, itemId) {
 // Another person's view of a thread: the handover lines (src/item-handover.js)
 // are dropped — they name the user's conversations and boxes — and so are
 // the author's box and conversation on every comment. A reply the user
-// withdrew (src/withdrawn-comments.js) shows without its words.
+// withdrew (src/withdrawn-comments.js) shows without its words. What an
+// agent on a private box wrote stays at home, as its items and milestones
+// do: a copy on another journal (src/federation-replica.js) drops it at the
+// next snapshot when the box turns private.
 export function listSharedComments(db, itemId) {
-  return listComments(db, itemId).filter((c) => !c.meta?.handover)
+  const hidden = new Set(db.prepare(`SELECT DISTINCT c.device_id AS id FROM item_comments c JOIN private_devices pd ON pd.id = c.device_id
+    WHERE c.item_id = ? AND c.author = 'agent'`).all(itemId).map((r) => r.id))
+  return listComments(db, itemId).filter((c) => !c.meta?.handover && !(c.author === 'agent' && hidden.has(c.device_id)))
     .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null }))
 }
 

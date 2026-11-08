@@ -24,7 +24,7 @@ test('well-known: configured → claims /u/* for the apps; served without a toke
   assert.equal(aasa.status, 200)
   assert.equal(aasa.headers.get('content-type'), 'application/json')
   assert.deepEqual(await aasa.json(), {
-    applinks: { details: [{ appIDs: ['ABCDE12345.com.example.matron', 'ABCDE12345.com.example.matron.dev'], components: [{ '/': '/u/*', comment: 'Matron tracker links' }] }] },
+    applinks: { details: [{ appIDs: ['ABCDE12345.com.example.matron', 'ABCDE12345.com.example.matron.dev'], components: [{ '/': '/u/*', comment: 'Matron tracker links' }, { '/': '/contact', comment: 'Matron contact invites' }] }] },
   })
   const al = await fetch(s.base + '/.well-known/assetlinks.json')
   assert.equal(al.status, 200)

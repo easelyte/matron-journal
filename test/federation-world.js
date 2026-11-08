@@ -9,14 +9,14 @@ import { upsertConversation } from '../src/journal.js'
 export const KEY = 'd'.repeat(64)
 export const post = (body) => ({ method: 'POST', body })
 
-export async function world(t) {
+export async function world(t, { federationLimits, federationOps = {} } = {}) {
   const bases = {}
   const client = makeFederationClient({
     allowHttp: true, allowHosts: ['127.0.0.1'],
     rewriteUrl: (u) => { const x = new URL(u); return bases[x.host] ? bases[x.host] + x.pathname + x.search : u },
   })
   const start = async (host) => {
-    const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: `https://${host}` }, federationClient: client })
+    const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: `https://${host}` }, federationClient: client, federationLimits, federationOps: federationOps[host] })
     t.after(() => s.close())
     bases[host] = s.base
     return s

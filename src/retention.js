@@ -411,9 +411,19 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   }
   const high = Math.floor(quotaBytes * highPct / 100)
   const target = Math.floor(quotaBytes * lowPct / 100)
+  // The same total as userBlobBytes (db.js): the user's blobs plus the
+  // attachments kept for their copies of missions shared from other journals.
   const users = db.prepare(
-    'SELECT owner_user_id AS userId, SUM(size) AS bytes FROM blobs GROUP BY owner_user_id HAVING bytes >= ?'
+    `SELECT userId, SUM(size) AS bytes FROM (
+       SELECT owner_user_id AS userId, size FROM blobs
+       UNION ALL SELECT user_id, size FROM fed_media WHERE disk_path IS NOT NULL)
+     GROUP BY userId HAVING bytes >= ?`
   ).all(high)
+  // Kept copies of shared attachments go first, least recently pulled
+  // first: the owner's journal still has them, so the next read pulls them
+  // again and nothing is lost.
+  const kept = db.prepare('SELECT id, size, disk_path FROM fed_media WHERE user_id = ? AND disk_path IS NOT NULL ORDER BY fetched_at ASC')
+  const forget = db.prepare('UPDATE fed_media SET disk_path=NULL, fetched_at=NULL WHERE id=? AND disk_path=?')
 
   // Driven from the small side (this user's blobs via idx_blobs_owner, each
   // probing events via idx_events_blob_ref) — the events-first join was a
@@ -479,6 +489,21 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   let bytesFreed = 0
   const graceCutoff = now - orphanGraceMs
   for (const user of users) {
+    // Kept copies go even when the rest cannot get the user under target:
+    // dropping them loses nothing.
+    let used = user.bytes
+    for (const copy of kept.all(user.userId)) {
+      if (used <= target) break
+      if (!forget.run(copy.id, copy.disk_path).changes) continue
+      try {
+        fs.unlinkSync(copy.disk_path)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: failed to unlink shared attachment copy ${copy.id} at ${copy.disk_path}`, err)
+      }
+      used -= copy.size
+      bytesFreed += copy.size
+      reaped += 1
+    }
     const garbage = orphans.all(user.userId, graceCutoff)
     // One list, oldest reference first, a blob once (a blob both a chat
     // event and an item comment name keeps its older timestamp).
@@ -489,8 +514,9 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
     }
     const cands = [...byBlob.values()].sort((a, b) => a.oldestTs - b.oldestTs)
     const reapable = garbage.reduce((n, c) => n + c.size, 0) + cands.reduce((n, c) => n + c.size, 0)
-    if (user.bytes - reapable >= target) {
-      const floor = user.bytes - reapable
+    if (used <= target) continue
+    if (used - reapable >= target) {
+      const floor = used - reapable
       const parts = floorParts.get(graceCutoff, user.userId)
       const other = floor - parts.toolBytes - parts.freshBytes
       console.warn(
@@ -501,7 +527,6 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       )
       continue
     }
-    let used = user.bytes
     for (const orphan of garbage) {
       if (used <= target) break
       const blob = getBlob(db, orphan.blobRef)

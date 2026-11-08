@@ -21,7 +21,10 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
     // The twin of a room with another person (person-rooms.js): the
     // inviter is the other person's agent. Its box name never crosses — the
     // frame names the person instead, and says so with `person`.
+    // A room for another person's agent: on this journal (a twin), or on
+    // another journal (src/federation-rooms.js), named by their address.
     const person = db.prepare('SELECT u.name FROM person_rooms pr JOIN users u ON u.id = pr.owner_user_id WHERE pr.guest_room_id=?').get(row.convo_id)
+      ?? db.prepare("SELECT peer_name || '@' || peer_host AS name FROM fed_rooms WHERE room_id=? AND role='guest'").get(row.convo_id)
     const from = person ? { name: person.name } : db.prepare('SELECT name FROM devices WHERE id=?').get(row.initiator_device_id)
     // approved_by: who let this ask through — 'coordinator' when the user's
     // Coordinator answered the card on their behalf (spec: 2026-09-29

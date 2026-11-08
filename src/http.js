@@ -29,6 +29,7 @@ import { handleSharingRoute } from './sharing-http.js'
 import { handleFederationRoute } from './federation-http.js'
 import { handlePersonRoomRoute } from './person-rooms-http.js'
 import { sessionsSharedWith } from './person-rooms.js'
+import { remoteSessionsFor } from './federation-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
 import { parseOwnerUserId } from './owner-user-id.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
@@ -152,7 +153,7 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 const isFilesPath = (pathname) => pathname === '/files' || pathname.startsWith('/files/')
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, agentCommentLimiter = makeAgentCommentLimiter() }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes, fileOwnerUserId = null, agentCommentLimiter = makeAgentCommentLimiter() }) {
   // Server-owned, built once at the trusted boundary rather than per request:
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
@@ -632,12 +633,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants, federationContribute }, req, res, url, who)) return
       if (await handleFederationRoute({ db, outbox: federationOutbox }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs, federationContacts, federationGrants }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
-      if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleMissionsRoute({ db, hub, pushPipeline, waker, federationContribute }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
@@ -877,6 +878,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           let p = people.find((x) => x.person === s.person)
           if (!p) { p = { person: s.person, sessions: [] }; people.push(p) }
           p.sessions.push({ convo_id: s.convo_id, title: s.title, agent_device_id: s.agent_device_id, session_state: s.session_state, created_at: s.created_at })
+        }
+        // Sessions contacts on other journals share (src/federation-rooms.js):
+        // the person is their address, and the id is this journal's for the
+        // share. No device, no state: a talk request names the person and the
+        // session, and their journal finds the agent.
+        for (const s of remoteSessionsFor(db, who.userId)) {
+          let p = people.find((x) => x.person === s.person)
+          if (!p) { p = { person: s.person, sessions: [] }; people.push(p) }
+          p.sessions.push({ convo_id: s.convo_id, title: s.title, agent_device_id: null, session_state: null, created_at: s.created_at, remote: true })
         }
         return json(res, 200, { agents, conversations, people })
       }
@@ -1399,6 +1409,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // owner learns from a 403 that a 404 doesn't already hide just as well,
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
+        // An attachment of a mission shared from another journal: its bytes
+        // come from there on first read (src/federation-media.js).
+        if (!blob && federationMedia && await federationMedia.serve(req, res, who, mm[1])) return
         if (!blob) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId) {
           // Shared visibility (spec 2026-09-23 tracker web/teams): a

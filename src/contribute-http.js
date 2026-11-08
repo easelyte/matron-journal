@@ -80,7 +80,8 @@ function missionFor(db, res, who, missionId) {
 const grantedComment = (c) => ({ ...c, device_id: 0, device_name: null, convo_id: null, convo_title: null, actions: [], chosen_action: null })
 
 // The owner-side marker of a contributor's write, in the owner's log.
-function toOwner(ctx, { contributor, item, action, comment = null }) {
+// Exported for a contributor on another journal (src/federation-contribute.js).
+export function toOwner(ctx, { contributor, item, action, comment = null }) {
   const { db, hub, pushPipeline } = ctx
   const owner = item.user_id
   // The owner-side row, decorated for the owner (contributor, never the
@@ -110,11 +111,21 @@ function toOwner(ctx, { contributor, item, action, comment = null }) {
 // filed: their filing conversation hears it, while they still contribute.
 // Called from items-http.js emitMarker for every owner-side item write;
 // returns at once for any other item. Never throws.
+// A contributor on another journal is told through their journal instead
+// (src/federation-contribute.js registers how, per database: one process
+// may run more than one journal, as the tests do).
+const remoteReplies = new WeakMap()
+export function onRemoteContributorReply(db, fn) { remoteReplies.set(db, fn) }
+
 export function forwardToContributor(ctx, who, item, { action, comment = null }) {
   if (!WAKES.has(action)) return
   const { db, hub, pushPipeline } = ctx
   try {
-    const row = db.prepare('SELECT user_id, mission_id, contributor_user_id, contributor_convo_id FROM items WHERE id=?').get(item.id)
+    const row = db.prepare('SELECT user_id, mission_id, contributor_user_id, contributor_convo_id, contributor_grant_id FROM items WHERE id=?').get(item.id)
+    if (row?.contributor_grant_id && who.userId === row.user_id) {
+      remoteReplies.get(db)?.({ grantId: row.contributor_grant_id, itemId: item.id, action, comment, via: who.kind === 'agent' ? 'agent' : 'user' })
+      return
+    }
     if (!row?.contributor_user_id || !row.contributor_convo_id || who.userId !== row.user_id) return
     const to = row.contributor_user_id
     if (missionAccess(db, to, row.mission_id) !== 'contribute') return
@@ -136,6 +147,49 @@ export function forwardToContributor(ctx, who, item, { action, comment = null })
   }
 }
 
+// The marker of a contributor's milestone, as contributeMilestone's
+// appendMarker writes it.
+export function contributedMilestoneMarker(db, { mission, contributor, row }) {
+  const ownerMission = getMission(db, mission.user_id, mission.id)
+  return { ...milestoneMarkerPayload({ milestone: row, mission: ownerMission, by: contributor.via }), person: { name: contributor.name, via: contributor.via } }
+}
+
+// After a contributor's milestone commits: the owner's apps hear it, and
+// grantees follow it.
+export function afterContributedMilestone(ctx, { mission, contributor, out }) {
+  const { db, hub } = ctx
+  const sender = personSender(contributor.name)
+  try {
+    if (out.peopleCreated) appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.convoId, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } })
+    broadcastAppended(db, hub, { userId: mission.user_id, convoId: out.convoId, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE, payload: contributedMilestoneMarker(db, { mission, contributor, row: out.milestone }) })
+  } catch (err) { console.error('contribute: milestone broadcast failed (row and marker already committed)', err) }
+  notifyGrantees(ctx, mission.id, 'milestone', out.milestone.id)
+}
+
+// After a contributor's status commits: the owner's origin conversation is
+// told, as for any status change (a flag, never the text), and grantees
+// follow it.
+export function afterContributedStatus(ctx, { mission, contributor, updated }) {
+  const { db, hub } = ctx
+  try {
+    appendAndBroadcast(db, hub, {
+      userId: mission.user_id, convoId: updated.origin_convo_id, sender: personSender(contributor.name), type: MISSION_EVENT_TYPE,
+      payload: { ...missionMarkerPayload({ mission: updated, action: 'updated', by: contributor.via, statusChanged: true }), person: { name: contributor.name, via: contributor.via } },
+    })
+  } catch (err) { console.error('contribute: mission marker failed (the status stands)', err) }
+  notifyGrantees(ctx, mission.id, 'mission')
+}
+
+// After a contributor's item commits: the People conversation's first use
+// is announced, and the owner hears the item.
+export function afterContributedItem(ctx, { mission, contributor, out }) {
+  const { db, hub } = ctx
+  if (out.peopleConvo.created) {
+    try { appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.peopleConvo.id, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } }) } catch (err) { console.error('contribute: people convo announce failed', err) }
+  }
+  toOwner(ctx, { contributor, item: { id: out.itemId, user_id: mission.user_id }, action: 'created' })
+}
+
 // POST /milestones {mission, kind, title, body?, convo_id?} on a mission of
 // another person's. `body` is already read.
 export function handleContributedMilestone(ctx, res, who, body, { writableConvo }) {
@@ -148,19 +202,13 @@ export function handleContributedMilestone(ctx, res, who, body, { writableConvo 
   if (!mission) return true
   const contributor = contributorOf(db, who)
   const sender = personSender(contributor.name)
-  const ownerMission = getMission(db, mission.user_id, mission.id)
-  const markerOf = (row) => ({ ...milestoneMarkerPayload({ milestone: row, mission: ownerMission, by: contributor.via }), person: { name: contributor.name, via: contributor.via } })
   const r = gone(res, () => contributeMilestone(db, {
     mission, contributor, kind: body.kind, title: body.title.trim(), body: body.body ?? '',
-    appendMarker: (convoId, row) => append(db, { userId: mission.user_id, convoId, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(row) }),
+    appendMarker: (convoId, row) => append(db, { userId: mission.user_id, convoId, sender, type: MILESTONE_EVENT_TYPE, payload: contributedMilestoneMarker(db, { mission, contributor, row }) }),
   }))
   if (!r) return true
   const { out } = r
-  try {
-    if (out.peopleCreated) appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.convoId, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } })
-    broadcastAppended(db, hub, { userId: mission.user_id, convoId: out.convoId, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(out.milestone) })
-  } catch (err) { console.error('contribute: milestone broadcast failed (row and marker already committed)', err) }
-  notifyGrantees(ctx, mission.id, 'milestone', out.milestone.id)
+  afterContributedMilestone(ctx, { mission, contributor, out })
   const { convo_id: _c, seq: _s, device_id: _d, ...text } = milestoneRow(out.milestone)
   json(res, 201, { milestone: text, mission: getGrantedMission(db, who.userId, mission.id) })
   return true
@@ -187,10 +235,7 @@ export function handleContributedItem(ctx, res, who, body, { writableConvo }) {
   const r = gone(res, () => contributeItem(db, { mission, contributor, replyConvoId: replyConvoId ?? null, kind: body.kind, ...v.value, labels: v.value.labels ?? [], links: v.value.links ?? [] }))
   if (!r) return true
   const { out } = r
-  if (out.peopleConvo.created) {
-    try { appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.peopleConvo.id, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } }) } catch (err) { console.error('contribute: people convo announce failed', err) }
-  }
-  toOwner(ctx, { contributor, item: { id: out.itemId, user_id: mission.user_id }, action: 'created' })
+  afterContributedItem(ctx, { mission, contributor, out })
   json(res, 201, { item: getSharedItem(db, who.userId, out.itemId) })
   return true
 }
@@ -261,16 +306,7 @@ export async function handleContributorMissionPatch(ctx, req, res, who, granted)
   const contributor = contributorOf(db, who)
   const r = gone(res, () => contributeStatus(db, { mission, contributor, status: v.value.status }))
   if (!r) return true
-  const updated = r.out
-  // The owner's origin conversation is told, as for any status change: a
-  // flag, never the text, from the other person.
-  try {
-    appendAndBroadcast(db, hub, {
-      userId: mission.user_id, convoId: updated.origin_convo_id, sender: personSender(contributor.name), type: MISSION_EVENT_TYPE,
-      payload: { ...missionMarkerPayload({ mission: updated, action: 'updated', by: contributor.via, statusChanged: true }), person: { name: contributor.name, via: contributor.via } },
-    })
-  } catch (err) { console.error('contribute: mission marker failed (the status stands)', err) }
-  notifyGrantees(ctx, mission.id, 'mission')
+  afterContributedStatus(ctx, { mission, contributor, updated: r.out })
   json(res, 200, { mission: getGrantedMission(db, who.userId, mission.id) })
   return true
 }

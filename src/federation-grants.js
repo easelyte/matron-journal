@@ -1,5 +1,6 @@
 // Mission shares with a contact on another journal (docs/protocol.md
-// "Shares across journals"). Read shares only, so far.
+// "Shares across journals"): read and contribute shares, and the raise of an
+// active read share to contribute.
 //
 // The owner's journal keeps the grant in `grants` as for any contact; its
 // contact row names the other journal, so there is no grantee user here.
@@ -8,8 +9,9 @@
 // keeps the grant it was offered in `fed_grants_in` (its own `fg_` id; the
 // owner's `gr_` id is `peer_grant_ref`).
 //
-//   grant.offer   owner → grantee  {grant, level, mission: {num, title}, preview}
-//   grant.answer  grantee → owner  {grant, decision: approve|decline}
+//   grant.offer   owner → grantee  {grant, level, mission: {num, title}, preview,
+//                 raise?: {sent}}  — raise: an active share offered at a higher level
+//   grant.answer  grantee → owner  {grant, decision: approve|decline, raise?: level}
 //   grant.revoke  either way       {grant}            urgent: cancels the grant's queue
 //   mission.snapshot owner → grantee, on accept: the mission's contents
 //   mission.event    owner → grantee, on each write since: one record's
@@ -20,7 +22,7 @@
 import { newId } from './items.js'
 import { enqueue } from './federation-outbox.js'
 import { remoteContactRaw } from './contacts.js'
-import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview } from './grants.js'
+import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview, askOf } from './grants.js'
 import { onRemoteMissionWrite, card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
@@ -30,6 +32,12 @@ export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
 export const REVOKE_OP = 'grant.revoke'
 export const INCOMING_STATES = ['pending', 'active', 'declined', 'revoked']
+// Offers from one contact waiting on the grantee's tap, at most: each one is
+// a card and a tracker item, so a journal past this is refused rather than
+// let fill the grantee's For you list.
+export const MAX_PENDING_OFFERS = 10
+// The levels a share across journals may have (a hand-over does not cross yet).
+export const REMOTE_LEVELS = ['read', 'contribute']
 
 const TITLE_CAP = 200
 const GRANT_REF = /^gr_[A-Za-z0-9_-]{1,64}$/
@@ -52,7 +60,7 @@ export function incomingRow(r) {
     id: r.id, direction: 'in', subject_kind: 'mission', subject_id: null, level: r.level, state: r.state,
     owner: { user_id: null, name: r.owner_name, address: r.owner_address },
     mission: { id: null, num: r.mission_num, title: r.mission_title },
-    pending_level: null, pending_state: null, requested_by: null, revoked_by: r.revoked_by ?? null,
+    pending_level: r.pending_level ?? null, pending_state: r.pending_level ? 'pending' : null, requested_by: null, revoked_by: r.revoked_by ?? null,
     created_at: r.created_at, updated_at: r.updated_at, answered_at: r.answered_at ?? null, revoked_at: r.revoked_at ?? null,
   }
 }
@@ -81,7 +89,9 @@ export function onIncomingEnded(ctx, before, by) {
   const from = plain(before.owner_address)
   const words = `mission "${titleOf(before.mission_title)}"`
   const mine = by === 'grantee' || by === 'contact_ended'
-  if (before.state === 'pending') {
+  // An offer's card, or a raise's card on a share that was active: either
+  // has nothing left to answer.
+  if (before.state === 'pending' || (before.state === 'active' && before.pending_level)) {
     closeMirror(ctx, {
       userId: before.user_id, itemId: before.item_id, consent: 'share', resolution: 'cancelled',
       author: mine ? 'user' : 'agent', comment: by === 'grantee' ? 'Declined.' : by === 'owner' ? `${from} withdrew the offer.` : 'The contact ended, so this share ended with it.',
@@ -104,7 +114,7 @@ function sharedFrame({ hub }, userId, frame) {
 }
 
 // `ctx` {db, hub, pushPipeline}; `federation` the loaded identity.
-// → {federate, answer, leave, kick, inbound, outbound, setOutbox}
+// → {federate, answer, leave, kick, resnapshot, inbound, outbound, setOutbox}
 export function makeGrantFederation({ db, hub = null, pushPipeline = null, federation, now: clock = Date.now, log = console }) {
   const ctx = { db, hub, pushPipeline }
   let outbox = null
@@ -121,12 +131,15 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     const to = `${g.grantee_name}@${g.grantee_journal}`
     if (what === 'offer') {
       const p = sharePreview(db, g.subject_id)
+      const ask = askOf(g)
       enqueue(db, {
         userId: g.owner_user_id, from, to, op: OFFER_OP, subject: subjectOf(g.id), now: clock(),
         body: {
-          grant: g.id, level: g.level, sent: g.sent_at,
+          grant: g.id, level: ask.level, sent: g.sent_at,
           mission: { num: g.mission_num, title: sanitizePeerText(g.mission_title, TITLE_CAP) },
           preview: { milestones: p.milestones, items: p.items, comments: p.comments, attachments: p.attachments },
+          // A raise: the share stands at g.level while this waits.
+          ...(ask.raise ? { raise: { sent: g.pending_at } } : {}),
         },
       })
     } else if (what === 'revoke') {
@@ -161,34 +174,74 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
   }
   onRemoteMissionWrite(db, onMissionWrite)
 
+  // A device's private flag changed (db.js devices_private_resnapshot):
+  // each queued share gets a fresh snapshot of what its grantee view shows
+  // now, which drops from the copy over there whatever it no longer shows.
+  // Run at the start of every outbox pass. A full outbox keeps the row for
+  // the next pass. A snapshot still queued for the share was read before the
+  // flag changed, so it is cancelled first: it would otherwise go out ahead
+  // of the fresh one (SNAPSHOT_OP's stillAllowed holds it back meanwhile).
+  function resnapshot() {
+    const rows = db.prepare('SELECT grant_id FROM fed_resnapshot ORDER BY queued_at LIMIT 50').all()
+    for (const { grant_id: id } of rows) {
+      const g = getGrantRaw(db, id)
+      try {
+        db.transaction(() => {
+          if (g && g.state === 'active') {
+            db.prepare("UPDATE fed_outbox SET state='cancelled', ended_at=?, last_error='superseded' WHERE peer_host=? AND subject=? AND op=? AND state='queued'")
+              .run(clock(), g.grantee_journal, subjectOf(g.id), SNAPSHOT_OP)
+            sendSnapshot(db, g, { from: `${g.owner_name}@${federation.host}`, to: `${g.grantee_name}@${g.grantee_journal}`, now: clock() })
+          }
+          db.prepare('DELETE FROM fed_resnapshot WHERE grant_id=?').run(id)
+        })()
+      } catch (err) {
+        if (err.message !== 'outbox_full' && err.message !== 'too_large') throw err
+        if (err.message === 'too_large') db.prepare('DELETE FROM fed_resnapshot WHERE grant_id=?').run(id)
+      }
+    }
+  }
+
   // --- The grantee's journal: the card, the answer, leaving -----------------
 
+  // The grantee's card for an offer, or for a raise of the share they have
+  // (`r.pending_level` set: the share stands at r.level meanwhile).
   function raiseCard(r) {
     const from = plain(r.owner_address)
     const convoId = peopleConvo(ctx, r.user_id)
     const preview = JSON.parse(r.preview ?? '{}')
+    const raise = !!r.pending_level
+    const level = raise ? r.pending_level : r.level
+    const contribute = level === 'contribute'
     card(ctx, {
       userId: r.user_id, convoId, sender: 'journal',
       payload: {
-        kind: SHARE_CARD_KIND, direction: 'in', grant_id: r.id, level: r.level,
+        kind: SHARE_CARD_KIND, direction: 'in', grant_id: r.id, level,
         owner: { user_id: null, name: r.owner_name, address: r.owner_address },
         mission: { id: null, num: r.mission_num, title: r.mission_title }, preview,
+        ...(raise ? { raise: true, from_level: r.level } : {}),
       },
     })
     const item = fileMirror(ctx, {
       userId: r.user_id, convoId, deviceId: 0, sender: 'journal', consent: 'share',
-      title: `${from} wants to share a mission with you — ${titleOf(r.mission_title)}`,
+      title: raise
+        ? `${from} invites you to contribute to a mission you read — ${titleOf(r.mission_title)}`
+        : `${from} wants to share a mission with you — ${titleOf(r.mission_title)}`,
       body: [
-        `Your contact \`${from}\`, on another Matron journal, offers you mission **${titleOf(r.mission_title)}** to read.`,
+        raise
+          ? `Your contact \`${from}\`, on another Matron journal, invites you to contribute to mission **${titleOf(r.mission_title)}**, which you already read.`
+          : `Your contact \`${from}\`, on another Matron journal, offers you mission **${titleOf(r.mission_title)}** to ${contribute ? 'contribute to' : 'read'}.`,
         '',
         `- **You will see:** the mission's title, description and status, its milestones as text, and its items with their comments and attachments, live, under "shared by \`${from}\`".`,
-        `- **Right now that is:** ${count(preview.milestones)} milestone(s), ${count(preview.items)} item(s), ${count(preview.comments)} comment(s), ${count(preview.attachments)} attachment(s).`,
-        '- **Read-only:** you cannot change it, and nothing of yours is shared back.',
-        '- Either of you can end the share at any time.',
+        ...(raise ? [] : [`- **Right now that is:** ${count(preview.milestones)} milestone(s), ${count(preview.items)} item(s), ${count(preview.comments)} comment(s), ${count(preview.attachments)} attachment(s).`]),
+        contribute
+          ? `- **Can contribute:** you and your agents can add milestones, file items, comment, close and reopen items, and set the mission's status. It all lands on \`${from}\`'s journal, in their numbering, marked as yours. You cannot rename, close or re-share the mission, or attach files.`
+          : '- **Read-only:** you cannot change it, and nothing of yours is shared back.',
+        raise ? '- Decline and the share stays read-only.' : '- Either of you can end the share at any time.',
         '',
         '**To answer:** tap **Accept** or **Decline**.',
       ].join('\n'),
-      link: shareLink(r.id), actions: PEER_ACTIONS, idemKey: `consent:share:${r.id}:grantee:${r.updated_at}`,
+      link: shareLink(r.id), actions: PEER_ACTIONS,
+      idemKey: raise ? `consent:share:${r.id}:grantee:raise:${r.raise_sent}` : `consent:share:${r.id}:grantee:${r.updated_at}`,
     })
     if (item) db.prepare('UPDATE fed_grants_in SET item_id=? WHERE id=?').run(item.id, r.id)
   }
@@ -199,23 +252,40 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     const out = db.transaction(() => {
       const before = getIncoming(db, userId, id)
       if (!before) return null
-      if (before.state !== 'pending') fail('not_pending')
       const at = clock()
+      const to = before.owner_address
+      // A raise: the share stands either way; only its level moves.
+      if (before.state === 'active' && before.pending_level) {
+        const raise = before.pending_level
+        if (decision === 'decline') db.prepare('UPDATE fed_grants_in SET pending_level=NULL, raise_sent=NULL, updated_at=? WHERE id=?').run(at, before.id)
+        else db.prepare('UPDATE fed_grants_in SET level=pending_level, pending_level=NULL, raise_sent=NULL, answered_at=?, updated_at=? WHERE id=?').run(at, at, before.id)
+        enqueue(db, {
+          userId, from: addressOfUser(userId), to, op: ANSWER_OP, body: { grant: before.peer_grant_ref, decision, raise },
+          meta: { from_level: before.level }, subject: subjectOf(before.peer_grant_ref), now: at,
+        })
+        return { outcome: decision === 'decline' ? 'declined' : 'accepted', raise, row: incomingById(db, before.id), before }
+      }
+      if (before.state !== 'pending') fail('not_pending')
       const state = decision === 'decline' ? 'declined' : 'active'
       db.prepare('UPDATE fed_grants_in SET state=?, answered_at=?, updated_at=? WHERE id=?').run(state, at, at, before.id)
-      const to = before.owner_address
       enqueue(db, { userId, from: addressOfUser(userId), to, op: ANSWER_OP, body: { grant: before.peer_grant_ref, decision, sent: before.offer_sent }, subject: subjectOf(before.peer_grant_ref), now: at })
       return { outcome: decision === 'decline' ? 'declined' : 'accepted', row: incomingById(db, before.id), before }
     })()
     if (!out) return null
     const from = plain(out.row.owner_address)
     const words = `mission "${titleOf(out.row.mission_title)}"`
-    const comment = out.outcome === 'accepted' ? `Accepted — the mission will appear in your shared list, shared by \`${from}\`.` : 'Declined.'
+    const comment = out.raise
+      ? (out.outcome === 'accepted' ? `Accepted — you can now contribute to the mission shared by \`${from}\`.` : 'Declined — the share stays read-only.')
+      : out.outcome === 'accepted' ? `Accepted — the mission will appear in your shared list, shared by \`${from}\`.` : 'Declined.'
     const closed = closeMirror(ctx, { userId, itemId: out.before.item_id, consent: 'share', resolution: 'decided', author: 'user', deviceId, comment })
     audit(ctx, userId, {
       event: out.outcome === 'accepted' ? 'grant.accepted' : 'grant.declined', contact: contactOf(db, out.row), grant: auditGrant(out.row),
       summary: out.outcome === 'accepted' ? `You accepted ${words} from ${from}` : `You declined ${words} from ${from}`,
     })
+    // What they may do with the copy they hold changed: the apps reread it.
+    if (out.raise && out.outcome === 'accepted' && out.row.replica_mission_id) {
+      sharedFrame(ctx, userId, { event: 'mission_changed', mission_id: out.row.replica_mission_id, grant_id: out.row.id, what: 'grant', owner: { user_id: 0, name: out.row.owner_address } })
+    }
     changed(ctx, userId, { grant_id: out.row.id })
     kick()
     return { ...out, closed }
@@ -263,14 +333,26 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     [OFFER_OP]: {
       apply({ db: d, envelope, peer, now }) {
         const ref = grantRef(envelope.body)
-        const { level, mission, preview } = envelope.body
+        const { level, mission, preview, raise } = envelope.body
         const sent = Number.isSafeInteger(envelope.body.sent) ? envelope.body.sent : null
         if (typeof mission !== 'object' || mission === null || typeof mission.title !== 'string' || !Number.isSafeInteger(mission.num) || mission.num < 1) fail('malformed')
-        if (level !== 'read') fail('level_unavailable')
+        if (raise !== undefined && (typeof raise !== 'object' || raise === null || !Number.isSafeInteger(raise.sent))) fail('malformed')
+        if (!REMOTE_LEVELS.includes(level)) fail('level_unavailable')
         const { user, contact } = party(d, envelope, peer)
         const host = hostOf(envelope.from)
         const cur = d.prepare(`${IN} WHERE peer_host=? AND peer_grant_ref=?`).get(host, ref)
         if (cur && cur.user_id !== user.id) fail('not_contact')
+        // A raise of the share this user has: one card, while it stands.
+        // One no newer than the last heard, or for what they already have,
+        // changes nothing. A share no longer active here has nothing to
+        // raise (its revoke is on the way, or already sent).
+        if (raise) {
+          if (!cur || cur.state !== 'active' || cur.level === level) return { state: cur?.state ?? 'revoked' }
+          if (cur.raise_sent != null && raise.sent <= cur.raise_sent) return { state: cur.state }
+          d.prepare('UPDATE fed_grants_in SET pending_level=?, raise_sent=?, updated_at=? WHERE id=?').run(level, raise.sent, now, cur.id)
+          pending.set(envelope, incomingById(d, cur.id))
+          return { state: cur.state }
+        }
         // An offer no newer than the last one heard (one still in flight
         // when it was withdrawn or sent again) changes nothing: offer_sent
         // only moves forward, and an ended share is not reopened by it.
@@ -281,6 +363,8 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
           d.prepare('UPDATE fed_grants_in SET offer_sent=? WHERE id=?').run(sent, cur.id)
           return { state: cur.state }
         }
+        const waiting = d.prepare("SELECT COUNT(*) AS n FROM fed_grants_in WHERE user_id=? AND contact_id=? AND state='pending'").get(user.id, contact.id).n
+        if (waiting >= MAX_PENDING_OFFERS) fail('too_many_offers')
         const fields = [level, sanitizePeerText(mission.title, TITLE_CAP) || 'Untitled', mission.num,
           JSON.stringify({ milestones: count(preview?.milestones), items: count(preview?.items), comments: count(preview?.comments), attachments: count(preview?.attachments) }), sent]
         let id = cur?.id
@@ -299,18 +383,21 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const r = pending.get(envelope)
         if (!r) return
         raiseCard(r)
-        audit(ctx, r.user_id, { event: 'grant.received', summary: `${plain(r.owner_address)} offered you mission "${titleOf(r.mission_title)}" to read`, contact: contactOf(db, r), grant: auditGrant(r), by: 'peer' })
+        const to = (r.pending_level ?? r.level) === 'contribute' ? 'contribute to' : 'read'
+        audit(ctx, r.user_id, { event: 'grant.received', summary: `${plain(r.owner_address)} offered you mission "${titleOf(r.mission_title)}" to ${to}`, contact: contactOf(db, r), grant: auditGrant(r), by: 'peer' })
         changed(ctx, r.user_id, { grant_id: r.id })
       },
-      errors: { malformed: 400, not_contact: 403, level_unavailable: 409 },
+      errors: { malformed: 400, not_contact: 403, level_unavailable: 409, too_many_offers: 409 },
     },
     // The owner's journal: the grantee's answer.
     [ANSWER_OP]: {
       apply({ db: d, envelope, peer, now }) {
         const ref = grantRef(envelope.body)
         if (!['approve', 'decline'].includes(envelope.body.decision)) fail('malformed')
+        const raise = envelope.body.raise
+        if (raise !== undefined && !REMOTE_LEVELS.includes(raise)) fail('malformed')
         const { user } = party(d, envelope, peer)
-        const out = answerRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, decision: envelope.body.decision, sent: envelope.body.sent, now })
+        const out = answerRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, decision: envelope.body.decision, sent: envelope.body.sent, raise: raise ?? null, now })
         if (out.outcome !== 'same') pending.set(envelope, out)
         // Accepted: the mission's contents follow, in the same transaction.
         // An outbox too full for it leaves the share standing without a
@@ -347,17 +434,23 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (!r || r.state !== 'active') fail('not_active')
         const out = applySnapshotPage(d, r, envelope.body, now)
         if (out.done) pending.set(envelope, { ...out, row: r })
-        return {}
+        // Given up for want of room: acknowledged, so the owner's journal
+        // sends no more of it, and told so (outbound onAcked).
+        return out.refused ? { refused: out.refused } : {}
       },
       after({ envelope }) {
         const p = pending.get(envelope)
         if (!p) return
+        if (p.done === 'withheld') {
+          sharedFrame(ctx, p.row.user_id, { event: 'mission_removed', mission_id: p.missionId, grant_id: p.row.id })
+          return
+        }
         sharedFrame(ctx, p.row.user_id, {
           event: p.done === 'added' ? 'mission_added' : 'mission_changed', mission_id: p.missionId, grant_id: p.row.id,
           ...(p.done === 'changed' ? { what: 'snapshot' } : {}), owner: { user_id: 0, name: p.row.owner_address },
         })
       },
-      errors: { malformed: 400, not_contact: 403, not_active: 409 },
+      errors: { malformed: 400, not_contact: 403, not_active: 409, too_large: 413, replica_full: 413 },
     },
     // The grantee's journal: one record changed over there.
     [EVENT_OP]: {
@@ -375,7 +468,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (!p) return
         sharedFrame(ctx, p.row.user_id, { event: 'mission_changed', mission_id: p.missionId, grant_id: p.row.id, what: p.kind, owner: { user_id: 0, name: p.row.owner_address } })
       },
-      errors: { malformed: 400, not_contact: 403, not_active: 409 },
+      errors: { malformed: 400, not_contact: 403, not_active: 409, too_large: 413, replica_full: 413 },
     },
     // Either side: the other one ended it.
     [REVOKE_OP]: {
@@ -416,18 +509,34 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     expired: 'could not be reached for 7 days', journal_not_allowed: 'is not one this journal federates with any more',
     peer_key_changed: 'changed its key', not_contact: 'no longer has you as a contact', not_pending: 'no longer has that offer open',
     level_unavailable: 'does not take that kind of share', peer_refused: 'does not accept messages from this journal',
+    too_many_offers: 'has too many of your offers waiting for an answer',
+    replica_full: 'has no more room for its copy of this mission', too_large: 'refused a record too large to keep',
   }
   const why = (error) => REASONS[error] ?? 'refused it'
 
   const outbound = {
     [OFFER_OP]: {
       // An offer withdrawn, or a contact ended, before it went out: nothing to send.
+      // A raise, while it still waits on the grantee (askOf).
       stillAllowed(d, entry) {
         const g = getGrantRaw(d, bodyOf(entry).grant)
-        return !!g && g.state === 'pending'
+        return !!g && askOf(g).state === 'pending'
       },
       onDead(d, entry, { error }) {
         const g = getGrantRaw(d, bodyOf(entry).grant)
+        // A raise that cannot get there just drops: the share stands.
+        if (g && g.state === 'active' && g.pending_state === 'pending' && bodyOf(entry).raise) {
+          const at = clock()
+          d.prepare("UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, updated_at=? WHERE id=? AND pending_state='pending'").run(at, g.id)
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't invite ${to} to contribute to mission #${g.mission_num}`,
+            body: `Their journal at ${g.grantee_journal} ${why(error)}, so mission **#${g.mission_num} ${titleOf(g.mission_title)}** stays shared with them as before. You can ask again.`,
+            idemKey: `fed-offer-dead:${entry.id}`,
+          })
+          changed(ctx, g.owner_user_id, { grant_id: g.id })
+          return 'discard'
+        }
         if (g && g.state === 'pending') {
           const at = clock()
           d.prepare("UPDATE grants SET state='expired', updated_at=? WHERE id=? AND state='pending'").run(at, g.id)
@@ -445,10 +554,33 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     [ANSWER_OP]: {
       stillAllowed(d, entry) {
         const r = incomingFor(d, entry)
-        return !!r && r.state === (bodyOf(entry).decision === 'decline' ? 'declined' : 'active')
+        const body = bodyOf(entry)
+        // A raise's answer goes while the share stands, whichever way it went.
+        if (body.raise) return !!r && r.state === 'active'
+        return !!r && r.state === (body.decision === 'decline' ? 'declined' : 'active')
       },
       onDead(d, entry, { error }) {
         const r = incomingFor(d, entry)
+        const body = bodyOf(entry)
+        // A raise that never got there: the share stands as the owner's
+        // journal still has it, so this one goes back to that level.
+        if (body.raise) {
+          if (r && r.state === 'active' && body.decision !== 'decline') {
+            const was = entry.meta?.from_level ?? null
+            if (REMOTE_LEVELS.includes(was)) {
+              d.prepare('UPDATE fed_grants_in SET level=?, updated_at=? WHERE id=?').run(was, clock(), r.id)
+              // The apps reread the copy, as they did when the accept raised it.
+              if (r.replica_mission_id) sharedFrame(ctx, r.user_id, { event: 'mission_changed', mission_id: r.replica_mission_id, grant_id: r.id, what: 'grant', owner: { user_id: 0, name: r.owner_address } })
+            }
+            fileNotice(ctx, {
+              userId: r.user_id, title: `Couldn't accept contributing to mission "${titleOf(r.mission_title)}"`,
+              body: `The journal at ${r.peer_host} ${why(error)}, so the share from \`${plain(r.owner_address)}\` stays ${was === 'read' ? 'read-only' : 'as it was'}. Ask them to offer it again.`,
+              idemKey: `fed-answer-dead:${entry.id}`,
+            })
+            changed(ctx, r.user_id, { grant_id: r.id })
+          }
+          return 'discard'
+        }
         if (r && r.state === 'active' && bodyOf(entry).decision !== 'decline') {
           const at = clock()
           d.prepare("UPDATE fed_grants_in SET state='revoked', revoked_by='owner', revoked_at=?, updated_at=? WHERE id=?").run(at, at, r.id)
@@ -463,13 +595,32 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
     },
     [SNAPSHOT_OP]: {
+      // Nor while a private flag change waits to resnapshot the share: the
+      // page was read before it, and resnapshot() replaces it.
       stillAllowed(d, entry) {
         const g = getGrantRaw(d, bodyOf(entry).grant)
-        return !!g && g.state === 'active'
+        if (!g || g.state !== 'active') return false
+        return !d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)
       },
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not
       // news (its revoke is on the way).
+      // Taken but given up over there (no room for the copy): as a page
+      // that died, once per snapshot.
+      onAcked(d, entry, result) {
+        if (typeof result?.refused !== 'string') return undefined
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        if (!g || g.state !== 'active') return undefined
+        return () => {
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${to}`,
+            body: `Their journal at ${g.grantee_journal} ${why(result.refused)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be out of date or missing. The share itself stands.`,
+            idemKey: `fed-snapshot-dead:${g.id}:${body.snap}`,
+          })
+        }
+      },
       onDead(d, entry, { error }) {
         const body = bodyOf(entry)
         const g = getGrantRaw(d, body.grant)
@@ -520,5 +671,5 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
     },
   }
-  return { federate, answer, leave, kick, inbound, outbound, setOutbox: (o) => { outbox = o } }
+  return { federate, answer, leave, kick, resnapshot, inbound, outbound, setOutbox: (o) => { outbox = o } }
 }

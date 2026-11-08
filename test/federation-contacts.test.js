@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createUser, createAgent } from '../src/auth.js'
 import { exportPublicKey, generateFederationKey, formatFingerprint, signEnvelope, newOpId } from '../src/federation-envelope.js'
 import { makeFederationClient } from '../src/federation-client.js'
-import { inviteLink, parseInviteLink, MAX_OPEN_INVITES } from '../src/federation-contacts.js'
+import { inviteLink, inviteWebLink, parseInviteLink, MAX_OPEN_INVITES } from '../src/federation-contacts.js'
 import { startTestServer } from './helpers.js'
 import { enqueue, makeOutbox } from '../src/federation-outbox.js'
 import { ensureFederationKey } from '../src/federation-identity.js'
@@ -89,6 +89,25 @@ test('links: made and read back; anything else in the link is refused', () => {
   ]) assert.equal(parseInviteLink(bad), null, String(bad))
 })
 
+test('links: the https form carries the same fields in its fragment, on the journal it names', () => {
+  const good = { host: 'a.example:8443', user: 'alice.s', token: TOKEN, fingerprint: FP }
+  const link = inviteWebLink(good)
+  assert.equal(link, `https://a.example:8443/contact#v=1&j=a.example%3A8443&u=alice.s&t=${TOKEN}&fp=${FP}`)
+  assert.deepEqual(parseInviteLink(link), good)
+  assert.deepEqual(parseInviteLink(inviteWebLink({ ...good, host: 'a.example' })), { ...good, host: 'a.example' })
+  assert.deepEqual(parseInviteLink(link.replace('https://a.example', 'https://A.EXAMPLE')), good, 'the host is case-blind')
+  const p443 = { ...good, host: 'a.example:443' }
+  assert.deepEqual(parseInviteLink(inviteWebLink(p443)), p443, 'a default port in j is the URL\'s own host')
+  for (const bad of [
+    link.replace('https:', 'http:'), link.replace('https://a.example:8443', 'https://b.example:8443'), link.replace(':8443/', '/'),
+    link.replace('/contact#', '/contact/#'), link.replace('/contact#', '/other#'), link.replace('/contact#', '/contact?x=1#'),
+    link.replace('/contact#', `/contact?${new URL(link).hash.slice(1)}#`), link.split('#')[0], `${link}&x=1`,
+    link.replace('https://', 'https://eve@'), link.replace('v=1', 'v=2'), link.replace(`t=${TOKEN}`, 't=short'),
+    `matron://contact#${new URL(link).hash.slice(1)}`, `${inviteLink(good)}#v=1`,
+    link.replace('j=a.example%3A8443', 'j=a.example%3A99999'),
+  ]) assert.equal(parseInviteLink(bad), null, String(bad))
+})
+
 // --- Invites ------------------------------------------------------------------
 
 test('invites: a client mints, lists and withdraws them; an agent never sees one', async (t) => {
@@ -132,6 +151,21 @@ test('invites: federation off answers every route with federation_off', async (t
 })
 
 // --- Opening and accepting ----------------------------------------------------
+
+test('end to end: the https link opens and accepts the same invite as its matron:// form', async (t) => {
+  const w = await world(t)
+  const made = (await w.phones.alice('/contacts/invites', post({}))).json
+  assert.equal(made.web_link, inviteWebLink(parseInviteLink(made.link)))
+  assert.ok(made.web_link.startsWith('https://a.example/contact#'))
+  const seen = await w.phones.bob('/contacts/invites/open', post({ link: made.web_link }))
+  assert.equal(seen.status, 200)
+  assert.equal(seen.json.inviter.address, 'alice@a.example')
+  assert.equal((await w.phones.bob('/contacts/invites/accept', post({ link: made.web_link }))).status, 202)
+  await w.settle()
+  assert.deepEqual((await contactsOf(w.phones.bob)).map((c) => [c.address, c.state]), [['alice@a.example', 'active']])
+  const listed = (await w.phones.alice('/contacts/invites')).json.invites
+  assert.deepEqual(listed.map((i) => [i.id, i.state]), [[made.invite.id, 'used']], 'one invite, whichever form was opened')
+})
 
 test('end to end: bob opens alice\'s link, accepts, and both sides are contacts', async (t) => {
   const w = await world(t)
@@ -481,12 +515,14 @@ test('invite asks: an agent parks one, the tap mints it and only the tapping dev
   assert.equal(tap.status, 200)
   assert.equal(tap.json.ask.state, 'approved')
   assert.equal(parseInviteLink(tap.json.link).user, 'alice')
+  assert.deepEqual(parseInviteLink(tap.json.web_link), parseInviteLink(tap.json.link))
   assert.equal(tap.json.ask.invite_id, tap.json.invite.id)
   assert.match(tap.json.comment.body, /shown on the device you tapped on/)
   assert.equal(JSON.stringify(tap.json.comment).includes('matron://contact'), false)
   assert.deepEqual(agentHeard(w.a, 'work'), [], 'the link is in no event')
   assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM items WHERE body LIKE '%matron://contact%'").get().n, 0)
-  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM item_comments WHERE body LIKE '%matron://contact%'").get().n, 0)
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM item_comments WHERE body LIKE '%matron://contact%' OR body LIKE '%/contact#%'").get().n, 0)
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM items WHERE body LIKE '%/contact#%'").get().n, 0)
   assert.equal(w.a.db.prepare('SELECT state FROM items WHERE id=?').get(mirror.id).state, 'closed')
 
   // The link it made works like any other.

@@ -45,7 +45,7 @@ export function parkInviteAsk(db, { userId, convoId, deviceId, now = Date.now() 
   })()
 }
 
-// The user's answer. `mint()` makes the invite ({invite, link}) inside this
+// The user's answer. `mint()` makes the invite ({invite, link, web_link}) inside this
 // transaction, so a refused mint (too_many_invites) leaves the ask waiting.
 // null = no such ask of theirs. Outcomes: 'approved' (with invite and link),
 // 'declined', 'expired' (it was past its 24 h). Error: 'not_pending'.
@@ -65,7 +65,7 @@ export function answerInviteAsk(db, { userId, askId, decision, mint, now = Date.
     }
     const made = mint()
     setState(db, before.id, 'approved', now, made.invite.id)
-    return { outcome: 'approved', ask: askById(db, before.id), before, invite: made.invite, link: made.link }
+    return { outcome: 'approved', ask: askById(db, before.id), before, invite: made.invite, link: made.link, web_link: made.web_link }
   })()
 }
 
@@ -152,6 +152,6 @@ export function applyInviteAnswer(ctx, who, askId, decision) {
   const closed = onInviteAskOutcome(ctx, who, out)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   const body = { ask: inviteAskView(out.ask) }
-  if (out.outcome === 'approved') Object.assign(body, { invite: out.invite, link: out.link })
+  if (out.outcome === 'approved') Object.assign(body, { invite: out.invite, link: out.link, web_link: out.web_link })
   return { status: 200, body, closed }
 }

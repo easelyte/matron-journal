@@ -154,7 +154,10 @@ export function discardDead(db, userId, peerHost, now = Date.now()) {
 
 // The worker. `client` is a federation client (src/federation-client.js);
 // `ops` the op hooks; `hub` reaches the user's clients with the notice.
-export function makeOutbox({ db, hub = null, federation, client, ops = {}, now = Date.now, random = Math.random, log = console, batch = 50 }) {
+// `beforePass`, when given, runs at the start of every pass, to queue what
+// other processes asked for in the database (federation-grants.js
+// resnapshot). Its errors are logged, never thrown.
+export function makeOutbox({ db, hub = null, federation, client, ops = {}, beforePass = null, now = Date.now, random = Math.random, log = console, batch = 50 }) {
   const due = db.prepare(`SELECT o.* FROM fed_outbox o
     WHERE o.state='queued' AND o.next_at<=?
       AND (o.urgent=1 OR NOT EXISTS (SELECT 1 FROM fed_outbox p WHERE p.peer_host=o.peer_host AND p.subject=o.subject
@@ -299,6 +302,7 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
     // async body: a pass with nothing due finishes before the assignment
     // below, and would otherwise leave `running` set for good.
     const pass = (async () => {
+      try { beforePass?.() } catch (err) { log.error('federation: before pass failed', err) }
       for (const entry of due.all(now(), batch)) await attempt(entry)
     })()
     running = pass.finally(() => { if (running === settled) running = null })

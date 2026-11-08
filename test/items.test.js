@@ -15,7 +15,7 @@ test('schema: items, item_comments, item_counters exist with the expected column
     'id', 'user_id', 'num', 'kind', 'state', 'resolution', 'awaiting', 'rank', 'title', 'body',
     'labels', 'links', 'supersedes', 'origin_convo_id', 'origin_device_id', 'created_by',
     'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent', 'actions', 'chosen_action', 'private', 'filed_convo_id', 'turn_requested_at',
-    'contributor_user_id', 'contributor_convo_id', 'contributor_name', 'contributor_via',
+    'contributor_user_id', 'contributor_convo_id', 'contributor_name', 'contributor_via', 'contributor_grant_id',
   ])
   assert.deepEqual(cols('item_comments'), [
     'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id', 'withdrawn_at',

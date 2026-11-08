@@ -1,6 +1,7 @@
 // The two app-link files (spec 2026-09-23 tracker web/teams, "Static
 // hosting" and "Why not universal links alone"): Apple's AASA and Android's
-// assetlinks, each claiming /u/* for the installed app. Built once from env
+// assetlinks, each claiming /u/* (and /contact, the https invite links of
+// federation-contacts.js) for the installed app. Built once from env
 // at boot; a journal with nothing configured claims nothing (404), so a
 // self-hosted journal without app builds never asserts an association it
 // cannot honour. Unauthenticated by design — the platforms fetch these
@@ -22,7 +23,7 @@ export function makeWellKnown({ appleAppIds = [], androidPackage = null, android
   if (fingerprints.length && !androidPackage) throw new Error('MATRON_ANDROID_PACKAGE is required alongside MATRON_ANDROID_CERT_SHA256')
 
   const aasa = appleAppIds.length
-    ? JSON.stringify({ applinks: { details: [{ appIDs: appleAppIds, components: [{ '/': '/u/*', comment: 'Matron tracker links' }] }] } })
+    ? JSON.stringify({ applinks: { details: [{ appIDs: appleAppIds, components: [{ '/': '/u/*', comment: 'Matron tracker links' }, { '/': '/contact', comment: 'Matron contact invites' }] }] } })
     : null
   const assetlinks = androidPackage
     ? JSON.stringify([{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app', package_name: androidPackage, sha256_cert_fingerprints: fingerprints } }])

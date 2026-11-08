@@ -57,6 +57,7 @@ export function pickableSessions(db, userId, limit = PICK_MAX) {
     WHERE c.owner_user_id=@u AND d.user_id=@u AND d.kind='agent' AND d.private=0
       AND c.parent_convo_id IS NULL AND c.system IS NULL AND c.session_state <> 'archived'
       AND NOT EXISTS(SELECT 1 FROM person_rooms pr WHERE pr.guest_room_id = c.id OR pr.owner_room_id = c.id)
+      AND NOT EXISTS(SELECT 1 FROM fed_rooms fr WHERE fr.room_id = c.id)
       AND NOT EXISTS(SELECT 1 FROM convo_agents ca WHERE ca.convo_id = c.id)
     ORDER BY c.last_seq DESC, c.created_at DESC`).all({ u: userId })
     .filter((c) => c.id !== coord && isShareableSession(db, userId, c.id))
@@ -205,6 +206,7 @@ export function isTalkTarget(db, userId, convoId, deviceId) {
   if (!c || c.agent_device_id !== deviceId) return false
   if (!isShareableSession(db, userId, convoId)) return false
   if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? OR guest_room_id=?').get(convoId, convoId)) return false
+  if (db.prepare('SELECT 1 FROM fed_rooms WHERE room_id=?').get(convoId)) return false
   if (db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=?').get(convoId)) return false
   return true
 }

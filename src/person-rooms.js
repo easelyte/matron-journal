@@ -26,7 +26,7 @@
 // owner's device through the twin.
 import { randomBytes } from 'node:crypto'
 import { newId } from './items.js'
-import { getContactRaw, isMutual, peerRowOf, OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE } from './contacts.js'
+import { getContactRaw, isMutual, isLiveRemote, peerRowOf, OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE } from './contacts.js'
 import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
@@ -87,7 +87,8 @@ export function parkedPeopleAsks(db, deviceId) {
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
     + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner'))
     + (SELECT COUNT(*) FROM session_shares WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM person_rooms WHERE owner_device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
+    + (SELECT COUNT(*) FROM person_rooms WHERE owner_device_id=@d AND state='awaiting_owner')
+    + (SELECT COUNT(*) FROM fed_rooms WHERE role='owner' AND device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
 }
 
 // `by` 'agent' parks for the user's approval; 'user' (a client) is the tap.
@@ -98,7 +99,9 @@ export function shareSession(db, { userId, convoId, contact, by, deviceId = null
     const session = shareableSession(db, userId, convoId)
     if (!session) fail('no_session')
     const own = getContactRaw(db, userId, contact)
-    if (!own || !isMutual(db, own)) fail('not_contact')
+    // A contact on another journal has no row here to check: theirs answers
+    // for them (federation-rooms.js sends them the share).
+    if (!own || !(own.peer_journal ? isLiveRemote(db, own) : isMutual(db, own))) fail('not_contact')
     const cur = db.prepare('SELECT * FROM session_shares WHERE convo_id=? AND contact_id=?').get(session.id, own.id)
     if (cur?.state === 'active') return { outcome: 'existing', share: cur }
     if (cur?.state === 'awaiting_user') fail('pending')
@@ -131,7 +134,7 @@ export function answerSessionShare(db, { userId, shareId, decision, now = Date.n
     if (now - row.updated_at > OWN_ASK_TTL_MS) return done('expired', 'expired')
     if (decision === 'decline') return done('withdrawn', 'declined')
     const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(row.contact_id)
-    if (!isMutual(db, contact)) return done('unavailable', 'revoked', `, revoked_at=${Number(now)}`)
+    if (!(contact?.peer_journal ? isLiveRemote(db, contact) : isMutual(db, contact))) return done('unavailable', 'revoked', `, revoked_at=${Number(now)}`)
     return done('shared', 'active')
   })()
 }
@@ -290,6 +293,10 @@ export function checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSen
   // stay a twin (isGuestRoom), and a fresh room is one agent_chat_start
   // away.
   if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? AND guest_room_id IS NOT NULL').get(roomId)) fail('room_busy')
+  // A room with a contact on another journal (src/federation-rooms.js)
+  // holds the room the same way: while it lives, once its ask left this
+  // journal, and always on the side that was asked.
+  if (db.prepare(`SELECT 1 FROM fed_rooms WHERE room_id=? AND (state IN ${LIVE_SQL} OR sent_at IS NOT NULL OR role='guest')`).get(roomId)) fail('room_busy')
   if (!isFreshRoom(db, { userId: ownerUserId, roomId, ownerSender })) fail('not_fresh')
   // Exactly two agents: the guest consented to talking with this one
   // session, not to whoever else the owner later adds.

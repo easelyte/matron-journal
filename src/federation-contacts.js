@@ -5,7 +5,12 @@
 // an address they typed. Alice's journal mints a single-use, 7-day invite
 // and shows her the link once:
 //
-//   matron://contact?v=1&j=<journal host>&u=<alice's name>&t=<token>&fp=<key fingerprint>
+//   https://<journal host>/contact#v=1&j=<journal host>&u=<alice's name>&t=<token>&fp=<key fingerprint>
+//
+// (`web_link`, the one to send: chat apps and mail make an https link
+// tappable, and the fragment never reaches a server's logs), or the same
+// fields as `matron://contact?v=1&j=…` (`link`, which older apps share).
+// Both open the same invite.
 //
 // Bob opens it in his app. His journal fetches Alice's journal's
 // well-known, refuses it unless its key fingerprint is the one in the link
@@ -41,6 +46,7 @@ import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { contactRow, getContactRaw, remoteContactRaw, removeContact } from './contacts.js'
 import { audit, changed, fileNotice, onGrantRevoked, addressOf } from './sharing-events.js'
 import { onIncomingEnded } from './federation-grants.js'
+import { fedRoomsOf } from './federation-rooms.js'
 
 export const INVITE_TTL_MS = 7 * 24 * 3600 * 1000
 export const MAX_OPEN_INVITES = 20
@@ -79,19 +85,34 @@ const who = (row) => plain(addressOf(row))
 
 // --- Links --------------------------------------------------------------------
 
-export function inviteLink({ host, user, token, fingerprint }) {
-  const q = new URLSearchParams({ v: '1', j: host, u: user, t: token, fp: fingerprint })
-  return `matron://contact?${q}`
+const linkFields = ({ host, user, token, fingerprint }) => new URLSearchParams({ v: '1', j: host, u: user, t: token, fp: fingerprint })
+
+export function inviteLink(inv) {
+  return `matron://contact?${linkFields(inv)}`
+}
+
+// The https form: the inviter's journal's /contact page (contact-page.js),
+// every field in the fragment.
+export function inviteWebLink(inv) {
+  return `https://${inv.host}/contact#${linkFields(inv)}`
 }
 
 // → {host, user, token, fingerprint} or null. Strict: exactly the fields a
-// link this journal makes carries, each in its own shape.
+// link this journal makes carries, each in its own shape, in either form.
+// An https link must be on the journal it names (`j`), at /contact, with
+// nothing but the fragment.
 export function parseInviteLink(link) {
   if (typeof link !== 'string' || link.length > 1024) return null
   let u
   try { u = new URL(link.trim()) } catch { return null }
-  if (u.protocol !== 'matron:' || u.host !== 'contact' || (u.pathname && u.pathname !== '/' && u.pathname !== '')) return null
-  const p = u.searchParams
+  let p
+  if (u.protocol === 'matron:') {
+    if (u.host !== 'contact' || (u.pathname && u.pathname !== '/' && u.pathname !== '') || u.hash) return null
+    p = u.searchParams
+  } else if (u.protocol === 'https:') {
+    if (u.pathname !== '/contact' || u.search || u.username || u.password || !u.hash) return null
+    p = new URLSearchParams(u.hash.slice(1))
+  } else return null
   if ([...p.keys()].some((k) => !['v', 'j', 'u', 't', 'fp'].includes(k))) return null
   if ([...new Set(p.keys())].length !== [...p.keys()].length) return null
   if (p.get('v') !== '1') return null
@@ -100,6 +121,13 @@ export function parseInviteLink(link) {
   const token = String(p.get('t') ?? '')
   const fingerprint = String(p.get('fp') ?? '').toLowerCase()
   if (!isAddress(`${user}@${host}`) || !TOKEN_RE.test(token) || !FP_RE.test(fingerprint)) return null
+  // As a URL writes it: an explicit default port (`:443`) is dropped. A port
+  // the URL parser refuses (over 65535) is no link.
+  if (u.protocol === 'https:') {
+    let named
+    try { named = new URL(`https://${host}`).host } catch { return null }
+    if (u.host !== named) return null
+  }
   return { host, user, token, fingerprint }
 }
 
@@ -111,8 +139,8 @@ export const inviteView = (r, now = Date.now()) => ({
   used_at: r.used_at ?? null, used_by: r.used_by_address ?? null, revoked_at: r.revoked_at ?? null,
 })
 
-// → {invite, link}. The link is returned this once: only the token's hash
-// is kept. Errors: 'unlisted', 'too_many_invites'.
+// → {invite, link, web_link}. The link is returned this once, in both
+// forms: only the token's hash is kept. Errors: 'unlisted', 'too_many_invites'.
 export function createInvite(db, { userId, federation, now = Date.now(), random = randomBytes }) {
   return db.transaction(() => {
     const user = userById(db, userId)
@@ -124,7 +152,8 @@ export function createInvite(db, { userId, federation, now = Date.now(), random 
     db.prepare('INSERT INTO fed_invites(id, token_hash, user_id, created_at, expires_at) VALUES(?,?,?,?,?)')
       .run(id, hashToken(token), userId, now, now + INVITE_TTL_MS)
     const row = db.prepare('SELECT * FROM fed_invites WHERE id=?').get(id)
-    return { invite: inviteView(row, now), link: inviteLink({ host: federation.host, user: user.name, token, fingerprint: federation.key.fingerprint }) }
+    const inv = { host: federation.host, user: user.name, token, fingerprint: federation.key.fingerprint }
+    return { invite: inviteView(row, now), link: inviteLink(inv), web_link: inviteWebLink(inv) }
   })()
 }
 
@@ -406,6 +435,7 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         })
         for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
         for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_removed')
+        fedRoomsOf(db)?.onContactEnded(out.contact.id)
         changed(ctx, out.contact.user_id, { contact_id: out.contact.id })
       },
       errors: {},

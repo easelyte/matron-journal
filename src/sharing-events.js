@@ -31,6 +31,7 @@ import { getItem, insertComment } from './items.js'
 import { withdrawOnClose } from './item-handover-http.js'
 import { CONSENT_LABEL, consentLink } from './consent-items.js'
 import { onIncomingEnded } from './federation-grants.js'
+import { fedRoomsOf } from './federation-rooms.js'
 
 export const CONTACT_CARD_KIND = 'contact_request'
 export const SHARE_CARD_KIND = 'mission_share'
@@ -310,6 +311,7 @@ export function onContactEnded(ctx, who, out, verb) {
   }
   for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
   for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_ended')
+  if (own.peer_journal) fedRoomsOf(ctx.db)?.onContactEnded(own.id)
   changed(ctx, own.user_id, { contact_id: own.id })
 }
 
@@ -448,7 +450,7 @@ export function onGrantOutcome(ctx, who, out) {
       break
     case 'accepted':
       if (remote) {
-        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared read-only`, contact: oc, grant: g, by: 'peer' })
+        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g, by: 'peer' })
         break
       }
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)

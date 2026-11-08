@@ -171,14 +171,17 @@ export function shareMission(db, { ownerUserId, missionId, contact, level, brief
     const own = getContactRaw(db, ownerUserId, contact)
     if (!own) fail('not_contact')
     if (own.peer_journal) {
-      // A contact on another journal: only a read share crosses so far, and
-      // only while this journal federates (`federate` sends the offer).
+      // A contact on another journal: a read or contribute share crosses
+      // (a hand-over does not yet), and only while this journal federates
+      // (`federate` sends the offer).
       if (!isLiveRemote(db, own)) fail('not_contact')
-      if (level !== 'read') fail('level_unavailable')
+      if (level === 'owner') fail('level_unavailable')
       if (!federate) fail('federation_off')
     } else if (!isMutual(db, own)) fail('not_contact')
     const out = upsertAsk(db, { ownerUserId, kind: 'mission', subjectId: mission.id, own, level, brief: level === 'owner' ? brief : null, excludeMedia, keepLevel, by, convoId, deviceId, now })
-    if (own.peer_journal && !out.existing && out.grant.state === 'pending') federate('offer', out.grant)
+    // A new ask, or a raise of an active share, that is the grantee's to
+    // answer now (an agent's waits for the owner's yes first).
+    if (own.peer_journal && !out.existing && askOf(out.grant).state === 'pending') federate('offer', out.grant)
     return out
   })()
 }
@@ -408,12 +411,27 @@ const staleFor = (g, sent) => g.state === 'pending' && Number.isSafeInteger(sent
 // answerGrant ('accepted' | 'declined'); answering what is already so again,
 // or a stale decline, is 'same'. Errors: not_pending (withdrawn, ended, or
 // not theirs).
-export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, decision, sent = null, now = Date.now() }) {
+//
+// `raise` names the level of a raise they answered (a read share offered to
+// contribute): it moves only the raise, the share standing either way. An
+// answer for a raise that is no longer waiting (answered already) is 'same'.
+export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, decision, sent = null, raise = null, now = Date.now() }) {
   return db.transaction(() => {
     const hit = remoteGrant(db, { ownerUserId, grantId, address, key })
     if (!hit) fail('not_pending')
     const { g, contact } = hit
     const done = (outcome) => ({ outcome, grant: getGrantRaw(db, g.id), before: g })
+    if (raise != null) {
+      if (g.state !== 'active') fail('not_pending')
+      if (g.pending_state !== 'pending' || g.pending_level !== raise) {
+        if (decision === 'decline' || g.level === raise) return done('same')
+        fail('not_pending')
+      }
+      if (!isLiveRemote(db, contact)) fail('not_pending')
+      if (decision === 'decline') dropRaise(db, g, now)
+      else db.prepare(`UPDATE grants SET level=pending_level, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, answered_at=?, updated_at=? WHERE id=?`).run(now, now, g.id)
+      return done(decision === 'decline' ? 'declined' : 'accepted')
+    }
     if (g.state === (decision === 'decline' ? 'declined' : 'active') && !g.pending_state) return done('same')
     if (decision === 'decline' && staleFor(g, sent)) return done('same')
     if (g.state !== 'pending' || !isLiveRemote(db, contact)) fail('not_pending')
