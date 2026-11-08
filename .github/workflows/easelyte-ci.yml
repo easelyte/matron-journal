@@ -1,0 +1,50 @@
+# easelyte fork CI: one unit-test run per pull request to master.
+#
+# This repo is public, so it runs on GitHub-hosted runners (free for public
+# repos) and never on our self-hosted pool, which must not run untrusted code.
+# Locked down: no secrets, read-only token, no credential persistence, no
+# schedule, nothing on drafts or docs-only changes, superseded runs cancelled.
+# Fork pull requests also need a maintainer's approval (repo setting).
+# To test a branch without a PR: gh workflow run easelyte-ci.yml --ref <branch>
+name: easelyte CI
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'media/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: easelyte-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
