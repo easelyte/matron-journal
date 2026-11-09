@@ -99,7 +99,10 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     value.title = t
   }
   if (fields.body !== undefined) {
-    if (typeof fields.body !== 'string' || fields.body.length > BODY_MAX) return { ok: false }
+    if (typeof fields.body !== 'string') return { ok: false }
+    // Named, with the limit, so a client can tell the user to split a long
+    // paste or attach it as a file rather than show a bare "bad request".
+    if (fields.body.length > BODY_MAX) return { ok: false, error: 'body_too_long', max: BODY_MAX }
     value.body = fields.body
   }
   if (fields.labels !== undefined) {
