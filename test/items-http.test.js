@@ -753,6 +753,23 @@ test('a colleague reading a shared item never sees a handover: no pending offer,
   assert.equal(list.json.items[0].handover, null)
 })
 
+test('a comment or a create over 32768 characters is a named 400 with the limit, and nothing is stored', async (t) => {
+  const { s, client } = await fleet(t)
+  const tooLong = await mkItem(s, client, { body: 'x'.repeat(32769) })
+  assert.equal(tooLong.status, 400)
+  assert.deepEqual(tooLong.json, { error: 'body_too_long', max: 32768 })
+  const created = await mkItem(s, client, { body: 'x'.repeat(32768) })
+  assert.equal(created.status, 201)
+  const id = created.json.item.id
+  const before = (await s.http(`/items/${id}`, { token: client })).json.comments.length
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'y'.repeat(32769) } })
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'body_too_long', max: 32768 })
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.comments.length, before, 'the refused comment stored nothing')
+  const ok = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'y'.repeat(32768) } })
+  assert.equal(ok.status, 201)
+})
+
 test('more than 20 attachments on a comment or a create is a named 400, and nothing is stored', async (t) => {
   const { s, client } = await fleet(t)
   const files = (n) => Array.from({ length: n }, (_, i) => ({ blob_ref: `b${i}`, mime: 'text/csv', name: `f${i}.csv`, size: 1 }))
