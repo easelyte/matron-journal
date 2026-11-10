@@ -140,6 +140,9 @@ export function closeProject(db, { userId, projectId, by, summary, excludePrivat
 // with "Merged into #N" and records merged_into. Rows are read unsieved —
 // the HTTP layer resolves both ends through the caller's sieve first. movedMissionIds lets the
 // HTTP layer write one `updated` marker (project_changed) per mission.
+// Under the sieve a merge never carries along a mission the caller cannot
+// see: a source holding one (a private-origin mission, in any state) refuses
+// with `private_missions` and nothing is written. The error names no mission.
 export function mergeProject(db, { userId, projectId, intoId, by, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const src = db.prepare('SELECT id, state FROM projects WHERE id=? AND user_id=?').get(projectId, userId)
@@ -148,6 +151,8 @@ export function mergeProject(db, { userId, projectId, intoId, by, excludePrivate
     if (src.id === dst.id) throw new Error('same_project')
     if (src.state === 'closed') throw new Error('closed')
     if (dst.state === 'closed') throw new Error('into_closed')
+    if (excludePrivateOwned && db.prepare(`SELECT 1 FROM missions m
+      WHERE m.project_id = ? AND m.user_id = ? AND NOT ${ORIGIN_SIEVE} LIMIT 1`).get(src.id, userId)) throw new Error('private_missions')
     const ts = now()
     const moved = db.prepare('SELECT id FROM missions WHERE project_id=? AND user_id=? ORDER BY num').all(src.id, userId).map((r) => r.id)
     db.prepare('UPDATE missions SET project_id=?, updated_at=? WHERE project_id=? AND user_id=?').run(dst.id, ts, src.id, userId)

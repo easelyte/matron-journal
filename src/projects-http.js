@@ -98,8 +98,9 @@ async function handleClose(ctx, req, res, who, project) {
 // rows unsieved): a project the caller cannot see is 404 as :id (route) or
 // as `into` (here). The Coordinator is sieved on any device, so on a private
 // one the route's own lookup of :id is repeated under the sieve.
-// movedMissionIds never leaves this function — it can name missions hidden
-// from a filtered caller.
+// A sieved merge moves no mission the caller cannot see: a source holding
+// one is 409 private_missions. movedMissionIds never leaves this function —
+// the user's own merge can move missions an agent may not see.
 async function handleMerge(ctx, req, res, who, project) {
   const { db } = ctx
   const body = await readBody(req)
@@ -115,6 +116,8 @@ async function handleMerge(ctx, req, res, who, project) {
   } catch (err) {
     if (err.message === 'same_project') return badRequest(res)
     if (err.message === 'closed' || err.message === 'into_closed') return conflict(res, { blocked_by: err.message })
+    // A mission hidden from the caller blocks the merge but is not named.
+    if (err.message === 'private_missions') return conflict(res, { blocked_by: 'private_missions' })
     if (err.message === 'no_project') return notFound(res)
     throw err
   }
