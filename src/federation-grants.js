@@ -26,7 +26,7 @@ import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview, askOf }
 import { onRemoteMissionWrite, card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
-import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, eventBody, applySnapshotPage, applyEvent } from './federation-replica.js'
+import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, eventBody, pageIsCurrent, applySnapshotPage, applyEvent } from './federation-replica.js'
 
 export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
@@ -597,10 +597,18 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     [SNAPSHOT_OP]: {
       // Nor while a private flag change waits to resnapshot the share: the
       // page was read before it, and resnapshot() replaces it.
+      // Nor a page that no longer shows what the grantee view shows (an
+      // item hidden or changed, a comment withdrawn, since it was queued):
+      // the share is queued for a fresh snapshot, and this one, page by
+      // page, is cancelled.
       stillAllowed(d, entry) {
-        const g = getGrantRaw(d, bodyOf(entry).grant)
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
         if (!g || g.state !== 'active') return false
-        return !d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)
+        if (d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)) return false
+        if (pageIsCurrent(d, g, body)) return true
+        d.prepare('INSERT OR IGNORE INTO fed_resnapshot(grant_id, queued_at) VALUES(?,?)').run(g.id, clock())
+        return false
       },
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not
@@ -643,6 +651,13 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const g = getGrantRaw(d, body.grant)
         if (!g || g.state !== 'active') return false
         return body.record === null || !!eventBody(d, g, body.kind, body.ref ?? null)
+      },
+      // The record as the grantee view has it at the attempt, not as it was
+      // queued: a comment withdrawn meanwhile crosses withdrawn.
+      refresh(d, entry) {
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        return (g && eventBody(d, g, body.kind, body.ref ?? null)) ?? undefined
       },
       // As for a snapshot: the share stands, their copy may be behind. Once
       // a day per share, however many events died.

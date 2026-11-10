@@ -110,7 +110,8 @@ approves it on his side.
   `GET /federation/outbox?state=dead|queued|sent|cancelled` (client devices
   only, and never the bodies). For the whole journal, look at the
   `fed_outbox` table: `state`, `attempts`, `last_status` and `last_error`
-  per entry.
+  per entry. Sent and cancelled entries are deleted a week after they
+  ended.
 - **Dead deliveries.** An op the other journal hasn't acknowledged within 7
   days, or that it refused for good, goes dead. Its user gets one notice per
   peer in their People conversation. Dead ops hold up later ops on the same
@@ -145,9 +146,25 @@ federation on again picks them up. The 7 days keep counting while it's off,
 so an op more than 7 days old by then goes dead, and its user can resend
 it.
 
-To cut off one journal and keep the others, add it to
-`MATRON_FEDERATION_DENY_JOURNALS` and restart. Its envelopes are refused with
-`403 peer_refused`, and what you would send it goes dead as
+To cut off one journal and keep the others, block it:
+
+```
+matron-admin federation block b.example
+matron-admin federation unblock b.example
+matron-admin federation peers
+```
+
+A block takes effect at once, with no restart. Its envelopes are refused
+with `403 peer_refused`, invite links from it are refused, and what you
+would send it goes dead as `peer_blocked`, with a notice to each user it
+was for. A host this journal has never heard from can be blocked ahead of
+time. After an unblock, its contacts work again with the key they pinned,
+and users can resend what went dead. `peers` lists every journal this one
+knows, with its state, live contacts, queued and dead ops, and when it last
+answered.
+
+Adding the host to `MATRON_FEDERATION_DENY_JOURNALS` and restarting does
+the same from the environment; what you would send it then goes dead as
 `journal_not_allowed`.
 
 ## What crosses, and what doesn't

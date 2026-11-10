@@ -21,6 +21,7 @@
 // own (the owner's is `ref`), and the last page drops whatever the snapshot
 // no longer had. The replica is served only while the grant is active; a
 // trigger (db.js) deletes it the moment the grant ends there.
+import { canonicalize } from './federation-jcs.js'
 import { newId } from './items.js'
 import { enqueue } from './federation-outbox.js'
 import { grantedMissionExport, activityOf } from './missions.js'
@@ -165,6 +166,24 @@ export function snapshotPages(db, g, snap) {
     used += n
   }
   return pages.map((p, page) => ({ grant: g.id, snap, page, pages: pages.length, ...p }))
+}
+
+// Whether a queued snapshot page of grant `g` still shows what the grantee
+// view shows now, record by record: each item as it is now, each milestone
+// still shown, and the mission withheld or not as it is now. Fields of the
+// mission itself are not compared: a change there is not a disclosure, and
+// its event follows the snapshot.
+export function pageIsCurrent(db, g, body) {
+  const view = grantedMissionExport(db, g.subject_id)
+  if (!view || body.mission === null) return !view && body.mission === null
+  const shown = new Set(view.milestones.map((l) => l.id))
+  if ((body.milestones ?? []).some((l) => !shown.has(l.ref))) return false
+  const blobOf = blobsOf(db)
+  for (const i of body.items ?? []) {
+    const [x] = grantedItemsExport(db, g.subject_id, { limit: 1, only: i.ref })
+    if (!x || canonicalize(wireItem(x, blobOf)) !== canonicalize(i)) return false
+  }
+  return true
 }
 
 // Queues a snapshot of grant `g` to its grantee, inside the caller's

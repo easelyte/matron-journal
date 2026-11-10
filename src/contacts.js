@@ -47,6 +47,11 @@ export function contactRow(row) {
     // than the one pinned for it: nothing goes to or comes from it until
     // the two exchange a fresh invite.
     key_changed: keyChanged(row),
+    // A contact on another journal that deliveries have been failing to
+    // (the federation outbox, src/federation-outbox.js): since when, in
+    // epoch ms, while anything still waits to be delivered there. null
+    // otherwise, and always for a same-journal contact.
+    unreachable_since: row.peer_journal ? row.journal_failing_since ?? null : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
     accepted_at: row.accepted_at ?? null,
@@ -57,8 +62,12 @@ export function contactRow(row) {
 const keyChanged = (row) => !!row.peer_journal && (row.journal_state === 'key_changed' ||
   (row.journal_key_now != null && row.peer_journal_key != null && row.journal_key_now !== row.peer_journal_key))
 // Every row this module hands out carries its journal's current key and
-// state (NULL for same-journal rows), for key_changed.
-const ROW = `SELECT c.*, p.key_pub AS journal_key_now, p.state AS journal_state FROM contacts c
+// state (NULL for same-journal rows), for key_changed, and when deliveries
+// to it started failing, for unreachable_since.
+const ROW = `SELECT c.*, p.key_pub AS journal_key_now, p.state AS journal_state,
+    CASE WHEN EXISTS (SELECT 1 FROM fed_outbox o WHERE o.peer_host = c.peer_journal AND o.state IN ('queued','dead'))
+      THEN p.failing_since END AS journal_failing_since
+  FROM contacts c
   LEFT JOIN fed_peers p ON p.host = c.peer_journal`
 const rawById = (db, id) => db.prepare(`${ROW} WHERE c.id=?`).get(id)
 // The caller's row for a contact on another journal, by name and host.

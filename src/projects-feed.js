@@ -14,8 +14,8 @@ export const FEED_LIMIT_MAX = 100
 export const DETAIL_PAGE = 6
 const ANSWER_MAX = 240
 
-const privateDevice = (col) => `EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = ${col})`
-const privateConvo = (alias) => privateDevice(`${alias}.agent_device_id`)
+export const privateDevice = (col) => `EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = ${col})`
+export const privateConvo = (alias) => privateDevice(`${alias}.agent_device_id`)
 
 // A page cursor is "<at>:<key>": rows sort by at DESC, then key DESC (a
 // fixed-width string, so equal timestamps never skip or repeat a row).
@@ -71,8 +71,10 @@ function decisionsSql(excludePrivateOwned) {
 // posted in a gap between two stints counts too, since the link table
 // keeps no history of gaps. An event in a conversation
 // linked to two of the project's missions is listed once, under the
-// lower-numbered mission.
-function filesSql(excludePrivateOwned) {
+// lower-numbered mission. `projectMatch` picks the missions (the feed: the
+// project's own; the timeline's week media also takes those of projects
+// merged into it).
+export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId') {
   const itemSieve = excludePrivateOwned
     ? `AND NOT ${privateConvo('c')} AND NOT ${privateDevice('ic.device_id')} AND ${ORIGIN_SIEVE}` : ''
   const eventSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
@@ -82,7 +84,7 @@ function filesSql(excludePrivateOwned) {
       i.num AS item_num, NULL AS convo_id, NULL AS seq, NULL AS caption, m.num AS mission_num
     FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id
     JOIN conversations c ON c.id = i.origin_convo_id, json_each(ic.attachments) je
-    WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
+    WHERE ${projectMatch} AND m.user_id = @userId AND i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
   UNION ALL
   SELECT 'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
       json_extract(e.payload, '$.size'), e.ts, 'e:' || ${pad('e.seq')}, NULL, e.convo_id, e.seq,
@@ -92,7 +94,7 @@ function filesSql(excludePrivateOwned) {
     JOIN conversations c ON c.id = l.convo_id
     JOIN events e ON e.convo_id = l.convo_id AND e.type IN ('image', 'file')
       AND e.ts >= COALESCE(l.first_joined_at, l.joined_at) AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
-    WHERE m.project_id = @projectId AND m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
+    WHERE ${projectMatch} AND m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
     GROUP BY e.seq`
   // `+e.user_id`: the unary plus keeps SQLite off the events primary key
   // (user_id, seq), which it otherwise prefers without ANALYZE statistics,
@@ -108,7 +110,8 @@ function milestonesSql(excludePrivateOwned) {
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
-// Test seam: the query-plan test reads the files SQL directly.
+// Test seam: the query-plan test reads the files SQL directly (the
+// timeline's week media reuses it as filesSql).
 export const filesSqlForTest = filesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest

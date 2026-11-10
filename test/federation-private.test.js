@@ -130,3 +130,29 @@ test('what a private box\'s agent said on a shared item leaves the copy too', as
   assert.equal(row.comment_count, 0)
   assert.equal(row.last_comment_at, null)
 })
+
+test('a snapshot page that no longer matches the mission is replaced by a fresh snapshot; an unchanged one goes as queued', async (t) => {
+  const { w, g } = await shared(t)
+  const raw = getGrantRaw(w.a.db, g.id)
+  const snapshots = () => w.a.db.prepare("SELECT id, state, last_error FROM fed_outbox WHERE op='mission.snapshot' ORDER BY seq").all()
+  const resend = () => sendSnapshot(w.a.db, raw, { from: 'alice@a.example', to: `${raw.grantee_name}@${raw.grantee_journal}`, now: Date.now() })
+
+  const before = snapshots().length
+  resend()
+  const same = snapshots().slice(before).map((r) => r.id)
+  await w.settle()
+  assert.deepEqual(snapshots().slice(before).map((r) => [r.id, r.state]), same.map((id) => [id, 'sent']), 'unchanged: sent as queued, nothing more')
+
+  // Queued, then the item is hidden by a write that sends no event.
+  resend()
+  const stale = snapshots().slice(before + same.length).map((r) => r.id)
+  w.a.db.prepare("UPDATE items SET private=1 WHERE title='From the shed'").run()
+  await w.settle()
+  await w.settle()
+  const after = snapshots()
+  for (const id of stale) assert.equal(after.find((r) => r.id === id).state, 'cancelled')
+  const fresh = after.slice(before + same.length + stale.length)
+  assert.ok(fresh.length >= 1 && fresh.every((r) => r.state === 'sent'), 'a fresh snapshot went instead')
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_resnapshot').get().n, 0)
+  assert.deepEqual(await bobItems(w), ['Tomatoes or beans?'])
+})

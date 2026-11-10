@@ -141,3 +141,30 @@ test('admin: federation status reports the switch and the key', async () => {
   out = await runAdmin(db, ['federation', 'status'], { env: { MATRON_TOKEN_KEY: KEY_B } })
   assert.match(out, /does not open under this MATRON_TOKEN_KEY/)
 })
+
+test('admin: federation peers, block and unblock', async () => {
+  const db = openDb(':memory:')
+  assert.equal(await runAdmin(db, ['federation', 'peers']), 'no other journals known')
+  db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen, last_ok_at) VALUES('b.example','https://b.example','pub','active',1,1700000000000)").run()
+  db.prepare(`INSERT INTO fed_outbox(id, peer_host, from_addr, to_addr, subject, op, body, next_at, expires_at, created_at)
+    VALUES('op1','b.example','a@a.example','b@b.example','s','test.op','{}',0,0,0)`).run()
+  let out = await runAdmin(db, ['federation', 'peers'])
+  assert.match(out, /^b\.example\tactive\tcontacts: 0\tqueued: 1, dead: 0\tlast ok: 2023-11-14T/)
+
+  assert.match(await runAdmin(db, ['federation', 'block', 'B.example']), /b\.example is blocked: .*1 queued op goes dead/)
+  assert.equal(db.prepare('SELECT state FROM fed_peers WHERE host=?').get('b.example').state, 'blocked')
+  assert.equal(await runAdmin(db, ['federation', 'block', 'b.example']), 'b.example is already blocked')
+  assert.match(await runAdmin(db, ['federation', 'unblock', 'b.example']), /no longer blocked: its contacts work again/)
+  assert.deepEqual(db.prepare('SELECT state, key_pub FROM fed_peers WHERE host=?').get('b.example'), { state: 'active', key_pub: 'pub' })
+  assert.equal(await runAdmin(db, ['federation', 'unblock', 'b.example']), 'b.example is not blocked')
+
+  // A journal never heard from is blocked ahead of time, and forgotten on unblock.
+  assert.match(await runAdmin(db, ['federation', 'block', 'c.example:8443']), /c\.example:8443 is blocked/)
+  assert.match(await runAdmin(db, ['federation', 'peers']), /c\.example:8443\tblocked/)
+  assert.match(await runAdmin(db, ['federation', 'unblock', 'c.example:8443']), /forgotten/)
+  assert.equal(db.prepare('SELECT 1 FROM fed_peers WHERE host=?').get('c.example:8443'), undefined)
+
+  for (const bad of [[], ['nohost'], ['a b.example'], ['https://b.example']]) {
+    await assert.rejects(runAdmin(db, ['federation', 'block', ...bad]), /usage/)
+  }
+})

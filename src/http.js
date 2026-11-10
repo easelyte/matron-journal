@@ -32,6 +32,7 @@ import { sessionsSharedWith } from './person-rooms.js'
 import { remoteSessionsFor } from './federation-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
 import { parseOwnerUserId } from './owner-user-id.js'
+import { handleTimelineRoute } from './timeline-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
@@ -640,6 +641,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker, federationContribute }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
+      if (await handleTimelineRoute({ db }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleBriefingsRoute({ db, hub, routineFirer }, req, res, url, who)) return

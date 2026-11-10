@@ -86,7 +86,7 @@ test('a cancelled queued reply: agents read that it was there, never its words; 
 })
 
 test('a reply sent from the queue, or one whose session ended, stays readable', async (t) => {
-  for (const action of ['send', 'send_one', 'expired']) {
+  for (const action of ['send', 'send_one', 'edited', 'expired']) {
     const { s, agent, item, reply } = await fleet(t)
     await queueAndRelease(s, agent, { item, reply, action })
     assert.equal(replyIn(await thread(s, agent.token, item), reply).body, 'use the zebra ledger', action)

@@ -7,6 +7,7 @@ import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
+import { makeGatewayClient } from '../src/gateway.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 // Peer_message is a routine coalesced activity push (priority 5), not an
@@ -318,26 +319,173 @@ test('acked-past suppression: a device whose cursor already covers the event seq
   assert.equal(stub.calls.length, 1, 'a seq beyond the acked cursor must still push')
 })
 
-test('a 410 response prunes the device apns_token/apns_env; a 400 keeps it', async (t) => {
-  const respond = (opts) => (opts.deviceToken === 'dead-token' ? { status: 410, reason: 'Unregistered' } : { status: 400, reason: 'BadDeviceToken' })
-  const stub = makeStubApnsClient(respond)
-  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
-  const deadDeviceId = registerDevice(db, alice.id, 'dead-phone', { token: 'dead-token' })
-  const wrongEnvDeviceId = registerDevice(db, alice.id, 'wrong-env-phone', { token: 'wrong-env-token' })
-
-  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
-  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
+// Fires one routine agent event through the pipeline and waits for every
+// send's result to be handled.
+async function pushOnce(db, pipeline, userId, body = 'hi') {
+  const r = append(db, { userId, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+  pipeline.onAppend(userId, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
   await new Promise((res) => setTimeout(res, 10))
+}
 
-  const dead = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deadDeviceId)
-  assert.equal(dead.apns_token, null)
-  assert.equal(dead.apns_env, null)
+const tokenOf = (db, deviceId) => db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+
+test('a 410 Unregistered response prunes the device apns_token/apns_env, keeping the device', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {})
+  const stub = makeStubApnsClient(() => ({ status: 410, reason: 'Unregistered' }))
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const deviceId = registerDevice(db, alice.id, 'dead-phone', { token: 'dead-token' })
+
+  await pushOnce(db, pipeline, alice.id)
+
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: null, apns_env: null })
+  assert.ok(db.prepare('SELECT 1 FROM devices WHERE id=?').get(deviceId), 'the device itself is kept')
   assert.equal(pipeline.counters.pruned, 1)
+  assert.equal(pipeline.counters.failed, 1)
+  assert.equal(logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0]))).length, 1)
+})
 
-  const wrongEnv = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(wrongEnvDeviceId)
-  assert.equal(wrongEnv.apns_token, 'wrong-env-token')
-  assert.equal(wrongEnv.apns_env, 'prod')
-  assert.equal(pipeline.counters.failed, 2)
+test('a 400 BadDeviceToken response prunes the token (logged once, with its env), keeping the device', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {})
+  const stub = makeStubApnsClient(() => ({ status: 400, reason: 'BadDeviceToken' }))
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub, coalesceMs: 1000 })
+  const deviceId = registerDevice(db, alice.id, 'bad-phone', { token: 'bad-token', env: 'sandbox' })
+
+  await pushOnce(db, pipeline, alice.id)
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: null, apns_env: null })
+  assert.ok(db.prepare('SELECT 1 FROM devices WHERE id=?').get(deviceId), 'the device itself is kept')
+  assert.equal(pipeline.counters.pruned, 1)
+  const pruneLogs = logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0])))
+  assert.equal(pruneLogs.length, 1)
+  assert.match(String(pruneLogs[0].arguments[0]), /BadDeviceToken/)
+  assert.match(String(pruneLogs[0].arguments[0]), /sandbox/)
+
+  // The pruned token is never tried again.
+  stub.calls.length = 0
+  await pushOnce(db, pipeline, alice.id, 'again')
+  assert.equal(stub.calls.length, 0)
+})
+
+test('failures that do not mean a dead token never prune it', async (t) => {
+  t.mock.method(console, 'error', () => {})
+  const results = {
+    'token-500': { status: 500, reason: 'InternalServerError' },
+    'token-503': { status: 503, reason: 'ServiceUnavailable' },
+    'token-429': { status: 429, reason: 'TooManyRequests' },
+    'token-403': { status: 403, reason: 'ExpiredProviderToken' },
+    'token-400-topic': { status: 400, reason: 'DeviceTokenNotForTopic' },
+    'token-400-other': { status: 400, reason: 'BadCollapseId' },
+    'token-400-none': { status: 400, reason: null },
+    // The relay's own request validation, not an APNs verdict.
+    'token-400-relay': { status: 400, reason: 'bad_device_token' },
+    'token-transport': { status: 0, reason: 'transport' },
+    'token-timeout': { status: 0, reason: 'timeout' },
+  }
+  const stub = makeStubApnsClient((opts) => results[opts.deviceToken])
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const ids = Object.keys(results).map((token) => [token, registerDevice(db, alice.id, `phone-${token}`, { token })])
+
+  await pushOnce(db, pipeline, alice.id)
+
+  assert.equal(stub.calls.length, ids.length)
+  for (const [token, id] of ids) assert.equal(tokenOf(db, id).apns_token, token, `${token} must be kept`)
+  assert.equal(pipeline.counters.pruned, 0)
+  assert.equal(pipeline.counters.failed, ids.length)
+})
+
+test('re-registering a pruned token restores pushes to it', async (t) => {
+  t.mock.method(console, 'error', () => {})
+  let dead = true
+  const stub = makeStubApnsClient(() => (dead ? { status: 400, reason: 'BadDeviceToken' } : { status: 200, reason: null }))
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub, coalesceMs: 1 })
+  const deviceId = registerDevice(db, alice.id, 'phone', { token: 'phone-token' })
+
+  await pushOnce(db, pipeline, alice.id)
+  assert.equal(tokenOf(db, deviceId).apns_token, null)
+
+  dead = false
+  setApnsRegistration(db, deviceId, { apnsToken: 'phone-token', apnsEnv: 'prod' })
+  stub.calls.length = 0
+  await pushOnce(db, pipeline, alice.id, 'back')
+
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].deviceToken, 'phone-token')
+  assert.equal(pipeline.counters.sent, 1)
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: 'phone-token', apns_env: 'prod' })
+})
+
+test('a late dead-token result never prunes a token registered since, and concurrent failures log once', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {})
+  const pending = []
+  const stub = {
+    calls: [],
+    send(opts) {
+      this.calls.push(opts)
+      return new Promise((resolve) => pending.push(() => resolve({ status: 410, reason: 'Unregistered' })))
+    },
+  }
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const deviceId = registerDevice(db, alice.id, 'phone', { token: 'old-token' })
+
+  // Two attention pushes in flight to the old token at once.
+  for (const body of ['one', 'two']) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { body } }, null)
+  }
+  assert.equal(stub.calls.length, 2)
+
+  // The first answer prunes; the app then registers a fresh token before the
+  // second answer for the old token arrives.
+  pending[0]()
+  await new Promise((res) => setTimeout(res, 5))
+  assert.equal(tokenOf(db, deviceId).apns_token, null)
+  setApnsRegistration(db, deviceId, { apnsToken: 'new-token', apnsEnv: 'prod' })
+  pending[1]()
+  await new Promise((res) => setTimeout(res, 5))
+
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: 'new-token', apns_env: 'prod' })
+  assert.equal(pipeline.counters.pruned, 1)
+  assert.equal(logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0]))).length, 1)
+})
+
+test('a late BadDeviceToken from the old environment never prunes the same token re-registered with a corrected environment', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {})
+  const pending = []
+  const stub = {
+    calls: [],
+    send(opts) {
+      this.calls.push(opts)
+      return new Promise((resolve) => pending.push(() => resolve({ status: 400, reason: 'BadDeviceToken' })))
+    },
+  }
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const deviceId = registerDevice(db, alice.id, 'phone', { token: 'phone-token', env: 'prod' })
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { body: 'one' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { body: 'one' } }, null)
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].env, 'prod')
+
+  // The app corrects its environment before the prod push's answer arrives.
+  setApnsRegistration(db, deviceId, { apnsToken: 'phone-token', apnsEnv: 'sandbox' })
+  pending[0]()
+  await new Promise((res) => setTimeout(res, 5))
+
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: 'phone-token', apns_env: 'sandbox' })
+  assert.equal(pipeline.counters.pruned, 0)
+  assert.equal(logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0]))).length, 0)
+})
+
+test('through the push gateway, a relayed 400 BadDeviceToken prunes the token', async (t) => {
+  t.mock.method(console, 'error', () => {})
+  const fetchImpl = async () => new Response(JSON.stringify({ status: 400, reason: 'BadDeviceToken' }), { status: 400 })
+  const client = makeGatewayClient({ url: 'https://push.example.com', fetchImpl })
+  const { db, alice, pipeline } = await setup(t, { apnsClient: client })
+  const deviceId = registerDevice(db, alice.id, 'phone', { token: 'a'.repeat(64) })
+
+  await pushOnce(db, pipeline, alice.id)
+
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: null, apns_env: null })
+  assert.equal(pipeline.counters.pruned, 1)
 })
 
 test('coalescing: two routine events within the window produce one leading push then one trailing push', async (t) => {

@@ -175,8 +175,8 @@ function buildPayload({ category, badge, thread_id }) {
 }
 
 // Every response body is {status, reason} with the HTTP status mirroring the
-// APNs status, so the journal's existing handleResult logic (410 → prune
-// token, 400 → env-mismatch warning) works against the relay unchanged. An
+// APNs status, so the journal's handleResult logic (410 or 400
+// BadDeviceToken → prune the token) works against the relay unchanged. An
 // APNs-side transport failure has status 0, which is not an HTTP status —
 // surfaced as 502 with the true {status: 0, reason} in the body.
 export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), rendezvous = makeRendezvousStore(), rendezvousLimiter = makeRendezvousLimiter() }) {

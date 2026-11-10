@@ -83,6 +83,7 @@ export function snippetOf(type, payload) {
   const p = payload && typeof payload === 'object' ? payload : {}
   if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
     if (p.kind === 'contact_request') return '🤝 Contact request'
+    if (p.kind === 'contact_invite') return '🤝 Invite link request'
     if (p.kind === 'mission_share') return '🤝 Mission share request'
     if (p.kind === 'mission_handover') return '🤝 Hand-over request'
     if (p.kind === 'person_room') return '🤝 Room with another person'

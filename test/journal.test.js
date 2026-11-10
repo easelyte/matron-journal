@@ -448,6 +448,12 @@ test('agent_chat card snippet is fixed — never the justification', () => {
   assert.ok(!s.includes('SECRET'))
 })
 
+test('contact_invite card snippet reads as an invite link request, like the native apps', () => {
+  const s = snippetOf('permission_request', { kind: 'contact_invite', justification: 'SECRET-DO-NOT-LEAK' })
+  assert.equal(s, '🤝 Invite link request')
+  assert.ok(!s.includes('SECRET'))
+})
+
 test('last_ts counts message events only — status/meta/read_marker rows do not resurface a chat', async () => {
   const { db, alice } = await setup()
   append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-2', type: 'text', payload: { body: 'real message' } })

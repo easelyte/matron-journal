@@ -3480,9 +3480,33 @@ itself; a peer agent joined to the conversation cannot.
   marker about the comment (a transcript landing after the cancel) carries
   no comment at all.
 
-A release with any other action (`send`, `send_one`, `expired`) withdraws
-nothing: a reply whose session ended before it was delivered was not
-cancelled by the user.
+A release with any other action (`send`, `send_one`, `edited`, `expired`)
+withdraws nothing: a reply whose session ended before it was delivered was
+not cancelled by the user.
+
+**Editing a queued reply.** A card may offer an edit (`edit: {mode,
+hold_seconds}` on its payload). The app answers it with a `prompt_reply`
+whose choice is `edit` (the bridge holds the message while it is edited),
+then `edit_cancel` (released as it was) or, for `mode: 'replace'`,
+`edit_save` with the edited text in `text` (the bridge replaces the message
+in place and retires the card with an `edited` release, then posts a new
+card for the same queue slot). The journal passes these replies through
+like any other; the bridge's router checks them.
+
+A hold is not permanent. The bridge releases it after `hold_seconds`, or
+when it restarts, and the original is then delivered at the next idle
+point even if the user is still editing. An app knows a save took effect
+only from the `edited` release: a save that arrives after the message left
+the queue changes nothing (the bridge posts a notice saying the edit was
+not used), and the card's release is whatever actually happened to it
+(`send`, `send_one` or `expired`).
+
+A reply on an item is `mode: 'resend'`: its comment is never rewritten.
+The app answers the held card with `cancel`, waits for the bridge's
+`cancel` release (which withdraws the original as above), and only then
+posts the edited reply as a new comment. A `cancel` reply is a request: if
+its release does not come, the original may still be queued, and posting
+the edit could deliver both.
 
 ### Item handover
 
@@ -4245,6 +4269,51 @@ plus the rollup fields on every route that returns one. `idem_key` and
 There is no project marker: the apps refresh `GET /projects` on any
 `mission` marker and while the Projects tab is open.
 
+**Timeline.** `src/timeline-http.js` (reads) and `src/week-stories.js`
+(the Coordinator's write). Five `GET` routes turn the projects into a weekly
+timeline, a sixth read gives the Coordinator the raw material for a week, and
+one `POST` stores the lede and story cards it writes from that. Weeks are the
+user's own local Monday 00:00 to the next, in their stored time zone
+(`Europe/London` by default); a *week key* is the Monday's local date,
+`YYYY-MM-DD`. Stored weeks are looked up by week key, so a change of time zone
+does not orphan them. A "move" is a milestone, an item created or closed, a
+user-visible item comment, or a mission created or closed; chat traffic and a
+project status edit are not. A project merged into another counts under the
+survivor and is never a row. Every route goes through the caller's sieve like
+`GET /projects` (an ordinary agent loses private-origin projects and
+private-owned moves). Bad parameters are 400 `{error:'bad_request'}`.
+
+| Route | Query | Response |
+|---|---|---|
+| `GET /timeline/weeks` | `before?` a Monday week key; `limit?` integer 1..52, default 12 | `{weeks:[{week, start, end, sentence, moved, written}], next_before}` — newest first from the current week (or the week before `before`) back to the week of the user's earliest mission, quiet weeks included. `moved` is how many projects moved; `sentence` is the first sentence of the Coordinator's lede for a written week, else a summary of the moves. `written` is true when the Coordinator has written the week (a lede, a story or the final flag; a row holding only notes is not written). `next_before` is the week key to pass for the next page, `null` at the end. |
+| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, written_at, stories:[{title, project, projects, sentence, next, needs_you, media}], also:[{…project ref, moved}]}` — one week. Unwritten: a story per project that moved, most moves first, at most 8, the rest under `also`; `title` and `lede` are `null`, `projects` is `[project]`, `written_at` is `null`, `sentence` is the newest milestone title that week, `needs_you` the project's open items awaiting the user (consent cards left out, only items created before the week ended) and `media` its newest image or video that week, or `null`. Written: the Coordinator's `lede`, `written_at` and stories in its order; `project` is the first of `projects` (the projects the story is about, merged ones through to the survivor), `needs_you` the items it named as `{id, num, title, done}` (`done` is true once an item no longer awaits the user), `media` its chosen picture (or the week's newest picture when that one is gone or hidden), and `also` the moving projects no story names. `final` is true for a week that has ended or was written final, false for the current week. A `:week` that is not a real Monday key is 400. |
+| `GET /timeline/weeks/:week?raw=1` | | Agents only (a client is 403). What the Coordinator writes a week from: `{week, start, end, final, written_at, current, stored, projects, more_projects}`. `final` is true for every week that has ended (and for one written final), so it does not say whether the week has been closed by a write: that is `stored.final`. `current` is true for the current week. `stored` is the written week with ids as refs, or `null`: `{lede, final, stories:[{title, sentence, next, projects, items, media_blob_id}]}`. `projects` are the projects that moved (most moves first, at most 40, the rest counted in `more_projects`), each `{project, moved, status, milestones, items, media, needs_you}`: up to 10 milestones, up to 10 items with activity that week, up to 5 pictures or videos, and `needs_you` — up to 10 open items awaiting the user that were created before the week ended, newest first, whatever the week's activity (consent cards left out), the set to name in `item_ids` and count in a lede. Always under the agent privacy sieve, on a private device too. |
+| `POST /timeline/weeks/:week` | body `{convo_id, lede?, stories?, final?, notes?}` | `201 {week, written, final}`. Agents only, and only the user's Coordinator naming its own conversation in `convo_id` (a client is 403 `forbidden`; any other agent 403 `forbidden` with `detail:'not_coordinator'`, as for `POST /briefings`). `lede` ≤ 600 characters. `stories` ≤ 8 of `{title ≤ 80, sentence ≤ 300, next? ≤ 300, project_ids (1..10), item_ids? (≤ 10), media_blob_id?}`; a project or item is a string id or the per-user number, `media_blob_id` a blob of the user's that is an image or a video. `notes` ≤ 50 of `{project_id, note ≤ 300}`, one sentence kept on a project. A write replaces the week's lede and stories (the notes are upserted per project). `:week` is this week or up to 10 weeks back. `final: true` closes a week that has ended (400 `week_not_ended` otherwise); after that only a final write replaces it (409 `{error:'conflict', detail:'week_final'}`). 400 `{error, detail, ref?}`: `detail` is `bad_week`, `week_out_of_range`, `week_not_ended`, or `unknown_project` / `unknown_item` / `unknown_blob` with the offending `ref`; a malformed body is a bare 400. Every reference is resolved first and nothing is written on an error. The write always runs under the agent privacy sieve (a project, item or picture of a private device's work is `unknown_*`), whatever device the Coordinator runs on. |
+| `GET /timeline/quiet` | `raw=1`? | `{total, rows:[{project, last_moved_at, weekly, note}]}` — *went quiet*: open projects that moved in at least two of the eight weeks up to their last move and have not moved for 14 days. Top 10 by moves; `total` counts them all. `weekly` is eight per-week move counts, oldest first, ending with the current week. `note` is the Coordinator's one-sentence note on the project, or `null` (see below). With `raw=1` from an agent the read is always under the agent privacy sieve, even on a private device (the Coordinator reads this list to write notes and a lede the filtered apps then show); from a client `raw=1` changes nothing. |
+| `GET /timeline/long` | `raw=1`? | `{total, rows:[{project, created_at, last_moved_at, weekly, note}]}` — *open a long time*: open projects with an open mission, created at least 21 days ago, oldest first. Top 10; `total` counts them all. `note` and `raw=1` as for `/timeline/quiet`. |
+| `GET /timeline/finished` | `before?` a `"<finished_at>:<project id>"` cursor; `limit?` integer 1..100, default 30 | `{rows:[{project, finished_at}], next_before}` — projects that are closed or have no open mission (and had at least one), newest finish first. `next_before` is the cursor for the next page, `null` at the end. |
+
+`project` in these bodies is the compact project reference `{id, num, title}` the timeline reads
+share, never the full row.
+
+**Stale notes.** A project's `note` is shown only while it is at least as new
+as the project's last move (or the project has never moved); once the project
+moves again the note reads `null` until the Coordinator writes a fresh one.
+
+**Re-sieving and its limits.** Stored stories keep resolved ids, not text, and
+every read re-checks them: a story is shown to an ordinary agent only through
+projects it may see, and its items and picture only while they are visible to
+it, so a project that turns private after the write drops out of that agent's
+view. Two limits are accepted. (1) The Coordinator's free text (the lede and
+each story's `title`, `sentence` and `next`) cannot be re-sieved: if a project
+becomes private after its week was written, a story that names it alongside a
+visible project is kept, and its sentence and the lede may still name the
+now-private project to ordinary agents. The write sieve stops private work
+entering the text at the time of writing; it cannot take it back out. (2) A
+story whose projects are all hidden from the caller is withheld from the
+caller's reads, including the raw read's `stored`, so a Coordinator that
+rewrites a week from the raw read silently drops those stories.
+
 **Visibility.** Same rules as missions. An ordinary agent never sees a
 project whose origin conversation is private-owned or that a private device
 created (404, absent from lists, not resolvable by `/lookup`); a status
@@ -4604,9 +4673,18 @@ GET    /contacts/:id/activity             {events:[…]} — the audit events na
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
-requested_by, origin_convo_id, key_changed, created_at, updated_at, accepted_at,
-revoked_at}`. `key_changed` is true for a contact on another journal whose
-journal now serves a different key than the one pinned for it.
+requested_by, origin_convo_id, key_changed, unreachable_since, created_at,
+updated_at, accepted_at, revoked_at}`. `key_changed` is true for a contact on
+another journal whose journal now serves a different key than the one pinned
+for it. `unreachable_since` (epoch ms, else `null`) is when deliveries to a
+contact's journal started failing: the federation outbox's first attempt to
+that journal that failed in a way it retries (a network error or timeout, an
+answer the journal did not sign, a 5xx, 408 or 429) since that journal last
+answered in its own signed word (an acknowledgement, a refusal, a stale
+clock), which clears it. It is kept through later failures and through
+entries going dead after 7 days, and is reported only while something to
+that journal is still queued or dead in the outbox: with nothing waiting
+there is no delivery failing. Always `null` for a same-journal contact.
 
 `POST /contacts` from a **client** is the user's own tap and goes straight
 to the other person. From an **agent** it needs `convo_id` (a conversation
@@ -5486,7 +5564,9 @@ Every op a journal sends is queued first, and a worker delivers it every
 few seconds. The rules:
 
 - **One id per op.** The id is set when the op is queued. Every attempt
-  keeps that id and body, takes a fresh `ts`, and is signed again.
+  keeps that id and body, takes a fresh `ts`, and is signed again. The
+  one exception is a `mission.event` whose record changed while it
+  waited (below): it takes a new id with its new body.
 - **Order.** Ops are delivered first in, first out per (peer, subject),
   where the subject is a mission, room, contact or grant. An op waits
   while an earlier one on its subject is queued or dead. Ops on other
@@ -5511,10 +5591,23 @@ few seconds. The rules:
   resend is refused (counted in `too_old`) for an op queued more than 23
   days earlier: its last attempt could otherwise fall after the peer has
   pruned the op's 30-day receipt, and the peer would apply it twice.
+- **Peers side by side.** Each peer with something due gets its own chain
+  of attempts, in order, and up to 8 peers are served at once. A peer that
+  answers slowly holds up only what is queued for it.
 - **Checks before sending.** Before each attempt the sender checks its own
   records again. An op whose grant or contact has ended here is cancelled
   rather than sent, and an op for a journal the operator's lists now
   refuse goes dead (`journal_not_allowed`).
+- **Sent as it is now.** A `mission.event` is sent with its record as the
+  grantee view has it at the attempt, not as it was when queued: a comment
+  withdrawn meanwhile crosses withdrawn. When the body changed, the op takes
+  a new id in its place in the queue (the old id with a new body would be
+  `409 id_reused`); a resend puts back the id the op had when it went
+  dead. A `mission.snapshot` page with a record that is now hidden or has
+  changed is cancelled with the rest of its snapshot, and a fresh snapshot
+  is queued instead.
+- **Pruning.** Sent and cancelled ops are deleted a week after they ended,
+  bodies and all. Dead ops stay until the user resends or discards them.
 - **Acknowledgement.** An entry is marked sent, and its op's own records
   updated, in one transaction, and only if the entry was still queued: an
   answer to an entry cancelled while its request was out changes nothing.
@@ -5628,6 +5721,16 @@ write to (`404` for one it may not). `503 unavailable` if the card could not be
 filed: nothing is kept, and the agent may ask again. An approve refused for
 `too_many_invites` leaves the ask waiting; one already answered is `409
 not_pending`, one past its 24 h `409 expired`.
+
+A repeated `approve` (a client's outbox retrying a tap whose answer it
+never got) from the device that approved, within 10 minutes and while the
+invite is still open, is answered `200` with the same `{ask, invite, link,
+web_link}` as the first time; nothing new is minted. The journal keeps the
+link for those 10 minutes in memory only, so a restart forgets it. Any
+other `approve` of an approved ask (another device, later, after a
+restart, or once the invite was used or withdrawn) is `409 not_pending`
+with a `message` telling the user to withdraw the invite from Open invites
+and make a new one: the link itself cannot be shown again.
 
 **The inviter's journal** keeps only the SHA-256 of the token. An invite is
 single use and lasts 7 days; a user may have 20 open at once
@@ -6681,9 +6784,16 @@ considers each of that user's *client* devices with a registered token
 - alert title is the conversation title (falling back to its id), body is
   the event's snippet, badge is `SUM(unread_count)` over the owner's
   conversations.
-- a 410 response prunes that device's `apns_token`/`apns_env` (dead token,
-  logged once); a 400 keeps the token but logs loudly — almost always a
-  sandbox/prod `apns_env` mismatch (the sygnal lesson), not a dead token.
+- a 410 response, or a 400 `BadDeviceToken`, prunes that device's
+  `apns_token`/`apns_env` (dead token, logged once with its `apns_env`); the
+  device itself is kept and pushes resume when the app registers a token
+  again. Only the token and environment that failed are cleared, so a late
+  answer never drops a registration made since (a new token, or the same
+  token with a corrected environment). Every other failure (429, 5xx, other 400s
+  including `DeviceTokenNotForTopic`, the relay's own validation errors,
+  transport) keeps the token. A `BadDeviceToken` is often a sandbox/prod
+  `apns_env` mismatch, but since the environment is registered with the
+  token, retrying the same pair never succeeds either.
 
 Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
 register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —

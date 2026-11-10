@@ -96,6 +96,20 @@ export function classify(type, payload, sender, prevState) {
   return { priority: 5, coalesce: true, kind: 'activity' }
 }
 
+// APNs answers that mean the token itself will never be delivered to: 410
+// Unregistered (the app was removed or the token retired) and 400
+// BadDeviceToken (not a token APNs knows in that environment). A
+// BadDeviceToken can come from a sandbox token sent to production, but the
+// environment is registered alongside every token, so retrying the same pair
+// can never succeed either; the prune log names the environment. Every other
+// failure (rate limits, server errors, other 400s, the relay's own request
+// validation, transport) is about the request or the service and keeps the
+// token. DeviceTokenNotForTopic also keeps it: it is as likely to mean the
+// journal's topic is misconfigured, and pruning on it would drop every token.
+function isDeadToken({ status, reason }) {
+  return status === 410 || (status === 400 && reason === 'BadDeviceToken')
+}
+
 // Wired in server.js after a successful journal append fans out (see the
 // `fanOut` choke point in ws.js). `apnsClient` is the makeApnsClient()
 // instance, or undefined when push is disabled (all onAppend calls become a
@@ -131,15 +145,13 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
     counters.failed += 1
     bumpReason(result.reason || (result.status === 0 ? 'transport' : String(result.status)))
-    if (result.status === 410) {
-      // Dead token: prune instead of retrying it forever.
-      pruneApnsToken(db, device.id)
-      counters.pruned += 1
-      console.error(`apns: device ${device.id} unregistered (410${result.reason ? ' ' + result.reason : ''}) — token pruned`)
-    } else if (result.status === 400) {
-      // Sygnal lesson: this is almost always a sandbox/prod environment
-      // mismatch, not a dead token — keep it, but log loudly so it gets fixed.
-      console.error(`apns: device ${device.id} got 400${result.reason ? ' ' + result.reason : ''} — keeping token, check apns_env (env=${device.apns_env})`)
+    if (isDeadToken(result)) {
+      // Retrying a dead token never succeeds, so it is pruned instead. Logged
+      // only by the send that actually cleared it.
+      if (pruneApnsToken(db, device.id, device.apns_token, device.apns_env)) {
+        counters.pruned += 1
+        console.error(`apns: device ${device.id} token rejected (${result.status}${result.reason ? ' ' + result.reason : ''}, env=${device.apns_env}) — token pruned until the app registers again`)
+      }
     } else {
       console.error(`apns: device ${device.id} push failed: status=${result.status}${result.reason ? ' reason=' + result.reason : ''}`)
     }

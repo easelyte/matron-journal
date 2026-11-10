@@ -8,16 +8,37 @@
 //   parkInviteAsk    POST /contacts/invites from an agent → awaiting_user
 //   answerInviteAsk  the user's tap: approve mints the invite, decline ends it
 //   expireInviteAsks the 24 h sweep, like every ask an agent parks
+//
+// A repeated Approve (a client's outbox retrying a tap whose answer it never
+// got) from the device that approved, within REPEAT_APPROVE_WINDOW_MS, is
+// answered with the same link again. Only the token's hash is stored, so
+// the link minted is kept for that window in this process's memory alone
+// (never in the database, never in an event or item): a restart forgets
+// it, and the retry then gets the plain refusal, which tells the user to
+// withdraw the invite and make a new one.
 import { newId } from './items.js'
 import { isUnlisted, parkedAsks, MAX_PARKED_PER_DEVICE, OWN_ASK_TTL_MS } from './contacts.js'
 import { card, fileMirror, closeMirror, changed, OWNER_ACTIONS } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
+import { inviteView } from './federation-contacts.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 
 export const INVITE_CARD_KIND = 'contact_invite'
 export const INVITE_ASK_STATES = ['awaiting_user', 'approved', 'declined', 'expired']
 
+export const REPEAT_APPROVE_WINDOW_MS = 10 * 60 * 1000
+export const ALREADY_APPROVED_MESSAGE = 'This invite link was already made and shown once, on the device that approved it, and cannot be shown again. If you do not have it, withdraw the invite from Open invites and make a new one.'
+
 const fail = (code) => { throw new Error(code) }
+
+// Per journal (its db): ask id → {deviceId, inviteId, link, web_link, at}.
+const minted = new WeakMap()
+function mintedFor(db, now) {
+  let m = minted.get(db)
+  if (!m) minted.set(db, (m = new Map()))
+  for (const [id, e] of m) if (now - e.at > REPEAT_APPROVE_WINDOW_MS) m.delete(id)
+  return m
+}
 const askById = (db, id) => db.prepare('SELECT * FROM fed_invite_asks WHERE id=?').get(id) ?? null
 const setState = (db, id, state, now, inviteId = null) =>
   db.prepare('UPDATE fed_invite_asks SET state=?, invite_id=COALESCE(?, invite_id), updated_at=? WHERE id=?').run(state, inviteId, now, id)
@@ -137,14 +158,15 @@ export function onInviteAskExpired(ctx, before) {
 // The answer route and the mirror's tap share this. `fed` is the journal's
 // contact federation (null: federation off — the ask waits).
 // → {status, body, closed}
-export function applyInviteAnswer(ctx, who, askId, decision) {
+export function applyInviteAnswer(ctx, who, askId, decision, { now = Date.now() } = {}) {
   const fed = ctx.federationContacts ?? null
   if (!fed) return { status: 409, body: { error: 'conflict', blocked_by: 'federation_off' } }
   let out
   try {
-    out = answerInviteAsk(ctx.db, { userId: who.userId, askId, decision, mint: () => fed.createInvite(who.userId) })
+    out = answerInviteAsk(ctx.db, { userId: who.userId, askId, decision, mint: () => fed.createInvite(who.userId), now })
   } catch (err) {
-    if (['not_pending', 'too_many_invites'].includes(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+    if (err.message === 'not_pending') return repeatedAnswer(ctx.db, who, askId, decision, now)
+    if (err.message === 'too_many_invites') return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
     if (err.message === 'unlisted') return { status: 403, body: { error: 'forbidden' } }
     throw err
   }
@@ -152,6 +174,28 @@ export function applyInviteAnswer(ctx, who, askId, decision) {
   const closed = onInviteAskOutcome(ctx, who, out)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   const body = { ask: inviteAskView(out.ask) }
-  if (out.outcome === 'approved') Object.assign(body, { invite: out.invite, link: out.link, web_link: out.web_link })
+  if (out.outcome === 'approved') {
+    Object.assign(body, { invite: out.invite, link: out.link, web_link: out.web_link })
+    mintedFor(ctx.db, now).set(out.ask.id, { deviceId: who.deviceId, inviteId: out.invite.id, link: out.link, web_link: out.web_link, at: now })
+  }
   return { status: 200, body, closed }
+}
+
+// An answer to an ask that is no longer waiting. The same Approve again, from
+// the device that approved, inside the window and while the invite is still
+// open, gets the same answer; anything else is refused, and a refused
+// Approve of an approved ask says how to get a working link.
+function repeatedAnswer(db, who, askId, decision, now) {
+  const ask = db.prepare('SELECT * FROM fed_invite_asks WHERE id=? AND user_id=?').get(askId, who.userId)
+  const kept = mintedFor(db, now).get(askId)
+  if (decision === 'approve' && ask?.state === 'approved' && kept && kept.deviceId === who.deviceId && kept.inviteId === ask.invite_id) {
+    const row = db.prepare('SELECT * FROM fed_invites WHERE id=? AND user_id=?').get(ask.invite_id, who.userId)
+    const invite = row ? inviteView(row, now) : null
+    if (invite?.state === 'open') {
+      return { status: 200, body: { ask: inviteAskView(ask), invite, link: kept.link, web_link: kept.web_link }, closed: null }
+    }
+  }
+  const body = { error: 'conflict', blocked_by: 'not_pending' }
+  if (decision === 'approve' && ask?.state === 'approved') body.message = ALREADY_APPROVED_MESSAGE
+  return { status: 409, body }
 }

@@ -595,6 +595,32 @@ CREATE TABLE IF NOT EXISTS briefing_refresh(
   requested_at INTEGER NOT NULL,
   outcome      TEXT
 );
+-- Weekly timeline stories (spec 2026-11-09 projects timeline, phase 2): the
+-- lede and story cards the user's Coordinator wrote for one local week
+-- (week_start is the Monday 00:00 instant in the user's zone, week_key its
+-- date), the stories as a JSON array with resolved project/item ids. A final
+-- row is a closed week: only a final write replaces it. project_notes is the
+-- one sentence the Coordinator keeps on a project, shown in the timeline's
+-- went-quiet and open-a-long-time lists.
+CREATE TABLE IF NOT EXISTS week_stories(
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  week_start INTEGER NOT NULL,
+  week_key   TEXT NOT NULL,
+  lede       TEXT,
+  stories    TEXT NOT NULL,
+  written_at INTEGER NOT NULL,
+  final      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(user_id, week_start)
+);
+-- Rows are looked up by week_key: the date survives a change of time zone.
+CREATE INDEX IF NOT EXISTS week_stories_key ON week_stories(user_id, week_key);
+CREATE TABLE IF NOT EXISTS project_notes(
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  project_id TEXT NOT NULL,
+  note       TEXT NOT NULL,
+  written_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, project_id)
+);
 -- Contacts and grants (spec 2026-10-02 matron-to-matron sharing, phase 1).
 -- A contact is one row PER SIDE; nothing is shared except between two rows
 -- that are both 'active'. peer_user is the address's user part and
@@ -2210,6 +2236,7 @@ export function openDb(path) {
   addTransferCauses(db)
   addTransferRecipient(db)
   addTransferConsentSetting(db)
+  addPeerFailingSince(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2365,6 +2392,12 @@ export function openDb(path) {
   // `matron-admin user 2fa-exempt <name> on`. Default 0.
   if (!userCols.some((c) => c.name === 'two_factor_exempt')) {
     db.exec('ALTER TABLE users ADD COLUMN two_factor_exempt INTEGER NOT NULL DEFAULT 0')
+  }
+  // The user's IANA time zone, which fixes where a Monday-to-Monday week
+  // starts for the Projects timeline (src/timeline.js). Validated where it is
+  // written; an unknown stored value reads back as the default.
+  if (!userCols.some((c) => c.name === 'time_zone')) {
+    db.exec("ALTER TABLE users ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'Europe/London'")
   }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
@@ -2583,10 +2616,17 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
   db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
 }
 
-// Called by the push pipeline on a 410 Unregistered response — the token is
-// dead, so stop trying it rather than retrying forever (sygnal lesson).
-export function pruneApnsToken(db, deviceId) {
-  db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=?').run(deviceId)
+// Called by the push pipeline when APNs says a token is dead (410
+// Unregistered, 400 BadDeviceToken), so it stops being tried rather than
+// retried on every push. Only the token is cleared, never the device: the app
+// registers a fresh one through /push/register. Clears only while the device
+// still holds the token AND environment the failed push used, so a late
+// answer never drops a registration made since — a new token, or the same
+// token re-registered with a corrected environment. Returns whether anything
+// was cleared, so a burst of failures for one token is logged once.
+export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
+  return db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=? AND apns_token=? AND apns_env=?')
+    .run(deviceId, apnsToken, apnsEnv).changes > 0
 }
 
 // Client devices (never agent — agents are never pushed to) with a
@@ -2801,6 +2841,14 @@ export function addTransferConsentSetting(db) {
 export function addTransferRecipient(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// When deliveries to a peer journal started failing (src/federation-outbox.js):
+// the first attempt that failed after it last answered, NULL while it
+// answers. A contact's unreachable_since (src/contacts.js). Idempotent.
+export function addPeerFailingSince(db) {
+  const cols = db.prepare('PRAGMA table_info(fed_peers)').all()
+  if (!cols.some((c) => c.name === 'failing_since')) db.exec('ALTER TABLE fed_peers ADD COLUMN failing_since INTEGER')
 }
 
 // The Coordinator answers file transfers too: consent_decisions.kind gains

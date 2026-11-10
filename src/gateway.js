@@ -2,7 +2,7 @@
 // protocol instead of APNs directly. Exact makeApnsClient contract —
 // send(opts) resolves {status, reason} and NEVER rejects; transport failure
 // resolves {status: 0, reason: 'transport'}, timeout {status: 0, reason:
-// 'timeout'} — so makePushPipeline (and its 410-prune / 400-env-mismatch
+// 'timeout'} — so makePushPipeline (and its dead-token prune
 // handleResult logic) works against a relay unchanged.
 //
 // Privacy is structural: only the content-free fields below are ever

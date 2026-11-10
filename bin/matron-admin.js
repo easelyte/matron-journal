@@ -31,6 +31,9 @@ const USAGE = `usage:
   matron-admin two-factor status
   matron-admin two-factor require on|off
   matron-admin federation status
+  matron-admin federation peers
+  matron-admin federation block <host>
+  matron-admin federation unblock <host>
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -246,6 +249,42 @@ export async function runAdmin(db, argv, deps = {}) {
       : !key.readable ? `key: stored, but it does not open under ${env.MATRON_TOKEN_KEY ? 'this' : 'a missing'} MATRON_TOKEN_KEY`
       : `key: ${key.pub}\nfingerprint: ${formatFingerprint(key.fingerprint)}${key.createdAt ? `\nmade: ${new Date(key.createdAt).toISOString()}` : ''}`
     return [`federation: ${switchLine}`, keyLine].join('\n')
+  }
+  if (a === 'federation' && b === 'peers') {
+    const rows = db.prepare(`SELECT p.*,
+        (SELECT COUNT(*) FROM contacts c WHERE c.peer_journal = p.host AND c.state = 'active') AS contacts,
+        (SELECT COUNT(*) FROM fed_outbox o WHERE o.peer_host = p.host AND o.state = 'queued') AS queued,
+        (SELECT COUNT(*) FROM fed_outbox o WHERE o.peer_host = p.host AND o.state = 'dead') AS dead
+      FROM fed_peers p ORDER BY p.host`).all()
+    if (!rows.length) return 'no other journals known'
+    const when = (t) => (t ? new Date(t).toISOString() : 'never')
+    return rows.map((r) => [
+      r.host, r.state, `contacts: ${r.contacts}`, `queued: ${r.queued}, dead: ${r.dead}`, `last ok: ${when(r.last_ok_at)}`,
+      ...(r.last_error ? [`last error: ${r.last_error}`] : []),
+    ].join('\t')).join('\n')
+  }
+  // A blocked journal is refused both ways at once, with no restart: its
+  // envelopes get 403 peer_refused, its invite links are refused, and what
+  // is queued for it goes dead at the outbox's next pass, a few seconds
+  // later (its users are told, and can resend after an unblock). A host never seen is blocked ahead of time; it has no key yet.
+  if (a === 'federation' && (b === 'block' || b === 'unblock')) {
+    const host = String(argv[2] ?? '').trim().toLowerCase()
+    if (!/^[a-z0-9.-]+(:[0-9]{1,5})?$/.test(host) || !host.includes('.')) throw new Error(USAGE)
+    const row = db.prepare('SELECT state, key_pub FROM fed_peers WHERE host=?').get(host)
+    if (b === 'block') {
+      if (row?.state === 'blocked') return `${host} is already blocked`
+      if (row) db.prepare("UPDATE fed_peers SET state='blocked', last_error='blocked' WHERE host=?").run(host)
+      else db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen, last_error) VALUES(?,?,'','blocked',?,'blocked')").run(host, `https://${host}`, Date.now())
+      const queued = db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE peer_host=? AND state='queued'").get(host).n
+      return `${host} is blocked: nothing goes to it or comes from it${queued ? `; ${queued} queued ${queued === 1 ? 'op goes' : 'ops go'} dead at the next outbox pass, and their users are told` : ''}`
+    }
+    if (row?.state !== 'blocked') return `${host} is not blocked`
+    if (!row.key_pub) {
+      db.prepare('DELETE FROM fed_peers WHERE host=?').run(host)
+      return `${host} is no longer blocked (it was never in touch, so it is forgotten)`
+    }
+    db.prepare("UPDATE fed_peers SET state='active', last_error=NULL WHERE host=?").run(host)
+    return `${host} is no longer blocked: its contacts work again with the key they pinned, and dead ops for it can be resent`
   }
   if (a === 'two-factor' && b === 'require') {
     const value = argv[2]
