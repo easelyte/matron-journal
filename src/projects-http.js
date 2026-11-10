@@ -7,7 +7,7 @@ import { json, readBody } from './http-body.js'
 import { idemKeyOf, badRequest, notFound, conflict } from './http-who.js'
 import { validateMissionFields, getMission } from './missions.js'
 import {
-  writableConvo, statusConvoOf, emitMissionMarker, byOf, validCloseSummary, closingConvo, refusedCloser,
+  writableConvo, statusConvoOf, emitMissionMarker, byOf, validCloseSummary, closingConvo, refusedCloser, coordinatorCaller,
 } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import {
@@ -96,14 +96,17 @@ async function handleClose(ctx, req, res, who, project) {
 
 // Both ends go through the caller's sieve before mergeProject (which reads
 // rows unsieved): a project the caller cannot see is 404 as :id (route) or
-// as `into` (here). movedMissionIds never leaves this function — it can
-// name missions hidden from a filtered caller.
+// as `into` (here). The Coordinator is sieved on any device, so on a private
+// one the route's own lookup of :id is repeated under the sieve.
+// movedMissionIds never leaves this function — it can name missions hidden
+// from a filtered caller.
 async function handleMerge(ctx, req, res, who, project) {
   const { db } = ctx
   const body = await readBody(req)
   if (typeof body.into !== 'string' && typeof body.into !== 'number') return badRequest(res)
   if (refusedCloser(res, coordinatorGate(db, who, body.convo_id))) return true
-  const excludePrivateOwned = filteredAgent(db, who)
+  const excludePrivateOwned = filteredAgent(db, who) || coordinatorCaller(db, who, body.convo_id)
+  if (excludePrivateOwned && !getProject(db, who.userId, project.id, { excludePrivateOwned })) return notFound(res)
   const into = getProject(db, who.userId, body.into, { excludePrivateOwned })
   if (!into) return notFound(res)
   let out
