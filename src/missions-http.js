@@ -93,10 +93,12 @@ export function emitMissionMarker({ db, hub }, who, { mission, action, convoId, 
 // own (createMission). Resolved through the
 // caller's own sieve, so a project it cannot read is the same 404 as one
 // that does not exist. Filing INTO a closed project is refused.
-export function projectRefOf(db, who, ref) {
+// `excludePrivateOwned` overrides the caller's own sieve (a mission move by
+// the Coordinator is always sieved).
+export function projectRefOf(db, who, ref, { excludePrivateOwned = filteredAgent(db, who) } = {}) {
   if (ref === null) return { status: 409, blockedBy: 'project_required' }
   if (typeof ref !== 'string' && typeof ref !== 'number') return { status: 400 }
-  const p = getProject(db, who.userId, ref, { excludePrivateOwned: filteredAgent(db, who) })
+  const p = getProject(db, who.userId, ref, { excludePrivateOwned })
   if (!p) return { status: 404 }
   if (p.state === 'closed') return { status: 409 }
   return { projectId: p.id }
@@ -221,8 +223,14 @@ async function handlePatch(ctx, req, res, who, mission) {
   const v = validateMissionFields(body, { partial: true, withName: true })
   if (!v.ok) return badFields(res, v)
   const fields = { ...v.value }
+  // A move by the Coordinator is sieved whatever device it runs on: the
+  // route resolved the mission through the device's own sieve, so on a
+  // private device it is read again here, and a private-origin mission or
+  // target project is the same 404 an ordinary agent gets.
+  const excludePrivateOwned = filteredAgent(db, who) || (body.project !== undefined && coordinatorCaller(db, who, body.convo_id))
   if (body.project !== undefined) {
-    const ref = projectRefOf(db, who, body.project)
+    if (excludePrivateOwned && !getMission(db, who.userId, mission.id, { excludePrivateOwned })) return notFound(res)
+    const ref = projectRefOf(db, who, body.project, { excludePrivateOwned })
     if (refusedProjectRef(res, ref)) return true
     fields.projectId = ref.projectId
     // A hand-over in flight was approved for a set of missions: the mission,
@@ -239,7 +247,7 @@ async function handlePatch(ctx, req, res, who, mission) {
   let retitled = []
   try {
     updated = updateMission(db, {
-      userId: who.userId, missionId: mission.id, fields, statusWriter, excludePrivateOwned: filteredAgent(db, who),
+      userId: who.userId, missionId: mission.id, fields, statusWriter, excludePrivateOwned,
       onRetitled: (rows) => { retitled = rows },
     })
   } catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
@@ -337,6 +345,16 @@ export function closingConvo(db, who, convoId, { isOn = () => false, required = 
   if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403 }
   return { convoId }
 }
+
+// True when an agent names the user's Coordinator conversation as the one it
+// acts for. The Coordinator works for the whole account from one device, so
+// what it MOVES (a mission to another project, a project merged into
+// another) is sieved as an ordinary agent's would be even when that device
+// is private: private work stays where its own device filed it. OR this into
+// the route's `excludePrivateOwned`; it only ever narrows, so a caller that
+// names the conversation without owning it gains nothing.
+export const coordinatorCaller = (db, who, convoId) =>
+  who.kind === 'agent' && typeof convoId === 'string' && !!convoId && getCoordinatorConvoId(db, who.userId) === convoId
 
 // The one mapping every closingConvo caller uses. True when it answered.
 export function refusedCloser(res, closer) {

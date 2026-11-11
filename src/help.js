@@ -380,7 +380,9 @@ close or merge.
   \`open_missions\`.
 - \`POST /projects/:id/merge\` \`{into, convo_id?}\` — same \`convo_id\` rule
   as close. Coordinator or user only; moves every mission into \`into\` and
-  closes this one ("Merged into #N").
+  closes this one ("Merged into #N"). A Coordinator merge of a project that
+  holds a mission from a private device is 409 \`private_missions\`: only
+  the user merges that one.
 - Activity: \`running\` (a linked session is running), \`waiting\` (one is
   waiting, or items await the user), \`quiet\` (no milestone, status update
   or conversation activity for 7 days), else \`idle\`.

@@ -164,11 +164,10 @@ test('close and merge: user or Coordinator only (403 not_coordinator otherwise);
   assert.equal((await close(b.id, client)).status, 409)
 })
 
-test('close and merge sieve both ends first: a project the filtered Coordinator cannot see is 404 as :id or as into; a hidden mission moved by a merge is never echoed', async (t) => {
-  const { s, alice, agent, priv, client } = await fleet(t)
+test('close and merge sieve both ends first: a project the filtered Coordinator cannot see is 404 as :id or as into', async (t) => {
+  const { s, alice, agent, priv } = await fleet(t)
   setCoordinatorConvoId(s.db, alice.id, 'c2')
   const pub = (await newProject(s, agent.token, { title: 'Pub' })).json.project
-  const pub2 = (await newProject(s, agent.token, { title: 'Pub2' })).json.project
   const hidden = (await newProject(s, priv.token, { title: 'Hidden', convo_id: 'secret' })).json.project
   const coord = { convo_id: 'c2' }
   const close = (id) => s.http(`/projects/${id}/close`, { method: 'POST', token: agent.token, body: { summary: 'done', ...coord } })
@@ -177,15 +176,36 @@ test('close and merge sieve both ends first: a project the filtered Coordinator 
   assert.equal((await merge(hidden.id, pub.id)).status, 404)
   assert.equal((await merge(pub.id, hidden.num)).status, 404)
   assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM projects WHERE state='closed'").get().n, 0, 'nothing written on a refusal')
-  // A private-origin mission filed into a project the Coordinator CAN see
-  // still moves with it (every mission moves) — but its id never comes back.
-  const secretMission = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private work', convo_id: 'secret', project: pub.id } })).json.mission
-  const r = await merge(pub.id, pub2.id)
-  assert.equal(r.status, 200)
-  const text = JSON.stringify(r.json)
-  assert.equal(text.includes(secretMission.id), false); assert.equal(text.includes('Private work'), false)
-  assert.equal(r.json.project.missions.running + r.json.project.missions.idle + r.json.project.missions.waiting, 0, 'the hidden mission adds to no rollup')
-  assert.equal((await s.http(`/missions/${secretMission.id}`, { token: client })).json.mission.project_id, pub2.id)
+})
+
+test('merge: a project holding a private-origin mission is 409 private_missions for the Coordinator and nothing moves; the user\'s own client merges it whole', async (t) => {
+  const { s, alice, agent, priv, client } = await fleet(t)
+  setCoordinatorConvoId(s.db, alice.id, 'c2')
+  const pub = (await newProject(s, agent.token, { title: 'Pub' })).json.project
+  const pub2 = (await newProject(s, agent.token, { title: 'Pub2' })).json.project
+  const open = (await startMission(s, agent.token, { title: 'Public work', project: pub.id })).json.mission
+  const secret = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private work', convo_id: 'secret', project: pub.id } })).json.mission
+  const merge = (token, body = {}) => s.http(`/projects/${pub.id}/merge`, { method: 'POST', token, body: { into: pub2.id, ...body } })
+  const projectOf = (id) => s.db.prepare('SELECT project_id FROM missions WHERE id=?').get(id).project_id
+  const before = s.db.prepare('SELECT state, merged_into, updated_at FROM projects WHERE id=?').get(pub.id)
+
+  const refused = await merge(agent.token, { convo_id: 'c2' })
+  assert.equal(refused.status, 409)
+  // The hidden mission blocks without being named.
+  assert.deepEqual(refused.json, { error: 'conflict', blocked_by: 'private_missions' })
+  assert.equal(projectOf(open.id), pub.id); assert.equal(projectOf(secret.id), pub.id)
+  assert.deepEqual(s.db.prepare('SELECT state, merged_into, updated_at FROM projects WHERE id=?').get(pub.id), before, 'the source is untouched')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM projects WHERE state='closed'").get().n, 0)
+
+  // A Coordinator on the private device is under the same sieve.
+  setCoordinatorConvoId(s.db, alice.id, 'secret')
+  const fromPrivate = await merge(priv.token, { convo_id: 'secret' })
+  assert.equal(fromPrivate.status, 409); assert.deepEqual(fromPrivate.json, { error: 'conflict', blocked_by: 'private_missions' })
+  assert.equal(projectOf(secret.id), pub.id)
+
+  const byUser = await merge(client)
+  assert.equal(byUser.status, 200); assert.equal(byUser.json.merged.merged_into, pub2.id)
+  assert.equal(projectOf(open.id), pub2.id); assert.equal(projectOf(secret.id), pub2.id)
 })
 
 test('a merge chain A into B then B into C: /lookup #A and GET /projects/A both land on C with merged_from', async (t) => {
@@ -233,4 +253,75 @@ test('GET /projects/:id/feed: pages decisions, files and milestones; 400 on a ba
   const list = await s.http('/projects', { token: client })
   const row = list.json.projects.find((x) => x.id === into.id)
   assert.equal(row.latest.title, 'step 2'); assert.equal(row.waiting_on, null); assert.equal(row.sessions_now, 1)
+})
+
+// The Coordinator's moves and merges are sieved like an ordinary agent's
+// even when its own device is private: it never moves private work.
+async function privateCoordinator(t) {
+  const f = await fleet(t)
+  const { s, alice, agent, priv } = f
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: alice.id, title: 'S2', agentDeviceId: priv.deviceId })
+  setCoordinatorConvoId(s.db, alice.id, 'secret')
+  const pub = (await newProject(s, agent.token, { title: 'Pub' })).json.project
+  const pub2 = (await newProject(s, agent.token, { title: 'Pub2' })).json.project
+  const hidden = (await newProject(s, priv.token, { title: 'Hidden', convo_id: 'secret2' })).json.project
+  const hidden2 = (await newProject(s, priv.token, { title: 'Hidden2', convo_id: 'secret2' })).json.project
+  const projectOf = (id) => s.db.prepare('SELECT project_id FROM missions WHERE id=?').get(id).project_id
+  return { ...f, pub, pub2, hidden, hidden2, projectOf }
+}
+
+test('PATCH /missions/:id {project} by a Coordinator on a private device: a private-origin mission or project is 404; public work still moves; the device\'s other agents are unchanged', async (t) => {
+  const { s, agent, priv, pub, pub2, hidden, hidden2, projectOf } = await privateCoordinator(t)
+  const secretMission = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private work', convo_id: 'secret2', project: hidden.id } })).json.mission
+  const openMission = (await startMission(s, agent.token, { project: pub.id })).json.mission
+  const patch = (id, body) => s.http(`/missions/${id}`, { method: 'PATCH', token: priv.token, body })
+  const coord = { convo_id: 'secret' }
+
+  const moved = await patch(secretMission.id, { project: pub.id, ...coord })
+  assert.equal(moved.status, 404, 'a private-origin mission is not the Coordinator\'s to move')
+  assert.deepEqual(moved.json, { error: 'not_found' })
+  assert.equal(projectOf(secretMission.id), hidden.id)
+  assert.equal((await patch(secretMission.id, { project: hidden2.id, ...coord })).status, 404, 'not even between private projects')
+  assert.equal((await patch(openMission.id, { project: hidden.id, ...coord })).status, 404, 'nothing is moved into a private-origin project')
+  assert.equal((await patch(openMission.id, { project: `#${hidden.num}`, ...coord })).status, 404)
+  assert.equal(projectOf(openMission.id), pub.id)
+
+  const ok = await patch(openMission.id, { project: pub2.id, ...coord })
+  assert.equal(ok.status, 200); assert.equal(ok.json.mission.project_id, pub2.id)
+
+  // The rule is about moves: the Coordinator still writes a status on a
+  // mission its own device can read.
+  assert.equal((await patch(secretMission.id, { status: 'Going well', ...coord })).status, 200)
+
+  // The same device, not as the Coordinator: naming another of its
+  // conversations, or none, it files its own private work as before.
+  const own = await patch(secretMission.id, { project: hidden2.id, convo_id: 'secret2' })
+  assert.equal(own.status, 200); assert.equal(own.json.mission.project_id, hidden2.id)
+  assert.equal((await patch(secretMission.id, { project: hidden.id })).status, 200)
+  assert.equal((await patch(openMission.id, { project: hidden.id, convo_id: 'secret2' })).status, 200)
+  assert.equal(projectOf(openMission.id), hidden.id)
+})
+
+test('POST /projects/:id/merge by a Coordinator on a private device: a private-origin project is 404 on either side; public projects still merge; the user still merges anything', async (t) => {
+  const { s, priv, client, pub, pub2, hidden, hidden2 } = await privateCoordinator(t)
+  const merge = (id, into, body = { convo_id: 'secret' }, token = priv.token) => s.http(`/projects/${id}/merge`, { method: 'POST', token, body: { into, ...body } })
+  const closedCount = () => s.db.prepare("SELECT COUNT(*) AS n FROM projects WHERE state='closed'").get().n
+
+  const asSource = await merge(hidden.id, pub.id)
+  assert.equal(asSource.status, 404); assert.deepEqual(asSource.json, { error: 'not_found' })
+  assert.equal((await merge(pub.id, hidden.id)).status, 404)
+  assert.equal((await merge(pub.id, hidden.num)).status, 404)
+  assert.equal((await merge(hidden.id, hidden2.id)).status, 404)
+  assert.equal(closedCount(), 0, 'nothing written on a refusal')
+
+  // Not the Coordinator: as before, an agent never merges at all.
+  const other = await merge(hidden.id, hidden2.id, { convo_id: 'secret2' })
+  assert.equal(other.status, 403); assert.equal(other.json.detail, 'not_coordinator')
+  assert.equal((await merge(hidden.id, hidden2.id, {})).status, 403)
+
+  const ok = await merge(pub.id, pub2.id)
+  assert.equal(ok.status, 200); assert.equal(ok.json.merged.merged_into, pub2.id)
+
+  const byUser = await merge(hidden.id, hidden2.id, {}, client)
+  assert.equal(byUser.status, 200); assert.equal(byUser.json.merged.merged_into, hidden2.id)
 })
