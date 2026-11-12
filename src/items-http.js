@@ -6,6 +6,8 @@ import { appendAndBroadcast, toEventShape } from './journal.js'
 import { isPrivateDevice } from './db.js'
 import { authorizeAgentWrite } from './auth.js'
 import { wakeConvoAgent } from './wake.js'
+import { getCoordinatorConvoId } from './coordinator.js'
+import { joinedAgentIds } from './participants.js'
 import { json, readBody } from './http-body.js'
 import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import {
@@ -18,7 +20,7 @@ import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FAL
 import { visibleMission, writableConvo } from './missions-http.js'
 import { handleContributedItem, handleContributorItemSub, forwardToContributor } from './contribute-http.js'
 import { contributableItem } from './contribute.js'
-import { filteredAgent, privateOwnedConvo } from './privacy.js'
+import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { transferTapAnswer } from './transfer-consent.js'
 import { consentItemTapAnswer } from './consent-answer.js'
@@ -110,6 +112,14 @@ function badFields(res, v) {
 // in a private device's conversation. Same 404 for every failure.
 // A consent mirror (isConsentMirror, items.js) is invisible to EVERY agent,
 // private ones included — it is the user's card in item form.
+// The owner conversation can receive a turn: it exists for this user and has
+// an assigned or joined agent to wake.
+function ownerHasAgent(db, userId, convoId) {
+  const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+  if (!row) return false
+  return row.agent_device_id != null || joinedAgentIds(db, convoId).length > 0
+}
+
 function visibleItem(db, who, idOrNum) {
   const item = getItem(db, who.userId, idOrNum)
   if (!item) return null
@@ -211,7 +221,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
     // conversation must not fail the request (same stance as spawns.js).
     console.error('items: marker append failed (item write already committed)', err)
     tellGrantees()
-    return
+    return false
   }
   try {
     if (!mirror) pushPipeline.onAppend(who.userId, toEventShape({ seq: r.seq, convo_id: item.origin_convo_id, ts: r.ts, sender, type: ITEM_EVENT_TYPE, payload }), who.deviceId)
@@ -265,6 +275,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // An item a contributor filed: the owner's reply reaches the conversation
   // that filed it, as another person's turn (src/contribute-http.js).
   if (item.mission_id && item.consent == null && !item.private) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
+  return true
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -657,6 +668,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       const handoverId = approvalQuestionOf(db, item.id, replyTo)
       if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey })
     }
+    // `replaces`: the id of the user's own withdrawn reply this one is the
+    // edited version of (addComment decides whether it counts). A client's
+    // field only; an agent never cancels and resends a reply.
+    // An id too long to be one is unknown like any other: dropped, not refused.
+    if (body.replaces != null && (typeof body.replaces !== 'string' || !body.replaces)) return badRequest(res)
+    const replaces = who.kind === 'agent' || body.replaces == null || body.replaces.length > ID_MAX ? null : body.replaces
     // `actions` on a comment is the other half: the buttons an AGENT offers
     // with a follow-up question. A client offering buttons to its own user
     // makes no sense, and would move `awaiting` back onto them, so it is
@@ -691,7 +708,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
@@ -714,18 +731,38 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       if (who.kind === 'agent' && item.consent == null && convoId !== item.origin_convo_id) {
         let reason = null
         if (!convoId) reason = 'commenter conversation unknown (as_convo_id not sent)'
-        else if (!db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=?').get(item.origin_convo_id, who.userId)) reason = 'owner conversation unavailable'
+        // The Coordinator comments on other conversations' items as routine
+        // housekeeping (answering, nudging, closing out); waking the owner for
+        // each would turn that into noise. It reaches an owner through the
+        // paths it already has, so it is exempt: no flag, no wake, no slot.
+        else if (getCoordinatorConvoId(db, who.userId) === convoId) reason = 'comments from the Coordinator do not wake the owner'
+        else if (!ownerHasAgent(db, who.userId, item.origin_convo_id)) reason = 'owner conversation unavailable'
         else if (!ctx.agentCommentLimiter.take(item.id, convoId)) reason = 'rate-limited'
         if (reason) {
           ownerNotice = `The owner session will not be notified of this comment: ${reason}`
+        } else if (!markerTitleAllowed(db, convoId, item.origin_convo_id)) {
+          // The commenter lives in a private device's conversation and the
+          // owner's events are readable by ordinary agents: flag the comment
+          // but name no conversation (id or title).
+          extra = { agent_comment: true }
+          ownerNotice = true
         } else {
           const row = db.prepare('SELECT title FROM conversations WHERE id=?').get(convoId)
-          const label = (row?.title ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, 120) || senderOf(db, who).replace(/^agent:/, '')
+          // Control characters become spaces; bidi and zero-width marks are dropped (they
+          // can reorder or hide the attribution a bridge puts in a turn header), and
+          // double quotes are flattened so the title cannot close a quoted label.
+          const label = (row?.title ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\u061c]/g, '').replace(/"/g, "'").trim().slice(0, 120) || senderOf(db, who).replace(/^agent:/, '')
           extra = { agent_comment: true, from_convo_id: convoId, from_label: label }
           ownerNotice = true
         }
       }
-      emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment, extra })
+      const emitted = emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment, extra })
+      if (ownerNotice === true && emitted === false) {
+        // No marker and no wake reached the owner: say so, and free the slot
+        // so a prompt retry is not throttled.
+        ctx.agentCommentLimiter.release(item.id, convoId)
+        ownerNotice = 'The owner session was not notified: the comment was saved but the notification could not be recorded'
+      }
       // Queued AFTER the marker so the follow-up can never precede it.
       if (transcribeHere) {
         // One job per blob: the same audio attached twice is one whisper run.

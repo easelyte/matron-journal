@@ -187,3 +187,41 @@ test('a cancelled tap gives the choice back to the earlier tap still standing', 
   await queueAndRelease(s, agent, { item, reply: tap, action: 'cancel' })
   assert.equal((await s.http(`/items/${item.id}`, { token: agent.token })).json.item.chosen_action, 'Plan A')
 })
+
+test('an edited resend names the cancelled reply it replaces; nothing else can be replaced', async (t) => {
+  const { s, alice, agent, client, item, reply } = await fleet(t)
+  const post = (token, body) => s.http(`/items/${item.id}/comments`, { method: 'POST', token, body })
+
+  // Not withdrawn yet: the link is dropped, the reply is still kept.
+  const early = await post(client, { body: 'use the yak ledger', replaces: reply.id })
+  assert.equal(early.status, 201); assert.equal(early.json.comment.replaces, undefined)
+
+  await queueAndRelease(s, agent, { item, reply, action: 'cancel' })
+
+  const edited = await post(client, { body: 'use the zebra ledger, from March', replaces: reply.id })
+  assert.equal(edited.status, 201); assert.equal(edited.json.comment.replaces, reply.id)
+  for (const token of [client, agent.token]) {
+    const c = (await thread(s, token, item)).find((x) => x.id === edited.json.comment.id)
+    assert.equal(c.replaces, reply.id); assert.equal(c.body, 'use the zebra ledger, from March')
+  }
+  // No other comment carries the field.
+  assert.equal('replaces' in replyIn(await thread(s, client, item), reply), false)
+
+  // An unknown id, another item's comment or an agent's own comment: dropped.
+  const agentNote = (await post(agent.token, { body: 'noted' })).json.comment
+  for (const id of ['cm_nope', agentNote.id]) {
+    const r = await post(client, { body: 'again', replaces: id })
+    assert.equal(r.status, 201); assert.equal(r.json.comment.replaces, undefined)
+  }
+  // An agent never replaces a reply; a malformed field is a bad request.
+  assert.equal((await post(agent.token, { body: 'mine', replaces: reply.id })).json.comment.replaces, undefined)
+  assert.equal((await post(client, { body: 'x', replaces: 7 })).status, 400)
+  assert.equal((await post(client, { body: 'x', replaces: '' })).status, 400)
+  // An id too long to be one is unknown, so the reply is kept without it.
+  const long = await post(client, { body: 'y', replaces: 'x'.repeat(500) })
+  assert.equal(long.status, 201); assert.equal(long.json.comment.replaces, undefined)
+  // The edit's marker in the conversation carries the link too.
+  const markers = log(s, alice.id).filter((e) => e.type === 'item').map((e) => JSON.parse(e.payload))
+  assert.equal(markers.find((m) => m.comment?.id === edited.json.comment.id).comment.replaces, reply.id)
+  assert.equal(markers.filter((m) => m.comment && 'replaces' in m.comment).length, 1)
+})

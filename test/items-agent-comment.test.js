@@ -17,7 +17,7 @@ async function fleet(t, clock) {
   upsertConversation(s.db, { id: 'c2', ownerUserId: alice.id, title: 'C2 commenter', agentDeviceId: agent.deviceId })
   const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
   const made = await s.http('/items', { method: 'POST', token: agent.token, body: { kind: 'question', title: 'Which auth?', convo_id: 'c1', body: 'A or B?' } })
-  return { s, agent, client: login.json.token, item: made.json.item, wakeCalls }
+  return { s, alice, agent, client: login.json.token, item: made.json.item, wakeCalls }
 }
 
 const lastMarker = (s) => {
@@ -108,4 +108,71 @@ test('no flag, no wake, no owner fields: owner own comment; missing as_convo_id;
   assert.equal(user.status, 201)
   assert.equal('owner_notified' in user.json, false)
   assert.equal(lastMarker(s).agent_comment, undefined)
+})
+
+test('private commenter: owner is flagged and woken, but the marker names no conversation', async (t) => {
+  const clock = { now: 1_000_000 }
+  const { s, alice, item, wakeCalls } = await fleet(t, clock)
+  const priv = createAgent(s.db, alice.id, 'priv-box')
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
+  upsertConversation(s.db, { id: 'cp', ownerUserId: alice.id, title: 'Secret plans', agentDeviceId: priv.deviceId })
+  wakeCalls.length = 0
+  const r = await s.http(`/items/${item.id}/comments`, { method: 'POST', token: priv.token, body: { body: 'psst', as_convo_id: 'cp' } })
+  assert.equal(r.status, 201)
+  assert.equal(r.json.owner_notified, true)
+  const m = lastMarker(s)
+  assert.equal(m.agent_comment, true)
+  assert.equal('from_convo_id' in m, false)
+  assert.equal('from_label' in m, false)
+  assert.equal(JSON.stringify(m).includes('Secret plans'), false)
+  assert.equal(JSON.stringify(m).includes('"cp"'), false)
+  assert.deepEqual(wakeCalls, ['box-2'])
+})
+
+test('owner conversation without any agent: not notified, no limiter slot taken', async (t) => {
+  const clock = { now: 1_000_000 }
+  const { s, alice, agent } = await fleet(t, clock)
+  upsertConversation(s.db, { id: 'c3', ownerUserId: alice.id, title: 'No agent', agentDeviceId: agent.deviceId })
+  const made = await s.http('/items', { method: 'POST', token: agent.token, body: { kind: 'question', title: 'Q', convo_id: 'c3', body: 'b' } })
+  const url = `/items/${made.json.item.id}/comments`
+  s.db.prepare('UPDATE conversations SET agent_device_id=NULL WHERE id=?').run('c3')
+  const r = await s.http(url, { method: 'POST', token: agent.token, body: { body: 'hi', as_convo_id: 'c2' } })
+  assert.equal(r.status, 201)
+  assert.equal(r.json.owner_notified, false)
+  assert.match(r.json.owner_notice, /owner conversation unavailable/)
+  assert.equal(lastMarker(s).agent_comment, undefined)
+  // The slot was not spent: once an agent is assigned, the same pair is delivered at once.
+  s.db.prepare('UPDATE conversations SET agent_device_id=? WHERE id=?').run(agent.deviceId, 'c3')
+  const r2 = await s.http(url, { method: 'POST', token: agent.token, body: { body: 'again', as_convo_id: 'c2' } })
+  assert.equal(r2.json.owner_notified, true)
+})
+
+test('failed marker emission: not reported as notified, slot released for a retry', async (t) => {
+  const clock = { now: 1_000_000 }
+  const { s, agent, item, wakeCalls } = await fleet(t, clock)
+  const url = `/items/${item.id}/comments`
+  s.db.exec("CREATE TRIGGER no_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'boom'); END")
+  wakeCalls.length = 0
+  const origErr = console.error
+  console.error = () => {}
+  let r
+  try { r = await s.http(url, { method: 'POST', token: agent.token, body: { body: 'lost?', as_convo_id: 'c2' } }) } finally { console.error = origErr }
+  assert.equal(r.status, 201)
+  assert.equal(r.json.owner_notified, false)
+  assert.match(r.json.owner_notice, /could not be recorded/)
+  assert.deepEqual(wakeCalls, [])
+  s.db.exec('DROP TRIGGER no_events')
+  // No clock advance: the released slot lets the retry through.
+  const retry = await s.http(url, { method: 'POST', token: agent.token, body: { body: 'retry', as_convo_id: 'c2' } })
+  assert.equal(retry.json.owner_notified, true)
+  assert.deepEqual(wakeCalls, ['box-2'])
+})
+
+test('from_label drops bidi and zero-width controls and flattens double quotes', async (t) => {
+  const clock = { now: 1_000_000 }
+  const { s, alice, agent, item } = await fleet(t, clock)
+  upsertConversation(s.db, { id: 'c4', ownerUserId: alice.id, title: 'ok‮"evil"⁦ title​', agentDeviceId: agent.deviceId })
+  const r = await s.http(`/items/${item.id}/comments`, { method: 'POST', token: agent.token, body: { body: 'hi', as_convo_id: 'c4' } })
+  assert.equal(r.status, 201)
+  assert.equal(lastMarker(s).from_label, "ok'evil' title")
 })

@@ -22,8 +22,15 @@ export function makeAgentCommentLimiter({ now = Date.now } = {}) {
     // true = delivered (and counted); false = throttled.
     take(itemId, fromConvoId) {
       const t = now()
-      if (pairs.size + items.size >= MAP_MAX) prune(t)
       const key = `${itemId}|${fromConvoId}`
+      // Entries this call would add. Over the cap even after dropping the
+      // expired ones, a new entry is throttled rather than letting the maps
+      // grow: live limits are never evicted, so they are never weakened.
+      const needed = (pairs.has(key) ? 0 : 1) + (items.has(itemId) ? 0 : 1)
+      if (pairs.size + items.size + needed > MAP_MAX) {
+        prune(t)
+        if (pairs.size + items.size + needed > MAP_MAX) return false
+      }
       const last = pairs.get(key)
       if (last != null && t - last < PER_PAIR_MS) return false
       const recent = (items.get(itemId) ?? []).filter((x) => t - x < PER_ITEM_MS)
@@ -32,6 +39,14 @@ export function makeAgentCommentLimiter({ now = Date.now } = {}) {
       items.set(itemId, recent)
       pairs.set(key, t)
       return true
+    },
+    // Give back the slot a take() reserved, when the delivery then failed.
+    release(itemId, fromConvoId) {
+      pairs.delete(`${itemId}|${fromConvoId}`)
+      const arr = items.get(itemId)
+      if (!arr) return
+      arr.pop()
+      if (!arr.length) items.delete(itemId)
     },
   }
 }

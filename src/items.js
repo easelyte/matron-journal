@@ -268,6 +268,9 @@ export function rowToComment(row) {
   // agent (src/withdrawn-comments.js). Absent on every other comment, like
   // attribution.
   if (withdrawnAt != null) attribution.withdrawn_at = withdrawnAt
+  // `replaces`: the withdrawn reply this one is the edited version of
+  // (addComment). Absent on every other comment, like attribution.
+  if (typeof m?.replaces === 'string') attribution.replaces = m.replaces
   return {
     ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
@@ -797,7 +800,14 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // `keepStatus` is for a consent mirror (isConsentMirror): its status belongs
 // to the ask it mirrors, so a user's comment is recorded but neither hands
 // the item to an agent (none can see it) nor reopens it.
-export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, actions = [], idemKey = null, keepStatus = false, now = Date.now() }) {
+//
+// `replaces` is the id of a reply the user cancelled before it reached the
+// agent (src/withdrawn-comments.js) and is now sending again, edited. It is
+// recorded as meta.replaces so every app can show the thread with the one
+// reply in it rather than a cancelled copy and its edit. It only counts for
+// the user's own withdrawn reply on this item; anything else is dropped
+// without refusing the comment, whose words matter more than the link.
+export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], idemKey = null, keepStatus = false, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -828,7 +838,11 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     // changes nothing — the same answer as a replay.
     const seen = row.kind === 'notice' && author === 'user' && action === NOTICE_ACTION && asked == null && !keepStatus
     if (seen && row.state === 'closed') return { item: getItem(db, userId, itemId), comment: null, duplicate: true, seen: true }
-    const meta = action == null ? null : (asked ? { action, reply_to: asked.id } : { action })
+    let meta = action == null ? null : (asked ? { action, reply_to: asked.id } : { action })
+    if (replaces != null && author === 'user') {
+      const original = db.prepare("SELECT id FROM item_comments WHERE id=? AND item_id=? AND kind='comment' AND author='user' AND withdrawn_at IS NOT NULL").get(replaces, itemId)
+      if (original) meta = { ...(meta ?? {}), replaces: original.id }
+    }
     let comment
     try {
       comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, idemKey, now })

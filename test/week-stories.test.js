@@ -6,7 +6,7 @@ import { createItem, addComment } from '../src/items.js'
 import { createMission } from '../src/missions.js'
 import { createProject, mergeProject } from '../src/projects.js'
 import { weekStartOf, formatWeekKey, previousWeekStart, weekEndOf } from '../src/timeline.js'
-import { WEEK_LIMITS, validWeekWrite, writeWeek, storedWeek, projectNotes } from '../src/week-stories.js'
+import { WEEK_LIMITS, validWeekWrite, writeWeek, storedWeek, projectNotes, pictureRollupSqlForTest } from '../src/week-stories.js'
 
 const LON = 'Europe/London'
 const NOW = Date.UTC(2026, 10, 11, 12) // Wed 11 Nov 2026, week of Mon 9 Nov
@@ -205,6 +205,18 @@ test('writeWeek refuses an unknown blob, another user\'s, one only a private con
   assert.equal(write(db, keyOf(0), { stories: [story('b-mine')] }).ok, true)
   assert.equal(write(db, keyOf(0), { stories: [story('b-secret')] }, { excludePrivateOwned: false }).ok, true)
   assert.equal(write(db, keyOf(0), { stories: [story('b-bob')] }, { excludePrivateOwned: false }).detail, 'unknown_blob')
+})
+
+test("the picture check reads only the user's own missions, never every user's comments or mission links", () => {
+  const db = seeded()
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${pictureRollupSqlForTest}`).all({ userId: 1, blobId: 'b-mine' })
+  const text = plan.map((r) => r.detail).join('\n')
+  assert.doesNotMatch(text, /SCAN (ic|l|m|i|e)\b/)
+  // Both arms of the roll-up start from the user's missions.
+  assert.equal((text.match(/SEARCH m USING INDEX idx_missions_user_state \(user_id=\?/g) ?? []).length, 2)
+  assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/)
+  assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/)
+  assert.match(text, /SEARCH l USING INDEX sqlite_autoindex_mission_conversations_1 \(mission_id=\?/)
 })
 
 test('writeWeek refuses a blob that is not an image or a video; a video is accepted', () => {

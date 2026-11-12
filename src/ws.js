@@ -562,6 +562,9 @@ export function attachWs({
     let conn = null
 
     ws.on('message', async (data) => {
+      // Closing (a restart close frame is out, waiting for the client's): no
+      // new work, the database is about to close.
+      if (ws.readyState !== 1) return
       ws._lastInbound = Date.now()
       let msg = null
       try { msg = JSON.parse(data) } catch { /* handled below */ }

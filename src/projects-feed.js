@@ -73,48 +73,67 @@ function decisionsSql(excludePrivateOwned) {
 // linked to two of the project's missions is listed once, under the
 // lower-numbered mission. `projectMatch` picks the missions (the feed: the
 // project's own; the timeline's week media also takes those of projects
-// merged into it).
-export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId') {
+// merged into it). The third argument makes it a roll-up for several
+// projects at once: `cols` leads each arm's columns (ending in a comma),
+// `join` joins the mission `m` to what they name and `group` (starting with
+// a comma) is the same expression, so an event in conversations of two
+// projects is listed once under each.
+export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId', { cols = '', join = '', group = '' } = {}) {
   const itemSieve = excludePrivateOwned
     ? `AND NOT ${privateConvo('c')} AND NOT ${privateDevice('ic.device_id')} AND ${ORIGIN_SIEVE}` : ''
   const eventSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  return `SELECT 'item' AS source, json_extract(je.value, '$.blob_ref') AS blob_id, json_extract(je.value, '$.name') AS name,
+  return `SELECT ${cols}'item' AS source, json_extract(je.value, '$.blob_ref') AS blob_id, json_extract(je.value, '$.name') AS name,
       json_extract(je.value, '$.mime') AS content_type, json_extract(je.value, '$.size') AS size,
       ic.created_at AS at, 'c:' || ic.id || ':' || printf('%03d', je.key) AS sort_key,
       i.num AS item_num, NULL AS convo_id, NULL AS seq, NULL AS caption, m.num AS mission_num
-    FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id
+    FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id ${join}
     JOIN conversations c ON c.id = i.origin_convo_id, json_each(ic.attachments) je
-    WHERE ${projectMatch} AND m.user_id = @userId AND i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
+    WHERE ${projectMatch} AND +m.user_id = @userId AND +i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
   UNION ALL
-  SELECT 'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
+  SELECT ${cols}'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
       json_extract(e.payload, '$.size'), e.ts, 'e:' || ${pad('e.seq')}, NULL, e.convo_id, e.seq,
       json_extract(e.payload, '$.caption'), MIN(m.num)
-    FROM missions m
+    FROM missions m ${join}
     JOIN mission_conversations l ON l.mission_id = m.id
     JOIN conversations c ON c.id = l.convo_id
     JOIN events e ON e.convo_id = l.convo_id AND e.type IN ('image', 'file')
       AND e.ts >= COALESCE(l.first_joined_at, l.joined_at) AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
-    WHERE ${projectMatch} AND m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
-    GROUP BY e.seq`
+    WHERE ${projectMatch} AND +m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
+    GROUP BY e.seq${group}`
   // `+e.user_id`: the unary plus keeps SQLite off the events primary key
   // (user_id, seq), which it otherwise prefers without ANALYZE statistics,
   // reading every event the user has. With it, each linked conversation is
   // read through idx_events_media (pinned by a test).
+  // `+i.consent`, likewise: it keeps SQLite off idx_items_consent, which
+  // would read nearly every item of every user. `+m.user_id` keeps it off
+  // idx_missions_user_state, so `projectMatch` is what finds the missions
+  // (through idx_missions_project) and each one's items are then read
+  // through idx_items_mission (pinned by the same test). A caller that wants
+  // every mission of the user must say so in `projectMatch` itself.
 }
 
-function milestonesSql(excludePrivateOwned) {
+// Every milestone of the project's missions. `projectMatch` picks the
+// missions, as in filesSql (the timeline's project history also takes those
+// of projects merged into it).
+export function milestonesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId') {
   const sieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
   return `SELECT l.*, m.num AS mission_num, l.created_at AS at, ${pad('l.seq')} AS sort_key
     FROM milestones l JOIN missions m ON m.id = l.mission_id JOIN conversations c ON c.id = l.convo_id
-    WHERE m.project_id = @projectId AND m.user_id = @userId ${sieve}`
+    WHERE ${projectMatch} AND +m.user_id = @userId ${sieve}`
+  // `+m.user_id`, as in filesSql: `projectMatch` finds the missions (through
+  // idx_missions_project), not a read of every mission the user has, and each
+  // one's milestones follow through idx_milestones_mission (pinned by tests).
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
-// Test seam: the query-plan test reads the files SQL directly (the
-// timeline's week media reuses it as filesSql).
+// Test seam: the query-plan tests read the files and milestones SQL directly
+// (the timeline's week media reuses the first as filesSql).
 export const filesSqlForTest = filesSql
+export const milestonesSqlForTest = milestonesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest
+// A milestonesSql row as the feed returns it (the project history returns the same).
+export const feedMilestone = (r) => milestoneRow(strip(r))
 const SHAPE = {
   decisions: (r) => strip(r),
   files: ({ source, item_num: itemNum, convo_id: convoId, seq, ...r }) => ({
@@ -122,7 +141,7 @@ const SHAPE = {
     posted_at: r.at,
     source: source === 'item' ? { item_num: itemNum } : { convo_id: convoId, seq },
   }),
-  milestones: (r) => milestoneRow(strip(r)),
+  milestones: feedMilestone,
 }
 
 // One page of one kind. `before` is a parsed cursor or null.

@@ -82,9 +82,12 @@ test('the signal handler closes the server with 1012 and exits 0; a stuck close 
   const realSetTimeout = global.setTimeout
   let watchdog
   global.setTimeout = (...a) => { watchdog = realSetTimeout(...a); return watchdog }
-  installShutdownHandlers({ close: () => new Promise(() => {}) }, { proc: stuckProc, timeoutMs: 30, log: () => {} })
-  stuckProc.emit('SIGINT')
-  global.setTimeout = realSetTimeout
+  try {
+    installShutdownHandlers({ close: () => new Promise(() => {}) }, { proc: stuckProc, timeoutMs: 30, log: () => {} })
+    stuckProc.emit('SIGINT')
+  } finally {
+    global.setTimeout = realSetTimeout
+  }
   assert.equal(watchdog.hasRef(), true)
   await new Promise((r) => setTimeout(r, 120))
   assert.deepEqual(stuckExits, [1])
@@ -100,7 +103,7 @@ test('a running journal process gives clients 1012 on SIGTERM and exits 0', asyn
   seed.close()
 
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.js', import.meta.url))], {
-    env: { ...process.env, MATRON_DB: dbPath, MATRON_PORT: '0' },
+    env: { ...process.env, MATRON_DB: dbPath, MATRON_PORT: '0', MATRON_BIND: '127.0.0.1', MATRON_SEMANTIC_SEARCH: 'off', MATRON_BACKGROUND_DELAY_MS: '600000' },
   })
   t.after(() => child.kill('SIGKILL'))
   const port = await new Promise((resolve, reject) => {

@@ -127,6 +127,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_TRANSFER_USER_QUOTA_BYTES` | 20 GiB (`21474836480`) | Per-user cap on the declared size of transfers whose bytes the journal still holds or will hold (in flight, or delivered within the last hour before their copy is deleted), separate from the media/attachment quota |
 | `MATRON_TRANSFER_MAX_AWAITING_PER_SENDER` | `50` | How many of one sending box's transfers may wait for the user's approval at once; the next `POST /transfers` is `409 too_many_awaiting` |
 | `MATRON_WS_PING_MS` | `55000` | WebSocket heartbeat interval (kept under common 60s proxy idle timeouts) |
+| `MATRON_KEEPALIVE_TIMEOUT_MS` | `120000` | How long an idle HTTP connection is kept open. Must be longer than the idle time of any reverse proxy in front of the journal, or the proxy can reuse a connection the journal is closing and answer 502 |
 | `MATRON_RPC_MAX_BYTES` | `16384` | Max inbound WebSocket RPC frame size |
 | `MATRON_TOOL_STREAM_MAX_BYTES` | `1048576` | Max bytes per live tool-output stream buffer |
 | `MATRON_TOOL_STREAM_MAX_BUFFERS` | `64` | Max concurrent tool-output stream buffers |

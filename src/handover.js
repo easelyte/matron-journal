@@ -291,6 +291,9 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
       const prior = parseJson(c.meta, null) ?? {}
       const meta = { ...prior, attribution: prior.attribution ?? (c.author === 'user' ? ownerName : `${ownerName}'s agent`) }
       if (meta.reply_to) meta.reply_to = commentIds.get(meta.reply_to) ?? null
+      // The withdrawn reply an edit replaced is not copied, so the copy
+      // has nothing for `replaces` to name.
+      delete meta.replaces
       insComment.run(cid, itemId, toUserId, c.kind, rewriteRefs(c.body, blobMap), JSON.stringify(attachments), JSON.stringify(meta), c.created_at, c.actions ?? '[]', c.chosen_action ?? null)
     }
     copied.push({ from: it.id, to: itemId })

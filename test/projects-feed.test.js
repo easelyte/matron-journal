@@ -5,7 +5,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, joinMission, leaveMission, createMilestone } from '../src/missions.js'
 import { createProject, listProjects, projectDetail } from '../src/projects.js'
-import { projectFeed, parseCursor, cardFields, filesSqlForTest } from '../src/projects-feed.js'
+import { projectFeed, parseCursor, cardFields, filesSqlForTest, milestonesSqlForTest } from '../src/projects-feed.js'
 
 function seeded() {
   const db = openDb(':memory:')
@@ -201,7 +201,7 @@ test('projectDetail carries the first page of each kind with totals', () => {
   assert.equal(out.recent_milestones.length, 5, 'kept for older apps')
 })
 
-test('files query reads a linked conversation through idx_events_media, never every event of the user', () => {
+test('files query reads a linked conversation through idx_events_media, never every event of the user, and items through their mission', () => {
   const db = seeded()
   const p = project(db)
   const m1 = mission(db, 'c1', 'one'); file(db, m1.id, p.id)
@@ -209,6 +209,25 @@ test('files query reads a linked conversation through idx_events_media, never ev
   const text = plan.map((r) => r.detail).join('\n')
   assert.match(text, /idx_events_media/)
   assert.doesNotMatch(text, /SEARCH e USING INDEX sqlite_autoindex_events_1/)
+  // The item arm reaches a file from the project's missions, through their
+  // items to the items' comments; never through the consent index.
+  assert.doesNotMatch(text, /idx_items_consent/)
+  assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/)
+  assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/)
+  assert.equal((text.match(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g) ?? []).length, 2)
+})
+
+test("milestones query finds the project's missions through idx_missions_project, never every mission of the user", () => {
+  const db = seeded()
+  const p = project(db)
+  const m1 = mission(db, 'c1', 'one'); file(db, m1.id, p.id)
+  for (const sieve of [false, true]) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM (${milestonesSqlForTest(sieve)})`).all({ projectId: p.id, userId: 1 })
+    const text = plan.map((r) => r.detail).join('\n')
+    assert.doesNotMatch(text, /idx_missions_user_state|SCAN (m|l)\b/, `sieved ${sieve}`)
+    assert.match(text, /SEARCH m USING INDEX idx_missions_project \(project_id=\?/, `sieved ${sieve}`)
+    assert.match(text, /SEARCH l USING INDEX idx_milestones_mission \(mission_id=\?/, `sieved ${sieve}`)
+  }
 })
 
 test('waiting_on counts a consent card like the needs_you number does', () => {

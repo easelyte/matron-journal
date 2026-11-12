@@ -65,6 +65,9 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
       // chosen button from the tap's marker without refetching the thread.
       actions: comment.actions ?? [],
       chosen_action: comment.chosen_action ?? null,
+      // An edited resend names the withdrawn reply it stands in for, so an
+      // app that draws the thread from markers can leave that one out.
+      ...(comment.replaces != null ? { replaces: comment.replaces } : {}),
       reply_to: comment.reply_to ?? null,
       attachments: (comment.attachments || []).map((a) => ({
         blob_ref: a.blob_ref, mime: a.mime, name: a.name, size: a.size, transcript: a.transcript ?? null,
