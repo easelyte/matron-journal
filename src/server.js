@@ -1204,6 +1204,9 @@ export function startServer({
             // its 20 s timeout: abort it, so the caller gets its 502 now.
             if (resolvedTts) resolvedTts.close()
             server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
+            // With the 120 s keep-alive (ccf6d09) a kept-alive socket outlives server.close() and
+            // holds the process open: give in-flight requests a moment, then drop what is left.
+            setTimeout(() => server.closeAllConnections?.(), 500).unref()
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
           if (!open.length) { finish(); return }
