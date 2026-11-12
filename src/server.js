@@ -583,7 +583,6 @@ export function startServer({
   // Coordinator approvals of file transfers per rolling 24 h, counted apart
   // from the daily cap above. 0 = no cap.
   consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
-  agentCommentClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
