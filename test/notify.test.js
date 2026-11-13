@@ -57,7 +57,7 @@ async function setup(t, opts = {}) {
 test('defaults: Coordinator mode, every switch at its preset; unreadable JSON falls back', () => {
   assert.deepEqual(parseNotifyPrefs(null), {
     mode: 'coordinator',
-    events: { prompts: true, questions: true, notices: true, coordinator_done: true, other_done: false, stopped: false, rooms: false, activity: false },
+    events: { prompts: true, questions: true, notices: true, coordinator_done: false, other_done: false, stopped: false, rooms: false, activity: false },
   })
   assert.equal(parseNotifyPrefs('{nope').mode, 'coordinator')
   assert.equal(parseNotifyPrefs('{"mode":"weird"}').mode, 'coordinator')
@@ -76,12 +76,20 @@ test('setNotifyPrefs: switching an event on a preset moves to custom from that p
   assert.equal(getNotifyPrefs(db, alice.id).mode, 'all')
 })
 
-test('Coordinator mode: other sessions finishing or stopping are silent; the Coordinator finishing pushes', async (t) => {
+test('Coordinator mode: no session finishing or stopping pushes, the Coordinator included', async (t) => {
   const { stub, finish } = await setup(t)
   finish('work')
   finish('work', 'done')
+  finish('coord')
+  finish('coord', 'done')
   await tick()
   assert.equal(stub.calls.length, 0)
+})
+
+test('Coordinator mode: switching "Coordinator finished a turn" back on pushes its turns again', async (t) => {
+  const { db, alice, stub, finish } = await setup(t)
+  assert.equal(setNotifyPrefs(db, alice.id, { events: { coordinator_done: true } }).mode, 'custom')
+  finish('work')
   finish('coord')
   await tick()
   assert.equal(stub.calls.length, 1)
@@ -249,9 +257,9 @@ test('badge: Coordinator mode counts the Coordinator\'s unread plus items awaiti
   const ctx = await setup(t)
   append(ctx.db, { userId: ctx.alice.id, convoId: 'work', sender: 'agent:box', type: 'text', payload: { body: 'unread elsewhere' } })
   createItem(ctx.db, { userId: ctx.alice.id, kind: 'question', title: 'q', awaiting: 'user', originConvoId: 'work', originDeviceId: ctx.workBox, createdBy: 'agent' })
-  ctx.finish('coord')
+  ctx.emit('coord', 'prompt', { question: 'go?' })
   await tick()
-  // 'coord' unread: the session_status itself is not unread content, so 0 + 1 item.
+  // 'coord' unread: its prompt, plus the 1 item.
   const coordUnread = ctx.db.prepare("SELECT unread_count FROM conversations WHERE id='coord'").get().unread_count
   assert.equal(ctx.stub.calls[0].payload.aps.badge, coordUnread + 1)
   setNotifyPrefs(ctx.db, ctx.alice.id, { mode: 'all' })

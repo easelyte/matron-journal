@@ -4,6 +4,8 @@ import http2 from 'node:http2'
 import { startRelay, makeRelayLimiter } from '../src/relay.js'
 import { makeApnsClient } from '../src/apns.js'
 import { makeTestKey, makeFakeApnsServer } from './apns-helpers.js'
+import { sealBox, boxPlaintext, BOX_MAX_CHARS, BOX_MAX_PLAIN_BYTES } from '../src/push-box.js'
+import { RECIPIENT } from './push-box-fixture.js'
 
 // Stub APNs client (push.test.js pattern): records calls, configurable result.
 function makeStubApnsClient(respond = () => ({ status: 200, reason: null })) {
@@ -100,11 +102,37 @@ test('validation 400s: unknown field, bad enum values, category/push_type mismat
   assert.equal(stub.calls.length, 0, 'nothing invalid may reach APNs')
 })
 
-test('body over 1 KB → 413 without touching APNs', async (t) => {
+test('body over the push limit → 413 without touching APNs', async (t) => {
   const { post, stub } = await startTestRelay(t)
-  const r = await post(null, { raw: JSON.stringify({ ...GOOD, thread_id: 'x'.repeat(2000) }) })
+  const r = await post(null, { raw: JSON.stringify({ ...GOOD, thread_id: 'x'.repeat(5000) }) })
   assert.equal(r.status, 413)
   assert.equal(stub.calls.length, 0)
+})
+
+test('box: forwarded untouched beside the fixed alert; the relay adds nothing readable', async (t) => {
+  const { post, stub } = await startTestRelay(t)
+  const box = sealBox(RECIPIENT.key, boxPlaintext({ title: 'SECRET TITLE', body: 'SECRET BODY', convoId: 'convo-1', seq: 7, kind: 'attention' }))
+  const r = await post({ ...GOOD, box })
+  assert.equal(r.status, 200)
+  assert.deepEqual(stub.calls[0].payload, {
+    aps: { alert: { title: 'Matron', body: 'Your agent needs you' }, 'mutable-content': 1, badge: 3, 'thread-id': 'convo-1' },
+    box,
+  })
+  assert.ok(!JSON.stringify(stub.calls[0]).includes('SECRET'))
+})
+
+test('box: the largest one a journal builds fits; shape is checked, wakes carry none', async (t) => {
+  const { post, stub } = await startTestRelay(t)
+  const biggest = sealBox(RECIPIENT.key, Buffer.alloc(BOX_MAX_PLAIN_BYTES, 0x20))
+  assert.equal(biggest.length, BOX_MAX_CHARS)
+  assert.equal((await post({ ...GOOD, thread_id: 'x'.repeat(200), collapse_id: 'y'.repeat(200), badge: 123456, box: biggest })).status, 200)
+  for (const bad of ['', 'short', 'x'.repeat(BOX_MAX_CHARS + 1), `${'x'.repeat(100)} has spaces`, `${'x'.repeat(100)}+/=`, 42, { a: 1 }]) {
+    const r = await post({ ...GOOD, box: bad })
+    assert.deepEqual([r.status, r.json.reason], [400, 'bad_box'], JSON.stringify(bad).slice(0, 40))
+  }
+  const wake = await post({ device_token: GOOD.device_token, env: 'prod', category: 'wake', priority: 5, push_type: 'background', box: biggest })
+  assert.deepEqual([wake.status, wake.json.reason], [400, 'bad_box'])
+  assert.equal(stub.calls.length, 1)
 })
 
 test('non-POST-/push routes 404', async (t) => {

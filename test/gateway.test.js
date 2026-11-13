@@ -132,3 +132,64 @@ test('category defaults to "wake" when undefined with pushType "background"', as
   })
   assert.equal(calls[0].body.category, 'wake')
 })
+
+const BOX = 'b'.repeat(200)
+const BOXED_OPTS = { ...ALERT_OPTS, payload: { ...ALERT_OPTS.payload, seq: 9, box: BOX } }
+
+test('box: sealed content is forwarded as given; nothing else from the payload goes with it', async () => {
+  const { calls, fetchImpl } = makeFetchStub()
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  await client.send(BOXED_OPTS)
+  assert.equal(calls[0].body.box, BOX)
+  assert.deepEqual(Object.keys(calls[0].body).sort(), ['badge', 'box', 'category', 'collapse_id', 'device_token', 'env', 'priority', 'push_type', 'thread_id'])
+  assert.ok(!JSON.stringify(calls[0].body).includes('SECRET'))
+})
+
+test('box: a relay that does not know the field still delivers, without it, and is not asked again for a while', async () => {
+  let clock = 1000
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body)
+    calls.push(body)
+    return 'box' in body
+      ? new Response(JSON.stringify({ status: 400, reason: 'unknown_field' }), { status: 400 })
+      : new Response(JSON.stringify({ status: 200, reason: null }), { status: 200 })
+  }
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl, boxRetryMs: 500, now: () => clock })
+  assert.deepEqual(await client.send(BOXED_OPTS), { status: 200, reason: null })
+  assert.deepEqual(calls.map((b) => 'box' in b), [true, false])
+  assert.deepEqual(await client.send(BOXED_OPTS), { status: 200, reason: null })
+  assert.deepEqual(calls.map((b) => 'box' in b), [true, false, false], 'no second refusal inside the window')
+  clock += 500
+  await client.send(BOXED_OPTS)
+  assert.deepEqual(calls.map((b) => 'box' in b), [true, false, false, true, false], 'tried again once the window has passed')
+})
+
+test('box: any other refusal is returned as it is, with no second send', async () => {
+  const { calls, fetchImpl } = makeFetchStub(() => new Response(JSON.stringify({ status: 400, reason: 'bad_box' }), { status: 400 }))
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  assert.deepEqual(await client.send(BOXED_OPTS), { status: 400, reason: 'bad_box' })
+  assert.equal(calls.length, 1)
+})
+
+test('box: an older relay whose body limit the box exceeds (413) is treated the same way', async () => {
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body)
+    calls.push(body)
+    return 'box' in body
+      ? new Response(JSON.stringify({ status: 413, reason: 'too_large' }), { status: 413 })
+      : new Response(JSON.stringify({ status: 200, reason: null }), { status: 200 })
+  }
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  assert.deepEqual(await client.send(BOXED_OPTS), { status: 200, reason: null })
+  await client.send(BOXED_OPTS)
+  assert.deepEqual(calls.map((b) => 'box' in b), [true, false, false])
+})
+
+test('a 413 for a push with no box is returned as it is', async () => {
+  const { calls, fetchImpl } = makeFetchStub(() => new Response(JSON.stringify({ status: 413, reason: 'too_large' }), { status: 413 }))
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  assert.deepEqual(await client.send(ALERT_OPTS), { status: 413, reason: 'too_large' })
+  assert.equal(calls.length, 1)
+})

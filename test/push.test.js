@@ -9,6 +9,10 @@ import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
 import { makeGatewayClient } from '../src/gateway.js'
 import { startTestServer, makeWsClient } from './helpers.js'
+import { createItem } from '../src/items.js'
+import { itemMarkerPayload } from '../src/items-marker.js'
+import { openBox } from '../src/push-box.js'
+import { RECIPIENT, keyPairFrom } from './push-box-fixture.js'
 
 // Peer_message is a routine coalesced activity push (priority 5), not an
 // attention alert and never silent — asserted explicitly, not via fallthrough.
@@ -1100,4 +1104,176 @@ test('background wake: a for_you phone\'s read-elsewhere wakes are paced like th
   clock += 1000
   pipeline.onAppend(alice.id, read(3), null)
   assert.equal(wakes().length, 2)
+})
+
+// --- Sealed notification content (src/push-box.js) ---
+
+function registerKeyedDevice(db, userId, name, pair = RECIPIENT) {
+  const id = registerDevice(db, userId, name)
+  setApnsRegistration(db, id, { apnsToken: `${name}-token`, apnsEnv: 'prod', pushKey: pair.key })
+  return id
+}
+const opened = (call, pair = RECIPIENT) => JSON.parse(openBox(pair, call.payload.box))
+
+test('a device with a key gets its content sealed: fixed visible text, the real text only in the box', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  registerKeyedDevice(db, alice.id, 'phone')
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } }, null)
+  assert.equal(stub.calls.length, 1)
+  const { payload, collapseId, category } = stub.calls[0]
+  assert.deepEqual(payload.aps.alert, { title: 'Matron', body: 'Your agent needs you' })
+  assert.equal(payload.aps['mutable-content'], 1)
+  assert.equal(payload.aps['thread-id'], 'c1')
+  assert.equal(collapseId, 'c1')
+  assert.equal(category, 'attention')
+  const { box, ...clear } = payload
+  assert.ok(!JSON.stringify(clear).includes('deploy'), 'the question is nowhere outside the box')
+  assert.ok(!JSON.stringify(clear).includes('convo one'), 'nor is the conversation name')
+  assert.deepEqual(opened(stub.calls[0]), { v: 1, title: 'convo one', body: '? deploy to production?', convo_id: 'c1', seq: r.seq, kind: 'attention' })
+})
+
+test('a device without a key is pushed exactly as before', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  registerDevice(db, alice.id, 'old-phone')
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  assert.deepEqual(stub.calls[0].payload, { aps: { alert: { title: 'convo one', body: '? go?' }, 'thread-id': 'c1', badge: stub.calls[0].payload.aps.badge }, seq: r.seq })
+  assert.equal(stub.calls[0].collapseId, 'c1')
+})
+
+test('each device gets a box only its own key opens', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const other = keyPairFrom('second phone')
+  registerKeyedDevice(db, alice.id, 'phone')
+  registerKeyedDevice(db, alice.id, 'tablet', other)
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  const byToken = Object.fromEntries(stub.calls.map((c) => [c.deviceToken, c]))
+  assert.equal(opened(byToken['phone-token']).body, '? go?')
+  assert.equal(opened(byToken['tablet-token'], other).body, '? go?')
+  assert.throws(() => opened(byToken['tablet-token']))
+})
+
+test('an item that needs the user reads as the item: title, its text, its buttons, and its own collapse id', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  registerKeyedDevice(db, alice.id, 'phone')
+  const { item } = createItem(db, {
+    userId: alice.id, kind: 'question', title: 'Ship the release notes?',
+    body: 'Two options:\n\n- ship now\n- wait for the screenshots', actions: ['Ship', 'Wait'],
+    awaiting: 'user', originConvoId: 'c1', originDeviceId: createAgent(db, alice.id, 'box-a').deviceId, createdBy: 'agent',
+  })
+  const created = itemMarkerPayload({ item, action: 'created', by: 'agent' })
+  pipeline.onAppend(alice.id, { seq: 5, convo_id: 'c1', ts: 1, sender: 'agent:a', type: 'item', payload: created }, null)
+  assert.equal(stub.calls[0].collapseId, item.id)
+  assert.equal(stub.calls[0].payload.aps['thread-id'], 'c1')
+  assert.deepEqual(opened(stub.calls[0]), {
+    v: 1, title: 'Ship the release notes?', subtitle: 'Question · convo one',
+    body: 'Two options: - ship now - wait for the screenshots',
+    convo_id: 'c1', seq: 5, kind: 'attention',
+    item: { id: item.id, num: item.num, kind: 'question', actions: ['Ship', 'Wait'] },
+  })
+
+  // A follow-up that asks its own question: the comment's text and buttons,
+  // answered against that comment.
+  const comment = { id: 'ic_1', body: 'Screenshots are in. Ship now?', actions: ['Yes', 'No'], attachments: [] }
+  pipeline.onAppend(alice.id, { seq: 6, convo_id: 'c1', ts: 2, sender: 'agent:a', type: 'item', payload: itemMarkerPayload({ item, action: 'commented', by: 'agent', comment }) }, null)
+  assert.equal(stub.calls[1].collapseId, item.id, 'the follow-up replaces the item\'s earlier notification')
+  const followUp = opened(stub.calls[1])
+  assert.equal(followUp.body, 'Screenshots are in. Ship now?')
+  assert.deepEqual(followUp.item, { id: item.id, num: item.num, kind: 'question', actions: ['Yes', 'No'], reply_to: 'ic_1' })
+
+  // A plain comment after a button was tapped offers no buttons.
+  const tapped = { ...item, chosen_action: 'Ship' }
+  pipeline.onAppend(alice.id, { seq: 7, convo_id: 'c1', ts: 3, sender: 'agent:a', type: 'item', payload: itemMarkerPayload({ item: tapped, action: 'commented', by: 'agent', comment: { id: 'ic_2', body: 'Done.', attachments: [] } }) }, null)
+  assert.deepEqual(opened(stub.calls[2]).item.actions, [])
+})
+
+test('a notice reads as something to read, with its Seen button', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  registerKeyedDevice(db, alice.id, 'phone')
+  const { item } = createItem(db, { userId: alice.id, kind: 'notice', title: 'Backup finished', body: 'All 3 volumes verified.', originConvoId: 'c1', originDeviceId: createAgent(db, alice.id, 'box-a').deviceId, createdBy: 'agent' })
+  pipeline.onAppend(alice.id, { seq: 5, convo_id: 'c1', ts: 1, sender: 'agent:a', type: 'item', payload: itemMarkerPayload({ item, action: 'created', by: 'agent' }) }, null)
+  const content = opened(stub.calls[0])
+  assert.equal(content.subtitle, 'To read · convo one')
+  assert.equal(content.body, 'All 3 volumes verified.')
+  assert.deepEqual(content.item.actions, ['Seen'])
+})
+
+test('through the relay client the box is the only content on the wire', async (t) => {
+  const bodies = []
+  const fetchImpl = async (url, init) => { bodies.push(JSON.parse(init.body)); return new Response(JSON.stringify({ status: 200, reason: null }), { status: 200 }) }
+  const { db, alice, pipeline } = await setup(t, { apnsClient: makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl }) })
+  registerKeyedDevice(db, alice.id, 'phone')
+  const { item } = createItem(db, { userId: alice.id, kind: 'question', title: 'Rotate the signing key?', body: 'It expires next week.', awaiting: 'user', originConvoId: 'c1', originDeviceId: createAgent(db, alice.id, 'box-a').deviceId, createdBy: 'agent' })
+  pipeline.onAppend(alice.id, { seq: 5, convo_id: 'c1', ts: 1, sender: 'agent:a', type: 'item', payload: itemMarkerPayload({ item, action: 'created', by: 'agent' }) }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(bodies.length, 1)
+  const { box, ...clear } = bodies[0]
+  assert.deepEqual(clear, { device_token: 'phone-token', env: 'prod', category: 'attention', priority: 10, push_type: 'alert', badge: clear.badge, thread_id: 'c1', collapse_id: item.id })
+  assert.equal(JSON.parse(openBox(RECIPIENT, box)).title, 'Rotate the signing key?')
+})
+
+test('registration: the key is replaced each time, and goes with the token', async (t) => {
+  const { db, alice } = await setup(t)
+  const id = registerKeyedDevice(db, alice.id, 'phone')
+  const keyOf = (d) => db.prepare('SELECT push_key FROM devices WHERE id=?').get(d).push_key
+  assert.equal(keyOf(id), RECIPIENT.key)
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod' })
+  assert.equal(keyOf(id), null, 'registering again without a key ends content')
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: RECIPIENT.key })
+  const second = registerDevice(db, alice.id, 'repaired', { token: 'phone-token' })
+  assert.equal(keyOf(id), null, 'a claimed token takes the old row\'s key with it')
+  assert.equal(keyOf(second), null)
+  setApnsRegistration(db, second, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: RECIPIENT.key })
+  setApnsRegistration(db, second, { apnsToken: null, apnsEnv: null, pushKey: RECIPIENT.key })
+  assert.equal(keyOf(second), null, 'no key without a token')
+})
+
+test('a keyed device whose box cannot be made gets the fixed text alone, never its content in the clear', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const id = registerDevice(db, alice.id, 'phone')
+  // A low-order point: shaped like a key, but the seal refuses it.
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: Buffer.alloc(32).toString('base64url') })
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } })
+  t.mock.method(console, 'error', () => {})
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } }, null)
+  assert.equal(stub.calls.length, 1)
+  assert.deepEqual(stub.calls[0].payload.aps.alert, { title: 'Matron', body: 'Your agent needs you' })
+  assert.equal('box' in stub.calls[0].payload, false)
+  assert.ok(!JSON.stringify(stub.calls[0].payload).includes('deploy'))
+})
+
+test('a push that waited out a coalescing window is sealed to the key registered by then', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const id = registerKeyedDevice(db, alice.id, 'phone')
+  const later = keyPairFrom('re-registered')
+  const text = (n) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } }, null)
+  }
+  text(1)
+  text(2)
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: later.key })
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(opened(stub.calls[0]).body, 'message 1')
+  assert.equal(opened(stub.calls[1], later).body, 'message 2')
+})
+
+test('a keyed device whose token moved on while a push waited is not sent content in the clear', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const id = registerKeyedDevice(db, alice.id, 'phone')
+  const text = (n) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } }, null)
+  }
+  text(1)
+  text(2)
+  setApnsRegistration(db, id, { apnsToken: 'new-token', apnsEnv: 'prod', pushKey: RECIPIENT.key })
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 2)
+  assert.deepEqual(stub.calls[1].payload.aps.alert, { title: 'Matron', body: 'New activity from your agent' })
+  assert.equal('box' in stub.calls[1].payload, false)
+  assert.ok(!JSON.stringify(stub.calls[1].payload).includes('message 2'))
 })

@@ -439,8 +439,18 @@ the machine-checkable version of this page.
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
   missing/non-string `apns_token` (unless it's `null`). Response `{ok:true}`.
+  Optional `push_key`: the device's public key for sealed notification
+  content (*Sealed notification content*, under *Push notifications*): 32 raw
+  X25519 bytes as unpadded base64url (43 characters); anything else is 400
+  `{error:'bad_request'}`. Each registration replaces the key, so one without
+  `push_key` (or with `null`) ends content for that device, and unregistering
+  drops it with the token.
   Which events push is decided by the user's synced notification settings
-  and the device's own level (`GET`/`PUT /notify`).
+  and the device's own level (`GET`/`PUT /notify`). By default, for a user
+  with a Coordinator, no session's finished turn pushes, the Coordinator's
+  included: what needs the user arrives as a tracker item awaiting them, and
+  that pushes. The `coordinator_done` switch turns the Coordinator's turns
+  back on.
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -6769,8 +6779,96 @@ inert no-op — everything else on the server works as normal.
 An alert payload carries the conversation as `aps.thread-id`. It also carries
 a top-level `seq`, the event the alert shows, so a tapped notification can
 report that one message as seen (read state, op `seen`). The push relay
-(`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
-`seq`. A client must treat a missing `seq` as "no tap receipt".
+(`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and a sealed
+`box` (below), and omits `seq`; a device that opens the box finds the `seq`
+inside it. A client must treat a missing `seq` as "no tap receipt".
+
+### Sealed notification content
+
+A device may register a public key with its push token (`POST
+/push/register`, `push_key`). Every alert push to that device then carries
+what the notification says in a top-level `box`: content the journal has
+encrypted to that key. The app's notification extension holds the private
+key, opens the box on the device, and shows the text. A device with no key is
+pushed as before.
+
+**The seal** is HPKE (RFC 9180), base mode, one message per context:
+DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, `info` =
+`matron-push-v1`, empty AAD. `box` is `enc || ciphertext || tag` (the 32-byte
+encapsulated key first) as unpadded base64url, at most 2112 characters. A
+fresh ephemeral key is used for every box (`src/push-box.js`).
+
+**The plaintext** is UTF-8 JSON, padded with trailing spaces to a multiple of
+256 bytes and at most 1536:
+
+    { "v": 1,
+      "title": "...", "subtitle": "...", "body": "...",
+      "convo_id": "...", "seq": 123,
+      "kind": "attention" | "done" | "activity",
+      "item": { "id": "...", "num": 12, "kind": "question",
+                "actions": ["Ship", "Wait"], "reply_to": "..." } }
+
+`subtitle` and `item` are optional. For a tracker item that needs the user
+(a question, a notice, a comment or reopen that hands it to them) the title is
+the item's title, the subtitle its kind and conversation ("Question · Docs"),
+and the body the text that came with it: the item's body when it was created,
+otherwise the comment. `item.actions` are the buttons on offer now: the
+comment's own, with `reply_to` naming that comment, or else the item's while
+none has been tapped. A client answers one exactly as a tap in the app does
+(`POST /items/:id/comments` with `action`, and `reply_to` when present). For
+everything else the title is the conversation's and the body the event's
+snippet. Text is cut to 120 / 80 / 240 characters and to one line. A client
+must ignore keys it does not know and treat a `v` it does not know as
+unopenable.
+
+**What stays outside the box.** The visible `aps.alert` is one of three fixed
+strings chosen by category ("Your agent needs you", "Your agent finished its
+turn", "New activity from your agent"), with `mutable-content: 1` so the
+extension runs. That is what shows if the box cannot be opened (no key on the
+device, a key that has since changed, an old app). Also outside: the badge
+count, `aps.thread-id` (the conversation id), the category, the priority, and
+`apns-collapse-id`. An item's notification collapses on the item's id rather
+than the conversation's, so two questions from one conversation both stay on
+screen, and a follow-up on one item replaces the notification it follows.
+
+**Who can read what.**
+
+| Party | Sees | Does not see |
+|---|---|---|
+| The journal | Everything: it is the user's own server and already holds the content. It also holds each device's public key. | The private key. |
+| The push relay | The device token and environment, the category, the badge, the conversation id and the collapse id (opaque ids), the priority, the time and rate of pushes, the length of the box in 256-byte steps, and the address of the journal that sent it. | Any title, body, item text, button label or conversation name. It holds no key that opens a box, and never sees a device's public key. |
+| Apple (APNs) | What the relay sees, plus the fixed fallback text. From a journal that talks to APNs directly, also the event's `seq` (a counter), which that path sends beside the box. | The same content the relay cannot see: the box crosses APNs still sealed. |
+| The device, locked | The opened text is shown according to the system's own "Show Previews" setting for the app; with previews set to "When Unlocked" a locked device shows only that there is a notification. Buttons that answer an item ask for the device to be unlocked first. | |
+| The device, unlocked | The opened text, which the system then keeps in its notification list like any other notification's. | |
+
+Things the seal does not do, by design:
+
+- **It does not hide that a push happened**, when, to which device, or which
+  conversation and category it belongs to. Those are what the relay and Apple
+  need to deliver and group it.
+- **It does not sign.** HPKE base mode authenticates nobody. A party that
+  knows a device's public key *and* can push to its token could show that
+  device a notification of its own making. The public key is sent only to the
+  user's journal, over the authenticated API, so the relay and Apple do not
+  have it. A forged box could show text; it could not read anything, and a
+  button tapped on it reaches only the user's own journal, which acts on its
+  own items only.
+- **It does not protect against the journal.** The journal is the sender.
+- **No forward secrecy for the device key.** The key lives in the device's
+  keychain (this device only, readable after first unlock so a notification
+  can be opened while the device is locked). Someone who extracts it and has
+  recorded past boxes can open them. Signing out, or re-registering, replaces
+  the key.
+
+A device with a key is never sent its content in the clear: if a box cannot
+be made for it (a key the seal rejects, content that will not fit), the push
+goes out with the fixed text alone.
+
+**Relay version skew.** A relay that predates `box` refuses it with 400
+`unknown_field`, or with 413 when the box takes the request past its older
+body limit. The journal's relay client then sends the same push again
+without the box, so the notification arrives with the fixed text, and leaves
+boxes off for an hour before trying one again.
 
 **Background wakes.** A new event also sends a silent background push
 (`content-available`, priority 5, no alert) to each of the user's push devices
@@ -6813,8 +6911,9 @@ considers each of that user's *client* devices with a registered token
 - `read_marker` rows trigger a silent background push
   (`content-available: 1`, no alert) to the user's *other* devices so they
   clear their badge — never back to the device whose read_marker it was.
-- alert title is the conversation title (falling back to its id), body is
-  the event's snippet, badge is `SUM(unread_count)` over the owner's
+- for a device with no `push_key`: alert title is the conversation title
+  (falling back to its id), body is the event's snippet. For a device with
+  one, see *Sealed notification content* above. Either way the badge is `SUM(unread_count)` over the owner's
   conversations.
 - a 410 response, or a 400 `BadDeviceToken`, prunes that device's
   `apns_token`/`apns_env` (dead token, logged once with its `apns_env`); the

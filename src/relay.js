@@ -1,15 +1,25 @@
 import http from 'node:http'
 import { makeRendezvousStore } from './rendezvous.js'
+import { isBoxShaped, BOX_MAX_CHARS } from './push-box.js'
 
 // The push.matron.chat relay: the one piece of shared infrastructure Matron
 // runs. Holds the APNs key for the chat.matron.app bundle id and forwards
 // pushes on behalf of self-hosted journals (which cannot have that key).
 //
 // Privacy is structural, not policy: the wire protocol below has NO field
-// that can carry a title, body, snippet, or conversation name — the relay
-// maps a category to one of three fixed strings. mutable-content: 1 is set
-// on every alert now so the v2 NSE fetch can enrich these on-device without
-// any relay change.
+// that carries a readable title, body, snippet, or conversation name — the
+// relay maps a category to one of three fixed strings. What a notification
+// actually says travels, if at all, in `box`: content the journal sealed to
+// the receiving device's own public key (src/push-box.js). The relay never
+// holds a key that opens one. It forwards the box as given, after checking
+// only its alphabet and length, and mutable-content: 1 on every alert lets
+// the app's notification extension open it on the device. The fixed string
+// is what shows when there is no box or it cannot be opened.
+//
+// A journal could put something other than ciphertext in `box`. That would
+// be the journal disclosing its own user's text, which this relay cannot
+// prevent any more than it could prevent an email; the reference journal
+// only ever puts a sealed box there.
 //
 // The endpoint is deliberately open (a self-hosted journal has nowhere to
 // pre-register): possession of a device token — an unguessable 32-byte value
@@ -22,8 +32,11 @@ import { makeRendezvousStore } from './rendezvous.js'
 // rather than being 413'd first. Do NOT drop this back to 1024. A 2000-char
 // box (~2010 bytes) still 413s, so oversized bodies are bounded as before.
 const BODY_LIMIT = 1100
+// A push may also carry a sealed box of up to BOX_MAX_CHARS, on top of the
+// ~700 bytes its other fields come to at their own caps.
+const PUSH_BODY_LIMIT = BOX_MAX_CHARS + 900
 
-const APS_ALERTS = {
+export const APS_ALERTS = {
   attention: { title: 'Matron', body: 'Your agent needs you' },
   // "Turn", not "session": push.js classifies a 'done' push for every
   // turn-finished transition (running -> waiting or -> done), and the
@@ -33,7 +46,7 @@ const APS_ALERTS = {
 }
 
 const REQUIRED = ['device_token', 'env', 'category', 'priority', 'push_type']
-const OPTIONAL = ['badge', 'thread_id', 'collapse_id']
+const OPTIONAL = ['badge', 'thread_id', 'collapse_id', 'box']
 const KNOWN = new Set([...REQUIRED, ...OPTIONAL])
 
 // Two token buckets gate every send:
@@ -159,10 +172,13 @@ function validate(body) {
   for (const k of ['thread_id', 'collapse_id']) {
     if (body[k] !== undefined && (typeof body[k] !== 'string' || body[k].length < 1 || body[k].length > 200)) return `bad_${k}`
   }
+  // Opaque to the relay: base64url of a bounded length, alerts only (a
+  // background wake shows nothing, so it has nothing to carry).
+  if (body.box !== undefined && (body.category === 'wake' || !isBoxShaped(body.box))) return 'bad_box'
   return null
 }
 
-function buildPayload({ category, badge, thread_id }) {
+function buildPayload({ category, badge, thread_id, box }) {
   if (category === 'wake') {
     const aps = { 'content-available': 1 }
     if (badge !== undefined) aps.badge = badge
@@ -171,7 +187,7 @@ function buildPayload({ category, badge, thread_id }) {
   const aps = { alert: APS_ALERTS[category], 'mutable-content': 1 }
   if (badge !== undefined) aps.badge = badge
   if (thread_id !== undefined) aps['thread-id'] = thread_id
-  return { aps }
+  return box !== undefined ? { aps, box } : { aps }
 }
 
 // Every response body is {status, reason} with the HTTP status mirroring the
@@ -192,13 +208,13 @@ export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), ren
   // Streaming JSON body read under BODY_LIMIT. Resolves the parsed object,
   // or null after having already responded (413/400). An empty body
   // resolves {} (creation POSTs carry no fields).
-  const readJsonBody = (req, res) => new Promise((resolve) => {
+  const readJsonBody = (req, res, limit = BODY_LIMIT) => new Promise((resolve) => {
     let data = ''
     let overflowed = false
     req.setEncoding('utf8')
     req.on('data', (c) => {
       data += c
-      if (data.length > BODY_LIMIT) {
+      if (data.length > limit) {
         overflowed = true
         req.removeAllListeners('data')
         req.pause()
@@ -231,7 +247,7 @@ export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), ren
   })
 
   async function handlePush(req, res) {
-    const body = await readJsonBody(req, res)
+    const body = await readJsonBody(req, res, PUSH_BODY_LIMIT)
     if (body === null) return
     const invalid = validate(body)
     if (invalid) return respond(res, 400, { status: 400, reason: invalid })

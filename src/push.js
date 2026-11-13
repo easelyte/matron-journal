@@ -6,6 +6,9 @@ import {
   effectiveEvents, eventKey, allowedForUser, allowedForDevice, getConvoNotify,
   holdsConsent, consentStillPending, notifyBadge,
 } from './notify.js'
+import { boxPlaintext, sealBox } from './push-box.js'
+import { APS_ALERTS } from './relay.js'
+import { inlineRefsToText } from './inline-refs.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
@@ -94,6 +97,45 @@ export function classify(type, payload, sender, prevState) {
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }
+}
+
+const ITEM_KIND_LABELS = { question: 'Question', notice: 'To read', task: 'Task', decision: 'Decision' }
+
+// What a notification says, before it is sealed for a device that
+// registered a key (src/push-box.js). An item that needs the user reads as
+// the item: its title, the text that came with it, and the buttons it
+// offers now. Everything else reads as its conversation and a snippet.
+// `itemBody(id)` fetches an item's own body, which the marker never carries.
+export function pushContent(event, convo, cls, itemBody = () => null) {
+  const base = { convoId: event.convo_id, seq: event.seq, kind: cls.kind }
+  const convoTitle = convo.title || ''
+  const p = event.payload
+  if (event.type !== 'item' || !p || typeof p !== 'object') {
+    return { ...base, title: convoTitle || 'Matron', body: snippetOf(event.type, p) }
+  }
+  const c = p.comment && typeof p.comment === 'object' ? p.comment : null
+  const text = p.action === 'created' ? (itemBody(p.item_id) ?? c?.body) : c?.body
+  let body = typeof text === 'string' ? inlineRefsToText(text) : ''
+  if (!body.trim() && Array.isArray(c?.attachments) && c.attachments.length) body = 'Attachment'
+  // The buttons on offer: the comment's own when it asks something, else the
+  // item's while nobody has tapped one.
+  const labels = (list) => (Array.isArray(list) ? list.filter((a) => typeof a === 'string' && a).slice(0, 4) : [])
+  const asked = labels(c?.actions)
+  const actions = asked.length ? asked : (p.chosen_action == null ? labels(p.actions) : [])
+  const label = ITEM_KIND_LABELS[p.kind] || 'Item'
+  return {
+    ...base,
+    title: String(p.title || '') || label,
+    subtitle: convoTitle ? `${label} · ${convoTitle}` : label,
+    body,
+    item: {
+      id: String(p.item_id),
+      num: Number(p.num) || 0,
+      kind: String(p.kind || ''),
+      actions,
+      ...(asked.length && c?.id ? { reply_to: String(c.id) } : {}),
+    },
+  }
 }
 
 // APNs answers that mean the token itself will never be delivered to: 410
@@ -335,6 +377,19 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   function sendAlert(userId, event, convo, cls, key, devices, originDeviceId) {
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
+    // Sealed content, for the devices that registered a key. Built once per
+    // event, on first need; sealed per device, since each has its own key.
+    let plain
+    const plaintext = () => (plain ??= {
+      bytes: boxPlaintext(pushContent(event, convo, cls,
+        (id) => db.prepare('SELECT body FROM items WHERE id=? AND user_id=?').get(id, userId)?.body ?? null)),
+    }).bytes
+    // An item's notification stands for the item, so a second question in
+    // one conversation does not replace the first on the lock screen, and a
+    // follow-up on the same item does replace what it follows. APNs caps the
+    // id at 64 bytes.
+    const itemId = event.type === 'item' && typeof event.payload?.item_id === 'string' && event.payload.item_id.length <= 64
+      ? event.payload.item_id : null
     for (const device of devices) {
       // Origin-device exclusion, uniformly for every push type (not just
       // read_marker above): a device must never be pushed about an event it
@@ -349,20 +404,55 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (!allowedForDevice(key, device.push_level)) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
-      const buildOpts = () => ({
-        // seq (read state): the message this alert shows, so a tapped
-        // notification can report that one message as seen.
-        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
-        priority: cls.priority,
-        pushType: 'alert',
-        collapseId: event.convo_id,
-        category: cls.kind,
-      })
+      const buildOpts = () => {
+        const key = currentKey(device)
+        const box = sealedFor(device, key, plaintext)
+        return {
+          // seq (read state): the message this alert shows, so a tapped
+          // notification can report that one message as seen.
+          //
+          // With a box, the visible alert is the fixed text the relay would
+          // use: the content is in the box alone, on the direct APNs path
+          // as well, and mutable-content hands it to the app's notification
+          // extension to open.
+          //
+          // A device that registered a key never gets its content in the
+          // clear: if the box could not be made, or its registration changed
+          // while this push waited, the fixed text goes alone.
+          payload: key || device.push_key
+            ? { aps: { alert: APS_ALERTS[cls.kind] ?? APS_ALERTS.activity, 'thread-id': event.convo_id, 'mutable-content': 1 }, seq: event.seq, ...(box ? { box } : {}) }
+            : { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
+          priority: cls.priority,
+          pushType: 'alert',
+          collapseId: (box && itemId) || event.convo_id,
+          category: cls.kind,
+        }
+      }
       if (cls.coalesce) {
         scheduleRoutine(device, userId, event.convo_id, buildOpts)
       } else {
         doSend(device, userId, buildOpts())
       }
+    }
+  }
+
+  // The key the device holds now, for the token this push goes to. Read at
+  // send time: a coalesced push can wait out its window, and a registration
+  // made meanwhile must not get a box sealed to the key it replaced.
+  function currentKey(device) {
+    return db.prepare('SELECT push_key FROM devices WHERE id=? AND apns_token=?').get(device.id, device.apns_token)?.push_key ?? null
+  }
+
+  // The box for one device, or null: no key registered, or sealing failed
+  // (the push then goes out with the fixed text alone).
+  function sealedFor(device, key, plaintext) {
+    if (!key) return null
+    try {
+      const bytes = plaintext()
+      return bytes ? sealBox(key, bytes) : null
+    } catch (err) {
+      console.error(`push: could not seal content for device ${device.id}`, err)
+      return null
     }
   }
 
