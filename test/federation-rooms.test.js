@@ -97,6 +97,17 @@ test('a talk across journals: Send, the guest picks a session, and the agents ta
   await w.settle()
   assert.deepEqual(texts(w.b, twin).at(-1), { sender: 'person:alice@a.example', body: 'Thanks' })
 
+  // The session a bridge stamps on its own message (payload.from_session) stays in the
+  // sender's journal: it is stored and replayed there, and the copy that crosses to the
+  // other person carries only the body (a convo id or title never leaves).
+  w.ws.alice.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'Stamped', from: 'agent', from_session: { convo_id: 'sess-1', title: 'Fix the build' } } })
+  await tick()
+  await w.settle()
+  const stampedOwn = JSON.parse(w.a.db.prepare("SELECT payload FROM events WHERE convo_id='room' AND type='text' AND json_extract(payload, '$.body')='Stamped'").get().payload)
+  assert.deepEqual(stampedOwn.from_session, { convo_id: 'sess-1', title: 'Fix the build' })
+  const stampedFar = JSON.parse(w.b.db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='text' AND json_extract(payload, '$.body')='Stamped'").get(twin).payload)
+  assert.deepEqual(Object.keys(stampedFar).sort(), ['body', 'person', 'via'])
+
   // The bridge's question at a foreign turn: who, and which side.
   const mine = await w.aliceChat('/person-rooms?room_id=room')
   assert.deepEqual([mine.json.person_room.role, mine.json.person_room.person, mine.json.person_room.remote], ['owner', 'bob@b.example', true])
