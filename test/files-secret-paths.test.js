@@ -1,5 +1,5 @@
-// Secret-bearing paths the File Explorer must never expose (2026-09-27
-// hardening after the maintainer's review of the File Explorer stack):
+// Secret-bearing paths the file viewer reads must never expose (2026-09-27
+// hardening after the maintainer's review of the file viewer reads stack):
 //   - ~/.secrets (operator-submitted secrets sit there for up to an hour),
 //     the journal agent-token / bridge agent-creds, and the bridge state files;
 //   - every top-level dot entry of the service user's home when a read-root
@@ -13,8 +13,8 @@ import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import {
-  isSensitivePath, pinAllowedRootsSync, withReadPolicy, withProtectedPaths, isDeniedPath,
-  validateAndOpen, listDirGuarded, FileLinkDenied,
+  isSensitivePath, pinAllowedRootsSync, withReadPolicy, isDeniedPath,
+  openGuarded, FileLinkDenied,
 } from '../src/file-guard.js'
 import { makeTmpDir } from './tmp-dir.js'
 
@@ -78,27 +78,13 @@ test('home dot-entry rule: $HOME root denies top-level dot entries unless a root
   assert.equal(isDeniedPath(path.join(home, '.devtool'), withWs), true)
   assert.equal(isDeniedPath(path.join(home, '.bashrc'), withWs), true)
 
-  await assert.rejects(validateAndOpen(path.join(home, '.bashrc'), { allowedRoots: withWs }),
+  await assert.rejects(openGuarded(path.join(home, '.bashrc'), { allowedRoots: withWs }),
     (e) => e instanceof FileLinkDenied && e.reason === 'sensitive')
-  const { content } = await validateAndOpen(path.join(ws, 'src', 'a.js'), { allowedRoots: withWs })
-  assert.equal(content.toString(), 'ok\n')
+  const { fd } = await openGuarded(path.join(ws, 'src', 'a.js'), { allowedRoots: withWs })
+  try { assert.equal(await fd.readFile('utf8'), 'ok\n') } finally { await fd.close() }
 
-  const names = listDirGuarded(home, { allowedRoots: withWs }).entries.map((e) => e.name)
-  assert.deepEqual(names.sort(), ['notes.md', 'proj'])
 })
 
-test('read policy survives withProtectedPaths and denies configured state paths', () => {
-  const root = fs.realpathSync(makeTmpDir('matron-files-'))
-  fs.mkdirSync(path.join(root, 'data'))
-  fs.writeFileSync(path.join(root, 'data', 'matron.db'), 'x')
-  const pinned = withProtectedPaths(
-    withReadPolicy(pinAllowedRootsSync([root]), { denyTrees: [path.join(root, 'data')], homeDir: null }),
-    [path.join(root, 'data', 'matron.db')])
-  assert.equal(isDeniedPath(path.join(root, 'data', 'matron.db'), pinned), true)
-  assert.equal(isDeniedPath(path.join(root, 'data', 'other.txt'), pinned), true)
-  assert.equal(isDeniedPath(path.join(root, 'readme.md'), pinned), false)
-  assert.ok(pinned.protectedPaths.length > 0)
-})
 
 test('a denied tree yields only inside a root configured within it, never to a broader root', () => {
   const root = fs.realpathSync(makeTmpDir('matron-files-'))
@@ -140,72 +126,8 @@ test('server: $HOME root hides ~/.secrets and dotfiles; an explicit workspace ro
     assert.notEqual(r.status, 200, `${p} must not be served`)
     assert.ok(!(await r.text()).includes('hunter2'))
   }
-  const listed = await (await get(s, `/files/list?path=${encodeURIComponent(home)}&all=1`, token)).json()
-  assert.deepEqual(listed.entries.map((e) => e.name).sort(), ['notes.md', 'proj'])
   const ok = await get(s, `/files/content?path=${encodeURIComponent(path.join(ws, 'src', 'a.js'))}`, token)
   assert.equal(ok.status, 200)
-})
-
-// The production shape: $HOME and a workspace inside one of its (denied) dot entries are both read
-// roots, and the workspace is the write root. The path-less default opens the workspace, and its
-// breadcrumb root is the workspace itself (the DEEPEST containing root), so no crumb or parent
-// points into the denied ~/.devtool.
-test('server: path-less list opens the workspace write root with a navigable breadcrumb', async (t) => {
-  const home = makeHome()
-  const ws = path.join(home, '.devtool', 'workspace')
-  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
-  const s = await startTestServer({
-    fileReadRoots: [home, ws], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  const body = await (await get(s, '/files/list', token)).json()
-  assert.equal(body.path, ws)
-  assert.equal(body.root, ws)
-  assert.equal(body.parent, null)
-  assert.equal(body.writable, true)
-  const sub = await (await get(s, `/files/list?path=${encodeURIComponent(path.join(ws, 'src'))}`, token)).json()
-  assert.equal(sub.root, ws)
-  assert.equal(sub.parent, ws)
-  // $HOME itself still lists with $HOME as its root.
-  assert.equal((await (await get(s, `/files/list?path=${encodeURIComponent(home)}`, token)).json()).root, home)
-})
-
-// A write root the READ policy refuses (inside a denied $HOME dot entry, no read root of its own)
-// is skipped: the default falls through to the first read root instead of answering 403.
-test('server: path-less list skips a write root the read policy denies', async (t) => {
-  const home = makeHome()
-  const ws = path.join(home, '.devtool', 'workspace')
-  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
-  const s = await startTestServer({
-    fileReadRoots: [home], fileHomeDir: home, fileWriteRoots: [ws], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  const r = await get(s, '/files/list', token)
-  assert.equal(r.status, 200)
-  const body = await r.json()
-  assert.equal(body.path, home)
-  assert.equal(body.root, home)
-})
-
-// Fail visible: a write root that is merely UNREADABLE right now (an operational failure, not a
-// read-policy refusal) is reported, not papered over by silently opening the first read root.
-test('server: path-less list surfaces an unreadable write root instead of falling back', { skip: process.getuid?.() === 0 }, async (t) => {
-  const root = fs.realpathSync(makeTmpDir('matron-files-'))
-  const work = path.join(root, 'work')
-  fs.mkdirSync(work)
-  const auditDir = fs.realpathSync(makeTmpDir('matron-home-audit-'))
-  const s = await startTestServer({
-    fileReadRoots: [root], fileHomeDir: null, fileWriteRoots: [work], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  fs.chmodSync(work, 0o000)
-  t.after(() => fs.chmodSync(work, 0o755))
-  const r = await get(s, '/files/list', token)
-  assert.notEqual(r.status, 200)
-  assert.deepEqual(await r.json(), { error: 'denied' })
 })
 
 test('server: the journal data directory is not readable through the file API', async (t) => {
@@ -220,6 +142,4 @@ test('server: the journal data directory is not readable through the file API', 
     const r = await get(s, `/files/content?path=${encodeURIComponent(path.join(root, 'data', name))}`, token)
     assert.notEqual(r.status, 200, `${name} must not be served`)
   }
-  const listed = await (await get(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
-  assert.deepEqual(listed.entries.map((e) => e.name), ['readme.md'])
 })

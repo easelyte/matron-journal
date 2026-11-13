@@ -1,36 +1,21 @@
-// Owner gate for the File Explorer (read AND write). Authentication proves a
-// device belongs to SOME user; the /files* routes expose the server's own disk,
-// so they are additionally authorized to exactly one user — the configured
-// owner (MATRON_FILE_OWNER_USER_ID), the same shape as GET /work's owner check.
-// Every /files* route is swept for: owner allowed, non-owner client denied,
-// admin non-owner denied, unconfigured owner fails closed, and a denied call
-// leaving no audit line, no idempotency reservation and no fs change.
+// Owner authorization for file viewer reads.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { FILE_AUDIT_BASENAME } from '../src/file-audit.js'
 import { makeTmpDir } from './tmp-dir.js'
 
 function makeFixture() {
   const root = fs.realpathSync(makeTmpDir('matron-owner-'))
-  const writeRoot = path.join(root, 'writable')
-  fs.mkdirSync(writeRoot)
   fs.writeFileSync(path.join(root, 'README.md'), '# hello\n')
-  fs.writeFileSync(path.join(writeRoot, 'existing.txt'), 'original\n')
-  fs.writeFileSync(path.join(writeRoot, 'victim.txt'), 'keep me\n')
-  const auditDir = fs.realpathSync(makeTmpDir('matron-owner-audit-'))
-  return { root, writeRoot, auditDir }
+  return { root }
 }
 
 function start(f, extra = {}) {
   return startTestServer({
     fileReadRoots: [f.root],
-    fileWriteRoots: [f.writeRoot],
-    fileEnableWrites: true,
-    fileAuditDir: f.auditDir,
     ...extra,
   })
 }
@@ -54,19 +39,12 @@ const call = (s, pathAndQuery, { method = 'GET', token, body, raw, headers = {} 
     body: body !== undefined ? JSON.stringify(body) : raw,
   })
 
-// One request per /files* route (every method the File Explorer serves).
+// One request per /files* route (every method the file viewer reads serves).
 // Built per fixture so every path is inside its roots.
 function routes(f) {
-  const w = f.writeRoot
   return [
-    ['GET /files/list', `/files/list?path=${encodeURIComponent(f.root)}`, {}],
     ['GET /files/meta', `/files/meta?path=${encodeURIComponent(path.join(f.root, 'README.md'))}`, {}],
     ['GET /files/content', `/files/content?path=${encodeURIComponent(path.join(f.root, 'README.md'))}`, {}],
-    ['POST /files/upload', `/files/upload?path=${encodeURIComponent(path.join(w, 'up.txt'))}`, { method: 'POST', raw: 'uploaded\n' }],
-    ['POST /files/mkdir', '/files/mkdir', { method: 'POST', body: { path: path.join(w, 'newdir') } }],
-    ['POST /files/move', '/files/move', { method: 'POST', body: { from: path.join(w, 'existing.txt'), to: path.join(w, 'moved.txt') } }],
-    ['POST /files/write', '/files/write', { method: 'POST', body: { path: path.join(w, 'written.txt'), content: 'hi\n' } }],
-    ['DELETE /files', `/files?path=${encodeURIComponent(path.join(w, 'victim.txt'))}&confirm=1`, { method: 'DELETE' }],
   ]
 }
 
@@ -83,25 +61,14 @@ function treeOf(dir) {
   return out
 }
 
-const auditText = (f) => {
-  const p = path.join(f.auditDir, FILE_AUDIT_BASENAME)
-  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''
-}
-
-const idemRows = (s) => s.db.prepare('SELECT COUNT(*) AS n FROM file_idem').get().n
-
 async function assertDeniedEverywhere(s, f, token, status, error, label) {
   const beforeTree = treeOf(f.root)
-  const beforeAudit = auditText(f)
-  const beforeIdem = idemRows(s)
   for (const [name, url, opts] of routes(f)) {
-    const r = await call(s, url, { ...opts, token, headers: { 'idempotency-key': `k-${name}` } })
+    const r = await call(s, url, { ...opts, token, headers: {} })
     assert.equal(r.status, status, `${label}: ${name} must answer ${status}`)
     assert.deepEqual(await r.json(), { error }, `${label}: ${name} body`)
   }
   assert.deepEqual(treeOf(f.root), beforeTree, `${label}: no fs change`)
-  assert.equal(auditText(f), beforeAudit, `${label}: no audit line`)
-  assert.equal(idemRows(s), beforeIdem, `${label}: no idempotency reservation`)
 }
 
 test('owner client device is allowed on every /files route', async () => {
@@ -115,11 +82,6 @@ test('owner client device is allowed on every /files route', async () => {
       assert.ok(r.status >= 200 && r.status < 300, `owner: ${name} answered ${r.status}`)
       await r.arrayBuffer()
     }
-    assert.equal(fs.readFileSync(path.join(f.writeRoot, 'up.txt'), 'utf8'), 'uploaded\n')
-    assert.ok(fs.statSync(path.join(f.writeRoot, 'newdir')).isDirectory())
-    assert.ok(fs.existsSync(path.join(f.writeRoot, 'moved.txt')))
-    assert.equal(fs.readFileSync(path.join(f.writeRoot, 'written.txt'), 'utf8'), 'hi\n')
-    assert.equal(fs.existsSync(path.join(f.writeRoot, 'victim.txt')), false)
   } finally { await s.close() }
 })
 
@@ -158,13 +120,11 @@ test('the owner\'s own agent device is still denied (client devices only)', asyn
 test('owner unconfigured fails closed: every /files route answers 500, even for user 1', async () => {
   const f = makeFixture()
   const s = await start(f, { fileOwnerUserId: null })
-  const errors = []
   const origError = console.error
-  console.error = (...args) => { errors.push(args.join(' ')) }
+  console.error = () => {}
   try {
     const first = await login(s, 'op')
     await assertDeniedEverywhere(s, f, first.token, 500, 'internal', 'unconfigured')
-    assert.ok(errors.some((l) => l.includes('MATRON_FILE_OWNER_USER_ID')), 'the refusal is logged')
   } finally { console.error = origError; await s.close() }
 })
 
@@ -179,7 +139,7 @@ test('owner id comes from MATRON_FILE_OWNER_USER_ID; a malformed value fails clo
     try {
       const first = await login(s, 'op')
       const second = await login(s, 'second')
-      const url = `/files/list?path=${encodeURIComponent(f.root)}`
+      const url = `/files/meta?path=${encodeURIComponent(path.join(f.root, 'README.md'))}`
       assert.equal((await call(s, url, { token: first.token })).status, 403)
       assert.equal((await call(s, url, { token: second.token })).status, 200)
     } finally { await s.close() }
@@ -189,7 +149,7 @@ test('owner id comes from MATRON_FILE_OWNER_USER_ID; a malformed value fails clo
       const s2 = await start(f, { fileOwnerUserId: undefined })
       try {
         const first = await login(s2, 'op')
-        const r = await call(s2, `/files/list?path=${encodeURIComponent(f.root)}`, { token: first.token })
+        const r = await call(s2, `/files/meta?path=${encodeURIComponent(path.join(f.root, 'README.md'))}`, { token: first.token })
         assert.equal(r.status, 500, `MATRON_FILE_OWNER_USER_ID=${JSON.stringify(bad)} must fail closed`)
       } finally { await s2.close() }
     }
@@ -204,7 +164,7 @@ test('feature off keeps the 404 fall-through even with no owner configured', asy
   const s = await startTestServer({ fileOwnerUserId: null })
   try {
     const first = await login(s, 'op')
-    const r = await call(s, '/files/list?path=/', { token: first.token })
+    const r = await call(s, '/files/meta?path=/', { token: first.token })
     assert.equal(r.status, 404)
   } finally { await s.close() }
 })
@@ -213,7 +173,7 @@ test('unauthenticated /files still answers 401 before the owner gate', async () 
   const f = makeFixture()
   const s = await start(f)
   try {
-    const r = await call(s, `/files/list?path=${encodeURIComponent(f.root)}`)
+    const r = await call(s, `/files/meta?path=${encodeURIComponent(path.join(f.root, 'README.md'))}`)
     assert.equal(r.status, 401)
   } finally { await s.close() }
 })
@@ -223,12 +183,12 @@ test('static hosting never answers for the /files namespace (no pre-auth bypass)
   const web = fs.realpathSync(makeTmpDir('matron-owner-web-'))
   fs.writeFileSync(path.join(web, 'index.html'), '<!doctype html>')
   fs.mkdirSync(path.join(web, 'files'))
-  fs.writeFileSync(path.join(web, 'files', 'list'), 'STATIC SHADOW')
+  fs.writeFileSync(path.join(web, 'files', 'meta'), 'STATIC SHADOW')
   fs.writeFileSync(path.join(web, 'files', 'meta.txt'), 'STATIC SHADOW')
   const s = await start(f, { webDir: web })
   try {
     // Unauthenticated: the API's 401, never the static file.
-    let r = await call(s, '/files/list')
+    let r = await call(s, '/files/meta')
     assert.equal(r.status, 401)
     assert.ok(!(await r.text()).includes('STATIC SHADOW'))
     r = await call(s, '/files/meta.txt')
@@ -237,7 +197,7 @@ test('static hosting never answers for the /files namespace (no pre-auth bypass)
     // A non-owner is still refused by the owner gate.
     await login(s, 'op')
     const other = await login(s, 'second')
-    r = await call(s, '/files/list', { token: other.token })
+    r = await call(s, '/files/meta', { token: other.token })
     assert.equal(r.status, 403)
     assert.ok(!(await r.text()).includes('STATIC SHADOW'))
     // Static hosting itself still works outside the namespace.

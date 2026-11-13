@@ -1,6 +1,6 @@
-// Real-server harness for the File Explorer read API (spec §5.2 / §8 / §10).
+// Real-server harness for the file viewer reads (spec §5.2 / §8 / §10).
 // Mirrors media.test.js: startTestServer + fs.mkdtempSync fixtures, asserting
-// the path-jail, sensitive-drop, hidden-toggle, streaming/Range, caps, auth
+// the path-jail, secret-path refusal, streaming/Range, caps, auth
 // gating, and uniform denials end-to-end over HTTP.
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -11,9 +11,6 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeHttpHandler } from '../src/http.js'
-import { pinAllowedRootsSync } from '../src/file-guard.js'
-import { assertNoProhibitedFileWriteRoots, pinProhibitedFileWriteRootsSync } from '../src/server.js'
 import { makeTmpDir } from './tmp-dir.js'
 
 // Build a canonical read-root with a representative tree + adversarial entries.
@@ -24,10 +21,7 @@ function makeFixture() {
   fs.writeFileSync(path.join(root, 'README.md'), '# hello\n')
   fs.writeFileSync(path.join(root, 'app.js'), 'console.log(1)\n')
   fs.writeFileSync(path.join(root, '.env'), 'SECRET=1\n')            // sensitive — always dropped
-  fs.writeFileSync(path.join(root, '.hidden'), 'dot\n')             // hidden by default (dotfile)
   fs.mkdirSync(path.join(root, 'src'))
-  fs.mkdirSync(path.join(root, 'node_modules'))                    // hidden by default
-  fs.mkdirSync(path.join(root, '.git'))                            // hidden by default
   fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export {}\n')
 
   // Non-UTF8 binary, so a string-based path would corrupt it.
@@ -35,7 +29,7 @@ function makeFixture() {
   fs.writeFileSync(path.join(root, 'blob.bin'), binBytes)
 
   // Credential/config material reachable under a broad /root-style root.
-  // Each must be dropped from listings (even ?all=1) and 403 on content/meta.
+  // Each must return 403 on content/meta.
   fs.mkdirSync(path.join(root, '.codex'))
   fs.writeFileSync(path.join(root, '.codex', 'auth.json'), '{"OPENAI_API_KEY":"sk-x"}\n')
   fs.mkdirSync(path.join(root, '.config', 'gh'), { recursive: true })
@@ -47,7 +41,7 @@ function makeFixture() {
   fs.writeFileSync(path.join(root, '.pgpass'), 'localhost:5432:db:u:p\n')
   fs.writeFileSync(path.join(root, '.claude.json'), '{"k":"v"}\n')
 
-  // Adversarial symlinks that must never be served / listed.
+  // Adversarial symlinks that must never be served.
   fs.writeFileSync(path.join(outside, 'target.txt'), 'ESCAPED SECRET\n')
   fs.symlinkSync(path.join(outside, 'target.txt'), path.join(root, 'escape.txt'))     // symlink-out
   fs.writeFileSync(path.join(outside, 'config.json'), '{"token":"x"}\n')
@@ -77,184 +71,6 @@ async function clientToken(s, name = 'op', pw = 'pw') {
 function authGet(s, pathAndQuery, token, headers = {}) {
   return fetch(s.base + pathAndQuery, { headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers } })
 }
-
-function captureHttpHandlerOptions() {
-  const capture = { options: null }
-  capture.factory = (options) => {
-    capture.options = options
-    return makeHttpHandler(options)
-  }
-  return capture
-}
-
-test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?all=1', async (t) => {
-  const { root } = makeFixture()
-  const s = await startTestServer({ fileReadRoots: [root] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-
-  const r = await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)
-  assert.equal(r.status, 200)
-  const body = await r.json()
-  assert.equal(body.path, root)
-  assert.equal(body.root, root)          // the containing read-root
-  assert.equal(body.parent, null)        // listing AT a read-root -> top boundary
-  assert.equal(body.truncated, false)
-  const names = body.entries.map((e) => e.name)
-
-  // sensitive + symlink-escape + symlink-to-secret never appear, in either mode
-  for (const forbidden of ['.env', 'escape.txt', 'looksok.txt']) {
-    assert.ok(!names.includes(forbidden), `${forbidden} must never be listed`)
-  }
-  // hidden by default
-  for (const hidden of ['.hidden', 'node_modules', '.git']) {
-    assert.ok(!names.includes(hidden), `${hidden} should be hidden by default`)
-  }
-  // visible content present
-  for (const shown of ['README.md', 'app.js', 'src', 'blob.bin']) {
-    assert.ok(names.includes(shown), `${shown} should be listed`)
-  }
-  // dirs first
-  const firstFileIdx = body.entries.findIndex((e) => e.kind === 'file')
-  const lastDirIdx = body.entries.map((e) => e.kind).lastIndexOf('dir')
-  assert.ok(lastDirIdx < firstFileIdx, 'all dirs must sort before files')
-  // entry shape
-  const app = body.entries.find((e) => e.name === 'app.js')
-  assert.equal(app.kind, 'file')
-  assert.equal(app.mime, 'text/plain')
-  assert.equal(typeof app.size, 'number')
-  assert.equal(typeof app.mtime, 'number')
-
-  // ?all=1 reveals dev-noise/dotfiles but STILL never the sensitive drop
-  const rAll = await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)
-  const allNames = (await rAll.json()).entries.map((e) => e.name)
-  assert.ok(allNames.includes('.hidden') && allNames.includes('node_modules') && allNames.includes('.git'))
-  for (const forbidden of ['.env', 'escape.txt', 'looksok.txt']) {
-    assert.ok(!allNames.includes(forbidden), `${forbidden} must never be listed even with all=1`)
-  }
-})
-
-test('GET /files/list: breadcrumb jail — root exposed, parent never above the read-root', async (t) => {
-  const { root } = makeFixture()
-  // nested subtree inside the read-root
-  const deep = path.join(root, 'src', 'nested')
-  fs.mkdirSync(deep, { recursive: true })
-  const s = await startTestServer({ fileReadRoots: [root] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-
-  // AT the read-root: root === path, parent null (top boundary)
-  const atRoot = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).json()
-  assert.equal(atRoot.root, root)
-  assert.equal(atRoot.path, root)
-  assert.equal(atRoot.parent, null)
-
-  // one level down: parent = the read-root itself, still the jail boundary
-  const atSrc = await (await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'src'))}`, token)).json()
-  assert.equal(atSrc.root, root)
-  assert.equal(atSrc.path, path.join(root, 'src'))
-  assert.equal(atSrc.parent, root)
-
-  // deeper: parent stays strictly within root, never escaping above it
-  const atDeep = await (await authGet(s, `/files/list?path=${encodeURIComponent(deep)}`, token)).json()
-  assert.equal(atDeep.root, root)
-  assert.equal(atDeep.path, deep)
-  assert.equal(atDeep.parent, path.join(root, 'src'))
-  // invariant: parent is always within/at root, never an ancestor above it
-  for (const b of [atRoot, atSrc, atDeep]) {
-    if (b.parent !== null) {
-      assert.ok(b.parent === b.root || b.parent.startsWith(b.root + path.sep), `parent ${b.parent} must be within root ${b.root}`)
-    }
-  }
-})
-
-test('GET /files/list: truncated flag when over the cap', async (t) => {
-  const { root } = makeFixture()
-  const s = await startTestServer({ fileReadRoots: [root], fileListMax: 3 })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  const body = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
-  assert.equal(body.entries.length, 3)
-  assert.equal(body.truncated, true)
-})
-
-test('GET /files/list: outside-root -> 403, missing -> 404, a file path -> 404 (not-a-dir)', async (t) => {
-  const { root, outside } = makeFixture()
-  const s = await startTestServer({ fileReadRoots: [root] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(outside)}`, token)).status, 403)
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'nope'))}`, token)).status, 404)
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
-  assert.equal((await authGet(s, `/files/list?path=relative`, token)).status, 400)
-  // An explicit but empty path is still malformed; only an ABSENT path means "the default".
-  assert.equal((await authGet(s, `/files/list?path=`, token)).status, 400)
-})
-
-// The client has no business hardcoding a host path, so a pathless list is the server's default
-// folder: the first read root that accepts writes right now, else the first read root.
-test('GET /files/list without a path lists the default folder: first writable read root, else first read root', async (t) => {
-  const first = fs.realpathSync(makeTmpDir('matron-files-first-'))
-  const second = fs.realpathSync(makeTmpDir('matron-files-second-'))
-  fs.writeFileSync(path.join(first, 'in-first.txt'), 'a\n')
-  fs.writeFileSync(path.join(second, 'in-second.txt'), 'b\n')
-  const auditDir = fs.realpathSync(makeTmpDir('matron-files-audit-'))
-
-  const readOnly = await startTestServer({ fileReadRoots: [first, second] })
-  t.after(() => readOnly.close())
-  const roToken = await clientToken(readOnly)
-  const roRes = await authGet(readOnly, '/files/list', roToken)
-  assert.equal(roRes.status, 200)
-  const ro = await roRes.json()
-  assert.equal(ro.path, first)
-  assert.equal(ro.root, first)
-  assert.equal(ro.parent, null)
-  assert.deepEqual(ro.entries.map((e) => e.name), ['in-first.txt'])
-  // ?all=1 still applies to the default listing.
-  assert.equal((await authGet(readOnly, '/files/list?all=1', roToken)).status, 200)
-
-  const writes = await startTestServer({
-    fileReadRoots: [first, second], fileWriteRoots: [second], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => writes.close())
-  const wBody = await (await authGet(writes, '/files/list', await clientToken(writes))).json()
-  assert.equal(wBody.path, second)
-  assert.equal(wBody.writable, true)
-
-  // Dry-run reports nothing writable, so the default falls back to the first read root.
-  const dry = await startTestServer({
-    fileReadRoots: [first, second], fileWriteRoots: [second], fileEnableWrites: true, fileWritesDryRun: true,
-    fileAuditDir: auditDir,
-  })
-  t.after(() => dry.close())
-  assert.equal((await (await authGet(dry, '/files/list', await clientToken(dry))).json()).path, first)
-
-  // A write root NESTED below a later read root is still where the default opens; its read root
-  // is the breadcrumb root, so the operator can still browse up from it.
-  const project = path.join(second, 'project')
-  fs.mkdirSync(project)
-  const nested = await startTestServer({
-    fileReadRoots: [first, second], fileWriteRoots: [project], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => nested.close())
-  const nBody = await (await authGet(nested, '/files/list', await clientToken(nested))).json()
-  assert.equal(nBody.path, project)
-  assert.equal(nBody.root, second)
-  assert.equal(nBody.parent, second)
-  assert.equal(nBody.writable, true)
-
-  // Overlapping READABLE roots keep upward navigation: /second + /second/project both read roots,
-  // the listing of project still reports the shallower /second as its breadcrumb root.
-  const overlap = await startTestServer({
-    fileReadRoots: [first, second, project], fileWriteRoots: [project], fileEnableWrites: true, fileAuditDir: auditDir,
-  })
-  t.after(() => overlap.close())
-  const oBody = await (await authGet(overlap, '/files/list', await clientToken(overlap))).json()
-  assert.equal(oBody.path, project)
-  assert.equal(oBody.root, second)
-  assert.equal(oBody.parent, second)
-})
 
 test('GET /files/meta: file + dir metadata; sensitive/outside denied', async (t) => {
   const { root, outside } = makeFixture()
@@ -374,28 +190,21 @@ test('File API is client-only (agent -> 403) and requires auth (-> 401)', async 
   const enc = encodeURIComponent(root)
   const fileEnc = encodeURIComponent(path.join(root, 'app.js'))
 
-  for (const url of [`/files/list?path=${enc}`, `/files/meta?path=${fileEnc}`, `/files/content?path=${fileEnc}`]) {
+  for (const url of [`/files/meta?path=${fileEnc}`, `/files/content?path=${fileEnc}`]) {
     assert.equal((await authGet(s, url, agentToken)).status, 403, `${url} must be 403 for an agent`)
     assert.equal((await authGet(s, url, null)).status, 401, `${url} must be 401 unauthenticated`)
     assert.equal((await authGet(s, url, token)).status, 200, `${url} must be 200 for a client`)
   }
 })
 
-// --- credential/config material is never listed or served ---------------
-test('sensitive credential entries are dropped from listings and 403 on meta/content', async (t) => {
+// --- credential/config material is refused ---------------
+test('sensitive credential entries return 403 on meta/content', async (t) => {
   const { root } = makeFixture()
   const s = await startTestServer({ fileReadRoots: [root] })
   t.after(() => s.close())
   const token = await clientToken(s)
 
   // Listing must never surface any credential entry, in either display mode.
-  for (const mode of ['', '&all=1']) {
-    const body = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}${mode}`, token)).json()
-    const names = body.entries.map((e) => e.name)
-    for (const forbidden of ['.codex', '.config', '.claude', 'auth.json', '.git-credentials', '.pgpass', '.claude.json']) {
-      assert.ok(!names.includes(forbidden), `${forbidden} must never be listed (mode="${mode}")`)
-    }
-  }
   // Direct meta + content on each must be 403 and never leak the secret bytes.
   for (const [rel, secret] of F2_SENSITIVE) {
     const abs = encodeURIComponent(path.join(root, rel))
@@ -487,7 +296,7 @@ test('with no roots configured, the server starts and /files/* is 404 (feature o
   // server is fully functional
   assert.equal((await s.http('/snapshot', { token })).status, 200)
   // file routes are simply not there
-  for (const url of ['/files/list?path=/tmp', '/files/meta?path=/etc/hosts', '/files/content?path=/etc/hosts']) {
+  for (const url of ['/files/meta?path=/etc/hosts', '/files/content?path=/etc/hosts']) {
     const r = await authGet(s, url, token)
     assert.equal(r.status, 404, `${url} should 404 when the file API is disabled`)
   }
@@ -507,7 +316,6 @@ test('an empty configured root set disables the API (never fails open)', async (
   assert.equal((await s.http('/snapshot', { token })).status, 200)
   // Must NOT serve an arbitrary absolute file — the route is off entirely.
   assert.equal((await authGet(s, '/files/content?path=/etc/hosts', token)).status, 404)
-  assert.equal((await authGet(s, '/files/list?path=/etc', token)).status, 404)
 })
 
 test('file API disabled (fail closed) when /proc/self/fd is unavailable', async (t) => {
@@ -517,119 +325,5 @@ test('file API disabled (fail closed) when /proc/self/fd is unavailable', async 
   t.after(() => s.close())
   const token = await clientToken(s)
   assert.equal((await s.http('/snapshot', { token })).status, 200)
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).status, 404)
   assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
-})
-
-// --- Phase 2: server-owned write configuration -----------------------
-test('writes are off by default even with a valid pinned write-root', async (t) => {
-  const { root } = makeFixture()
-  const writeRoot = path.join(root, 'src')
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileWriteRoots: [writeRoot], httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.deepEqual(capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath), [writeRoot])
-  assert.equal(capture.options.fileEnableWrites, false)
-  assert.equal(capture.options.fileWritesDryRun, false)
-})
-
-test('ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
-  const { root } = makeFixture()
-  const warn = t.mock.method(console, 'warn', () => {})
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileEnableWrites: true, httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal(capture.options.fileWriteRoots, null)
-  assert.equal(capture.options.fileEnableWrites, false)
-})
-
-test('ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
-  const { root } = makeFixture()
-  const warn = t.mock.method(console, 'warn', () => {})
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true,
-    httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal(capture.options.fileWriteRoots, null)
-  assert.equal(capture.options.fileEnableWrites, false)
-})
-
-test('write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
-  const { root } = makeFixture()
-  const envNames = ['MATRON_FILE_WRITE_ROOTS', 'MATRON_FILE_ENABLE_WRITES', 'MATRON_FILE_WRITES_DRYRUN']
-  const previous = new Map(envNames.map((name) => [name, process.env[name]]))
-  t.after(() => {
-    for (const [name, value] of previous) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-  })
-  process.env.MATRON_FILE_WRITE_ROOTS = `${path.join(root, 'src')}:${path.join(root, 'node_modules')}`
-  process.env.MATRON_FILE_ENABLE_WRITES = '1'
-  process.env.MATRON_FILE_WRITES_DRYRUN = '1'
-
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root],
-    fileAuditDir: makeTmpDir('matron-files-audit-'),
-    httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-  assert.deepEqual(
-    capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath),
-    [path.join(root, 'src'), path.join(root, 'node_modules')],
-  )
-  assert.equal(capture.options.fileEnableWrites, true)
-  assert.equal(capture.options.fileWritesDryRun, true)
-})
-
-test('broad write-root identities reject synthetic bind-mount aliases', () => {
-  const { root, outside } = makeFixture()
-  const broadRoots = [root, path.join(root, 'src'), path.join(root, 'node_modules')]
-  const missingRoot = path.join(root, 'host-path-not-present')
-  const prohibitedRoots = pinProhibitedFileWriteRootsSync([...broadRoots, missingRoot])
-  assert.deepEqual(prohibitedRoots.roots.map((pinned) => pinned.realPath), broadRoots)
-
-  for (const [index, broadRoot] of broadRoots.entries()) {
-    const pinnedWriteRoots = pinAllowedRootsSync([broadRoot])
-    const aliasPath = path.join(outside, `synthetic-bind-alias-${index}`)
-    const aliasedWriteRoots = {
-      roots: pinnedWriteRoots.roots.map((pinned) => ({ ...pinned, realPath: aliasPath })),
-    }
-    assert.throws(
-      () => assertNoProhibitedFileWriteRoots(aliasedWriteRoots, prohibitedRoots),
-      (err) => err?.message === `file writes: configured write-root is prohibited because it is too broad: ${aliasPath}`,
-      aliasPath,
-    )
-  }
-})
-
-test('a write-root outside all read-roots fails visibly at boot', async () => {
-  const { root, outside } = makeFixture()
-  await assert.rejects(
-    startTestServer({ fileReadRoots: [root], fileWriteRoots: [outside] }),
-    /every configured write-root must be contained in a configured read-root/,
-  )
-})
-
-test('an unreadable configured write-root fails visibly while pinning', async () => {
-  const { root } = makeFixture()
-  await assert.rejects(
-    startTestServer({
-      fileReadRoots: [root],
-      fileWriteRoots: [path.join(root, 'missing-' + crypto.randomBytes(6).toString('hex'))],
-    }),
-    (e) => e && e.reason === 'bad-workdir',
-  )
 })

@@ -3,7 +3,7 @@ import { startServer } from '../src/server.js'
 
 export async function startTestServer(opts = {}) {
   // fileOwnerUserId: 1 is the first user a test creates in a fresh :memory:
-  // DB — the File Explorer owner gate fails closed without one, so suites that
+  // DB — the file viewer reads owner gate fails closed without one, so suites that
   // exercise /files as "the operator" get it by default. Owner-gate tests
   // override it (a different id, or null for the unconfigured case).
   // Search: no embedder (never load a real model), background work unpaced.
