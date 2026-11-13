@@ -1807,9 +1807,9 @@ test('offloadPass reads each page after its pause: a row rewritten meanwhile is 
   assert.ok(db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).blob_ref)
   const plan = db.prepare(
     "EXPLAIN QUERY PLAN SELECT rowid AS rid, user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
-    'AND (ts > ? OR (ts = ? AND rowid > ?)) ORDER BY ts, rowid LIMIT ?'
+    'AND ts >= ? AND (ts > ? OR rowid > ?) ORDER BY ts, rowid LIMIT ?'
   ).all(1, 0, 0, 0, 1).map((p) => p.detail).join(' | ')
-  assert.match(plan, /idx_events_offload_pending/)
+  assert.match(plan, /idx_events_offload_pending \(ts>\? AND ts<\?\)/, 'the cursor seeks: both ts bounds on the index')
   assert.doesNotMatch(plan, /TEMP B-TREE/, 'pages walk the index in order, no sort')
 })
 

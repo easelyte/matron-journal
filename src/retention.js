@@ -99,7 +99,9 @@ export function* offloadPass(db, { days = 30, mediaDir, batchSize = RETENTION_RO
     // so one stretch never loads more than a page of payloads (a single
     // up-front read of ~1k due payloads held the loop for seconds).
     "SELECT rowid AS rid, user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
-    'AND (ts > ? OR (ts = ? AND rowid > ?)) ' +
+    // `ts >= ?` is the index lower bound (the OR alone is not one, and
+    // every page would re-walk the skipped live-log rows before the cursor).
+    'AND ts >= ? AND (ts > ? OR rowid > ?) ' +
     "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.live_log') IS NULL " +
     "AND json_extract(payload,'$.expired') IS NULL AND json_extract(payload,'$.blob_expired') IS NULL ELSE 1 END " +
     'ORDER BY ts, rowid LIMIT ?'
