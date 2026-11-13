@@ -1861,3 +1861,29 @@ test('the scheduled (deferred) retention pass yields: a timer fires while it run
   assert.equal(pending(), 0, 'the pass finished')
   assert.ok(sawMidPass, 'the loop ran between batches of the pass')
 })
+
+test('expireLogsPass yields every batchSize rows, keeps a row rewritten while paused, and stops when closed', async () => {
+  const { expireLogsPass } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const seqs = []
+  for (let i = 0; i < 5; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}`, snippet: 'out' } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
+    seqs.push(r.seq)
+  }
+  const expiredCount = () => db.prepare("SELECT COUNT(*) n FROM events WHERE json_extract(payload,'$.expired') = 1").get().n
+  const gen = expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 })
+  assert.equal(gen.next().done, false)
+  assert.equal(expiredCount(), 2, 'exactly one batch before the first yield')
+  const rewritten = JSON.stringify({ live_log: true, command: 'edited', snippet: 'new' })
+  db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(rewritten, alice.id, seqs[2])
+  assert.equal(gen.next().done, false)
+  assert.equal(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).payload, rewritten, 'a row changed after the read is not overwritten')
+  assert.equal(expiredCount(), 3)
+  // Closed before the last batch (as a stopped drainAsync closes it): the
+  // remaining row survives, and the next pass also re-reads the rewritten one.
+  gen.return()
+  assert.equal(expiredCount(), 3)
+  assert.deepEqual(runExpireLogs(db, { hours: 24, mediaDir }), { expired: 2 })
+})
