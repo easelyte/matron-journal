@@ -226,12 +226,18 @@ That's the whole list.
 Only the app author holds the APNs key for the `chat.matron.app` bundle id, so a
 self-hosted journal cannot talk to Apple directly. Set
 `MATRON_PUSH_GATEWAY_URL=https://push.matron.chat` and the journal sends each
-push as a content-free event instead: device token, environment, a category
-(`attention` / `done` / `activity` / `wake`), badge count, and conversation-id
-routing fields. The relay maps the category to a fixed generic string ("Your
-agent needs you", "Session finished", …) — your message content, titles, and
-conversation names never leave your server, structurally: the relay protocol
-has no field that could carry them.
+push as an event with nothing readable in it: device token, environment, a
+category (`attention` / `done` / `activity` / `wake`), badge count, and
+conversation-id routing fields. The relay maps the category to a fixed generic
+string ("Your agent needs you", "Your agent finished its turn", …).
+
+What a notification actually says (an item's title, a snippet, its buttons)
+travels only as a sealed box: the journal encrypts it to a public key the
+device registered, the relay and Apple pass the ciphertext along, and the
+app's notification extension opens it on the device. The relay holds no key
+that opens a box. A device that registered no key gets the generic string
+alone. The construction, and what each party can and cannot see, are in
+[docs/protocol.md](docs/protocol.md) under "Sealed notification content".
 
 Running your own relay (needs an Apple Developer membership and the app's APNs
 key, so this is for the hosted one's operator):

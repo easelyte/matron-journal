@@ -254,6 +254,18 @@ test('POST /push/register: client devices can register/unregister an apns token;
   assert.equal(row.apns_token, 'abc123')
   assert.equal(row.apns_env, 'sandbox')
 
+  // An optional public key for sealed notification content rides along.
+  const key = Buffer.alloc(32, 7).toString('base64url')
+  assert.equal((await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox', push_key: key } })).status, 200)
+  assert.equal(s.db.prepare('SELECT push_key FROM devices WHERE id=?').get(deviceId).push_key, key)
+  for (const bad of ['short', 42, key + 'AA', { k: 1 }]) {
+    const r = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox', push_key: bad } })
+    assert.equal(r.status, 400, JSON.stringify(bad))
+  }
+  assert.equal(s.db.prepare('SELECT push_key FROM devices WHERE id=?').get(deviceId).push_key, key, 'a refused registration changes nothing')
+  assert.equal((await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox', push_key: null } })).status, 200)
+  assert.equal(s.db.prepare('SELECT push_key FROM devices WHERE id=?').get(deviceId).push_key, null)
+
   // {apns_token: null} unregisters (both columns cleared)
   const unreg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: null } })
   assert.equal(unreg.status, 200)

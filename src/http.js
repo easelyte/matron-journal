@@ -60,6 +60,7 @@ import { handleTtsRoute } from './tts-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
+import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
@@ -737,14 +738,18 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // itself and are never pushed to.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const body = await readBody(req)
-        const { apns_token, environment } = body
+        const { apns_token, environment, push_key } = body
         if (apns_token === null) {
           setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
           return json(res, 200, { ok: true })
         }
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
-        setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
+        // Optional: the device's public key for sealed notification content.
+        // Absent or null registers without one.
+        const pushKey = push_key == null ? null : parsePushKey(push_key)
+        if (push_key != null && !pushKey) return json(res, 400, { error: 'bad_request' })
+        setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment, pushKey })
         return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/password') {

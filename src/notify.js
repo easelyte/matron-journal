@@ -13,7 +13,9 @@ export const DEVICE_LEVELS = ['all', 'needs_me', 'off']
 export const NEEDS_ME = new Set(['prompts', 'questions', 'notices'])
 
 const PRESETS = {
-  coordinator: { prompts: true, questions: true, notices: true, coordinator_done: true, other_done: false, stopped: false, rooms: false, activity: false },
+  // No turn-finished pushes at all: with a Coordinator, what it wants from
+  // the user arrives as a For you item, and that is what pushes.
+  coordinator: { prompts: true, questions: true, notices: true, coordinator_done: false, other_done: false, stopped: false, rooms: false, activity: false },
   all: { prompts: true, questions: true, notices: true, coordinator_done: true, other_done: true, stopped: true, rooms: false, activity: false },
 }
 

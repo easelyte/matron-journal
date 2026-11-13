@@ -2124,6 +2124,11 @@ export function openDb(path) {
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
   }
+  // The public key a device registered for sealed notification content
+  // (src/push-box.js). NULL = none: its pushes carry no content.
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_key')) {
+    db.exec('ALTER TABLE devices ADD COLUMN push_key TEXT')
+  }
   // A client's sync scope as its last hello named it (src/sync-scope.js):
   // NULL = everything, 'for_you' = the tracker and the chats it opens.
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'sync_scope')) {
@@ -2609,11 +2614,17 @@ export function userBlobBytes(db, userId) {
 // rate-limit one: a device handed to someone else must stop receiving its
 // previous owner's notifications. Unregistering scavenges nothing — it
 // touches only the caller's own row.
-export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
+//
+// `pushKey` is the device's public key for sealed notification content
+// (src/push-box.js), already validated. It is replaced on every
+// registration, so a registration without one, or an unregistration, ends
+// content for that device; the old holder of a claimed token loses its key
+// with the token.
+export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv, pushKey = null }) {
   if (apnsToken != null) {
-    db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE apns_token=? AND id<>?').run(apnsToken, deviceId)
+    db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL, push_key=NULL WHERE apns_token=? AND id<>?').run(apnsToken, deviceId)
   }
-  db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
+  db.prepare('UPDATE devices SET apns_token=?, apns_env=?, push_key=? WHERE id=?').run(apnsToken, apnsEnv, apnsToken != null ? pushKey : null, deviceId)
 }
 
 // Called by the push pipeline when APNs says a token is dead (410
@@ -2625,7 +2636,7 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
 // token re-registered with a corrected environment. Returns whether anything
 // was cleared, so a burst of failures for one token is logged once.
 export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
-  return db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=? AND apns_token=? AND apns_env=?')
+  return db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL, push_key=NULL WHERE id=? AND apns_token=? AND apns_env=?')
     .run(deviceId, apnsToken, apnsEnv).changes > 0
 }
 
@@ -2633,7 +2644,7 @@ export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
 }
 
