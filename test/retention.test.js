@@ -1749,3 +1749,115 @@ test('retention scans use their partial indexes, and runOffload no longer select
   const r = runOffload(db, { days: 30, mediaDir })
   assert.equal(r.offloaded, 2)
 })
+
+// ---- Yielding passes (the 6-hourly schedule must not hold the event loop) ----
+
+test('drainAsync hands the loop back between batches: offloadPass yields every batchSize rows', async () => {
+  const { offloadPass, drainAsync } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  for (let i = 0; i < 5; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(100) } })
+    backdate(db, r.seq, alice.id, 40)
+  }
+  let turns = 0
+  let slices = 0
+  const r = await drainAsync(offloadPass(db, { days: 30, mediaDir, batchSize: 2 }), {
+    yieldFn: () => new Promise((resolve) => setImmediate(() => { turns += 1; resolve() })),
+    onSlice: () => { slices += 1 },
+  })
+  assert.deepEqual(r, { offloaded: 5 })
+  assert.equal(turns, 3, '5 rows in pages of 2: a yield after each page')
+  assert.equal(slices, 4, 'the last stretch finds the empty page')
+})
+
+test('drainAsync stops at the next yield once shouldStop is true, and returns null', async () => {
+  const { offloadPass, drainAsync } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  for (let i = 0; i < 4; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(100) } })
+    backdate(db, r.seq, alice.id, 40)
+  }
+  const r = await drainAsync(offloadPass(db, { days: 30, mediaDir, batchSize: 1 }), { shouldStop: () => true })
+  assert.equal(r, null)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events WHERE blob_ref IS NOT NULL').get().n, 1, 'only the first batch ran')
+})
+
+test('offloadPass reads each page after its pause: a row rewritten meanwhile is judged on its new payload', async () => {
+  const { offloadPass } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const seqs = []
+  for (let i = 0; i < 3; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(100) } })
+    backdate(db, r.seq, alice.id, 40 - i)
+    seqs.push(r.seq)
+  }
+  const gen = offloadPass(db, { days: 30, mediaDir, batchSize: 1 })
+  assert.equal(gen.next().done, false) // first page offloaded, paused
+  const live = JSON.stringify({ live_log: true, snippet: 'streamed' })
+  db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(live, alice.id, seqs[1])
+  let r = gen.next()
+  while (!r.done) r = gen.next()
+  assert.deepEqual(r.value, { offloaded: 2 })
+  const row = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[1])
+  assert.equal(row.payload, live, 'a live log is runExpireLogs\' to handle, never offloaded')
+  assert.equal(row.blob_ref, null)
+  assert.ok(db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).blob_ref)
+  const plan = db.prepare(
+    "EXPLAIN QUERY PLAN SELECT rowid AS rid, user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
+    'AND (ts > ? OR (ts = ? AND rowid > ?)) ORDER BY ts, rowid LIMIT ?'
+  ).all(1, 0, 0, 0, 1).map((p) => p.detail).join(' | ')
+  assert.match(plan, /idx_events_offload_pending/)
+  assert.doesNotMatch(plan, /TEMP B-TREE/, 'pages walk the index in order, no sort')
+})
+
+test('reapOrphanBlobsPass scans in rowid ranges and still sees a payload reference written while it was paused', async () => {
+  const { reapOrphanBlobsPass } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const early = seedAgedBlob(db, mediaDir, { userId: alice.id, hoursAgo: 72 })
+  const late = seedAgedBlob(db, mediaDir, { userId: alice.id, hoursAgo: 72 })
+  const orphan = seedAgedBlob(db, mediaDir, { userId: alice.id, hoursAgo: 72 })
+  // Referenced only inside a payload (blob_ref column NULL), as agent publishes are.
+  append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { text: 'a', meta: { blob_ref: early.id } } })
+  for (let i = 0; i < 4; i++) append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { text: `filler ${i}` } })
+
+  const gen = reapOrphanBlobsPass(db, { graceMs: 24 * HOUR, mediaDir, scanBatchRows: 2 })
+  let yields = 0
+  let r = gen.next()
+  // Mid-scan, a new event names `late` in its payload only.
+  append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { text: 'b', meta: { blob_ref: late.id } } })
+  while (!r.done) { yields += 1; r = gen.next() }
+  assert.ok(yields >= 2, `the scan yielded between ranges (${yields})`)
+  assert.deepEqual(r.value, { reaped: 1, bytesFreed: orphan.size })
+  assert.equal(getBlob(db, orphan.id), undefined)
+  assert.ok(getBlob(db, early.id))
+  assert.ok(getBlob(db, late.id), 'a reference written mid-scan keeps its blob')
+})
+
+test('the scheduled (deferred) retention pass yields: a timer fires while it runs', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = makeTmpDir('matron-retention-yield-')
+  const dbPath = path.join(dir, 'test.db')
+  const preDb = openDb(dbPath)
+  const alice = await createUser(preDb, 'alice', 'pw')
+  upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
+  for (let i = 0; i < 300; i++) {
+    const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(200) } })
+    preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
+  }
+  preDb.close()
+  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 50 })
+  t.after(() => s.close())
+  const pending = () => s.db.prepare('SELECT COUNT(*) n FROM events WHERE type=\'tool_output\' AND blob_ref IS NULL').get().n
+  let sawMidPass = false
+  const deadline = Date.now() + 10000
+  while (pending() > 0 && Date.now() < deadline) {
+    if (pending() < 300) sawMidPass = true
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(pending(), 0, 'the pass finished')
+  assert.ok(sawMidPass, 'the loop ran between batches of the pass')
+})
