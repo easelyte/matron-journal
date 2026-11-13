@@ -107,6 +107,9 @@ test('a talk across journals: Send, the guest picks a session, and the agents ta
   assert.deepEqual(stampedOwn.from_session, { convo_id: 'sess-1', title: 'Fix the build' })
   const stampedFar = JSON.parse(w.b.db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='text' AND json_extract(payload, '$.body')='Stamped'").get(twin).payload)
   assert.deepEqual(Object.keys(stampedFar).sort(), ['body', 'person', 'via'])
+  // And at the sending boundary: the queued room.message body is exactly {n, body, via} plus the room ref.
+  const out = w.a.db.prepare("SELECT body FROM fed_outbox WHERE op='room.message' AND body LIKE '%Stamped%'").get()
+  assert.deepEqual(Object.keys(JSON.parse(out.body)).sort(), ['body', 'n', 'room', 'via'])
 
   // The bridge's question at a foreign turn: who, and which side.
   const mine = await w.aliceChat('/person-rooms?room_id=room')
