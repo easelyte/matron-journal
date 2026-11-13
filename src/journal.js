@@ -92,7 +92,6 @@ export function snippetOf(type, payload) {
   }
   if (type === PEOPLE_EVENT_TYPE) return `👥 ${String(p.summary || 'Contacts updated')}`.slice(0, 120)
   if (type === 'text') return String(p.body || '').slice(0, 120)
-  if (type === 'peer_message') return `💬 ${sanitizePeerText(p.body)}`.slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
   // A captioned attachment reads better in the chat list as what the user

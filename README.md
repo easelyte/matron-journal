@@ -148,7 +148,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
-| `MATRON_FILE_OWNER_USER_ID` | unset | Numeric journal user ID authorized to use the File Explorer (`/files*`, read and write). **Required** whenever `MATRON_FILE_READ_ROOTS` (or writes) are enabled: unset or malformed, every `/files` request answers 500. Every other user, admin or not, gets 403 |
+| `MATRON_FILE_READ_ROOTS` | unset (off) | Colon-separated absolute roots for file viewer reads. Owner client devices only; secret paths and journal state are refused. A root of `/` is refused; Linux `/proc/self/fd` is required |
+| `MATRON_FILE_OWNER_USER_ID` | unset | Numeric journal user ID authorized for file viewer reads (`GET /files/meta` and `GET /files/content`). **Required** whenever `MATRON_FILE_READ_ROOTS` are enabled: unset or malformed, every `/files` request answers 500. Every other user, admin or not, gets 403 |
 
 ## How it fits together
 

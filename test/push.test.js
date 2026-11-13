@@ -16,9 +16,6 @@ import { RECIPIENT, keyPairFrom } from './push-box-fixture.js'
 
 // Peer_message is a routine coalesced activity push (priority 5), not an
 // attention alert and never silent — asserted explicitly, not via fallthrough.
-test('classify(peer_message) deep-equals a coalesced activity push', () => {
-  assert.deepEqual(classify('peer_message'), { priority: 5, coalesce: true, kind: 'activity' })
-})
 
 // A stub apnsClient recording every send() call. `respond` maps a call to a
 // {status, reason} result (default: 200 success); tests override it to

@@ -1,16 +1,13 @@
 import http from 'node:http'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
-import { accessSync, constants as fsConstants, realpathSync, readlinkSync } from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
-const { resolve } = path
+import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
-import { parseOwnerUserId } from './owner-user-id.js'
-import { ensurePreapproveKey, resolvePreapproveKeyPath } from './preapprove-key.js'
+import { ensurePreapproveKey } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
 import { makeLinkStore } from './link.js'
 import { makeHub } from './hub.js'
@@ -20,8 +17,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { canonicalizeThroughExistingAncestor, contains, pinAllowedRootsSync, withProtectedPaths, withReadPolicy } from './file-guard.js'
-import { FILE_AUDIT_BASENAME, auditPathFor } from './file-audit.js'
+import { resolveFileReads } from './files-read-http.js'
 import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
@@ -71,32 +67,6 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // busiest user's footprint on a production deployment — generous headroom, not a squeeze.
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
-// File Explorer read API (spec: matron-file-explorer §5.4). OPT-IN: there is
-// no host-specific default read-root — the feature is OFF unless
-// MATRON_FILE_READ_ROOTS is set at deploy (or fileReadRoots is passed). When
-// enabled, reads are broad by operator preference; the always-on secret
-// denylist (isDeniedPath: name patterns, the server's own state, and every
-// top-level dot entry of the service user's home) bounds exposure regardless
-// of root breadth. A read-root of / is refused at boot.
-export const DEFAULT_FILE_LIST_MAX = 2000
-// Broad directories that can never be a file write-root. The service user's
-// home joins the fixed set, so a non-root deploy refuses its own home the same
-// way /root is refused; as root the set is unchanged. The home comes from the
-// passwd entry (not $HOME), so an overridden HOME cannot change the set.
-export function serviceUserHome() {
-  try {
-    return os.userInfo().homedir
-  } catch {
-    return os.homedir()
-  }
-}
-
-export function prohibitedFileWriteRoots(home = serviceUserHome()) {
-  const roots = new Set(['/', '/root', '/opt/matron'])
-  if (home && path.isAbsolute(home)) roots.add(path.resolve(home))
-  return roots
-}
-const PROHIBITED_FILE_WRITE_ROOTS = prohibitedFileWriteRoots()
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // first pass 2 min after boot, not at boot
@@ -132,60 +102,6 @@ export function resolveNumericEnv(name, raw, defaultValue) {
     return defaultValue
   }
   return n
-}
-
-// Pin every prohibited broad directory that exists on this host. Some deploys
-// do not have all of the host-specific paths (notably /opt/matron), so absence
-// is not itself a configuration error. The returned dev/ino identities let the
-// caller recognize bind-mount aliases whose realPath spelling is different.
-export function pinProhibitedFileWriteRootsSync(rootPaths = PROHIBITED_FILE_WRITE_ROOTS) {
-  const existingRootPaths = []
-  for (const rootPath of rootPaths) {
-    try {
-      realpathSync(rootPath)
-      existingRootPaths.push(rootPath)
-    } catch (err) {
-      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
-    }
-  }
-  return pinAllowedRootsSync(existingRootPaths)
-}
-
-// The server's own persistent state. A write root that overlaps ANY of these
-// would let an authenticated client overwrite the audit log that just recorded
-// its intent, or move the live database out from under the process — so the
-// overlap is refused at boot (fail-visible) rather than left for the per-request
-// guard to catch. `paths` are file/dir paths, not pinned roots: they may not
-// exist yet (the audit log is created on the first write).
-export function assertWriteRootsExcludeServerState(fileWriteRoots, paths) {
-  for (const candidate of paths) {
-    if (!candidate) continue
-    // Both the configured spelling and the one the filesystem resolves to. A
-    // protected path often does not exist yet (the audit log is created on the
-    // first write), and realpath() refuses a missing final component — so
-    // resolve through the deepest existing ancestor instead, or a state path
-    // under a symlink that points INTO a write root reads as external here and
-    // becomes internal the moment it is created.
-    const spellings = [resolve(candidate)]
-    const canonical = canonicalizeThroughExistingAncestor(candidate)
-    if (canonical !== spellings[0]) spellings.push(canonical)
-    for (const statePath of spellings) {
-      const clash = fileWriteRoots.roots.find((writeRoot) =>
-        contains(writeRoot.realPath, statePath) || contains(statePath, writeRoot.realPath))
-      if (clash) {
-        throw new Error(`file writes: configured write-root ${clash.realPath} overlaps server-owned state (${statePath}); writes must never be able to reach the database, the preapprove key, the media store, or the audit log`)
-      }
-    }
-  }
-}
-
-export function assertNoProhibitedFileWriteRoots(fileWriteRoots, prohibitedRoots) {
-  const prohibitedRoot = fileWriteRoots.roots.find((writeRoot) =>
-    prohibitedRoots.roots.some((candidate) =>
-      candidate.dev === writeRoot.dev && candidate.ino === writeRoot.ino))
-  if (prohibitedRoot) {
-    throw new Error(`file writes: configured write-root is prohibited because it is too broad: ${prohibitedRoot.realPath}`)
-  }
 }
 
 // The consent cap is the one knob where 0 is a value, not garbage: it means
@@ -611,10 +527,10 @@ export function startServer({
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
-  agentCommentClock = Date.now,
   // Coordinator approvals of file transfers per rolling 24 h, counted apart
   // from the daily cap above. 0 = no cap.
   consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
+  agentCommentClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -632,8 +548,8 @@ export function startServer({
   routinesSweepIntervalMs = null,
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
-  mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots, fileWriteRoots, fileEnableWrites, fileWritesDryRun,
-  fileAuditDir, fileWriteMaxBytes, fileListMax, fileOwnerUserId, procSelfFdAvailable, fileHomeDir,
+  mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, fileReadRoots,
+  fileOwnerUserId, procSelfFdAvailable, fileHomeDir,
   github, githubRefreshIntervalMs, webDir,
   // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
   // it off. `ttsCacheDir` overrides where the clips are kept.
@@ -719,141 +635,7 @@ export function startServer({
   const resolvedTransferUserQuotaBytes = transferUserQuotaBytes ?? resolveNumericEnv('MATRON_TRANSFER_USER_QUOTA_BYTES', process.env.MATRON_TRANSFER_USER_QUOTA_BYTES, TRANSFER_USER_QUOTA_BYTES_DEFAULT)
   const resolvedTransferMaxAwaiting = transferMaxAwaitingPerSender ?? resolveNumericEnv('MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
-  // File Explorer read API config (spec §5.4). OPT-IN + fail-safe by design:
-  //  - No roots configured (fileReadRoots opt absent AND MATRON_FILE_READ_ROOTS
-  //    unset) -> feature DISABLED; handler gets null; /files/* -> 404; the rest
-  //    of the server starts normally. A deploy enables it via env.
-  //  - Configured but EMPTY (opt [] or MATRON_FILE_READ_ROOTS="") -> DISABLED
-  //    too (an empty root set must never fail open).
-  //  - Configured & non-empty but /proc/self/fd unavailable (non-Linux) ->
-  //    DISABLED: the fd-identity re-check needs procfs; refuse the racy
-  //    realpath fallback rather than serve with a TOCTOU hole.
-  //  - Configured & non-empty & procfs OK -> pin the roots ONCE, on the trusted
-  //    server side. pinAllowedRootsSync fails VISIBLE (throws, restart-loud) on
-  //    an unreadable/missing configured root: that is an explicit operator
-  //    misconfiguration, not a reason to silently disable.
-  const fileRootsConfigured = fileReadRoots !== undefined
-    ? fileReadRoots
-    : (process.env.MATRON_FILE_READ_ROOTS !== undefined
-        ? process.env.MATRON_FILE_READ_ROOTS.split(':').filter(Boolean)
-        : null)
-  const procFdOk = procSelfFdAvailable ?? (() => {
-    try { readlinkSync('/proc/self/fd/0'); return true } catch { return false }
-  })()
-  let resolvedFileReadRoots = null
-  if (Array.isArray(fileRootsConfigured) && fileRootsConfigured.length > 0) {
-    if (!procFdOk) {
-      console.warn('file API: disabled — /proc/self/fd unavailable; refusing the racy realpath fallback (set up on a Linux host to enable)')
-    } else {
-      resolvedFileReadRoots = pinAllowedRootsSync(fileRootsConfigured)
-    }
-  } else if (Array.isArray(fileRootsConfigured)) {
-    console.warn('file API: disabled — configured read-root list is empty')
-  }
-  // File Explorer write config (Phase 2). Write roots are a
-  // separate, narrower, server-owned pin. They are resolved even while the
-  // kill switch is off so a bad deployment fails visibly at boot instead of
-  // becoming a latent escape that appears only when the switch is flipped.
-  // Only literal `1` (or boolean true via the test/programmatic option) enables
-  // a flag; every other value fails closed.
-  const writeRootsConfigured = fileWriteRoots !== undefined
-    ? fileWriteRoots
-    : (process.env.MATRON_FILE_WRITE_ROOTS !== undefined
-        ? process.env.MATRON_FILE_WRITE_ROOTS.split(':').filter(Boolean)
-        : null)
-  const writesRequested = fileEnableWrites !== undefined
-    ? fileEnableWrites === true || fileEnableWrites === 1 || fileEnableWrites === '1'
-    : process.env.MATRON_FILE_ENABLE_WRITES === '1'
-  const resolvedFileWritesDryRun = fileWritesDryRun !== undefined
-    ? fileWritesDryRun === true || fileWritesDryRun === 1 || fileWritesDryRun === '1'
-    : process.env.MATRON_FILE_WRITES_DRYRUN === '1'
-  const auditPath = auditPathFor(resolvedDbPath)
-  // Canonical, so the writer and the protected-path set name the same file.
-  const configuredAuditDir = fileAuditDir !== undefined
-    ? fileAuditDir
-    : (auditPath ? path.dirname(auditPath) : null)
-  const resolvedFileAuditDir = configuredAuditDir
-    ? canonicalizeThroughExistingAncestor(configuredAuditDir)
-    : null
-  // Everything the server owns on disk and must never expose to a write route.
-  const serverStatePaths = [
-    resolvedDbPath === ':memory:' ? null : resolvedDbPath,
-    resolvedDbPath === ':memory:' ? null : `${resolvedDbPath}-wal`,
-    resolvedDbPath === ':memory:' ? null : `${resolvedDbPath}-shm`,
-    resolvedDbPath === ':memory:' ? null : resolvePreapproveKeyPath(resolvedDbPath, preapproveKeyPath),
-    resolvedMediaDir,
-    resolvedFileAuditDir ? path.join(resolvedFileAuditDir, FILE_AUDIT_BASENAME) : null,
-  ].filter(Boolean)
-  // The same state is also refused to READS (2026-09-27): the database holds
-  // every transcript and device-token hash, and its directory also holds the
-  // bridge's agent credentials. The named state files are always denied; the
-  // data directory is a denied TREE, which yields only inside a root that was
-  // configured within it (a broader root never reaches into it).
-  const readPolicy = {
-    denyPaths: serverStatePaths,
-    denyTrees: resolvedDbPath === ':memory:' ? [] : [path.dirname(resolvedDbPath)],
-    homeDir: fileHomeDir !== undefined ? fileHomeDir : serviceUserHome(),
-  }
-  if (resolvedFileReadRoots) resolvedFileReadRoots = withReadPolicy(resolvedFileReadRoots, readPolicy)
-  let resolvedFileWriteRoots = null
-  if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
-    resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
-    assertNoProhibitedFileWriteRoots(resolvedFileWriteRoots, pinProhibitedFileWriteRootsSync())
-    assertWriteRootsExcludeServerState(resolvedFileWriteRoots, serverStatePaths)
-    if (!resolvedFileReadRoots || resolvedFileWriteRoots.roots.some((writeRoot) =>
-      !resolvedFileReadRoots.roots.some((readRoot) => contains(readRoot.realPath, writeRoot.realPath)))) {
-      throw new Error('file writes: every configured write-root must be contained in a configured read-root')
-    }
-    // Belt-and-braces: the per-request guards refuse these paths too, so a
-    // future root-resolution change cannot quietly reopen the hole.
-    resolvedFileWriteRoots = withProtectedPaths(withReadPolicy(resolvedFileWriteRoots, readPolicy), serverStatePaths)
-  }
-  // The write audit is a PRECONDITION for writes, not a
-  // decoration: every destructive op writes its intent line before the first
-  // irreversible fs call and refuses if that append fails. So a deploy with
-  // nowhere to put the log (an in-memory DB has no data directory) must not
-  // enable writes at all, and a data directory the process cannot write is an
-  // operator misconfiguration that fails VISIBLY at boot rather than turning
-  // every write into a runtime 507.
-  const resolvedFileEnableWrites = writesRequested
-    && resolvedFileWriteRoots !== null
-    && resolvedFileAuditDir !== null
-  if (writesRequested && resolvedFileWriteRoots === null) {
-    console.warn('file writes: disabled — MATRON_FILE_ENABLE_WRITES=1 but MATRON_FILE_WRITE_ROOTS is unset or empty')
-  } else if (writesRequested && resolvedFileAuditDir === null) {
-    console.warn(`file writes: disabled — no data directory to hold ${FILE_AUDIT_BASENAME}, and writes are never served unaudited`)
-  } else if (resolvedFileEnableWrites) {
-    try {
-      accessSync(resolvedFileAuditDir, fsConstants.W_OK)
-    } catch (err) {
-      throw new Error(`file writes: the audit directory ${resolvedFileAuditDir} is not writable, so ${FILE_AUDIT_BASENAME} cannot be kept: ${err.message}`)
-    }
-    // The file API — read AND write — is scoped to server-owned roots, not to
-    // the calling user: every client device sees the same tree. That is the
-    // single-operator model the feature was designed for, and it is inherited
-    // unchanged from the Phase-1 read API. On a SHARED journal it means any
-    // user's client device can write anywhere in the write roots, which is
-    // very unlikely to be what the operator intended — so say so, loudly,
-    // rather than let a team deploy discover it later.
-    const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n ?? 0
-    if (userCount > 1) {
-      console.warn(`SECURITY: file writes are enabled on a journal with ${userCount} users. The write roots are GLOBAL — they are not scoped per user, so every user's client devices can overwrite, move and delete anything inside them. Enable writes only on a single-operator journal, or narrow MATRON_FILE_WRITE_ROOTS accordingly.`)
-    }
-  }
-  // File Explorer owner (MATRON_FILE_OWNER_USER_ID): the one user whose client
-  // devices may use /files*. Authentication proves a device is ours; this is
-  // the authorization dimension — the read/write roots are the server's disk,
-  // not a per-user space, so no other user (admin or not) may reach them.
-  // Fails closed: absent/unparseable leaves the routes answering 500.
-  const resolvedFileOwnerUserId = parseOwnerUserId(
-    fileOwnerUserId !== undefined
-      ? (fileOwnerUserId === null ? undefined : String(fileOwnerUserId))
-      : process.env.MATRON_FILE_OWNER_USER_ID
-  )
-  if ((resolvedFileReadRoots || resolvedFileEnableWrites) && resolvedFileOwnerUserId === null) {
-    console.error('file API: MATRON_FILE_OWNER_USER_ID is absent or is not a positive integer — every /files request will be refused until it is set')
-  }
-  const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
+  const fileReads = resolveFileReads({ fileReadRoots, fileOwnerUserId, procSelfFdAvailable, fileHomeDir, dbPath: resolvedDbPath, mediaDir: resolvedMediaDir, preapproveKeyPath })
   const hub = makeHub()
   const broker = makeRpcBroker()
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
@@ -1013,10 +795,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
-    fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
-    fileWriteRoots: resolvedFileWriteRoots, fileEnableWrites: resolvedFileEnableWrites,
-    fileWritesDryRun: resolvedFileWritesDryRun, fileAuditDir: resolvedFileAuditDir, fileWriteMaxBytes,
-    fileOwnerUserId: resolvedFileOwnerUserId,
+    fileReads,
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   })))

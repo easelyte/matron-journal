@@ -21,6 +21,21 @@ test('openDb creates schema idempotently', () => {
   assert.equal(db.pragma('foreign_keys', { simple: true }), 1)
 })
 
+test('openDb leaves retired peer idempotency data intact without creating it in new databases', (t) => {
+  const dir = makeTmpDir('matron-retired-peer-schema-')
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'journal.db')
+  const db = openDb(dbPath)
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='agent_idem'").get(), undefined)
+  db.exec('CREATE TABLE agent_idem(key TEXT PRIMARY KEY, seq INTEGER, expires_at INTEGER)')
+  db.prepare('INSERT INTO agent_idem VALUES(?, ?, ?)').run('legacy', 7, 123)
+  db.close()
+  const reopened = openDb(dbPath)
+  try {
+    assert.deepEqual(reopened.prepare('SELECT * FROM agent_idem').all(), [{ key: 'legacy', seq: 7, expires_at: 123 }])
+  } finally { reopened.close() }
+})
+
 test('events PK is (user_id, seq)', () => {
   const db = openDb(':memory:')
   db.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('a','x',0)").run()
@@ -573,9 +588,7 @@ test('openDb collapses duplicate APNs tokens, keeping the newest device row', ()
 // handed its id straight to the next insert, and a replacement then inherited
 // the revoked device's idempotency namespace (idemKeyOf embeds who.deviceId).
 // AUTOINCREMENT makes the id monotonic and never-reused, closing the hole at
-// the source. By design, the downstream workarounds
-// (file_idem trigger/gen/SET NULL, agent_idem incarnation-binding) are LEFT in
-// place as belt-and-braces and removed in a follow-up.
+// the source. Existing device-reference defenses remain in place.
 
 test('fresh DB: devices.id is AUTOINCREMENT and a revoked id is never reused', async () => {
   const db = openDb(':memory:')
@@ -666,7 +679,7 @@ test('openDb rebuilds a pre-AUTOINCREMENT devices table in place, preserving row
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
 
-test('devices rebuild preserves inbound FK children and the file_idem revoke trigger', (t) => {
+test('devices rebuild preserves inbound FK children', (t) => {
   const dir = makeTmpDir('matron-devices-ai-fk-')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-ai.db')
@@ -690,28 +703,19 @@ test('devices rebuild preserves inbound FK children and the file_idem revoke tri
     DROP TABLE devices;
     ALTER TABLE devices_old RENAME TO devices;
   `)
-  // A joined membership (cascades) and two file_idem reservations for device 6.
+  // A joined membership must survive the rebuild and still cascade.
   raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
   raw.exec("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room',6,5,'joined',0)")
-  raw.exec(`INSERT INTO file_idem(key, device_id, gen, fingerprint, boot_id, state, created_at, expires_at)
-            VALUES('6:done', 6, 'g1', 'fp', 'boot', 'done', 0, 9e18),
-                  ('6:pending', 6, 'g2', 'fp', 'boot', 'pending', 0, 9e18)`)
   raw.close()
 
   const db = openDb(dbPath)
   assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql, /AUTOINCREMENT/)
   // Children carried across the parent rebuild.
   assert.equal(db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=6").get().n, 1)
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM file_idem').get().n, 2)
   assert.equal(db.pragma('foreign_key_check').length, 0)
 
-  // The BEFORE DELETE trigger was dropped with the old table and must be back:
-  // revoking device 6 drops its SETTLED file_idem row and detaches the PENDING
-  // one, and cascades its membership.
+  // Revocation still cascades membership.
   db.prepare('DELETE FROM devices WHERE id=6').run()
-  assert.equal(db.prepare("SELECT COUNT(*) n FROM file_idem WHERE key='6:done'").get().n, 0, 'settled row dropped by trigger')
-  const pending = db.prepare("SELECT device_id FROM file_idem WHERE key='6:pending'").get()
-  assert.equal(pending.device_id, null, 'pending row detached to a tombstone, not deleted')
   assert.equal(db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=6").get().n, 0, 'membership cascaded')
   db.close()
 })

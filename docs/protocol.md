@@ -584,9 +584,9 @@ the machine-checkable version of this page.
   `status` op), present only once the session has reported one;
   `mission_num` is the number of the session's current mission, `null`
   when it has none (or, for an ordinary agent, when that mission was born
-  on a private box). Scoped to the
-  caller's own user like every other read. See "Agent chat rooms" below for
-  what a room and `summary` are.
+  on a private box). Scoped to
+  the caller's own user like every other read. See "Agent chat rooms" below
+  for what a room and `summary` are.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
