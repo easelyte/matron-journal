@@ -80,10 +80,9 @@ the machine-checkable version of this page.
   or not — gets `snippet` omitted from every row (it can carry `tool_output`
   text, a credential surface); an ordinary (non-private) agent additionally
   has private-owned conversations excluded entirely — see "Device privacy"
-  below. Conversations are ordered by last message time, exactly as `/roster`
-  documents below: `COALESCE(last_ts, created_at) DESC, id DESC`, so non-message
-  activity (`session_status`/`convo_meta`/`read_marker`) never resurfaces an
-  idle conversation.
+  below. Conversations use the same ordering as `/roster`:
+  `COALESCE(last_ts, created_at) DESC, id DESC`. Status, metadata and
+  read-marker events do not move idle conversations ahead of newer messages.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -130,7 +129,9 @@ the machine-checkable version of this page.
   another user (or a nonexistent one) yields the same empty result set
   the user-scoping already guarantees for a genuinely-unmatched query —
   there is no separate existence check, so this is not an oracle for
-  "does this convo_id exist." Results are ranked by `sm.is_diff` first (a
+  "does this convo_id exist." For 2–8 whitespace-separated query terms,
+  adjacent, in-order prose matches rank first. Within each tier, results
+  are ranked by `sm.is_diff` (a
   `diff` hit ranks below every prose hit matching the same terms — a code
   change is rarely what "why did we do this" means), then FTS5 `bm25()`
   (best match first), ties broken by `ts DESC`; `snippet` is the FTS5
@@ -141,11 +142,12 @@ the machine-checkable version of this page.
   only read its transcript. `mission_num` is the number of the hit's
   conversation's current mission (same pointer `mode=chats` reports, see
   below), sieved the same way for an ordinary agent caller, or `null` when
-  it isn't on one. `why` is `'phrase'` when the hit holds the query's terms adjacent
-  and in order (2–8 terms, prose only; these rank first), `'words'` when it
-  matched every query term, or `'some_words'` when it is part of the fallback described next.
-  Fewer than 5 `'words'` hits, with `q` carrying 2+ terms, runs the same
-  query again matching ANY term (still FTS-quoted, same ordering, same
+  it isn't on one. `why` is `'exact'` for the adjacent prose tier (the same value the tracker tiers report for a phrase match),
+  `'words'` for other hits matching every query term, or `'some_words'`
+  for the fallback described next. Clients should treat an unknown `why`
+  as a plain match. Fewer than 5 combined `'exact'` and `'words'` hits,
+  with `q` carrying 2+ terms, runs the same query again matching ANY term
+  (still FTS-quoted, same ordering, same
   privacy and subagent filters) for up to the remaining `limit`, excluding
   seqs already returned, and tags those `'some_words'` — ranked search
   never goes from a handful of exact hits to nothing just because no
@@ -571,16 +573,14 @@ the machine-checkable version of this page.
   `[{id, title, session_state, last_seq, summary, agent_device_id,
   created_at, last_ts, mission_num, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
-  chat targets), ordered by last message time —
-  `COALESCE(last_ts, created_at) DESC, id DESC` (most recent message first,
-  falling back to the conversation's own `created_at` when it has no message
-  events, with the immutable `id` as a stable tie-break). Deliberately NOT
-  `last_seq DESC`: a `session_status`/`convo_meta`/`read_marker` event advances
-  `last_seq` without being a message, so a `last_seq` order resurfaced an idle
-  conversation to the top on non-message activity. `last_ts` is the newest
-  **message** event's timestamp (`null` for a conversation with no message
-  events), same derivation as `/snapshot`; `status` is the session's persisted
-  header `{reported_at, model?, context?, stall?, limits?}` (see the agent
+  chat targets), ordered by `COALESCE(last_ts, created_at) DESC, id DESC`:
+  newest last message first, falling back to `created_at` when there are no
+  message events, then immutable id descending for ties. `last_seq` still
+  advances on non-message events and does not determine list order.
+  `last_ts` is the newest message event's timestamp (`null` when there are
+  no message events), same derivation as `/snapshot`; `status` is the
+  session's persisted header
+  `{reported_at, model?, context?, stall?, limits?}` (see the agent
   `status` op), present only once the session has reported one;
   `mission_num` is the number of the session's current mission, `null`
   when it has none (or, for an ordinary agent, when that mission was born
@@ -966,14 +966,19 @@ Rows from before the stamp carry neither, and don't count.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
-  `hello` may carry an optional `max_replay` (non-negative integer) that
-  **lowers** the valve for that connection only: the server trips
-  `snapshot_required` when the gap exceeds `min(MATRON_MAX_REPLAY,
-  max_replay)`. It can never raise the server's limit, and any other value
-  (negative, fractional, non-number) is ignored rather than rejected, so an
-  older client that omits it is unaffected. The web client sends 500: it
-  applies replayed rows one at a time, and past a few hundred rows a
-  snapshot is far cheaper than the replay.
+  Clients may send an optional `hello.max_replay` (non-negative integer) to
+  lower the replay ceiling to `min(MATRON_MAX_REPLAY, max_replay)` for that
+  connection, allowing a snapshot instead of costly per-event replay on
+  mobile devices. It cannot raise the server limit. Zero requests a snapshot
+  whenever replay would carry any events; equality still replays. Omitted
+  or invalid values are ignored, as is the field on agent connections.
+  A very low ceiling can loop on a busy account: events that land between
+  `GET /snapshot` and the reconnect count as a gap, so the reconnect gets
+  `snapshot_required` again. Send `max_replay` on ordinary connects only;
+  on the reconnect straight after a snapshot, omit it (or send a generous
+  value) so that reconnect always replays.
+  Live-only connections (`cursor: null` or omitted) are unaffected. For
+  `for_you`, the lower ceiling applies to the scoped count described below.
 - **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
   and what a client that sends nothing gets) carries every event of every
   conversation. `'for_you'` is for a phone that follows only the tracker:
@@ -1322,6 +1327,17 @@ Rows from before the stamp carry neither, and don't count.
   `up_to_seq >= last_seq` always resets it to 0. Certain event kinds are
   never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
   and `edit` (not new activity).
+- Silent events: a message-type event (`text`, `prompt`, `file`, …) whose
+  payload carries `silent: true` is content the user can read in the chat
+  but is never told about. It appears in the conversation, replays and
+  fans out like any other event, and its buttons work; but it never
+  increments `unread_count` (at append or in a `read_marker` recompute),
+  never triggers an APNs alert, and is never listed as unseen. Only the
+  literal `true` counts. A bridge sets it on a card that only records
+  something, such as the Send now / Cancel card for a reminder an agent
+  set itself. Clients that count unread or raise notifications themselves
+  apply the same rule to the event: skip the count and the notification,
+  still show the row.
 - `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
   (payload is opaque to the server — no field-level validation or size caps
   enforced; the server only checks the payload is a non-null object; any
@@ -4322,7 +4338,8 @@ private-owned moves). Bad parameters are 400 `{error:'bad_request'}`.
 | Route | Query | Response |
 |---|---|---|
 | `GET /timeline/weeks` | `before?` a Monday week key; `limit?` integer 1..52, default 12 | `{weeks:[{week, start, end, sentence, moved, written}], next_before}` — newest first from the current week (or the week before `before`) back to the week of the user's earliest mission, quiet weeks included. `moved` is how many projects moved; `sentence` is the first sentence of the Coordinator's lede for a written week, else a summary of the moves. `written` is true when the Coordinator has written the week (a lede, a story or the final flag; a row holding only notes is not written). `next_before` is the week key to pass for the next page, `null` at the end. |
-| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, written_at, stories:[{title, project, projects, sentence, next, needs_you, media, marks}], also:[{…project ref, moved}]}` — one week. Unwritten: a story per project that moved, most moves first, at most 8, the rest under `also`; `title` and `lede` are `null`, `projects` is `[project]`, `written_at` is `null`, `sentence` is the newest milestone title that week, `needs_you` the project's open items awaiting the user (consent cards left out, only items created before the week ended) and `media` its newest image or video that week, or `null`. Written: the Coordinator's `lede`, `written_at` and stories in its order; `project` is the first of `projects` (the projects the story is about, merged ones through to the survivor), `needs_you` the items it named as `{id, num, title, done}` (`done` is true once an item no longer awaits the user), `media` its chosen picture (or the week's newest picture when that one is gone or hidden), and `also` the moving projects no story names. A written week is **one card per project**: when two stored stories have the same main project (`project`: a week written as grouped stories, or a merge after the write) only the first is returned. A week written through `…/entries` has `lede: null` and every story's `title: null`. Every story carries `marks: {for_you, done, next}`, counted when read and through the caller's sieve, never stored: `for_you` is how many open items of the main project await the user (consent cards left out, only items created before the week ended), `done` how many of its items were closed in the week (consent cards left out), `next` whether the story has a `next` (always `false` for an unwritten week). `final` is true for a week that has ended or was written final, false for the current week. A `:week` that is not a real Monday key is 400. |
+| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, written_at, stories:[{title, project, projects, sentence, next, needs_you, media, marks}], also:[{…project ref, moved}]}` — one week. Unwritten: a story per project that moved, most moves first, at most 8, the rest under `also`; `title` and `lede` are `null`, `projects` is `[project]`, `written_at` is `null`, `sentence` is the newest milestone title that week, `needs_you` the project's open items awaiting the user (consent cards left out, only items created before the week ended) and `media` its newest image or video that week, or `null`. Written: the Coordinator's `lede`, `written_at` and stories in its order; `project` is the first of `projects` (the projects the story is about, merged ones through to the survivor), `needs_you` the items it named as `{id, num, title, done}` (`done` is true once an item no longer awaits the user), `media` its chosen picture (or the week's newest picture when that one is gone or hidden), and `also` the moving projects no story names. `also` holds refs only; the same projects, in the same order, can be read as cards through `GET /timeline/weeks/:week/projects`. A written week is **one card per project**: when two stored stories have the same main project (`project`: a week written as grouped stories, or a merge after the write) only the first is returned. A week written through `…/entries` has `lede: null` and every story's `title: null`. Every story carries `marks: {for_you, done, next}`, counted when read and through the caller's sieve, never stored: `for_you` is how many open items of the main project await the user (consent cards left out, only items created before the week ended), `done` how many of its items were closed in the week (consent cards left out), `next` whether the story has a `next` (always `false` for an unwritten week). `final` is true for a week that has ended or was written final, false for the current week. A `:week` that is not a real Monday key is 400. |
+| `GET /timeline/weeks/:week/projects` | `offset?` integer from 0, default 0; `limit?` integer 1..50, default 24 | `{week, total, offset, next_offset, projects:[{project, moved, sentence, media, marks}]}` — the projects `GET /timeline/weeks/:week` lists under `also`, as cards, a page at a time, so the apps can show every project that moved: exactly that list for the same caller, in the same order (most moves first, ties by number). Unwritten week: the moving projects past the first 8; written: the moving projects no shown story names. `project` is a project ref and `moved` its moves that week. `sentence` is the project's newest milestone title that week, else its status (clipped to 300 characters, ending in `…` when cut; a status written from or by a private device reads as `null` for a filtered caller), else `null`. `media` is its newest image or video that week, or `null`. `marks: {for_you, done, next}` are counted as on the week read's stories (`next` is always `false`). `total` counts the whole list, `offset` echoes the request and `next_offset` is the `offset` of the next page, `null` on the last. A bad `offset` or `limit`, or a `:week` that is not a real Monday key, is 400. Who may read it and the privacy sieve are those of `GET /timeline/weeks/:week`. A journal without this route answers 404. |
 | `GET /timeline/weeks/:week?raw=1` | `offset?` integer from 0, default 0; `limit?` integer 1..20, default 12 | Agents only (a client is 403). What the Coordinator writes a week from, a page of projects at a time: `{week, start, end, final, written_at, current, stored, projects, projects_total, offset, next_offset, more_projects}`. `final` is true for every week that has ended (and for one written final), so it does not say whether the week has been closed by a write: that is `stored.final`. `current` is true for the current week. `projects` are the projects that moved, most moves first, from `offset`, at most `limit` of them, each `{project, moved, status, milestones, items, media, needs_you}`: up to 6 `milestones` `{title, kind, at}`, up to 6 `items` with activity that week `{id, num, title, kind, state, awaiting, at}`, up to 3 pictures or videos `{blob_id, content_type, name, at}`, and `needs_you` — up to 5 open items awaiting the user `{id, num, title}` that were created before the week ended, newest first, whatever the week's activity (consent cards left out). Every list is newest first. Text is clipped, ending in `…` when cut: a milestone or item title (a stored story's items included) and a file name to 140 characters, `status` to 300. `projects_total` counts every project that moved, `offset` echoes the request, `more_projects` is how many come after this page and `next_offset` is the `offset` of the next page, `null` on the last. **The response never exceeds 36,000 characters of JSON**: while it would, the page gives up its last project (never its only one), so a page can hold fewer than `limit`, and `next_offset` always follows what was returned. `stored` is the written week with ids as refs, on the first page only (`offset=0`); `null` on later pages and for an unwritten week (`written_at` tells the two apart): `{lede, final, legacy, stories:[{title, sentence, next, projects, items:[{id, num, title}], media_blob_id}], items_omitted?, projects_omitted?}`. `legacy` is true when the week was written as grouped stories (a story with a title, or one naming more than one project) rather than one entry per project. When a page down to one project is still over the bound, the stored stories come back with `items: []` and `items_omitted: true`, and if that is not enough with only their first project and `projects_omitted: true`; both keys are absent otherwise. A bad `offset` or `limit` is 400. Always under the agent privacy sieve, on a private device too. |
 | `GET /timeline/weeks/:week?raw=1&index=1` | | Agents only (a client is 403). The whole week in one response, for choosing which projects to read in full: `{week, start, end, final, written_at, current, stored, projects_total, projects, more_projects}`; `week` to `current` are as on the paged read. `projects` is **every** project that moved, ranked as the pages rank them (most moves first, ties by number), one compact row each: `{id, num, title, moved, milestones, done, for_you, media, newest}` — `moved` its moves that week, `milestones` how many it posted, `done` how many of its items were closed that week, `for_you` how many of its open items await the user (only items created before the week ended), `media` how many pictures or videos it has that week, and `newest` the title of its newest milestone that week, `null` without one. Consent cards are in no count; a project merged into another counts for its survivor. `title` is clipped to 80 characters and `newest` to 100, ending in `…` when cut. `stored` is `null` for an unwritten week, else `{final, legacy, entries:[{project, sentence}]}`: each stored story as its main project (through a merge to the survivor; a story left with no project the caller may see is left out) and its sentence, `legacy` as on the paged read. `projects_total` counts every project that moved. **The response never exceeds 36,000 characters of JSON.** A week too crowded for that gives up, from the last-ranked project upward and only as far as needed: first `newest` (`null`), then the `title` beyond 40 characters, then the project itself; `more_projects` counts the projects left off the end (`0` when none were). About 200 projects fit whole, however long their names. Takes no paging: with `offset`, `limit` or `projects` it is 400, as is an `index` other than `1`. Always under the agent privacy sieve, on a private device too. |
 | `GET /timeline/weeks/:week?raw=1&projects=<refs>` | `projects` 1..12 comma-separated project ids or numbers | Agents only (a client is 403). The paged read's body for exactly the named projects, plus `omitted`: `{week, start, end, final, written_at, current, stored, projects, projects_total, offset, next_offset, more_projects, omitted}`. `projects` holds each named project the caller may see, in the order given and once each, in the page's shape and under its caps and clipping. A reference is followed through a merge to the project that survived it; one that names nothing, or a project hidden by the privacy sieve, is silently left out; a project that did not move that week is included with `moved: 0` and whatever it has (its status and the items awaiting the user). `projects_total` is still the number of projects that moved that week; `offset` is `0`, `next_offset` `null` and `more_projects` `0`; `stored` is as on the first page. **The response never exceeds 36,000 characters of JSON**: while it would, the last project is dropped (never the only one) and its id listed in `omitted`, in the order given, so asking again for those ids reads the rest; `omitted` is `[]` otherwise. No reference, more than 12, or a malformed one (anything but a `pj_…` id or a positive integer) is 400, as is `projects` together with `index`, `offset` or `limit`. Always under the agent privacy sieve, on a private device too. |
@@ -4448,7 +4465,9 @@ when any of these is true:
   or by the prompt's own `payload.prompt_id` (how a bridge settles a card
   itself: a queued message it sent at turn end);
 - it is a prompt whose payload says `blocking: false` (a card nothing
-  waits on, such as a reminder the agent set itself).
+  waits on, such as a reminder the agent set itself);
+- its payload says `silent: true` (see *Unread semantics*). A silent event
+  is also never the conversation's `final` message: the one before it is.
 
 An open, non-consent item is unseen while it has agent content (its creation,
 or an agent comment) newer than what `item_seen` covers, and the user hasn't

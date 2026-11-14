@@ -90,16 +90,15 @@ export function runOffload(db, opts) {
 export function* offloadPass(db, { days = 30, mediaDir, batchSize = RETENTION_ROW_BATCH }) {
   const cutoff = Date.now() - days * 86400000
   const page = db.prepare(
-    // No json filter here: live-log and tombstoned rows (~26k on the live DB)
-    // are skipped by the loop below instead. A filter in SQL reads every one
-    // of those payloads before it can return the first due row, and on a
-    // cold page cache that one statement held the loop for 8 s. Paging on
-    // the index alone bounds each stretch to `batchSize` payload reads.
+    // No json filter here: live-log and tombstoned rows are skipped by the
+    // loop below instead. A filter in SQL reads every one of those payloads
+    // before it can return the first due row, and on a cold page cache that
+    // one statement held the loop for 8 s on a 1.6 GB DB. Paging on the
+    // index alone bounds each stretch to `batchSize` payload reads.
     // type is a literal, not a bound parameter: the partial index
     // idx_events_offload_pending is only usable when SQLite can see it.
     // Read in pages of `batchSize` on a (ts, rowid) cursor, in index order,
-    // so one stretch never loads more than a page of payloads (a single
-    // up-front read of ~1k due payloads held the loop for seconds).
+    // so one stretch never loads more than a page of payloads.
     "SELECT rowid AS rid, user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
     // `ts >= ?` is the index lower bound (the OR alone is not one, and
     // every page would re-walk the skipped live-log rows before the cursor).
@@ -173,14 +172,19 @@ export function runExpireLogs(db, opts) {
 
 export function* expireLogsPass(db, { hours = 24, mediaDir, batchSize = RETENTION_ROW_BATCH }) {
   const cutoff = Date.now() - hours * 3600000
-  const rows = db.prepare(
-    "SELECT user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
-    "AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL"
-  ).all(cutoff)
+  // Read in pages of `batchSize` on a (ts, rowid) cursor, in index order
+  // (idx_events_logs_pending), so a large backlog never loads more than a
+  // page of payloads in one stretch. The cursor, not "expired rows leave the
+  // filter", is what advances: a row skipped below stays in the filter.
+  // `ts >= ?` is the index lower bound (the OR alone is not one).
+  const page = db.prepare(
+    "SELECT rowid AS rid, ts, user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
+    "AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL " +
+    'AND ts >= ? AND (ts > ? OR rowid > ?) ORDER BY ts, rowid LIMIT ?'
+  )
 
   let expired = 0
-  // Guarded on the payload the scan read, as in offloadPass: the pass
-  // yields between batches.
+  // Guarded on the payload the scan read, as in offloadPass.
   const update = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=? AND payload=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
   // `conversations.last_seq` is bumped by EVERY event append (read_marker,
@@ -195,50 +199,56 @@ export function* expireLogsPass(db, { hours = 24, mediaDir, batchSize = RETENTIO
   )
   const updateConvoSnippet = db.prepare('UPDATE conversations SET snippet=? WHERE id=?')
 
-  let sinceYield = 0
-  for (const row of rows) {
-    if (sinceYield >= batchSize) { sinceYield = 0; yield }
-    sinceYield += 1
-    let payload
-    try { payload = JSON.parse(row.payload) } catch { payload = null }
-    if (!payload || payload.live_log !== true) continue // defense in depth; SQL already filters
-    const blob = row.blob_ref ? getBlob(db, row.blob_ref) : null
-    const tombstone = {
-      message_ref: payload.message_ref,
-      command: payload.command,
-      exit_code: payload.exit_code,
-      denied: payload.denied,
-      truncated: payload.truncated,
-      live_log: true,
-      expired: true,
-      blob_ref: null,
-    }
-    const done = db.transaction(() => {
-      if (!update.run(JSON.stringify(tombstone), row.user_id, row.seq, row.payload).changes) return false
-      if (row.blob_ref) deleteBlobRow.run(row.blob_ref)
-      // Purged output must not linger in the conversation-list preview: if
-      // this event is still the convo's latest MESSAGE_TYPES event, rewrite
-      // the preview from the tombstone ($ <command>). A newer message-type
-      // event owns the preview otherwise.
-      const latest = latestMessageSeq.get(row.convo_id, ...MESSAGE_TYPES)
-      if (latest && latest.seq === row.seq) {
-        updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
+  let ts = Number.MIN_SAFE_INTEGER
+  let rid = 0
+  for (;;) {
+    const rows = page.all(cutoff, ts, ts, rid, batchSize)
+    if (rows.length === 0) break
+    ts = rows[rows.length - 1].ts
+    rid = rows[rows.length - 1].rid
+    for (const row of rows) {
+      let payload
+      try { payload = JSON.parse(row.payload) } catch { payload = null }
+      if (!payload || payload.live_log !== true) continue // defense in depth; SQL already filters
+      const blob = row.blob_ref ? getBlob(db, row.blob_ref) : null
+      const tombstone = {
+        message_ref: payload.message_ref,
+        command: payload.command,
+        exit_code: payload.exit_code,
+        denied: payload.denied,
+        truncated: payload.truncated,
+        live_log: true,
+        expired: true,
+        blob_ref: null,
       }
-      return true
-    })()
-    if (!done) continue
-    if (blob) {
-      try {
-        fs.unlinkSync(blob.disk_path)
-      } catch (err) {
-        // ENOENT ("already gone") is the expected steady state — the DB row
-        // is the source of truth and is already committed as purged. Any
-        // other error (EACCES/EIO/...) means the bytes are still on disk
-        // while the DB claims purged, which is worth surfacing loudly.
-        if (err.code !== 'ENOENT') console.error(`retention: failed to unlink blob ${blob.id} at ${blob.disk_path}`, err)
+      const done = db.transaction(() => {
+        if (!update.run(JSON.stringify(tombstone), row.user_id, row.seq, row.payload).changes) return false
+        if (row.blob_ref) deleteBlobRow.run(row.blob_ref)
+        // Purged output must not linger in the conversation-list preview: if
+        // this event is still the convo's latest MESSAGE_TYPES event, rewrite
+        // the preview from the tombstone ($ <command>). A newer message-type
+        // event owns the preview otherwise.
+        const latest = latestMessageSeq.get(row.convo_id, ...MESSAGE_TYPES)
+        if (latest && latest.seq === row.seq) {
+          updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
+        }
+        return true
+      })()
+      if (!done) continue
+      if (blob) {
+        try {
+          fs.unlinkSync(blob.disk_path)
+        } catch (err) {
+          // ENOENT ("already gone") is the expected steady state — the DB row
+          // is the source of truth and is already committed as purged. Any
+          // other error (EACCES/EIO/...) means the bytes are still on disk
+          // while the DB claims purged, which is worth surfacing loudly.
+          if (err.code !== 'ENOENT') console.error(`retention: failed to unlink blob ${blob.id} at ${blob.disk_path}`, err)
+        }
       }
+      expired += 1
     }
-    expired += 1
+    yield
   }
   return { expired }
 }

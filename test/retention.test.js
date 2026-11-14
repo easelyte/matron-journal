@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
@@ -1693,25 +1694,7 @@ test('MATRON_DEVICE_RETENTION: the pass runs at boot and logs its rules once; an
   }
 })
 
-test('the first retention pass waits for retentionInitialDelayMs instead of running at boot', async (t) => {
-  const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-retention-delay-')
-  const dbPath = path.join(dir, 'test.db')
-  const preDb = openDb(dbPath)
-  const alice = await createUser(preDb, 'alice', 'pw')
-  upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
-  const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'late offload', body: 'x'.repeat(200) } })
-  preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
-  preDb.close()
-
-  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 200 })
-  t.after(() => s.close())
-  assert.equal(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref, null, 'nothing offloaded at boot')
-  await new Promise((resolve) => setTimeout(resolve, 600))
-  assert.ok(s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref, 'the deferred pass ran')
-})
-
-test('retention scans use their partial indexes, and runOffload skips live-log, tombstoned and pre-purge rows', async () => {
+test('retention scans use their partial indexes, and the offload page skips rows it would only pass over', async () => {
   const { db, alice } = await setup()
   const mediaDir = tmpMediaDir()
   const mk = (payload, raw) => {
@@ -1728,7 +1711,6 @@ test('retention scans use their partial indexes, and runOffload skips live-log, 
   const plan = (sql) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(Date.now()).map((r) => r.detail).join(' | ')
   assert.match(plan("SELECT user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
     "AND json_valid(payload) AND json_extract(payload,'$.live_log') AND json_extract(payload,'$.expired') IS NULL"), /idx_events_logs_pending/)
-  assert.match(plan("SELECT user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL"), /idx_events_offload_pending/)
   const r = runOffload(db, { days: 30, mediaDir })
   assert.equal(r.offloaded, 2)
 })
@@ -1814,6 +1796,152 @@ test('offloadPass reads each page after its pause: a row rewritten meanwhile is 
   assert.doesNotMatch(plan, /TEMP B-TREE/, 'pages walk the index in order, no sort')
 })
 
+test('offloadPass pages through rows that share a timestamp without skipping or repeating any', async () => {
+  const { offloadPass } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const ts = Date.now() - 40 * 86400000
+  for (let i = 0; i < 5; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(100) } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(ts, alice.id, r.seq)
+  }
+  const gen = offloadPass(db, { days: 30, mediaDir, batchSize: 2 })
+  let r = gen.next()
+  while (!r.done) r = gen.next()
+  assert.deepEqual(r.value, { offloaded: 5 })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 5)
+})
+
+test('the scheduled retention pass yields: a timer fires while it runs', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-yield-'))
+  const dbPath = path.join(dir, 'test.db')
+  const preDb = openDb(dbPath)
+  const alice = await createUser(preDb, 'alice', 'pw')
+  upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
+  preDb.close()
+  // The pass at boot is synchronous and finds nothing; the rows below are
+  // written after it, so the first timed (asynchronous) pass picks them up.
+  const s = await startTestServer({ dbPath, retentionDays: 30, retentionIntervalMs: 100 })
+  t.after(() => s.close())
+  for (let i = 0; i < 300; i++) {
+    const r = append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(200) } })
+    s.db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
+  }
+  const pending = () => s.db.prepare('SELECT COUNT(*) n FROM events WHERE type=\'tool_output\' AND blob_ref IS NULL').get().n
+  let sawMidPass = false
+  const deadline = Date.now() + 10000
+  while (pending() > 0 && Date.now() < deadline) {
+    if (pending() < 300) sawMidPass = true
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(pending(), 0, 'the pass finished')
+  assert.ok(sawMidPass, 'the loop ran between batches of the pass')
+})
+
+test('expireLogsPass reads and yields in pages of batchSize, reads each page fresh (a row edited while paused is left alone), and stops when closed', async () => {
+  const { expireLogsPass } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const seqs = []
+  for (let i = 0; i < 7; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}`, snippet: 'out' } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
+    seqs.push(r.seq)
+  }
+  const expiredCount = () => db.prepare("SELECT COUNT(*) n FROM events WHERE json_extract(payload,'$.expired') = 1").get().n
+  const gen = expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 })
+  assert.equal(gen.next().done, false)
+  assert.equal(expiredCount(), 2, 'exactly one page before the first yield')
+  // A row that stops being a live log while paused is simply not in the next page.
+  const rewritten = JSON.stringify({ command: 'edited', snippet: 'new' })
+  db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(rewritten, alice.id, seqs[2])
+  assert.equal(gen.next().done, false)
+  assert.equal(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).payload, rewritten, 'a row that is no longer a live log is left alone')
+  assert.equal(expiredCount(), 4, 'the next page holds the next two live logs')
+  // Closed before the last page (as a stopped drainAsync closes it): the
+  // remaining rows survive and the next pass takes them.
+  gen.return()
+  assert.equal(expiredCount(), 4)
+  assert.deepEqual(runExpireLogs(db, { hours: 24, mediaDir }), { expired: 2 })
+})
+
+test('expireLogsPass pages past rows it cannot expire instead of re-reading them', async () => {
+  const { expireLogsPass, drainAsync } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  // live_log truthy but not `true`: matches the SQL filter, skipped by the
+  // JS guard, never leaves the filter. Pages of 2 must still reach the rest.
+  for (let i = 0; i < 4; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: 1, command: `s${i}` } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 49 * 3600000, alice.id, r.seq)
+  }
+  for (let i = 0; i < 3; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}` } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
+  }
+  const r = await drainAsync(expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 }), {
+    yieldFn: () => new Promise((resolve) => setImmediate(resolve)),
+  })
+  assert.deepEqual(r, { expired: 3 })
+})
+
+test('runOffload offloads a payload whose live_log, expired and blob_expired flags are all false', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const flags = [{ live_log: false }, { expired: false }, { blob_expired: false }]
+  const seqs = flags.map((f, i) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-2', type: 'tool_output', payload: { command: `c${i}`, snippet: 'output', ...f } })
+    backdate(db, r.seq, alice.id, 40)
+    return r.seq
+  })
+  assert.equal(runOffload(db, { days: 30, mediaDir }).offloaded, 3)
+  for (const seq of seqs) {
+    const row = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seq)
+    assert.ok(row.blob_ref, 'false-valued flag stays eligible for offload')
+    assert.equal(JSON.parse(row.payload).blob_ref, row.blob_ref)
+  }
+})
+
+test('the first retention pass defaults to two minutes, runs async, accepts an override, and is cancelled on close', async (t) => {
+  // Exercise scheduling without opening a socket.
+  t.mock.method(http.Server.prototype, 'listen', function (_port, _bind, ready) { queueMicrotask(ready); return this })
+  t.mock.method(http.Server.prototype, 'address', () => ({ port: 0 }))
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-delay-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const delay of [undefined, 200, 0]) {
+    const dbPath = path.join(dir, `delay-${delay}.db`)
+    const preDb = openDb(dbPath)
+    const alice = await createUser(preDb, 'alice', 'pw')
+    upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
+    const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'deferred' } })
+    backdate(preDb, r.seq, alice.id, 40)
+    preDb.close()
+
+    const s = await startTestServer({ dbPath, retentionInitialDelayMs: delay })
+    const blobRef = () => s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref
+    if (delay !== 0) {
+      assert.equal(blobRef(), null)
+      t.mock.timers.tick((delay ?? 120000) - 1)
+      assert.equal(blobRef(), null)
+      t.mock.timers.tick(1)
+      // The delayed pass is the async one: it starts on the timer, not
+      // inside it, and finishes after yielding to the loop.
+      for (let i = 0; i < 50 && !blobRef(); i++) await new Promise((resolve) => setImmediate(resolve))
+    }
+    assert.ok(blobRef(), 'the first pass ran at the configured delay')
+    await s.close()
+  }
+  const errors = t.mock.method(console, 'error', () => {})
+  const s = await startTestServer({ retentionInitialDelayMs: 200 })
+  await s.close()
+  t.mock.timers.tick(200)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(errors.mock.callCount(), 0, 'closed server must not run retention against its closed database')
+})
+
 test('reapOrphanBlobsPass scans in rowid ranges and still sees a payload reference written while it was paused', async () => {
   const { reapOrphanBlobsPass } = await import('../src/retention.js')
   const { db, alice } = await setup()
@@ -1838,53 +1966,3 @@ test('reapOrphanBlobsPass scans in rowid ranges and still sees a payload referen
   assert.ok(getBlob(db, late.id), 'a reference written mid-scan keeps its blob')
 })
 
-test('the scheduled (deferred) retention pass yields: a timer fires while it runs', async (t) => {
-  const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-retention-yield-')
-  const dbPath = path.join(dir, 'test.db')
-  const preDb = openDb(dbPath)
-  const alice = await createUser(preDb, 'alice', 'pw')
-  upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
-  for (let i = 0; i < 300; i++) {
-    const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: `s${i}`, output: 'x'.repeat(200) } })
-    preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
-  }
-  preDb.close()
-  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 50 })
-  t.after(() => s.close())
-  const pending = () => s.db.prepare('SELECT COUNT(*) n FROM events WHERE type=\'tool_output\' AND blob_ref IS NULL').get().n
-  let sawMidPass = false
-  const deadline = Date.now() + 10000
-  while (pending() > 0 && Date.now() < deadline) {
-    if (pending() < 300) sawMidPass = true
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-  assert.equal(pending(), 0, 'the pass finished')
-  assert.ok(sawMidPass, 'the loop ran between batches of the pass')
-})
-
-test('expireLogsPass yields every batchSize rows, keeps a row rewritten while paused, and stops when closed', async () => {
-  const { expireLogsPass } = await import('../src/retention.js')
-  const { db, alice } = await setup()
-  const mediaDir = tmpMediaDir()
-  const seqs = []
-  for (let i = 0; i < 5; i++) {
-    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}`, snippet: 'out' } })
-    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
-    seqs.push(r.seq)
-  }
-  const expiredCount = () => db.prepare("SELECT COUNT(*) n FROM events WHERE json_extract(payload,'$.expired') = 1").get().n
-  const gen = expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 })
-  assert.equal(gen.next().done, false)
-  assert.equal(expiredCount(), 2, 'exactly one batch before the first yield')
-  const rewritten = JSON.stringify({ live_log: true, command: 'edited', snippet: 'new' })
-  db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(rewritten, alice.id, seqs[2])
-  assert.equal(gen.next().done, false)
-  assert.equal(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).payload, rewritten, 'a row changed after the read is not overwritten')
-  assert.equal(expiredCount(), 3)
-  // Closed before the last batch (as a stopped drainAsync closes it): the
-  // remaining row survives, and the next pass also re-reads the rewritten one.
-  gen.return()
-  assert.equal(expiredCount(), 3)
-  assert.deepEqual(runExpireLogs(db, { hours: 24, mediaDir }), { expired: 2 })
-})

@@ -110,6 +110,29 @@ test('auto-archive: idle conversations only, with every exemption', async () => 
   assert.deepEqual(runAutoArchive(db, NOW).size, 0, 'a second pass changes nothing')
 })
 
+test('auto-archive: sub-chat activity uses its newest message by sequence', async (t) => {
+  const { db, alice } = await seedDb()
+  t.after(() => db.close())
+  const cutoff = NOW - 30 * DAY
+  const addEvent = (type, ts, payload) => {
+    const { seq } = append(db, { userId: alice.id, convoId: 'child', sender: 'agent:1', type, payload })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(ts, alice.id, seq)
+  }
+  const candidates = () => autoArchiveCandidates(db, alice.id, 30, NOW)
+
+  assert.deepEqual(candidates(), ['old'], 'an empty sub-chat does not keep its parent')
+  addEvent('text', cutoff - 1, { body: 'old message' })
+  addEvent('session_status', NOW, { state: 'done' })
+  assert.deepEqual(candidates(), ['old'], 'recent non-message events do not count as activity')
+  addEvent('tool_output', cutoff, { body: 'at cutoff' })
+  assert.deepEqual(candidates(), [], 'a message at the cutoff keeps its parent')
+  addEvent('text', cutoff + 1, { body: 'recent message' })
+  addEvent('session_status', NOW, { state: 'done' })
+  assert.deepEqual(candidates(), [], 'a later status does not hide a recent message')
+  addEvent('text', cutoff - 1, { body: 'newest message with an earlier timestamp' })
+  assert.deepEqual(candidates(), ['old'], 'sequence determines the newest message, even if timestamps go backward')
+})
+
 async function fleet(t) {
   const s = await startTestServer({})
   t.after(() => s.close())

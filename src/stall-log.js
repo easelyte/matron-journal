@@ -1,7 +1,6 @@
 // Event-loop stall log. The journal does synchronous SQLite on one thread, so
 // any blocking call (an fsync in a WAL checkpoint, a cold read of a large
-// table under disk pressure) stalls every request, and a client that waits
-// 10 s reports the journal as unreachable. This names the stalls: a timer
+// table under disk pressure) stalls every request. This names the stalls: a timer
 // ticks every `tickMs`; when a tick arrives more than `thresholdMs` late it
 // logs one line with the wall time lost and the process CPU used across it.
 // cpu ~ wall means the thread was busy in JS/SQLite; cpu << wall means it was
@@ -9,7 +8,8 @@
 //
 // `timed(label, fn)` wraps a synchronous call and logs when it alone took
 // longer than `thresholdMs`, so a stall can be matched to the call behind it.
-// Both are log-only: no behaviour change. Off with MATRON_STALL_LOG=0.
+// Diagnostics are on by default. MATRON_STALL_LOG=0 disables the monitor,
+// request wrapper and maintenance timings; the underlying work still runs.
 
 import { performance } from 'node:perf_hooks'
 
@@ -27,6 +27,7 @@ export function startStallLog({
   setIntervalImpl = setInterval,
   clearIntervalImpl = clearInterval,
 } = {}) {
+  if (process.env.MATRON_STALL_LOG === '0') return { stop() {} }
   let last = now()
   let lastCpu = cpu()
   const timer = setIntervalImpl(() => {
@@ -45,6 +46,7 @@ export function startStallLog({
 }
 
 export function timed(label, fn, { thresholdMs = STALL_THRESHOLD_MS, log = (line) => console.warn(line), now = defaultNow } = {}) {
+  if (process.env.MATRON_STALL_LOG === '0') return fn()
   const start = now()
   try {
     return fn()
@@ -57,8 +59,11 @@ export function timed(label, fn, { thresholdMs = STALL_THRESHOLD_MS, log = (line
 // Logs a request that took `thresholdMs` or longer, by method and path (no
 // query string). The event loop is single-threaded, so a request that was
 // slow because the loop was blocked shows up here too, next to the stall
-// line; a request that is itself the blocker ends right at the stall.
+// line; a request that is itself the blocker ends right at the stall. Uses its
+// own "slow request:" prefix because a media download or upload over a slow
+// link is legitimately slow and is not an event-loop stall.
 export function logSlowRequests(handler, { thresholdMs = STALL_THRESHOLD_MS, log = (line) => console.warn(line), now = defaultNow } = {}) {
+  if (process.env.MATRON_STALL_LOG === '0') return handler
   return (req, res) => {
     const start = now()
     let done = false
@@ -66,7 +71,7 @@ export function logSlowRequests(handler, { thresholdMs = STALL_THRESHOLD_MS, log
       if (done) return
       done = true
       const ms = now() - start
-      if (ms >= thresholdMs) log(`stall: request ${req.method} ${String(req.url || '').split('?')[0]} took ${Math.round(ms)}ms (status ${res.statusCode})`)
+      if (ms >= thresholdMs) log(`slow request: ${req.method} ${String(req.url || '').split('?')[0]} took ${Math.round(ms)}ms (status ${res.statusCode})`)
     }
     res.once('finish', finish)
     res.once('close', finish)

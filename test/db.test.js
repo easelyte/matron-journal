@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, upsertDeviceStatus, deviceStatuses } from '../src/db.js'
-import { createUser } from '../src/auth.js'
+import { createUser, createAgent, login, revokeDevice, authorizeAgentWrite } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { makeTmpDir } from './tmp-dir.js'
 import { participantConvoIds } from '../src/participants.js'
@@ -73,8 +73,7 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
   const db = openDb(dbPath)
   const cols = db.prepare('PRAGMA table_info(devices)').all().map((c) => c.name)
   assert.ok(cols.includes('apns_env'), 'apns_env column missing after migration')
-  // Pre-existing row survives untouched, with apns_env now NULL rather than
-  // the row being wiped or rebuilt.
+  // Pre-existing row survives untouched, with apns_env now NULL.
   const row = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=1').get()
   assert.equal(row.apns_token, 'pre-existing-token')
   assert.equal(row.apns_env, null)
@@ -762,46 +761,6 @@ test('devices rebuild seeds the sequence above a dangling conversation owner, no
   db.close()
 })
 
-// Regression: the FK audit runs INSIDE the
-// transaction, so a devices-parent orphan rolls the whole rebuild back and the
-// AUTOINCREMENT DDL never lands. A restart therefore re-attempts and re-fails
-// rather than skipping the (never-completed) migration and booting with the
-// broken FK state silently accepted.
-test('a devices-parent FK violation rolls the rebuild back and re-fails on restart', (t) => {
-  const dir = makeTmpDir('matron-devices-ai-fkfail-')
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  const dbPath = path.join(dir, 'pre-ai.db')
-
-  openDb(dbPath).close()
-  const raw = new Database(dbPath)
-  raw.pragma('foreign_keys = OFF')
-  raw.exec("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)")
-  raw.exec(`
-    CREATE TABLE devices_old(
-      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE, cursor INTEGER NOT NULL DEFAULT 0, apns_token TEXT,
-      created_at INTEGER NOT NULL, last_seen_at INTEGER, apns_env TEXT, push_prefs TEXT,
-      private INTEGER NOT NULL DEFAULT 0, private_pinned INTEGER NOT NULL DEFAULT 0, tag_char TEXT);
-    INSERT INTO devices_old(id, user_id, kind, name, token_hash, created_at) VALUES(1,1,'agent','live','h1',0);
-    DROP VIEW IF EXISTS private_devices;
-    DROP TABLE devices;
-    ALTER TABLE devices_old RENAME TO devices;
-  `)
-  // A convo_agents row pointing at a device (99) that is NOT in devices: a
-  // devices-parent orphan the rebuild's scoped audit must catch.
-  raw.exec("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)")
-  raw.exec("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room',99,1,'joined',0)")
-  raw.close()
-
-  assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'the audit fails the migration')
-  // Rolled back: devices is still the non-AUTOINCREMENT table.
-  const check = new Database(dbPath)
-  assert.doesNotMatch(check.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get().sql, /AUTOINCREMENT/)
-  check.close()
-  // Restart re-attempts and re-fails rather than silently accepting the state.
-  assert.throws(() => openDb(dbPath), /orphaned a child reference/, 'restart does not skip the never-completed migration')
-})
-
 // The high-water scan must be schema-complete, not a
 // hand-list. A revoked id surviving ONLY in items.origin_device_id (an integer
 // column reached by the dynamic *_device_id scan) or ONLY in events.idem_key
@@ -985,9 +944,8 @@ test('schema: causes columns on both ask tables, cause columns on consent_decisi
 })
 
 // device_status rides the device row: a revoked box takes its last report
-// with it, so a replacement that happens to reuse the integer id (devices.id
-// is a plain rowid, not AUTOINCREMENT) cannot inherit the old usage, paths
-// and account email on /devices and /roster until it reports.
+// with it. Even an explicit insert reusing its integer id cannot inherit
+// the old usage, paths and account email on /devices and /roster.
 test('device_status: the row goes with its device on revoke, and a reused id starts clean', () => {
   const db = openDb(':memory:')
   seedDevice(db, 1)
@@ -1240,4 +1198,145 @@ test('openDb rebuilds an old person_rooms table for talk requests, keeping its r
   db.prepare("UPDATE person_rooms SET state='starting' WHERE id='pr_1'").run()
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
+})
+
+// AUTOINCREMENT only changes schema metadata. Remove it on disk to exercise
+// the upgrade from the otherwise current upstream schema, including late columns.
+function legacyDeviceIds(db) {
+  db.unsafeMode(true)
+  db.pragma('writable_schema = ON')
+  db.prepare("UPDATE sqlite_master SET sql=replace(sql, ' AUTOINCREMENT', '') WHERE name='devices'").run()
+  db.pragma('writable_schema = OFF')
+  db.unsafeMode(false)
+  db.prepare("DELETE FROM sqlite_sequence WHERE name='devices'").run()
+}
+
+test('device ids increase after agent revocation, client sign-out, and deleting every device', async (t) => {
+  const db = openDb(':memory:')
+  t.after(() => db.close())
+  const user = await createUser(db, 'alice', 'password')
+  const agent = createAgent(db, user.id, 'agent')
+  revokeDevice(db, agent.deviceId)
+  const client = await login(db, { username: 'alice', password: 'password', deviceName: 'phone' })
+  assert.ok(client.deviceId > agent.deviceId)
+  revokeDevice(db, client.deviceId)
+  const next = createAgent(db, user.id, 'replacement')
+  assert.ok(next.deviceId > client.deviceId)
+  db.prepare('DELETE FROM devices').run()
+  const direct = db.prepare("INSERT INTO devices(user_id,kind,name,token_hash,created_at) VALUES(?,'agent','direct','direct',0)").run(user.id)
+  assert.ok(direct.lastInsertRowid > next.deviceId, 'implicit SQLite allocation also respects the sequence')
+})
+
+test('device id migration preserves columns, constraints, indexes, privacy objects and children', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-ids-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'journal.db')
+  let db = openDb(dbPath)
+  seedDevice(db, 1)
+  seedDevice(db, 2)
+  db.exec(`UPDATE devices SET private=1, private_eligible=1, private_pinned=1,
+    push_level='all', push_key='key', sync_scope='for_you', default_model='model',
+    consent_user_only=1, tag_char='A', apns_token='token', apns_env='prod' WHERE id=2;
+    INSERT INTO convo_agents(convo_id,agent_device_id,initiator_device_id,state,created_at)
+      VALUES('room',2,1,'joined',0);
+    INSERT INTO seen_devices(device_id,first_at) VALUES(2,0);`)
+  upsertDeviceStatus(db, { userId: 1, deviceId: 2, status: { connected: true }, reportedAt: 5 })
+  const rows = db.prepare('SELECT * FROM devices ORDER BY id').all()
+  const cols = db.pragma('table_info(devices)')
+  const objects = () => db.prepare(`SELECT type,name,sql FROM sqlite_master
+    WHERE type IN ('index','trigger','view') AND sql IS NOT NULL ORDER BY name`).all()
+  const beforeObjects = objects()
+  legacyDeviceIds(db)
+  db.close()
+
+  db = openDb(dbPath)
+  assert.deepEqual(db.prepare('SELECT * FROM devices ORDER BY id').all(), rows)
+  assert.deepEqual(db.pragma('table_info(devices)'), cols)
+  assert.deepEqual(objects(), beforeObjects)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM convo_agents').get().n, 1)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM device_status').get().n, 1)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM seen_devices').get().n, 1)
+  assert.deepEqual(db.pragma('foreign_key_check'), [])
+  assert.equal(db.pragma('foreign_keys', { simple: true }), 1)
+  assert.throws(() => db.prepare("UPDATE devices SET kind='invalid' WHERE id=2").run(), /CHECK/)
+  assert.throws(() => db.prepare("UPDATE devices SET token_hash='h1' WHERE id=2").run(), /UNIQUE/)
+  assert.throws(() => db.prepare("UPDATE devices SET apns_token='token' WHERE id=1").run(), /UNIQUE/)
+  revokeDevice(db, 2)
+  assert.ok(db.prepare('SELECT id FROM private_devices WHERE id=2').get(), 'revoked private identity stays private')
+  for (const table of ['convo_agents', 'device_status', 'seen_devices']) {
+    assert.equal(db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n, 0, `${table} still cascades on revoke`)
+  }
+  const fresh = createAgent(db, 1, 'replacement')
+  assert.ok(fresh.deviceId > 2)
+  revokeDevice(db, fresh.deviceId)
+  db.close()
+  db = openDb(dbPath)
+  assert.ok(createAgent(db, 1, 'after-reopen').deviceId > fresh.deviceId)
+  db.close()
+})
+
+for (const [name, reference] of [
+  ['private tombstone', "INSERT INTO revoked_private_devices VALUES(80,1,0)"],
+  ['conversation owner', "INSERT INTO conversations(id,owner_user_id,agent_device_id,created_at) VALUES('old',1,80,0)"],
+  ['integer reference with quoted names', 'CREATE TABLE "historical\""records"("old_device_id" INTEGER); INSERT INTO "historical\""records" VALUES(80)'],
+  ['client event key', "INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key) VALUES(1,1,'old',0,'s','text','{}','client:80:retry')"],
+  ['agent event key', "INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key) VALUES(1,1,'old',0,'s','text','{}','agent:80:retry')"],
+  ['child orphan before cleanup', "INSERT INTO device_status(device_id,user_id,reported_at,status) VALUES(80,1,0,'{}')"],
+]) {
+  test(`device id migration allocates above a dangling ${name}`, (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-reference-'))
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+    const dbPath = path.join(dir, 'journal.db')
+    let db = openDb(dbPath)
+    seedDevice(db, 1)
+    db.pragma('foreign_keys = OFF')
+    db.exec(reference)
+    legacyDeviceIds(db)
+    db.close()
+    db = openDb(dbPath)
+    const fresh = createAgent(db, 1, 'replacement')
+    assert.equal(fresh.deviceId, 81)
+    if (name === 'conversation owner') {
+      assert.equal(authorizeAgentWrite(db, 1, fresh.deviceId, 'old'), false)
+    }
+    if (name.includes('event key')) {
+      assert.equal(db.prepare('SELECT idem_key FROM events').get().idem_key.split(':')[1], '80')
+    }
+    db.close()
+  })
+}
+
+test('device id migration ignores malformed and overflowing event key ids', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-key-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'journal.db')
+  let db = openDb(dbPath)
+  seedDevice(db, 1)
+  const insert = db.prepare("INSERT INTO events(user_id,seq,convo_id,ts,sender,type,payload,idem_key) VALUES(1,?,'old',0,'s','text','{}',?)")
+  for (const [i, key] of ['client:999junk:x', 'agent:9223372036854775808:x', 'client:-900:x', 'other:999:x', 'client:1e9:x'].entries()) {
+    insert.run(i + 1, key)
+  }
+  legacyDeviceIds(db)
+  db.close()
+  db = openDb(dbPath)
+  assert.equal(createAgent(db, 1, 'replacement').deviceId, 2)
+  db.close()
+})
+
+test('device id migration rolls back its schema changes if the rebuild fails', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-rollback-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'journal.db')
+  const db = openDb(dbPath)
+  seedDevice(db, 1)
+  db.exec('CREATE TABLE devices_ai(block_rebuild INTEGER)')
+  legacyDeviceIds(db)
+  const objects = db.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all()
+  db.close()
+  assert.throws(() => openDb(dbPath), /already exists/)
+  const raw = new Database(dbPath)
+  assert.deepEqual(raw.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all(), objects)
+  assert.equal(raw.prepare('SELECT COUNT(*) n FROM devices').get().n, 1)
+  assert.equal(raw.prepare('SELECT COUNT(*) n FROM private_devices').get().n, 0)
+  raw.close()
 })

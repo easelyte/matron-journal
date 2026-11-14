@@ -489,3 +489,22 @@ test('snapshot: conversations carry repo', async () => {
   assert.equal(byId.c2.repo, null)
   db.close()
 })
+
+test('a silent event never counts as unread, at append or when a read recomputes the count', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'alice', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: u.id })
+  const first = append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body: 'one' } }).seq
+  append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'prompt', payload: { question: 'Reminder set', options: ['Send now', 'Cancel'], blocking: false, silent: true } })
+  append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body: 'two' } })
+  // Only a strict true is silent.
+  append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body: 'three', silent: 1 } })
+  const row = () => db.prepare("SELECT unread_count, snippet FROM conversations WHERE id='c1'").get()
+  assert.equal(row().unread_count, 3)
+  markRead(db, u.id, 'c1', first)
+  assert.equal(row().unread_count, 2)
+  // It is still content: the chat list shows it as the latest line.
+  append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'prompt', payload: { question: 'Reminder set', options: [], silent: true } })
+  assert.equal(row().unread_count, 2)
+  assert.equal(row().snippet, '? Reminder set')
+})

@@ -4,7 +4,8 @@
 // (GET /timeline/projects/:id/history); the Coordinator's
 // paged raw read of one week (GET /timeline/weeks/:week?raw=1), with its
 // index of the whole week (&index=1) and its read of named projects
-// (&projects=); and its two
+// (&projects=); the rest of a week's projects as cards
+// (GET /timeline/weeks/:week/projects); and its two
 // writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
 // one entry per project (POST /timeline/weeks/:week/entries), storage and
 // rules in src/week-stories.js. The read functions in src/timeline.js assume
@@ -19,7 +20,7 @@ import { resolveProject } from './projects.js'
 import { projectPage, projectHistory, PROJECT_HISTORY } from './timeline-project.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
 import {
-  weeksList, weekDetail, weekRaw, weekIndex, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
+  weeksList, weekDetail, weekProjects, weekRaw, weekIndex, RAW, TIMELINE, WEEK_PROJECTS, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
 } from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
@@ -27,6 +28,7 @@ const FINISHED_LIMIT = { default: 30, max: 100 }
 const PROJECTS_LIMIT = { default: TIMELINE.allPage, max: 100 }
 const HISTORY_LIMIT = { default: PROJECT_HISTORY.page, max: PROJECT_HISTORY.pageMax }
 const RAW_LIMIT = { default: RAW.page, max: RAW.pageMax }
+const WEEK_PROJECTS_LIMIT = { default: WEEK_PROJECTS.page, max: WEEK_PROJECTS.pageMax }
 
 // The integer `limit` query parameter: its default when absent, null when not
 // an integer in 1..max.
@@ -112,6 +114,19 @@ function handleProjectHistory(db, res, url, who, ref, opts) {
   return true
 }
 
+// GET /timeline/weeks/:week/projects?offset=<int from 0>&limit=<1..50> — the
+// projects the week's page lists under `also`, as cards, a page at a time.
+// Who may read it and its sieve are those of GET /timeline/weeks/:week.
+function handleWeekProjects(db, res, url, who, week, opts) {
+  const offset = offsetOf(url)
+  const limit = limitOf(url, WEEK_PROJECTS_LIMIT)
+  if (offset == null || limit == null) return badRequest(res)
+  const page = weekProjects(db, who.userId, week, { offset, limit, ...opts })
+  if (!page) return badRequest(res)
+  json(res, 200, page)
+  return true
+}
+
 // POST /timeline/weeks/:week — the Coordinator's lede and story cards for one
 // week, and its notes on projects. POST /timeline/weeks/:week/entries — the
 // same week as one entry per project (`entries` true): no lede, no titles,
@@ -163,6 +178,12 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
     let ref
     try { ref = decodeURIComponent(one[1]) } catch { return badRequest(res) }
     return one[2] ? handleProjectHistory(db, res, url, who, ref, rawOpts) : handleProject(db, res, who, ref, rawOpts)
+  }
+  const wp = path.match(/^\/timeline\/weeks\/([^/]+)\/projects$/)
+  if (wp) {
+    let week
+    try { week = decodeURIComponent(wp[1]) } catch { return badRequest(res) }
+    return handleWeekProjects(db, res, url, who, week, opts)
   }
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false

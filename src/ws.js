@@ -8,7 +8,7 @@ import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
-import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { sanitizePeerText, sanitizeConsentText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle, getSpawn } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
@@ -650,11 +650,10 @@ export function attachWs({
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
             // with the fresh cursor instead. Close 4009 right after; the socket
             // is never registered (no live traffic for this abandoned attempt).
-            // A client may LOWER the valve for its own connection with an optional
-            // hello `max_replay` (non-negative integer; anything else is ignored,
-            // not rejected — it is an additive field). It can never raise the
-            // server's limit.
-            const clientMax = Number.isInteger(msg.max_replay) && msg.max_replay >= 0 ? msg.max_replay : Infinity
+            // Clients may lower the valve for this connection only. Invalid
+            // values are ignored; agents keep the server's limit.
+            const clientMax = who.kind === 'client' && Number.isInteger(msg.max_replay) && msg.max_replay >= 0
+              ? msg.max_replay : Infinity
             const valve = Math.min(maxReplay, clientMax)
             // A for_you replay is measured by what it would send, not by the
             // whole journal's gap: most of that gap is never sent to it.
@@ -1126,23 +1125,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Read-only sub-chat guard (see isReadOnlyChild above).
         if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
         const replyPayload = { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null }
-        // stamp queued_release provenance onto the reply, resolved from
-        // the stored target prompt's own kind. A tap on a queued_release card
-        // is a control action, not a chat message, so clients suppress its raw
-        // "send"/"cancel:N" echo. Clients can only derive that from the card
-        // being in their loaded page; when it has paginated out of view the
-        // echo leaks into the thread until the card scrolls back in.
-        // This makes the marker authoritative and page-independent. Keyed on
-        // the target prompt's kind, NEVER the reply's value shape — so a
-        // genuine answer that merely reads like a control token is never
-        // suppressed (a regression that value-shape matching once caused).
-        // Scoped to conn.userId: append() stores every convo event under the
-        // owner's user_id, so this resolves the same prompt append() will
-        // authorize the reply against, and can't read another user's rows.
+        // Derive control provenance from the stored prompt, even when clients
+        // no longer have its card loaded. Ordinary answers can also say "send".
         const targetPrompt = db.prepare(
           'SELECT type, payload FROM events WHERE user_id=? AND convo_id=? AND seq=?'
         ).get(conn.userId, msg.convo_id, msg.target_seq)
-        if (targetPrompt && targetPrompt.type === 'prompt') {
+        if (targetPrompt?.type === 'prompt') {
           let targetKind
           try { targetKind = JSON.parse(targetPrompt.payload)?.kind } catch { targetKind = undefined }
           if (targetKind === 'queued_release') replyPayload.kind = 'queued_release'
@@ -1641,7 +1629,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
           const from = resolveFromConvo()
           if (from.err) return fail(...from.err)
-          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          const pJustification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
           // An address: a contact on another journal (src/federation-rooms.js).
           if (msg.target_person.includes('@')) {
@@ -1652,7 +1640,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               half = fr.parkTalk({
                 ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
                 person: msg.target_person, session: remoteSession ? msg.target_convo_id : null, missionRef: msg.mission ?? null,
-                topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+                topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
               })
             } catch (err) {
               if (err.message === 'not_found' && remoteSession) return fail('not_found', 'that session is not shared with you by this contact any more: check agent_roster')
@@ -1675,7 +1663,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             link = parkTalk(db, {
               ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
               person: msg.target_person, missionRef: msg.mission ?? null,
-              topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+              topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
             })
           } catch (err) {
             if (err.message === 'not_found') return fail('not_found')
@@ -1712,8 +1700,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
           const from = resolveFromConvo()
           if (from.err) return fail(...from.err)
-          const pTopic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
-          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          const pTopic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+          const pJustification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
           let link
           try {
@@ -1774,8 +1762,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const from = resolveFromConvo()
         if (from.err) return fail(...from.err)
         const fromConvoTitle = from.title
-        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
-        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        const topic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const justification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
         // a payload of spaces/control chars passes it and THEN sanitises
         // down to '', which would park/relay an invite with an empty
@@ -1849,7 +1837,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         if (personLinked(msg.room_id)) return fail('conflict', 'a room with another person holds just the two agents')
-        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        const justification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // See agent_invite's matching check: the raw-string check above only
         // catches a literally empty string, not whitespace/control chars
         // that sanitise down to ''.

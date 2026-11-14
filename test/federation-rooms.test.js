@@ -269,3 +269,34 @@ test('a room holding a talk across journals takes no other person; a cancelled a
   assert.equal(err.code, 'conflict')
   assert.match(err.message ?? err.detail ?? '', /room_busy/)
 })
+
+// A modified or older remote journal can put anything in an ask. The guest
+// journal applies the consent-card sieve itself rather than trusting the
+// sender: bidi overrides come out of topic and justification, and a
+// justification with nothing left is refused.
+async function askWithRawText(w, { topic, justification }) {
+  w.ws.alice.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'Hello bob', from: 'agent' } })
+  w.ws.alice.send({ op: 'agent_invite', room_id: 'room', target_person: 'bob@b.example', topic: 'placeholder', justification: 'placeholder', from_convo_id: 'room' })
+  await w.ws.alice.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await tick()
+  w.a.db.prepare('UPDATE fed_rooms SET topic=?, justification=? WHERE id=?').run(topic, justification, half(w.a).id)
+  const own = await roomItem(w.phones.alice)
+  await w.phones.alice(`/items/${own.id}/comments`, post({ action: 'Send' }))
+  await w.settle()
+}
+
+test('the guest journal strips bidi overrides from a remote ask\'s topic and justification', async (t) => {
+  const w = await rooms(t)
+  await askWithRawText(w, { topic: '‮Cover‬ editor', justification: 'Compare ⁦notes⁩ on the cover' })
+  const g = half(w.b)
+  assert.equal(g.role, 'guest')
+  assert.equal(g.topic, 'Cover editor')
+  assert.equal(g.justification, 'Compare notes on the cover')
+})
+
+test('the guest journal refuses a remote ask whose justification is only invisible characters', async (t) => {
+  const w = await rooms(t)
+  await askWithRawText(w, { topic: 'Cover editor', justification: '​⁠﻿' })
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) AS n FROM fed_rooms WHERE role='guest'").get().n, 0)
+  assert.equal(await roomItem(w.phones.bob), undefined)
+})

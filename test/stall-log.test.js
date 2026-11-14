@@ -1,6 +1,15 @@
-import { test } from 'node:test'
+import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { startStallLog, timed, logSlowRequests } from '../src/stall-log.js'
+
+beforeEach((t) => {
+  const previous = process.env.MATRON_STALL_LOG
+  delete process.env.MATRON_STALL_LOG
+  t.after(() => {
+    if (previous === undefined) delete process.env.MATRON_STALL_LOG
+    else process.env.MATRON_STALL_LOG = previous
+  })
+})
 
 function fakeTimers() {
   let tick = null
@@ -36,9 +45,9 @@ test('logs a stall with wall time and cpu, labelled blocked when cpu is low', ()
 test('timed logs only calls at or over the threshold and returns the result', () => {
   const lines = []
   let clock = 0
-  const slow = timed('x', () => { clock += 700; return 7 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })
+  const slow = timed('x', () => { clock += 500; return 7 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })
   assert.equal(slow, 7)
-  assert.deepEqual(lines, ['stall: x took 700ms'])
+  assert.deepEqual(lines, ['stall: x took 500ms'])
   timed('y', () => { clock += 10 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })
   assert.equal(lines.length, 1)
 })
@@ -58,7 +67,7 @@ test('logSlowRequests logs a slow request once, by path without the query', () =
   const wrapped = logSlowRequests((req, r) => { clock += 900; r.statusCode = 200 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })
   wrapped({ method: 'GET', url: '/items?token=secret' }, res)
   handlers.finish(); handlers.close()
-  assert.deepEqual(lines, ['stall: request GET /items took 900ms (status 200)'])
+  assert.deepEqual(lines, ['slow request: GET /items took 900ms (status 200)'])
 })
 
 test('logSlowRequests stays quiet for a fast request', () => {
@@ -69,4 +78,23 @@ test('logSlowRequests stays quiet for a fast request', () => {
   logSlowRequests((req, r) => { clock += 5 }, { thresholdMs: 500, log: (l) => lines.push(l), now: () => clock })({ method: 'GET', url: '/x' }, res)
   handlers.finish()
   assert.deepEqual(lines, [])
+})
+
+test('MATRON_STALL_LOG=0 disables the monitor, request wrapper and all maintenance timings', () => {
+  process.env.MATRON_STALL_LOG = '0'
+  const unexpected = () => assert.fail('disabled diagnostics must not sample, log or schedule')
+  const opts = { now: unexpected, cpu: unexpected, log: unexpected,
+    setIntervalImpl: unexpected, clearIntervalImpl: unexpected }
+  startStallLog(opts).stop()
+
+  let calls = 0
+  for (const label of ['wal_checkpoint(PASSIVE)', 'retention run', 'auto-archive sweep', 'tts sweep']) {
+    assert.equal(timed(label, () => { calls++; return 7 }, opts), 7)
+  }
+  assert.equal(calls, 4, 'maintenance still runs when diagnostics are disabled')
+  const error = new Error('maintenance failed')
+  assert.throws(() => timed('retention run', () => { throw error }, opts), (err) => err === error)
+
+  const handler = () => 42
+  assert.equal(logSlowRequests(handler, opts), handler, 'no response listeners are added')
 })

@@ -427,21 +427,22 @@ export function storyProjects(story, projects) {
 // media: {blob_id,content_type,name}|null }. A story left with no visible
 // project is dropped; items and media that are gone or hidden are left out.
 function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
-  const all = (f) => [...new Set(stored.stories.flatMap(f))]
-  const projects = survivingProjects(db, userId, all((s) => s.project_ids), byId)
+  const projects = survivingProjects(db, userId, [...new Set(stored.stories.flatMap((s) => s.project_ids))], byId)
+  const pairs = stored.stories.map((story) => ({ story, rows: storyProjects(story, projects) })).filter(({ rows }) => rows.length)
+  return resolveStories(db, userId, pairs, byId, excludePrivateOwned)
+}
+
+// resolveStored for stories whose projects are already resolved: `pairs` is
+// [{ story, rows }], `rows` the story's visible projects (never empty).
+function resolveStories(db, userId, pairs, byId, excludePrivateOwned) {
+  const all = (f) => [...new Set(pairs.flatMap(({ story }) => f(story)))]
   const items = liveItems(db, userId, all((s) => s.item_ids), byId, excludePrivateOwned)
   const media = liveMedia(db, userId, all((s) => (s.media_blob_id ? [s.media_blob_id] : [])), excludePrivateOwned)
-  const out = []
-  for (const s of stored.stories) {
-    const rows = storyProjects(s, projects)
-    if (!rows.length) continue
-    out.push({
-      title: s.title, sentence: s.sentence, next: s.next, projects: rows,
-      items: s.item_ids.map((id) => items.get(id)).filter(Boolean),
-      media: s.media_blob_id ? media.get(s.media_blob_id) ?? null : null,
-    })
-  }
-  return out
+  return pairs.map(({ story: s, rows }) => ({
+    title: s.title, sentence: s.sentence, next: s.next, projects: rows,
+    items: s.item_ids.map((id) => items.get(id)).filter(Boolean),
+    media: s.media_blob_id ? media.get(s.media_blob_id) ?? null : null,
+  }))
 }
 
 // A caller's sieve over an item's or milestone's conversation `c` and mission `m`.
@@ -481,6 +482,72 @@ export const cardItemsSqlForTest = (excludePrivateOwned) => {
   return { forYou: forYouSql(sieve), needsYou: needsYouSql(sieve), done: doneSql(sieve) }
 }
 
+// The SQL behind an apps' week card, for one project (@projectId) and one
+// week (@start, @end), through the caller's sieve: `sentence`, the title of
+// the project's newest milestone that week, and `media`, its newest picture
+// or video that week (the project feed's files roll-up, narrowed to the week).
+const cardSql = (excludePrivateOwned) => {
+  const convoSieve = convoSieveOf(excludePrivateOwned)
+  return {
+    sentence: `SELECT l.title FROM milestones l JOIN missions m ON m.id = l.mission_id
+      JOIN conversations c ON c.id = l.convo_id
+    WHERE ${OF_PROJECT} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
+    ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`,
+    media: `SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, IN_PROJECT)}) f
+    WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
+    ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`,
+  }
+}
+// Test seam: the per-card sentence and media queries as SQL.
+export const cardSqlForTest = cardSql
+
+// Every statement a week card runs, prepared once per read and run once per
+// card shown.
+function cardStatements(db, excludePrivateOwned) {
+  const convoSieve = convoSieveOf(excludePrivateOwned)
+  const sql = cardSql(excludePrivateOwned)
+  return {
+    sentence: db.prepare(sql.sentence),
+    media: db.prepare(sql.media),
+    needsYou: db.prepare(needsYouSql(convoSieve)),
+    forYou: db.prepare(forYouSql(convoSieve)),
+    done: db.prepare(doneSql(convoSieve)),
+  }
+}
+
+// The stored stories the week's page shows as cards, in stored order, each
+// with its projects as the reader sees them now (`projects`, survivingProjects'
+// map): one card per main project, the first story wins; a story left with no
+// project the caller may see is not shown.
+function shownStories(stored, projects) {
+  const mains = new Set()
+  return stored.stories.map((story) => ({ story, rows: storyProjects(story, projects) }))
+    .filter(({ rows }) => rows.length && !mains.has(rows[0].id) && mains.add(rows[0].id))
+}
+
+// What one week's page is built from, for a caller: the week, every project
+// the caller may see as a row (`byId`), the projects that moved (`moved`,
+// ranked), the stored week (null when unwritten) with the stories it shows
+// (`shown`), and `also`, the moving projects the page has no card for, in
+// rank order: for an unwritten week those past TIMELINE.storiesMax, for a
+// written one those no shown story names. weekDetail's `also` and
+// weekProjects' pages are both this list. null when `weekKey` is not a week
+// key.
+function weekFrame(db, userId, weekKey, excludePrivateOwned) {
+  const tz = userTimeZone(db, userId)
+  const start = parseWeekKey(weekKey, tz)
+  if (start == null) return null
+  const end = weekEndOf(start, tz)
+  const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
+  const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
+  const stored = writtenWeek(db, userId, weekKey)
+  if (!stored) return { tz, start, end, byId, moved, stored, shown: null, also: moved.slice(TIMELINE.storiesMax) }
+  const projects = survivingProjects(db, userId, [...new Set(stored.stories.flatMap((s) => s.project_ids))], byId)
+  const shown = shownStories(stored, projects)
+  const named = new Set(shown.flatMap(({ rows }) => rows.map((p) => p.id)))
+  return { tz, start, end, byId, moved, stored, shown, also: moved.filter(({ project }) => !named.has(project.id)) }
+}
+
 // One week's page: a story per project that moved, most moves first, at most
 // TIMELINE.storiesMax, the rest under `also` -- or, when the Coordinator has
 // written the week, its lede and stories in its order, one per main project
@@ -489,54 +556,32 @@ export const cardItemsSqlForTest = (excludePrivateOwned) => {
 // Every story carries `marks`: { for_you, done, next }, counted now, as the
 // caller may see them. null when `weekKey` is not a week key.
 export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, now = Date.now() } = {}) {
-  const tz = userTimeZone(db, userId)
-  const start = parseWeekKey(weekKey, tz)
-  if (start == null) return null
-  const end = weekEndOf(start, tz)
-  const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
-  const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
-  const convoSieve = convoSieveOf(excludePrivateOwned)
-  const inProject = IN_PROJECT
-  const ofProject = OF_PROJECT
-  const sentence = db.prepare(`SELECT l.title FROM milestones l JOIN missions m ON m.id = l.mission_id
-      JOIN conversations c ON c.id = l.convo_id
-    WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
-    ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
-  const needsYou = db.prepare(needsYouSql(convoSieve))
-  const forYou = db.prepare(forYouSql(convoSieve))
-  const done = db.prepare(doneSql(convoSieve))
-  // The project feed's files roll-up, narrowed to the week's pictures and videos.
-  const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, inProject)}) f
-    WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
-    ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`)
-  const weekMedia = (project) => media.get({ userId, projectId: project.id, start, end }) ?? null
+  const frame = weekFrame(db, userId, weekKey, excludePrivateOwned)
+  if (!frame) return null
+  const { tz, start, end, byId, moved, stored, shown } = frame
+  const q = cardStatements(db, excludePrivateOwned)
+  const weekMedia = (project) => q.media.get({ userId, projectId: project.id, start, end }) ?? null
   const head = { week: formatWeekKey(start, tz), start, end }
-  const stored = writtenWeek(db, userId, weekKey)
+  const also = frame.also.map(({ project, moved: n }) => ({ ...refOf(project), moved: n }))
   if (!stored) {
     const stories = moved.slice(0, TIMELINE.storiesMax).map(({ project }) => {
       const args = { userId, projectId: project.id, start, end }
-      const waiting = needsYou.all(args).map((r) => ({ ...r, done: false }))
+      const waiting = q.needsYou.all(args).map((r) => ({ ...r, done: false }))
       return {
         title: null,
         project: refOf(project),
         projects: [refOf(project)],
-        sentence: sentence.get(args)?.title ?? null,
+        sentence: q.sentence.get(args)?.title ?? null,
         next: null,
         needs_you: waiting,
         media: weekMedia(project),
         // The list above is every item the for-you count would count.
-        marks: { for_you: waiting.length, done: done.get(args).n, next: false },
+        marks: { for_you: waiting.length, done: q.done.get(args).n, next: false },
       }
     })
-    return {
-      ...head, final: end <= now, lede: null, written_at: null, stories,
-      also: moved.slice(TIMELINE.storiesMax).map(({ project, moved: n }) => ({ ...refOf(project), moved: n })),
-    }
+    return { ...head, final: end <= now, lede: null, written_at: null, stories, also }
   }
-  const mains = new Set()
-  const cards = resolveStored(db, userId, stored, byId, excludePrivateOwned)
-    .filter((s) => !mains.has(s.projects[0].id) && mains.add(s.projects[0].id))
-  const stories = cards.map((s) => {
+  const stories = resolveStories(db, userId, shown, byId, excludePrivateOwned).map((s) => {
     const args = { userId, projectId: s.projects[0].id, start, end }
     return {
       title: s.title,
@@ -546,16 +591,43 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
       next: s.next,
       needs_you: s.items,
       media: s.media ?? weekMedia(s.projects[0]),
-      marks: { for_you: forYou.get(args).n, done: done.get(args).n, next: !!s.next },
-      _ids: s.projects.map((p) => p.id),
+      marks: { for_you: q.forYou.get(args).n, done: q.done.get(args).n, next: !!s.next },
     }
   })
-  const named = new Set(stories.flatMap((s) => s._ids))
-  return {
-    ...head, final: stored.final || end <= now, lede: stored.lede, written_at: stored.written_at,
-    stories: stories.map(({ _ids, ...s }) => s),
-    also: moved.filter(({ project }) => !named.has(project.id)).map(({ project, moved: n }) => ({ ...refOf(project), moved: n })),
-  }
+  return { ...head, final: stored.final || end <= now, lede: stored.lede, written_at: stored.written_at, stories, also }
+}
+
+// The limits of the paged read of a week's other projects.
+export const WEEK_PROJECTS = { page: 24, pageMax: 50, statusMax: 300 }
+
+// The projects one week's page lists under `also`, as cards, a page at a
+// time: exactly weekDetail's `also` for the same caller, in its order (most
+// moves first), from `offset`, at most `limit` of them, each
+// { project, moved, sentence, media, marks: { for_you, done, next: false } }.
+// `sentence` is the project's newest milestone title that week, else its
+// status (clipped to WEEK_PROJECTS.statusMax), else null; `media` and `marks`
+// are counted as weekDetail counts them. `total` is the length of the whole
+// list and `next_offset` where the next page starts, null on the last.
+// Statements run per card on the page only. `offset` and `limit` are assumed
+// valid. null when `weekKey` is not a week key.
+export function weekProjects(db, userId, weekKey, { offset = 0, limit = WEEK_PROJECTS.page, excludePrivateOwned = false } = {}) {
+  const frame = weekFrame(db, userId, weekKey, excludePrivateOwned)
+  if (!frame) return null
+  const { tz, start, end, also } = frame
+  const q = cardStatements(db, excludePrivateOwned)
+  const page = also.slice(offset, offset + limit)
+  const projects = page.map(({ project, moved: n }) => {
+    const args = { userId, projectId: project.id, start, end }
+    return {
+      project: refOf(project),
+      moved: n,
+      sentence: q.sentence.get(args)?.title ?? clip(project.status || null, WEEK_PROJECTS.statusMax),
+      media: q.media.get(args) ?? null,
+      marks: { for_you: q.forYou.get(args).n, done: q.done.get(args).n, next: false },
+    }
+  })
+  const after = offset + page.length
+  return { week: formatWeekKey(start, tz), total: also.length, offset, next_offset: after < also.length ? after : null, projects }
 }
 
 // The limits of the Coordinator's raw week read: the page of projects it

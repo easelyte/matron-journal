@@ -1,7 +1,7 @@
 // test/search.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { indexableBody, backfillSearchIndex, backfillIsDiff } from '../src/search.js'
+import { indexableBody, backfillSearchIndex, backfillIsDiff, searchMessages } from '../src/search.js'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { makeTmpDir } from './tmp-dir.js'
@@ -804,7 +804,7 @@ test('startServer starts the background backfills only after backgroundDelayMs, 
 // Phrase tier: a message holding the typed words adjacent and in order beats
 // a shorter one that merely contains each word (bm25 alone prefers short
 // bodies), and a diff holding the phrase never jumps above prose.
-test('ranked: an adjacent-phrase match outranks a scattered all-words match and is tagged phrase', async () => {
+test('ranked: an adjacent-phrase match outranks a scattered all-words match and is tagged exact', async () => {
   const s = await startTestServer()
   await createUser(s.db, 'alice', 'password-123')
   const { token, user_id } = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'password-123' } })).json
@@ -815,7 +815,7 @@ test('ranked: an adjacent-phrase match outranks a scattered all-words match and 
   const r = await s.http('/search?q=lantern+export', { token })
   assert.equal(r.status, 200)
   assert.deepEqual(r.json.hits.map((h) => [h.seq, h.why]), [
-    [phrase.seq, 'phrase'],
+    [phrase.seq, 'exact'],
     [scattered.seq, 'words'],
     [diff.seq, 'words'],
   ])
@@ -852,4 +852,73 @@ test('searchChats groups only the newest CHAT_SCAN_CAP matches, so a common word
   assert.equal(chats.find((c) => c.convo_id === 'busy').count, CHAT_SCAN_CAP - 1)
   // Under the cap every match still counts.
   assert.equal(searchChats(db, 1, { query: 'oldest', limit: 10 }).chats[0].count, 1)
+})
+
+test('ranked: adjacent prose precedes scattered, reversed, diff and partial matches without duplicates', () => {
+  const db = openDb(':memory:')
+  try {
+    const { userId, convoId } = seedUserAndConvo(db)
+    const add = (body, type = 'text') => append(db, { userId, convoId, sender: 'user:alice', type, payload: type === 'diff' ? { diff: body } : { body } }).seq
+    const scattered = add('lantern festival export')
+    const reversed = add('export lantern')
+    const phrase = add('we agreed the lantern export should run nightly after the harbour backup finishes and the report is mailed')
+    const diff = add('+ lantern export', 'diff')
+    const partial = add('lantern repairs')
+    const hits = searchMessages(db, userId, { query: 'lantern export' }).hits
+    assert.equal(hits[0].seq, phrase)
+    assert.equal(hits[0].why, 'exact')
+    assert.deepEqual(new Set(hits.slice(1, 3).map((h) => h.seq)), new Set([scattered, reversed]))
+    assert.deepEqual(hits.map((h) => h.why), ['exact', 'words', 'words', 'words', 'some_words'])
+    assert.equal(hits[3].seq, diff)
+    assert.equal(hits[4].seq, partial)
+    assert.equal(new Set(hits.map((h) => h.seq)).size, hits.length)
+    assert.deepEqual(searchMessages(db, userId, { query: 'lantern export', limit: 1 }).hits, hits.slice(0, 1))
+    assert.deepEqual(searchMessages(db, userId, { query: 'lantern export', limit: 2 }).hits, hits.slice(0, 2))
+    add('another lantern export')
+    const enough = searchMessages(db, userId, { query: 'lantern export' }).hits
+    assert.equal(enough.length, 5, 'five combined exact and words hits suppress the partial fallback')
+    assert.ok(enough.every((h) => h.why !== 'some_words'))
+  } finally { db.close() }
+})
+
+test('ranked: phrase tier covers two through eight terms and preserves literal quoting', () => {
+  const db = openDb(':memory:')
+  try {
+    const { userId, convoId } = seedUserAndConvo(db)
+    append(db, { userId, convoId, sender: 'user:alice', type: 'text', payload: { body: 'amber birch cedar dogwood elm fir hazel ivy juniper' } })
+    for (const [query, why] of [
+      ['amber', 'words'],
+      ['amber birch', 'exact'],
+      ['amber birch cedar dogwood elm fir hazel ivy', 'exact'],
+      ['amber birch cedar dogwood elm fir hazel ivy juniper', 'words'],
+      ['  amber   birch  ', 'exact'],
+      ['"amber birch"', 'exact'],
+      ['amber "birch', 'exact'],
+      ['amber, birch!', 'exact'],
+    ]) {
+      assert.deepEqual(searchMessages(db, userId, { query }).hits.map((h) => h.why), [why], query)
+    }
+  } finally { db.close() }
+})
+
+test('ranked: phrase tier shares user, conversation, private-owner and subagent filters', () => {
+  const db = openDb(':memory:')
+  try {
+    const { userId, convoId } = seedUserAndConvo(db)
+    const agent = createAgent(db, userId, 'private-agent')
+    db.prepare('UPDATE devices SET private=1 WHERE id=?').run(agent.deviceId)
+    upsertConversation(db, { id: 'private', ownerUserId: userId, agentDeviceId: agent.deviceId })
+    upsertConversation(db, { id: 'child', ownerUserId: userId, parentConvoId: convoId })
+    seedUserAndConvo(db, { userId: 2, convoId: 'other' })
+    for (const id of [convoId, 'private', 'child', 'other']) {
+      append(db, { userId: id === 'other' ? 2 : userId, convoId: id, sender: 'user:alice', type: 'text', payload: { body: 'lantern export' } })
+    }
+    const search = (options = {}) => searchMessages(db, userId, { query: 'lantern export', ...options }).hits
+    assert.equal(search().length, 3)
+    assert.ok(search().every((h) => h.why === 'exact'))
+    assert.deepEqual(search({ excludePrivateOwned: true, excludeSubagents: true }).map((h) => h.convo_id), [convoId])
+    assert.deepEqual(search({ convoId: 'private', excludePrivateOwned: true }), [])
+    assert.deepEqual(search({ convoId: 'other' }), [])
+    assert.deepEqual(search({ convoId: 'child' }).map((h) => h.convo_id), ['child'])
+  } finally { db.close() }
 })

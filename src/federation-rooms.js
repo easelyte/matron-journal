@@ -43,7 +43,7 @@ import { isPrivateDevice } from './db.js'
 import { participantIds } from './participants.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { wakeIfOffline, wakeConvoAgent } from './wake.js'
-import { sanitizePeerText, plainText as plain } from './peer-text.js'
+import { sanitizePeerText, sanitizeConsentText, plainText as plain } from './peer-text.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, fileNotice } from './sharing-events.js'
 import { ROOM_CARD_KIND, COPY_BODY_MAX, BACKFILL_MAX, roomLink, deviceName } from './person-rooms-events.js'
 import { checkRoomFree, isGuestRoom, isShareableSession, LIVE_ROOM_STATES, PERSON_SENDER_PREFIX } from './person-rooms.js'
@@ -84,6 +84,8 @@ const nameOf = (address) => address.slice(0, address.indexOf('@'))
 const subjectOf = (ref) => `room:${ref}`
 const shareSubjectOf = (id) => `share:${id}`
 const t = (s, n = 120) => plain(sanitizePeerText(s ?? '', n))
+// Same, for the consent text (topic, justification) shown on a card.
+const tc = (s, n = 120) => plain(sanitizeConsentText(s ?? '', n))
 const bodyOf = (entry) => (typeof entry.body === 'string' ? JSON.parse(entry.body) : entry.body ?? {})
 // A message body keeps its lines; only control characters other than tab
 // and newline go.
@@ -213,7 +215,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       ? `In a turn started by ${t(addressOf(r))}'s side, your agent may only reply in the room and read the shared mission "${t(m.title)}". Anything more needs your tap.`
       : `In a turn started by ${t(addressOf(r))}'s side, your agent may only reply in the room. Anything more needs your tap.`
   }
-  const topicSuffix = (r) => (r.topic ? ` — ${t(r.topic, 80)}` : '')
+  const topicSuffix = (r) => (r.topic ? ` — ${tc(r.topic, 80)}` : '')
   // The shared session a room is aimed at, by its title as this side knows
   // it: the title the sharer sent (owner side), or the session's own (the
   // sharer's side). null for a talk request to the person.
@@ -286,7 +288,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         payload: {
           kind: ROOM_CARD_KIND, direction: 'out', room_link_id: r.id, person: { name: addressOf(r) },
           session_title: session == null ? null : sanitizePeerText(session, TITLE_MAX),
-          topic: sanitizePeerText(r.topic, TOPIC_MAX), justification: sanitizePeerText(r.justification, WHY_MAX),
+          topic: sanitizeConsentText(r.topic, TOPIC_MAX), justification: sanitizeConsentText(r.justification, WHY_MAX),
           mission: m ? { num: m.num, title: sanitizePeerText(m.title, 120) } : null,
           talk: session == null, contact_pending: false, choices: OWNER_TALK_ACTIONS, remote: true,
           from_device_id: r.device_id, from_name: sanitizePeerText(box, 80),
@@ -300,8 +302,8 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
             ? `**${t(box, 80)}** asks to talk with **${to}**'s agent in this room. ${to} is on another Matron journal.`
             : `**${t(box, 80)}** asks to talk, in this room, with **${to}**'s session "${t(session, 80)}", which ${to} shares with you. ${to} is on another Matron journal.`,
           '',
-          ...(r.topic ? [`- **Topic:** ${t(r.topic, TOPIC_MAX)}`] : []),
-          `- **Why:** ${t(r.justification, WHY_MAX)}`,
+          ...(r.topic ? [`- **Topic:** ${tc(r.topic, TOPIC_MAX)}`] : []),
+          `- **Why:** ${tc(r.justification, WHY_MAX)}`,
           ...(m ? [`- **Attached to:** mission #${m.num} ${t(m.title)}, which ${to} can already read.`] : []),
           session == null
             ? `- **What happens:** ${to} gets one card on their journal and chooses where their side talks: a new session, their Coordinator, or one of their sessions.`
@@ -375,7 +377,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         payload: {
           kind: ROOM_CARD_KIND, direction: 'in', room_link_id: r.id, person: { name: addressOf(r) },
           session_title: session == null ? null : sanitizePeerText(session, TITLE_MAX),
-          topic: sanitizePeerText(r.topic, TOPIC_MAX), justification: sanitizePeerText(r.justification, WHY_MAX),
+          topic: sanitizeConsentText(r.topic, TOPIC_MAX), justification: sanitizeConsentText(r.justification, WHY_MAX),
           mission: m ? { num: null, title: sanitizePeerText(m.title, 120) } : null,
           talk: session == null, contact_pending: false, choices, remote: true,
         },
@@ -388,8 +390,8 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
             ? `**${from}**, on another Matron journal, asks for their agent to talk with one of your agents.`
             : `**${from}**, on another Matron journal, asks for their agent to talk with your session "${t(session, 80)}", which you share with them.`,
           '',
-          ...(r.topic ? [`- **Topic:** ${t(r.topic, TOPIC_MAX)}`] : []),
-          `- **Why, in their agent's words:** ${t(r.justification, WHY_MAX)}`,
+          ...(r.topic ? [`- **Topic:** ${tc(r.topic, TOPIC_MAX)}`] : []),
+          `- **Why, in their agent's words:** ${tc(r.justification, WHY_MAX)}`,
           ...(m ? [`- **Attached to:** their mission "${t(m.title)}", which they share with you.`] : []),
           `- **What crosses:** the room's messages, both ways, to ${t(r.peer_host)}. Files do not.`,
           `- ${scope(r)}`,
@@ -898,11 +900,17 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
           if (!sharedTarget(d, { session_ref: b.session, user_id: user.id, contact_id: contact.id })) fail('not_shared')
           sessionRef = b.session
         }
+        // The least trusted source of consent-card text (an older or modified
+        // remote journal): same sieve as a local ask, and a justification that
+        // sanitises down to nothing is refused.
+        const topic = sanitizeConsentText(b.topic ?? '', TOPIC_MAX)
+        const justification = sanitizeConsentText(b.justification, WHY_MAX)
+        if (!justification) fail('malformed')
         const id = newId('fr')
         d.prepare(`INSERT INTO fed_rooms(id, user_id, role, contact_id, peer_host, peer_name, ref, mission_id, grant_ref, session_ref, state, topic, justification, created_at, updated_at)
           VALUES(?,?,'guest',?,?,?,?,?,?,?,'awaiting_guest',?,?,?,?)`)
           .run(id, user.id, contact.id, hostOf(envelope.from), nameOf(envelope.from), ref, missionId, grantRef, sessionRef,
-            sanitizePeerText(b.topic ?? '', TOPIC_MAX), sanitizePeerText(b.justification, WHY_MAX), now, now)
+            topic, justification, now, now)
         pending.set(envelope, { id })
         return {}
       },

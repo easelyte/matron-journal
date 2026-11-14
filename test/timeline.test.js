@@ -12,7 +12,7 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
 import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
-  weekRaw, weekIndex, INDEX, indexSqlForTest, RAW, cardItemsSqlForTest, allProjects, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
+  weekRaw, weekIndex, INDEX, indexSqlForTest, RAW, cardItemsSqlForTest, cardSqlForTest, weekProjects, WEEK_PROJECTS, allProjects, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -1916,4 +1916,208 @@ test('weekRaw picked: twelve heavy projects stay within 36,000 characters; the o
     left = more.omitted
   }
   assert.deepEqual(seen, ids)
+})
+
+// ---- The rest of a week's projects as cards (weekProjects) ----
+
+const CARD_KEYS = ['project', 'moved', 'sentence', 'media', 'marks']
+const wpOf = (db, n = -1, o = {}) => weekProjects(db, 1, keyOf(n), o)
+const alsoOf = (db, n = -1, o = {}) => weekDetail(db, 1, keyOf(n), { ...at, ...o }).also
+// Every page of a week's other projects, following next_offset from 0.
+function wpPages(db, n = -1, o = {}) {
+  const pages = [wpOf(db, n, { ...o, offset: 0 })]
+  while (pages.at(-1).next_offset != null) pages.push(wpOf(db, n, { ...o, offset: pages.at(-1).next_offset }))
+  return pages
+}
+// `count` projects that moved last week, project i with i milestones.
+function ladder(db, count) {
+  const ps = []
+  for (let i = 1; i <= count; i++) {
+    const x = proj(db, `P${i}`)
+    for (let j = 0; j < i; j++) postAt(db, x.convo, `P${i} step ${j}`, mid(-1, j))
+    ps.push(x)
+  }
+  return ps
+}
+// The week's 8 cards, filled by projects that each moved more than any project a test adds after.
+function filler(db) {
+  for (let i = 1; i <= 8; i++) {
+    const x = proj(db, `Busy ${i}`)
+    for (let j = 0; j < 20; j++) postAt(db, x.convo, `Busy ${i} step ${j}`, mid(-1, -j))
+  }
+}
+
+test('weekProjects, unwritten week: the projects past the first 8, most moves first, as cards; a bad key is null', () => {
+  const db = seeded()
+  const ps = ladder(db, 12)
+  const out = wpOf(db)
+  assert.deepEqual(Object.keys(out), ['week', 'total', 'offset', 'next_offset', 'projects'])
+  assert.equal(out.week, keyOf(-1)); assert.equal(out.total, 4); assert.equal(out.offset, 0); assert.equal(out.next_offset, null)
+  assert.deepEqual(out.projects.map((c) => c.project), [ps[3], ps[2], ps[1], ps[0]].map((x) => ref(x.p)))
+  assert.deepEqual(Object.keys(out.projects[0]), CARD_KEYS)
+  assert.deepEqual(out.projects[0], {
+    project: ref(ps[3].p), moved: 4, sentence: 'P4 step 3', media: null, marks: { for_you: 0, done: 0, next: false },
+  })
+  // The same list, in the same order, as weekDetail's `also`.
+  assert.deepEqual(out.projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db))
+  // A week with 8 or fewer moving projects has nothing past its cards.
+  assert.deepEqual(wpOf(db, 0), { week: keyOf(0), total: 0, offset: 0, next_offset: null, projects: [] })
+  assert.equal(weekProjects(db, 1, '2026-11-10'), null)
+  assert.equal(weekProjects(db, 1, 'nope'), null)
+})
+
+test('weekProjects pages: limit and offset slice the list, next_offset follows the page and is null on the last, total is the whole list', () => {
+  const db = seeded()
+  ladder(db, 8 + 7)
+  const whole = alsoOf(db).map((r) => r.id)
+  assert.equal(whole.length, 7)
+  const pages = wpPages(db, -1, { limit: 3 })
+  assert.deepEqual(pages.map((p) => [p.offset, p.next_offset, p.projects.length, p.total]), [[0, 3, 3, 7], [3, 6, 3, 7], [6, null, 1, 7]])
+  assert.deepEqual(pages.flatMap((p) => p.projects.map((c) => c.project.id)), whole)
+  // A page that ends exactly at the end has no next page.
+  assert.equal(wpOf(db, -1, { offset: 4, limit: 3 }).next_offset, null)
+  assert.equal(wpOf(db, -1, { offset: 0, limit: 7 }).next_offset, null)
+  assert.equal(wpOf(db, -1, { offset: 0, limit: 6 }).next_offset, 6)
+  // Past the end: an empty page, still with the total.
+  assert.deepEqual(wpOf(db, -1, { offset: 7 }), { week: keyOf(-1), total: 7, offset: 7, next_offset: null, projects: [] })
+  assert.deepEqual(wpOf(db, -1, { offset: 50 }).projects, [])
+  // The default page.
+  assert.equal(WEEK_PROJECTS.page, 24)
+  assert.equal(wpOf(db).projects.length, 7)
+})
+
+test('weekProjects, written week: the moving projects no shown story names, in rank order, through a merge; it agrees with also', () => {
+  const db = seeded()
+  const ps = ladder(db, 6)
+  // An entry for P5 and P2; P1 never moved into a story.
+  assert.equal(putEntries(db, -1, { entries: [entry(ps[4].p), entry(ps[1].p)] }).ok, true)
+  const ids = (out) => out.projects.map((c) => c.project.id)
+  assert.deepEqual(ids(wpOf(db)), [ps[5], ps[3], ps[2], ps[0]].map((x) => x.p.id))
+  assert.deepEqual(wpOf(db).projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db))
+  // A grouped story names every project it is about; a second story on the same main project is not shown,
+  // so the other projects only it names stay in the list.
+  put(db, -1, { lede: 'L.', stories: [tale({ project_ids: [ps[0].p.id, ps[2].p.id] }), tale({ project_ids: [ps[0].p.id, ps[5].p.id] })] })
+  assert.deepEqual(ids(wpOf(db)), [ps[5], ps[4], ps[3], ps[1]].map((x) => x.p.id))
+  assert.deepEqual(wpOf(db).projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db))
+  // A project merged into a named one moves for its survivor and so is named too.
+  mergeProject(db, { userId: 1, projectId: ps[4].p.id, intoId: ps[2].p.id, by: 'user' })
+  assert.deepEqual(ids(wpOf(db)), [ps[5], ps[3], ps[1]].map((x) => x.p.id))
+  assert.deepEqual(wpOf(db).projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db))
+  // A written week with no entries left: every moving project is in the list, none capped.
+  assert.equal(putEntries(db, -1, { entries: [] , final: true }).ok, true)
+  assert.equal(wpOf(db).total, alsoOf(db).length)
+  assert.deepEqual(wpOf(db).projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db))
+})
+
+test("weekProjects sentence: the week's newest milestone, else the status clipped to 300, else null", () => {
+  const db = seeded()
+  filler(db) // fills the cards, so each project below lands in the list
+  const a = proj(db, 'Milestone'); const b = proj(db, 'Status'); const c = proj(db, 'Long status'); const d = proj(db, 'Nothing')
+  postAt(db, a.convo, 'Older', mid(-1, -1)); postAt(db, a.convo, 'Newest', mid(-1, 1)); postAt(db, a.convo, 'Next week', mid(0))
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 'A status' }, statusWriter: { by: 'agent', deviceId: 7, convoId: null } })
+  updateProject(db, { userId: 1, projectId: b.p.id, fields: { status: 'Waiting on review.' }, statusWriter: { by: 'agent', deviceId: 7, convoId: null } })
+  updateProject(db, { userId: 1, projectId: c.p.id, fields: { status: 'z'.repeat(400) }, statusWriter: { by: 'agent', deviceId: 7, convoId: null } })
+  // b, c and d move in the week with an item, not a milestone (one before the week does not count).
+  postAt(db, b.convo, 'Last week only', mid(-2))
+  for (const x of [b, c, d]) item(db, x.convo, 'task', 'Work', { now: mid(-1) })
+  const card = (x) => wpOf(db).projects.find((r) => r.project.id === x.p.id)
+  assert.equal(card(a).sentence, 'Newest')
+  assert.equal(card(b).sentence, 'Waiting on review.')
+  assert.equal(card(c).sentence.length, 300); assert.ok(card(c).sentence.endsWith('…'))
+  assert.equal(card(d).sentence, null)
+  // A status written by a private device reads as null for a filtered caller.
+  updateProject(db, { userId: 1, projectId: b.p.id, fields: { status: 'Secret plans' }, statusWriter: { by: 'agent', deviceId: 9, convoId: null } })
+  assert.equal(card(b).sentence, 'Secret plans')
+  assert.equal(wpOf(db, -1, { excludePrivateOwned: true }).projects.find((r) => r.project.id === b.p.id).sentence, null)
+})
+
+test("weekProjects media and marks: the week's newest picture, and the for-you and done counts as weekDetail counts them", () => {
+  const db = seeded()
+  filler(db)
+  const a = proj(db, 'Billing'); const other = proj(db, 'Other')
+  postAt(db, other.convo, 'moved', mid(-1))
+  const it = item(db, a.convo, 'task', 'Screens', { now: mid(-1) })
+  blobRow(db, 'b-old'); attachAt(db, it, 'b-old', mid(-1, -2))
+  blobRow(db, 'b-new'); attachAt(db, it, 'b-new', mid(-1, 2))
+  blobRow(db, 'b-doc', 'application/pdf'); attachAt(db, it, 'b-doc', mid(-1, 3), 'application/pdf')
+  blobRow(db, 'b-later'); attachAt(db, it, 'b-later', mid(0))
+  item(db, a.convo, 'question', 'Which plan?', { now: mid(-1) })
+  item(db, a.convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-1) })
+  item(db, a.convo, 'question', 'Created after the week', { now: mid(0) })
+  const shut = item(db, a.convo, 'task', 'Invoices', { now: mid(-3) })
+  closeItem(db, { userId: 1, itemId: shut.id, resolution: 'done', author: 'agent', deviceId: 7, now: mid(-1) })
+  const cards = wpOf(db).projects
+  const card = cards.find((r) => r.project.id === a.p.id)
+  assert.deepEqual(card.media, { blob_id: 'b-new', content_type: 'image/png', name: 'b-new.png' })
+  assert.deepEqual(card.marks, { for_you: 1, done: 1, next: false })
+  assert.equal(cards.find((r) => r.project.id === other.p.id).media, null)
+  // weekDetail's card for the same project, once written so it is a card, counts the same.
+  assert.equal(putEntries(db, -1, { entries: [entry(a.p)] }).ok, true)
+  const story = cardOf(db, -1, a.p)
+  assert.deepEqual(story.marks, { ...card.marks, next: false })
+  assert.deepEqual(story.media, card.media)
+})
+
+test('weekProjects under the agent sieve: no private-origin project, and no private milestone, item or picture behind a card', () => {
+  const db = seeded()
+  filler(db)
+  const a = proj(db, 'Open'); const b = proj(db, 'Turned private')
+  postAt(db, a.convo, 'public milestone', mid(-1)); postAt(db, b.convo, 'b', mid(-1))
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  db.prepare("UPDATE conversations SET mission_id = ? WHERE id = 'secret'").run(a.m.id)
+  post(db, 'secret', 'private milestone', 9)
+  db.prepare("UPDATE milestones SET created_at = ? WHERE title = 'private milestone'").run(mid(-1, 1))
+  const priv = item(db, 'secret', 'question', 'Private ask', { awaiting: 'user', now: mid(-1, 1) })
+  db.prepare('UPDATE items SET mission_id = ? WHERE id = ?').run(a.m.id, priv.id)
+  blobRow(db, 'b-secret'); attachAt(db, priv, 'b-secret', mid(-1, 2))
+  const shut = item(db, 'secret', 'task', 'Private done', { now: mid(-3) })
+  db.prepare('UPDATE items SET mission_id = ? WHERE id = ?').run(a.m.id, shut.id)
+  closeItem(db, { userId: 1, itemId: shut.id, resolution: 'done', author: 'agent', deviceId: 9, now: mid(-1) })
+  const mine = wpOf(db)
+  const theirs = wpOf(db, -1, { excludePrivateOwned: true })
+  assert.ok(mine.projects.some((r) => r.project.id === b.p.id))
+  assert.ok(!theirs.projects.some((r) => r.project.id === b.p.id))
+  assert.equal(theirs.total, alsoOf(db, -1, { excludePrivateOwned: true }).length)
+  assert.deepEqual(theirs.projects.map((c) => ({ ...c.project, moved: c.moved })), alsoOf(db, -1, { excludePrivateOwned: true }))
+  const full = mine.projects.find((r) => r.project.id === a.p.id)
+  const sieved = theirs.projects.find((r) => r.project.id === a.p.id)
+  assert.equal(full.sentence, 'private milestone'); assert.equal(sieved.sentence, 'public milestone')
+  assert.equal(full.media?.blob_id, 'b-secret'); assert.equal(sieved.media, null)
+  assert.deepEqual(full.marks, { for_you: 1, done: 1, next: false })
+  assert.deepEqual(sieved.marks, { for_you: 0, done: 0, next: false })
+  assert.ok(!JSON.stringify(theirs).includes('private') && !JSON.stringify(theirs).includes('Private'))
+})
+
+test('weekProjects runs a bounded number of statements per page, whatever the week holds', () => {
+  const db = seeded()
+  crowd(db, 8 + 5)
+  const small = statementsOf(db, () => wpOf(db, -1, { limit: 2 }))
+  crowd(db, 60)
+  let out
+  const big = statementsOf(db, () => { out = wpOf(db, -1, { limit: 2 }) })
+  assert.equal(out.projects.length, 2); assert.equal(out.total, 65)
+  assert.equal(big, small)
+  // Each card on the page adds its four statements and no more.
+  assert.equal(statementsOf(db, () => wpOf(db, -1, { limit: 3 })) - big, 4)
+})
+
+test("a week card's sentence and media queries reach milestones and items through the project's missions, never by scanning", () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  for (const sieved of [false, true]) {
+    const sql = cardSqlForTest(sieved)
+    assert.deepEqual(Object.keys(sql), ['sentence', 'media'])
+    const planOf = (name) => db.prepare(`EXPLAIN QUERY PLAN ${sql[name]}`).all({ userId: 1, projectId: a.p.id, start: weekOf(-1), end: weekOf(0) }).map((r) => r.detail).join('\n')
+    for (const name of Object.keys(sql)) {
+      const text = planOf(name)
+      const what = `${name}, sieved ${sieved}`
+      assert.doesNotMatch(text, /idx_items_consent/, what)
+      assert.doesNotMatch(text, /SCAN (m|i|l|ic|p|q|e|c)\b/, what)
+      assert.match(text, /SEARCH q USING INDEX idx_projects_user_state \(user_id=\?/, what)
+    }
+    assert.match(planOf('sentence'), /SEARCH l USING INDEX idx_milestones_mission \(mission_id=\? AND created_at>\? AND created_at<\?/, `sieved ${sieved}`)
+    assert.match(planOf('media'), /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `sieved ${sieved}`)
+    assert.match(planOf('media'), /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\? AND created_at>\? AND created_at<\?/, `sieved ${sieved}`)
+    assert.match(planOf('media'), /SEARCH e USING INDEX idx_events_media \(convo_id=\?/, `sieved ${sieved}`)
+  }
 })

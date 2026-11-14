@@ -153,6 +153,32 @@ test('replay: the snapshot valve counts what a for_you replay would send, not th
   await p2.waitFor((f) => f.op === 'snapshot_required')
 })
 
+test('replay: hello max_replay counts scoped markers and Coordinator messages only', { timeout: 5000 }, async (t) => {
+  const { s, login, add } = await fixture(t, { maxReplay: 100 })
+  for (let i = 0; i < 10; i++) add('work', 'text')
+  const token = (await login('test')).token
+  const open = (max_replay) => makeWsClient(s.base, { token, cursor: 0, hello: { sync: 'for_you', max_replay } })
+  const empty = await open(0)
+  await empty.waitFor((f) => f.op === 'cursor' && f.seq === 10)
+  assert.deepEqual(empty.journal(), [])
+  empty.close()
+
+  const marker = add('work', 'convo_meta', { title: 'Updated' })
+  const message = add('coord', 'text')
+  const equal = await open(2)
+  await equal.waitFor((f) => f.op === 'cursor' && f.seq === message)
+  assert.deepEqual(equal.journal().map((f) => f.seq), [marker, message])
+  assert.equal(equal.frames.some((f) => f.op === 'snapshot_required'), false)
+  equal.close()
+
+  for (const max of [0, 1]) {
+    const over = await open(max)
+    const code = await new Promise((resolve) => over.ws.once('close', resolve))
+    assert.deepEqual(over.frames.map((f) => f.op), ['hello_ok', 'snapshot_required'])
+    assert.equal(code, 4009)
+  }
+})
+
 test('live: a for_you socket hears markers, the Coordinator and the chats it views', async (t) => {
   const { s, login } = await fixture(t)
   const phone = await login('phone')

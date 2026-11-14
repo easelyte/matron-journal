@@ -764,12 +764,8 @@ test('a forged device name reaches /agent-chat/pending sanitised, never as forge
   assert.ok(!r.json.pending[0].initiator_name.includes('\n'), 'no newline reaches the client as two forged lines')
 })
 
-// Device ids are reused: `devices.id` is a plain INTEGER PRIMARY KEY, so
-// SQLite assigns max(rowid)+1 — revoke the newest device and the next one
-// created lands on exactly its id. Anything keyed on a device id therefore
-// has to die with the device. "Retire an agent, register its replacement" is
-// the ordinary sequence that hits this.
-test('revoking a device clears its room membership, and a fresh-id replacement inherits nothing', async (t) => {
+// Revocation removes membership; a replacement also gets a fresh identity.
+test('revoking a device clears its room membership and never reuses its id', async (t) => {
   const { s, alice, agA, clientToken } = await roomFleet(t)
   const doomed = createAgent(s.db, alice.id, 'dev-doomed')
   parkInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, initiatorDeviceId: agA.deviceId })
@@ -780,11 +776,8 @@ test('revoking a device clears its room membership, and a fresh-id replacement i
 
   assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
 
-  // devices.id is AUTOINCREMENT: the replacement gets a fresh id, never
-  // the revoked one — and the cascade above already cleared the membership, so
-  // it starts from nothing under either its own or the old id.
   const fresh = createAgent(s.db, alice.id, 'dev-replacement')
-  assert.notEqual(fresh.deviceId, doomed.deviceId, 'the revoked id is not reused')
+  assert.ok(fresh.deviceId > doomed.deviceId, 'the replacement gets a new identity')
   assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
 })
 
@@ -1023,4 +1016,34 @@ test('a renewed chat ask does not expose the previous ask\'s item: consent items
   const mine = await s.http(`/items/${first.id}`, { token: clientToken })
   assert.equal(mine.status, 200)
   assert.equal(mine.json.item.consent, 'chat')
+})
+
+// A justification of only invisible format characters is not whitespace to
+// sanitizePeerText, so it used to pass and publish a blank-looking card.
+
+test('agent_invite rejects a zero-width-only justification: nothing parked, no card published', async (t) => {
+  const { s, agB, client, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: '​⁠​' })
+  const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.detail, 'bad justification')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard))
+})
+
+test('agent_join rejects a zero-width-only justification: nothing parked, no card published', async (t) => {
+  const { s, agB, client, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: '​⁠' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  assert.equal(err.detail, 'bad justification')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard))
+})
+
+test('agent_invite card strips bidi overrides and keeps a ZWJ emoji in the justification', async (t) => {
+  const { agB, client, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: '‮need logs‬ \u{1F469}‍\u{1F4BB}' })
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat')
+  assert.equal(card.payload.justification, 'need logs \u{1F469}‍\u{1F4BB}')
 })
