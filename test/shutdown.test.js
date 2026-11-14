@@ -60,6 +60,9 @@ test('a request in flight at close() still gets its full response, and close() d
   await new Promise((resolve) => setTimeout(resolve, 700))
   sock.write('}')
   await closing
+  // The response can still be in the client's read queue when close() resolves
+  // (same process, same loop turn); the socket's close event follows its data.
+  if (!sock.destroyed) await new Promise((resolve) => sock.once('close', resolve))
   assert.ok(Date.now() - started < 4000, 'close() finished without the hard cut')
   assert.match(data, /^HTTP\/1\.1 \d{3} /, 'the in-flight request got a complete response')
   assert.equal(s.db.open, false)
