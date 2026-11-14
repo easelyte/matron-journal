@@ -9,6 +9,7 @@ import {
 import { boxPlaintext, sealBox } from './push-box.js'
 import { APS_ALERTS } from './relay.js'
 import { inlineRefsToText } from './inline-refs.js'
+import { isSilentEvent } from './message-types.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
@@ -61,6 +62,9 @@ export function classify(type, payload, sender, prevState) {
   // `reopened` fallback from an agent would otherwise read as a normal
   // agent-authored text and push a second time for one event.
   if (type === 'text' && payload && typeof payload === 'object' && payload.fallback_for) return null
+  // A silent event (src/message-types.js) is there to be read in the chat,
+  // never to tell anyone: a card recording the reminder an agent set itself.
+  if (isSilentEvent(payload)) return null
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
     const state = payload && payload.state

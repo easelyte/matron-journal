@@ -235,6 +235,10 @@ test('a client "send" (sender user:*) never triggers an alert push, not even to 
 // not double it.
 test('classify: a flagged item fallback text never pushes, even from an agent sender', () => {
   assert.equal(classify('text', { body: '📌 x', fallback_for: 'item' }, 'agent:box-2', undefined), null)
+  // A silent event of any type pushes nothing; only a strict true is silent.
+  assert.equal(classify('prompt', { question: 'Reminder set', options: ['Send now', 'Cancel'], blocking: false, silent: true }, 'agent:box-2', undefined), null)
+  assert.equal(classify('text', { body: 'x', silent: true }, 'agent:box-2', undefined), null)
+  assert.equal(classify('prompt', { question: 'Pick', options: ['A'], silent: 'true' }, 'agent:box-2', undefined).kind, 'attention')
 })
 
 test('origin-device exclusion applies to every push type, not just read_marker (defensive: a push recipient device that is also the event\'s origin is skipped)', async (t) => {

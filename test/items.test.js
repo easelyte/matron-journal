@@ -46,7 +46,9 @@ const base = (o = {}) => ({
 test('validateItemFields: trims, caps, dedupes, rejects junk', () => {
   assert.equal(validateItemFields({ title: '  ' }).ok, false)
   assert.equal(validateItemFields({ title: 'x'.repeat(201) }).ok, false)
-  assert.equal(validateItemFields({ title: 't', body: 'x'.repeat(32769) }).ok, false)
+  assert.deepEqual(validateItemFields({ title: 't', body: 'x'.repeat(32769) }), { ok: false, error: 'body_too_long', max: 32768 })
+  assert.equal(validateItemFields({ title: 't', body: 'x'.repeat(32768) }).value.body.length, 32768)
+  assert.deepEqual(validateItemFields({ title: 't', body: 42 }), { ok: false })
   assert.equal(validateItemFields({ title: 't', labels: ['a', 'a', 'b'] }).value.labels.join(), 'a,b')
   assert.equal(validateItemFields({ title: 't', labels: 'nope' }).ok, false)
   assert.equal(validateItemFields({ title: 't', links: [{ url: 'https://x' }] }).value.links[0].url, 'https://x')
@@ -618,11 +620,17 @@ test('itemMarkerPayload carries the spec fields and trims the comment', async ()
   assert.equal(ITEM_EVENT_TYPE, 'item')
   assert.deepEqual(Object.keys(p).sort(), ['action', 'actions', 'awaiting', 'by', 'chosen_action', 'comment', 'item_id', 'kind', 'num', 'origin_convo_id', 'origin_convo_title', 'resolution', 'title'])
   assert.equal(p.comment.body, 'use A'); assert.equal(p.comment.attachments[0].transcript, null)
-  // Fork-only: origin conversation rides on the marker for client-side provenance labelling.
   assert.equal(p.origin_convo_id, 'c1'); assert.equal(p.origin_convo_title, 'C1')
   const created = itemMarkerPayload({ item: q, action: 'created', by: 'agent' })
   assert.equal(created.comment, undefined); assert.equal(created.awaiting, 'user')
   assert.equal(created.origin_convo_id, 'c1'); assert.equal(created.origin_convo_title, 'C1')
+})
+
+test('itemMarkerPayload keeps the origin id when the title is unavailable', () => {
+  const p = itemMarkerPayload({ item: { origin_convo_id: 'c1' }, action: 'updated', by: 'agent' })
+  assert.equal(p.origin_convo_id, 'c1'); assert.equal(p.origin_convo_title, null)
+  const absent = itemMarkerPayload({ item: {}, action: 'updated', by: 'agent' })
+  assert.equal(absent.origin_convo_id, null); assert.equal(absent.origin_convo_title, null)
 })
 
 test('snippetOf renders item markers', () => {

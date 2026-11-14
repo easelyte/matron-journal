@@ -11,6 +11,7 @@ import { getNoticesEnabled } from './settings.js'
 import { isClientOnlyEvent, snippetOf } from './journal.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { inlineRefsToText } from './inline-refs.js'
+import { notSilentSql } from './message-types.js'
 
 // The content a person reads. tool_output and diff are working output; the
 // item marker is covered by the item itself.
@@ -67,7 +68,7 @@ function gapIsEmpty(db, userId, convoId, afterSeq, beforeSeq) {
   // i.e. every event the user has in the gap across all conversations.
   return !db.prepare(
     `SELECT 1 FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND seq<? AND user_id=?
-       AND type IN (${UNSEEN_TYPES_SQL}) AND sender NOT LIKE 'user:%' LIMIT 1`
+       AND type IN (${UNSEEN_TYPES_SQL}) AND sender NOT LIKE 'user:%' AND ${notSilentSql()} LIMIT 1`
   ).get(convoId, afterSeq, beforeSeq, userId)
 }
 
@@ -201,6 +202,7 @@ export function listUnseen(db, userId, {
        FROM events e JOIN conversations c ON c.id=e.convo_id
       WHERE e.user_id=? AND c.owner_user_id=? AND e.seq>=? AND e.ts<=?
         AND e.type IN (${UNSEEN_TYPES_SQL}) AND e.sender NOT LIKE 'user:%'
+        AND ${notSilentSql('e')}
         AND c.parent_convo_id IS NULL AND c.session_state!='archived'
         ${where.join(' ')}
         AND NOT EXISTS(SELECT 1 FROM seen_ranges s WHERE s.user_id=e.user_id AND s.convo_id=e.convo_id
@@ -220,6 +222,7 @@ export function listUnseen(db, userId, {
     `SELECT convo_id, MAX(CASE WHEN sender LIKE 'user:%' THEN seq END) AS u,
             MAX(CASE WHEN sender NOT LIKE 'user:%'
                       AND json_extract(payload, '$.fallback_for') IS NULL
+                      AND ${notSilentSql()}
                       AND (type!='permission_request' OR COALESCE(json_extract(payload, '$.kind'), '') NOT IN ('agent_chat','agent_spawn','contact_request','mission_share','mission_handover'))
                      THEN seq END) AS o
        FROM events WHERE user_id=? AND seq>=? AND type IN (${UNSEEN_TYPES_SQL},'prompt_reply') GROUP BY convo_id`

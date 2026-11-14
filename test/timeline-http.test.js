@@ -793,3 +793,101 @@ test('raw=1 on the project routes is always sieved for an agent, even on a priva
   assert.equal(await status(`${page}/history?raw=1`, client), 200)
   assert.equal((await get(s, `/timeline/projects/${open.p.id}?raw=1`, client)).json.counts.missions_open, 2)
 })
+
+// ---- GET /timeline/weeks/:week/projects (the rest of a week's projects as cards) ----
+
+// `count` projects that each moved this week, project i with i + extra milestones.
+function climbing(s, alice, agent, count, { extra = 0 } = {}) {
+  const out = []
+  for (let i = 1; i <= count; i++) {
+    const x = another(s, alice, agent, `Step ${i}`)
+    const convo = `w${x.num}`
+    upsertConversation(s.db, { id: convo, ownerUserId: alice.id, title: x.title, agentDeviceId: agent.deviceId })
+    createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: convo, title: 'one', projectId: x.id })
+    for (let j = 0; j < i + extra; j++) {
+      createMilestone(s.db, {
+        userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: convo, kind: 'progress', title: `${x.title} step ${j}`,
+        appendMarker: (payload) => append(s.db, { userId: alice.id, convoId: convo, sender: 'agent:x', type: 'milestone', payload }),
+      })
+    }
+    out.push(x)
+  }
+  return out
+}
+const asAlso = (page) => page.projects.map((c) => ({ ...c.project, moved: c.moved }))
+
+test('week projects: 401 without a token; a client gets the projects under also as cards, in its order, a page at a time', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const week = thisWeek(s, alice)
+  assert.equal((await get(s, `/timeline/weeks/${week}/projects`, undefined)).status, 401)
+  climbing(s, alice, agent, 13)
+  const detail = (await get(s, `/timeline/weeks/${week}`, client)).json
+  assert.equal(detail.also.length, 5)
+  const first = await get(s, `/timeline/weeks/${week}/projects?limit=2`, client)
+  assert.equal(first.status, 200)
+  assert.deepEqual(Object.keys(first.json), ['week', 'total', 'offset', 'next_offset', 'projects'])
+  assert.equal(first.json.week, week); assert.equal(first.json.total, 5); assert.equal(first.json.offset, 0); assert.equal(first.json.next_offset, 2)
+  assert.deepEqual(Object.keys(first.json.projects[0]), ['project', 'moved', 'sentence', 'media', 'marks'])
+  assert.deepEqual(first.json.projects[0].marks, { for_you: 0, done: 0, next: false })
+  assert.equal(first.json.projects[0].sentence, 'Step 5 step 4')
+  const pages = [first.json]
+  while (pages.at(-1).next_offset != null) {
+    pages.push((await get(s, `/timeline/weeks/${week}/projects?limit=2&offset=${pages.at(-1).next_offset}`, client)).json)
+  }
+  assert.deepEqual(pages.map((p) => p.offset), [0, 2, 4])
+  assert.deepEqual(pages.flatMap(asAlso), detail.also)
+  // The default page holds them all.
+  const all = (await get(s, `/timeline/weeks/${week}/projects`, client)).json
+  assert.deepEqual(asAlso(all), detail.also); assert.equal(all.next_offset, null)
+})
+
+test('week projects: a written week lists the moving projects no card names, as also does', async (t) => {
+  const { s, alice, agent, client } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const ps = climbing(s, alice, agent, 4)
+  const body = { convo_id: 'coord', entries: [{ project: ps[1].id, sentence: 'Done.' }] }
+  assert.equal((await s.http(`/timeline/weeks/${week}/entries`, { method: 'POST', token: agent.token, body })).status, 201)
+  const detail = (await get(s, `/timeline/weeks/${week}`, client)).json
+  const page = (await get(s, `/timeline/weeks/${week}/projects`, client)).json
+  assert.deepEqual(asAlso(page), detail.also)
+  assert.deepEqual(page.projects.map((c) => c.project.id), [ps[3].id, ps[2].id, ps[0].id])
+  assert.equal(page.total, 3)
+})
+
+test('week projects: limit must be an integer in 1..50, offset one from 0, and :week a Monday key, else 400', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const week = thisWeek(s, alice)
+  for (const q of ['limit=0', 'limit=51', 'limit=-1', 'limit=2.5', 'limit=x', 'limit=', 'offset=-1', 'offset=1.5', 'offset=x', 'offset=', 'offset=99999999999999999999']) {
+    assert.equal((await get(s, `/timeline/weeks/${week}/projects?${q}`, client)).status, 400, q)
+    assert.equal((await get(s, `/timeline/weeks/${week}/projects?${q}`, agent.token)).status, 400, q)
+  }
+  for (const q of ['limit=1', 'limit=50', 'offset=0', 'offset=1000']) {
+    assert.equal((await get(s, `/timeline/weeks/${week}/projects?${q}`, client)).status, 200, q)
+  }
+  for (const bad of ['2026-11-10', '2026-02-30', 'nope', '%E0%A4%A']) {
+    assert.equal((await get(s, `/timeline/weeks/${bad}/projects`, client)).status, 400, bad)
+  }
+  assert.equal((await get(s, `/timeline/weeks/${week}/projects/extra`, client)).status, 404)
+})
+
+test('week projects: an agent never sees private work; the client and an agent on a private device do, as for the week read', async (t) => {
+  const { s, alice, agent, priv, client } = await fleet(t)
+  const week = thisWeek(s, alice)
+  climbing(s, alice, agent, 8, { extra: 5 }) // the week's 8 cards
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'priv', projectId: hidden.id })
+  another(s, alice, agent, 'Visible')
+  const visible = s.db.prepare("SELECT * FROM projects WHERE title = 'Visible'").get()
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: visible.id })
+  const titles = async (token) => (await get(s, `/timeline/weeks/${week}/projects`, token)).json.projects.map((c) => c.project.title).sort()
+  assert.deepEqual(await titles(client), ['Hidden', 'Visible'])
+  assert.deepEqual(await titles(priv.token), ['Hidden', 'Visible'])
+  assert.deepEqual(await titles(agent.token), ['Visible'])
+  // Each caller's list is its own week read's also.
+  for (const token of [client, agent.token, priv.token]) {
+    const detail = (await get(s, `/timeline/weeks/${week}`, token)).json
+    const page = (await get(s, `/timeline/weeks/${week}/projects`, token)).json
+    assert.deepEqual(asAlso(page), detail.also)
+    assert.equal(page.total, detail.also.length)
+  }
+})

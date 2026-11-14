@@ -8,18 +8,14 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
 import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
-import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL, isSilentEvent, notSilentSql } from './message-types.js'
 import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
-// Conversation-list order: newest last-MESSAGE time first (last_ts, falling
-// back to created_at for a conversation with no message events), tie-broken by
-// the immutable id DESC. Done in JS by snapshot() and the /roster handler over
-// the already-fetched rows — NOT a SQL ORDER BY, which would re-evaluate the
-// correlated last_ts subquery a second time per row. Byte-for-byte the same
-// comparator the web client uses (matron-web database.ts) so the two agree.
+// Sort fetched rows so the correlated last_ts query need not run again for
+// ordering. Non-message activity must not change the immutable id tie-break.
 export function byLastMessageThenId(a, b) {
   const activity = (b.last_ts ?? b.created_at) - (a.last_ts ?? a.created_at)
   if (activity) return activity
@@ -373,7 +369,8 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
       // owner's unread badge (server-side "silent children", mirrored by the
       // push pipeline's short-circuit in push.js). last_seq/snippet still
       // advance — only the unread increment is exempt.
-      const sql = sender.startsWith('user:') || convo.parent_convo_id != null
+      // A silent event (isSilentEvent) is exempt the same way.
+      const sql = sender.startsWith('user:') || convo.parent_convo_id != null || isSilentEvent(payload)
         ? 'UPDATE conversations SET last_seq=?, snippet=? WHERE id=?'
         : 'UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?'
       db.prepare(sql).run(seq, snippetOf(type, payload), convoId)
@@ -694,10 +691,11 @@ export function markRead(db, userId, convoId, upToSeq, sender = null) {
     // reader's own messages as unread — and silent children
     // (parent_convo_id set) are skipped entirely, so a partial read_marker
     // can never resurrect a positive count append() would not have made.
+    // Silent events are skipped too, as append() skips them.
     db.prepare(
       `UPDATE conversations SET unread_count=(
          SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
-           AND e.sender NOT LIKE 'user:%'
+           AND e.sender NOT LIKE 'user:%' AND ${notSilentSql('e')}
        ) WHERE id=? AND parent_convo_id IS NULL`
     ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
     return { ...r, upToSeq: resolvedUpToSeq }

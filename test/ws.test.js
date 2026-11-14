@@ -296,45 +296,45 @@ test('prompt_reply requires an integer target_seq (the ref it answers)', async (
   c.close()
 })
 
-test('prompt_reply to a queued_release card is stamped kind=queued_release; other targets are not', async (t) => {
+test('prompt_reply derives queued_release kind from the stored target without replay', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
-  // Seed the two prompts the reply can target: a queued_release card and an
-  // ordinary prompt whose option value merely reads like a control token.
-  const release = append(s.db, {
-    userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt',
-    payload: { kind: 'queued_release', question: '3 queued', options: [{ id: 'send', value: 'send' }, { id: 'cancel', value: 'cancel:3' }] },
-  })
-  const ordinary = append(s.db, {
-    userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt',
-    payload: { question: 'which?', options: [{ id: 'a', value: 'send' }] },
-  })
-  const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
-  const c = await makeWsClient(s.base, { token: l.json.token, cursor: 0 })
+  const alice = await createUser(s.db, 'alice', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id })
+  upsertConversation(s.db, { id: 'c2', ownerUserId: alice.id })
+  const seed = (type, payload, convoId = 'c1') => append(s.db, {
+    userId: alice.id, convoId, sender: 'agent:a', type, payload,
+  }).seq
+  const release = seed('prompt', { kind: 'queued_release', question: 'Send queued messages?' })
+  const ordinary = seed('prompt', { question: 'Which value?' })
+  const nonPrompt = seed('text', { kind: 'queued_release', body: 'send' })
+  const otherConvo = seed('prompt', { kind: 'queued_release' }, 'c2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  const c = await makeWsClient(s.base, { token: login.json.token, cursor: null })
+  t.after(() => c.close())
   await c.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(c.journal().length, 0, 'the target cards are not loaded')
 
-  // Tap on the queued_release card → the persisted reply carries the marker,
-  // so clients suppress the raw echo without needing the card in their page.
-  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: release.seq, choice: 'send' })
-  const tap = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply')
-  assert.equal(tap.payload.kind, 'queued_release')
-  // Broadcast frame must match the persisted row byte-for-byte.
-  assert.equal(JSON.parse(s.db.prepare('SELECT payload FROM events WHERE seq=?').get(tap.seq).payload).kind, 'queued_release')
-
-  // A genuine answer to an ordinary prompt whose value shape looks like a
-  // control token is NOT stamped — provenance is the target prompt's kind,
-  // never the reply's value shape (guards against a value-shape regression).
-  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: ordinary.seq, choice: 'send' })
-  const answer = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > tap.seq)
-  assert.equal(answer.payload.kind, undefined)
-
-  // A reply targeting a non-existent seq still appends, unmarked.
-  c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: 9999, choice: 'send' })
-  const orphan = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > answer.seq)
-  assert.equal(orphan.payload.kind, undefined)
-  c.close()
+  let lastSeq = otherConvo
+  for (const [target, choice, text, kind] of [
+    [release, 'send', null, 'queued_release'],
+    [release, 'cancel:3', null, 'queued_release'],
+    [release, null, 'edited message', 'queued_release'],
+    [ordinary, 'send', null, undefined],
+    [ordinary, null, 'cancel:3', undefined],
+    [nonPrompt, 'send', null, undefined],
+    [otherConvo, 'send', null, undefined],
+    [9999, 'send', null, undefined],
+  ]) {
+    c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: target, choice, text, kind: 'queued_release' })
+    const reply = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > lastSeq)
+    lastSeq = reply.seq
+    const expected = { target_seq: target, choice, text }
+    if (kind) expected.kind = kind
+    assert.deepEqual(reply.payload, expected)
+    const stored = s.db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, reply.seq)
+    assert.deepEqual(JSON.parse(stored.payload), expected)
+  }
 })
 
 test('read_marker requires up_to_seq to be null or a non-negative integer', async (t) => {
@@ -512,71 +512,47 @@ test('snapshot_required: a replay gap at or under MATRON_MAX_REPLAY still replay
   c.close()
 })
 
-async function helloRaw(s, token, hello) {
-  const raw = new (await import('ws')).default(s.base.replace('http', 'ws') + '/ws')
-  await new Promise((r) => raw.on('open', r))
-  const frames = []
-  raw.on('message', (d) => frames.push(JSON.parse(d)))
-  let closeCode = null
-  const closed = new Promise((r) => raw.on('close', (code) => { closeCode = code; r() }))
-  raw.send(JSON.stringify({ op: 'hello', token, ...hello }))
-  return { raw, frames, closed, closeCode: () => closeCode }
-}
-
-async function seedTen(s) {
-  const dan = await createUser(s.db, 'dan', 'pw')
-  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
-  for (let i = 0; i < 10; i++) {
-    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
-  }
-  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
-  return { dan, token: login.json.token }
-}
-
-test('hello max_replay: a client limit below the gap trips snapshot_required before any replay', async (t) => {
-  const s = await startTestServer({ maxReplay: 100 })
-  t.after(() => s.close())
-  const { dan, token } = await seedTen(s)
-  const c = await helloRaw(s, token, { cursor: 2, max_replay: 5 }) // gap 8 > client limit 5
-  await c.closed
-  assert.ok(c.frames.some((f) => f.op === 'hello_ok' && f.seq === 10), 'hello_ok (with the head seq) still comes first')
-  assert.ok(c.frames.some((f) => f.kind === 'control' && f.op === 'snapshot_required'))
-  assert.equal(c.frames.filter((f) => f.kind === 'journal').length, 0)
-  assert.equal(c.closeCode(), 4009)
-  assert.equal(s.hub.connsOf(dan.id).length, 0)
-})
-
-test('hello max_replay: a gap within the client limit replays normally', async (t) => {
-  const s = await startTestServer({ maxReplay: 100 })
-  t.after(() => s.close())
-  const { token } = await seedTen(s)
-  const c = await makeWsClient(s.base, { token, cursor: 2, max_replay: 8 }) // gap 8, not over 8
-  await c.waitFor((f) => f.kind === 'journal' && f.seq === 10)
-  assert.equal(c.journal().length, 8)
-  assert.ok(!c.frames.some((f) => f.op === 'snapshot_required'))
-  c.close()
-})
-
-test('hello max_replay: can only lower the server limit, never raise it', async (t) => {
-  const s = await startTestServer({ maxReplay: 5 })
-  t.after(() => s.close())
-  const { token } = await seedTen(s)
-  const c = await helloRaw(s, token, { cursor: 0, max_replay: 1000 })
-  await c.closed
-  assert.ok(c.frames.some((f) => f.op === 'snapshot_required'), 'server valve (5) still applies to a gap of 10')
-  assert.equal(c.closeCode(), 4009)
-})
-
-test('hello max_replay: a malformed value is ignored (additive field), not rejected', async (t) => {
-  const s = await startTestServer({ maxReplay: 100 })
-  t.after(() => s.close())
-  const { token } = await seedTen(s)
-  for (const bad of [-1, 2.5, '3', null, { n: 1 }]) {
-    const c = await makeWsClient(s.base, { token, cursor: 0, max_replay: bad })
-    await c.waitFor((f) => f.kind === 'journal' && f.seq === 10)
-    assert.equal(c.journal().length, 10, `max_replay=${JSON.stringify(bad)} must fall back to the server limit`)
-    c.close()
-  }
+test('hello max_replay: client ceiling, boundaries and compatibility', async (t) => {
+  const cases = [
+    { name: 'lower ceiling requires snapshot', max: 5, snapshot: true },
+    { name: 'equal gap replays', max: 8 },
+    { name: 'cannot raise server ceiling', max: 1000, serverMax: 5, snapshot: true },
+    { name: 'zero with backlog requires snapshot', max: 0, snapshot: true },
+    { name: 'zero at head stays live', max: 0, cursor: 10 },
+    { name: 'null cursor stays live', max: 0, cursor: null },
+    { name: 'omitted cursor stays live', max: 0, cursor: undefined },
+    { name: 'omitted ceiling uses server limit' },
+    ...[-1, 2.5, '3', null, true, [], {}].map((max) => ({ name: `ignores ${JSON.stringify(max)}`, max })),
+    { name: 'agent ignores client ceiling', max: 0, agent: true },
+  ]
+  for (const c of cases) await t.test(c.name, { timeout: 5000 }, async (t) => {
+    const s = await startTestServer({ maxReplay: c.serverMax ?? 100 })
+    t.after(() => s.close())
+    const alice = await createUser(s.db, 'alice', 'pw')
+    upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id })
+    for (let i = 0; i < 10; i++) {
+      append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+    }
+    const login = c.agent
+      ? createAgent(s.db, alice.id, 'test')
+      : (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'test' } })).json
+    const cursor = Object.hasOwn(c, 'cursor') ? c.cursor : 2
+    const client = await makeWsClient(s.base, { token: login.token, cursor, hello: { max_replay: c.max } })
+    t.after(() => client.close())
+    if (c.snapshot) {
+      const code = await new Promise((resolve) => client.ws.once('close', resolve))
+      assert.deepEqual(client.frames.map((f) => f.op), ['hello_ok', 'snapshot_required'])
+      assert.equal(client.frames[0].seq, 10)
+      assert.equal(code, 4009)
+      assert.equal(s.hub.connsOf(alice.id).length, 0)
+    } else {
+      const expected = cursor == null ? [] : Array.from({ length: 10 - cursor }, (_, i) => cursor + i + 1)
+      await client.waitFor((f) => expected.length ? f.kind === 'journal' && f.seq === 10 : f.op === 'hello_ok')
+      assert.deepEqual(client.journal().map((f) => f.seq), expected)
+      assert.equal(client.frames.some((f) => f.op === 'snapshot_required'), false)
+      assert.equal(s.hub.connsOf(alice.id).length, 1)
+    }
+  })
 })
 
 test('revoked device: its next WS frame gets error {code:"revoked"} and closes 4001; the same token also 401s over HTTP', async (t) => {

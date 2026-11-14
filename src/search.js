@@ -1,5 +1,5 @@
 import { ORIGIN_SIEVE } from './missions.js'
-import { parseQuery } from './search-query.js'
+import { parseQuery, matchExact } from './search-query.js'
 import { yieldTurn } from './background.js'
 
 // Single source of truth for what the search index can see (prose only).
@@ -56,19 +56,16 @@ export function ftsAnyQueryFor(raw) {
   return terms.map(quoteFtsTerm).join(' OR ')
 }
 
-// Adjacent-phrase match (see searchMessages). Capped so a pasted paragraph
-// is not run as a phrase.
+// Adjacent-phrase tier (see searchMessages): 2 to MAX_PHRASE_TERMS terms, so
+// a pasted paragraph is not run as a phrase. The terms come from parseQuery
+// and the match string from matchExact, the same pair the tracker tiers use.
 const MAX_PHRASE_TERMS = 8
-export function ftsPhraseQueryFor(raw) {
-  const terms = String(raw).split(/\s+/).filter(Boolean)
-  return terms.length < 2 ? null : quoteFtsTerm(terms.join(' '))
+function phraseMatchFor(parsed) {
+  return parsed && parsed.terms.length >= 2 && parsed.terms.length <= MAX_PHRASE_TERMS ? matchExact(parsed) : null
 }
 
-// WHERE/SELECT builder shared by searchMessages's main (all-words) query and
-// its some_words fallback below — the only difference between the two is
-// the MATCH string and an extra "already have these seqs" exclusion, so
-// they are built from one template rather than two copies of the privacy
-// and subagent predicates drifting apart.
+// WHERE/SELECT builder shared by all ranked tiers, keeping privacy and
+// subagent predicates identical. The phrase tier additionally excludes diffs.
 // excludePrivateOwned (spec: agent visibility & privacy): hits from
 // conversations owned by a private device vanish for ordinary agent
 // callers. NULL-owner (legacy) conversations are never private-owned.
@@ -106,7 +103,7 @@ function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqs
 // failure should be unreachable, but a SQLite error must surface as
 // badQuery (→ 400), never a 500 with internals in it.
 //
-// some_words fallback: fewer than 5 all-words (`why: 'words'`)
+// some_words fallback: fewer than 5 combined exact-phrase and all-words
 // hits, and the query has 2+ terms — any one term, excluding the seqs
 // already returned, up to the remaining limit, tagged `why: 'some_words'`.
 // Inherits the exact same privacy/subagent filters via rankedSql, so the
@@ -137,14 +134,14 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null, 
     hits.push(...db.prepare(sql).all(...args).map((r) => toHit(r, why)))
   }
   const parsed = parseQuery(query)
-  const termCount = String(query).split(/\s+/).filter(Boolean).length
+  const phraseMatch = phraseMatchFor(parsed)
   try {
     // Phrase tier (2+ terms): a message holding the terms adjacent and in
     // order ranks above one that merely contains every term somewhere: a
     // person recalling what was said types a fragment of it. Prose only, so
     // a diff never jumps above prose matching the same terms.
-    if (termCount >= 2 && termCount <= MAX_PHRASE_TERMS) {
-      runTier(ftsPhraseQueryFor(query), 'phrase', { proseOnly: true })
+    if (phraseMatch != null) {
+      runTier(phraseMatch, 'exact', { proseOnly: true })
     }
     runTier(match, 'words')
   } catch (err) {

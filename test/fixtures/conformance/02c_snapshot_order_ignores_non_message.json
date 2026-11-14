@@ -2,24 +2,24 @@
   "name": "snapshot: ordering is by last message time, so a later non-message event does not resurface an idle conversation",
   "description": "c1 gets an early agent message, then c2 gets a later agent message, then c1 receives a session_status event (higher last_seq, but not a message). Under the retired last_seq DESC order c1 would sort first; under COALESCE(last_ts, created_at) DESC, id DESC it must sort AFTER c2, whose last message is newer. Pins the non-message-does-not-resurface contract for every conformance consumer.",
   "seed": {
-    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-2" }],
+    "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-2" }],
     "conversations": [
-      { "id": "c1", "owner": "dan", "title": "Older chat", "sessionState": "running" },
-      { "id": "c2", "owner": "dan", "title": "Newer chat", "sessionState": "running" }
+      { "id": "c1", "owner": "alice", "title": "Older chat", "sessionState": "running" },
+      { "id": "c2", "owner": "alice", "title": "Newer chat", "sessionState": "running" }
     ],
     "events": [
-      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "older message" } },
-      { "convo": "c2", "sender": "agent:dev-2", "type": "text", "payload": { "body": "newer message" } },
-      { "convo": "c1", "sender": "agent:dev-2", "type": "session_status", "payload": { "state": "waiting" } }
+      { "convo": "c1", "sender": "agent:box-2", "type": "text", "payload": { "body": "older message" } },
+      { "convo": "c2", "sender": "agent:box-2", "type": "text", "payload": { "body": "newer message" } },
+      { "convo": "c1", "sender": "agent:box-2", "type": "session_status", "payload": { "state": "waiting" } }
     ]
   },
   "steps": [
     { "kind": "http", "method": "POST", "path": "/login",
-      "body": { "username": "dan", "password": "fixture-pw-2", "device_name": "mac" },
+      "body": { "username": "alice", "password": "fixture-pw-2", "device_name": "mac" },
       "expect": { "status": 200, "body": {
-        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+        "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
+    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": {
         "coordinator_convo_id": null,
         "pins": [],

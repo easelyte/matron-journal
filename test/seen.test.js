@@ -275,3 +275,26 @@ test('listUnseen: a prompt the bridge settled itself (prompt_reply naming its pr
   say('c1', null, 'agent:ang', 'prompt_reply', { kind: 'queued_release', prompt_id: 'pr_2', action: 'send', released: [] })
   assert.deepEqual(listUnseen(db, alice.id, { now: later }).entries.map((e) => [e.convo_id, e.reasons]), [['pc', ['prompt']]])
 })
+
+test('listUnseen: a silent event is never listed, and the message before it stays the "final" one', async () => {
+  const { db, alice, say, later } = await world()
+  const last = say('c1', 'Done, I will check the build again at 18:00')
+  say('c1', null, 'agent:ang', 'prompt', { question: 'The agent set itself reminder #3 for 18:00', options: ['Send now', 'Cancel'], prompt_id: 'timer_3_1', blocking: false, silent: true })
+  say('c2', 'Timer cancelled', 'agent:ang', 'text', { body: 'Timer cancelled', from: 'assistant', silent: true })
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, sessionState: 'waiting' })
+  const all = listUnseen(db, alice.id, { now: later, importance: 'all' }).entries
+  assert.deepEqual(all.map((e) => [e.convo_id, e.seq, e.reasons]), [['c1', last, ['final']]])
+  // Only a strict true is silent.
+  say('c2', 'Hello', 'agent:ang', 'text', { body: 'Hello', from: 'assistant', silent: 'yes' })
+  assert.equal(listUnseen(db, alice.id, { now: later, importance: 'all' }).entries.filter((e) => e.convo_id === 'c2').length, 1)
+})
+
+test('addSeenRanges: a silent event in the gap between two ranges does not keep them apart', async () => {
+  const { db, alice, say } = await world()
+  const a = say('c1', 'one')
+  say('c1', null, 'agent:ang', 'prompt', { question: 'Reminder set', options: ['Send now', 'Cancel'], blocking: false, silent: true })
+  const b = say('c1', 'two')
+  addSeenRanges(db, alice.id, 'c1', [[a, a]])
+  addSeenRanges(db, alice.id, 'c1', [[b, b]])
+  assert.deepEqual(seenRanges(db, alice.id, 'c1'), [[a, b]])
+})

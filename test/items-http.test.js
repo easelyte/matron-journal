@@ -753,21 +753,30 @@ test('a colleague reading a shared item never sees a handover: no pending offer,
   assert.equal(list.json.items[0].handover, null)
 })
 
-test('a comment or a create over 32768 characters is a named 400 with the limit, and nothing is stored', async (t) => {
+test('oversized item and comment bodies return a named 400 with the limit without storing changes', async (t) => {
   const { s, client } = await fleet(t)
   const tooLong = await mkItem(s, client, { body: 'x'.repeat(32769) })
-  assert.equal(tooLong.status, 400)
-  assert.deepEqual(tooLong.json, { error: 'body_too_long', max: 32768 })
+  assert.deepEqual([tooLong.status, tooLong.json], [400, { error: 'body_too_long', max: 32768 }])
+  assert.equal((await s.http('/items', { token: client })).json.items.length, 0)
   const created = await mkItem(s, client, { body: 'x'.repeat(32768) })
   assert.equal(created.status, 201)
   const id = created.json.item.id
-  const before = (await s.http(`/items/${id}`, { token: client })).json.comments.length
-  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'y'.repeat(32769) } })
-  assert.equal(r.status, 400)
-  assert.deepEqual(r.json, { error: 'body_too_long', max: 32768 })
-  assert.equal((await s.http(`/items/${id}`, { token: client })).json.comments.length, before, 'the refused comment stored nothing')
-  const ok = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'y'.repeat(32768) } })
-  assert.equal(ok.status, 201)
+  const before = (await s.http(`/items/${id}`, { token: client })).json
+  for (const [path, method] of [[`/items/${id}`, 'PATCH'], [`/items/${id}/comments`, 'POST']]) {
+    const rejected = await s.http(path, { method, token: client, body: { body: 'y'.repeat(32769) } })
+    assert.deepEqual([rejected.status, rejected.json], [400, { error: 'body_too_long', max: 32768 }])
+    assert.deepEqual((await s.http(`/items/${id}`, { token: client })).json, before)
+    const malformed = await s.http(path, { method, token: client, body: { body: 42 } })
+    assert.deepEqual([malformed.status, malformed.json], [400, { error: 'bad_request' }])
+  }
+  const malformed = await mkItem(s, client, { body: 42 })
+  assert.deepEqual([malformed.status, malformed.json], [400, { error: 'bad_request' }])
+  const patched = await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { body: 'y'.repeat(32768) } })
+  assert.equal(patched.status, 200)
+  assert.equal(patched.json.item.body, 'y'.repeat(32768))
+  const comment = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'y'.repeat(32768) } })
+  assert.equal(comment.status, 201)
+  assert.equal(comment.json.comment.body, 'y'.repeat(32768))
 })
 
 test('more than 20 attachments on a comment or a create is a named 400, and nothing is stored', async (t) => {
