@@ -1,0 +1,83 @@
+{
+  "type": "http.post.missions.201",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "15_missions_roundtrip.json#step[0]",
+      "frame": {
+        "mission": {
+          "id": "sample-mission_id",
+          "user_id": 9544,
+          "num": 1,
+          "state": "open",
+          "title": "Missions & milestones",
+          "body": "Ship it",
+          "close_summary": null,
+          "closed_by": null,
+          "closed_over_open_items": 0,
+          "origin_convo_id": "c1",
+          "name": null,
+          "origin_device_id": 9308,
+          "created_by": "agent",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "last_milestone_at": null,
+          "closed_at": null,
+          "status": null,
+          "status_by": null,
+          "status_convo_id": null,
+          "status_updated_at": null,
+          "closed_convo_id": null,
+          "open_items": 0,
+          "needs_you": 0,
+          "conversations": 1,
+          "milestones": 0,
+          "last_milestone": null,
+          "project_id": "sample-project_id",
+          "project_num": 2,
+          "activity": "running",
+          "last_activity_at": 1700000000000
+        }
+      }
+    },
+    {
+      "source": "17_mission_links_and_projects.json#step[0]",
+      "frame": {
+        "mission": {
+          "id": "sample-id",
+          "user_id": 1,
+          "num": 1,
+          "state": "sample-state",
+          "title": "sample-title",
+          "body": "sample-body",
+          "close_summary": null,
+          "closed_by": null,
+          "closed_over_open_items": 1,
+          "origin_convo_id": "sample-origin_convo_id",
+          "origin_device_id": 1,
+          "created_by": "sample-created_by",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "last_milestone_at": null,
+          "closed_at": null,
+          "status": null,
+          "status_by": null,
+          "status_convo_id": null,
+          "status_updated_at": null,
+          "closed_convo_id": null,
+          "project_id": "sample-project_id",
+          "name": null,
+          "open_items": 1,
+          "needs_you": 1,
+          "conversations": 1,
+          "milestones": 1,
+          "project_num": 1,
+          "last_milestone": null,
+          "last_activity_at": 1700000000000,
+          "activity": "sample-activity"
+        }
+      }
+    }
+  ]
+}

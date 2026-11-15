@@ -1,0 +1,76 @@
+{
+  "type": "http.post.items.comments.201",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "14_items_roundtrip.json#step[3]",
+      "frame": {
+        "item": {
+          "id": "sample-item_id",
+          "user_id": 9544,
+          "num": 1,
+          "kind": "question",
+          "state": "open",
+          "resolution": null,
+          "awaiting": "agent",
+          "rank": 1024,
+          "title": "Which auth library?",
+          "body": "A or B?",
+          "labels": [],
+          "links": [],
+          "supersedes": null,
+          "origin_convo_id": "c1",
+          "origin_device_id": 9308,
+          "created_by": "agent",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "closed_at": null,
+          "mission_id": null,
+          "mission_num": null,
+          "consent": null,
+          "actions": [],
+          "chosen_action": null,
+          "private": false,
+          "origin_convo_title": "Session",
+          "filed_convo_id": null,
+          "step_up": false,
+          "subject": null,
+          "device_name": "box-2",
+          "handover": null,
+          "comment_count": 1,
+          "last_comment_at": 1700000000000,
+          "last_user_input_at": 1700000000000,
+          "attachments": [],
+          "has_image": false,
+          "working": {
+            "state": "running",
+            "since": 1,
+            "until": null
+          }
+        },
+        "comment": {
+          "id": "sample-comment_id",
+          "item_id": "sample-item_id",
+          "author": "user",
+          "device_id": 1,
+          "kind": "comment",
+          "body": "Use A",
+          "created_at": 1700000000000,
+          "attachments": [],
+          "meta": null,
+          "action": null,
+          "reply_to": null,
+          "actions": [],
+          "chosen_action": null,
+          "step_up": false,
+          "subject": null,
+          "approval": null,
+          "device_name": null,
+          "convo_id": null,
+          "convo_title": null
+        }
+      }
+    }
+  ]
+}

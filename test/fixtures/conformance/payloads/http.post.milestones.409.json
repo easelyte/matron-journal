@@ -1,0 +1,14 @@
+{
+  "type": "http.post.milestones.409",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "15_missions_roundtrip.json#step[1]",
+      "frame": {
+        "error": "conflict",
+        "blocked_by": "no_mission"
+      }
+    }
+  ]
+}

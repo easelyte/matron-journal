@@ -4,15 +4,17 @@
 // owning bridge and every open app hear it live and replay it later.
 import { append, broadcastAppended, CONVO_ID_MAX_CHARS } from './journal.js'
 import { json, readBody } from './http-body.js'
-import { senderOf, badRequest, notFound } from './http-who.js'
+import { senderOf, badRequest } from './http-who.js'
 import { filteredAgent } from './privacy.js'
 import { COORDINATOR_EVENT_TYPE, coordinatorFor, setCoordinatorConvoId } from './coordinator.js'
 import { getConsentEnabled, setConsentEnabled, getTransferConsentEnabled, setTransferConsentEnabled } from './consent.js'
 import { seedRoutines } from './routines.js'
+import { guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
+import { securityLogOf, convoTarget } from './security-log.js'
 
 export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/coordinator') return false
-  const { db, hub } = ctx
+  const { db, hub, journalHost = null } = ctx
   // `consent` (spec: 2026-09-29 coordinator consent): whether the
   // Coordinator may answer chat and spawn asks on the user's behalf. Read by
   // both kinds; set by a client alone, with or without a convo_id change.
@@ -31,17 +33,16 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (!('convo_id' in body) && !('consent' in body) && !('transfer_consent' in body)) return badRequest(res)
   if ('consent' in body && typeof body.consent !== 'boolean') return badRequest(res)
   if ('transfer_consent' in body && typeof body.transfer_consent !== 'boolean') return badRequest(res)
-  const saveSwitches = () => {
-    if ('consent' in body) setConsentEnabled(db, who.userId, body.consent, Date.now())
-    if ('transfer_consent' in body) setTransferConsentEnabled(db, who.userId, body.transfer_consent, Date.now())
-  }
-  if (!('convo_id' in body)) {
-    saveSwitches()
-    json(res, 200, view())
-    return true
-  }
   const convoId = body.convo_id
-  if (convoId !== null && (typeof convoId !== 'string' || !convoId || convoId.length > CONVO_ID_MAX_CHARS)) return badRequest(res)
+  if ('convo_id' in body && convoId !== null && (typeof convoId !== 'string' || !convoId || convoId.length > CONVO_ID_MAX_CHARS)) return badRequest(res)
+  // An account action: once the user has an approval key, each change is
+  // signed — {op:'set_coordinator', convo:<id, or '' to clear>} or
+  // {op:'set_consent', which:'spawns'|'transfers', on:'true'|'false'} —
+  // and a request makes one change, since one statement names one subject.
+  const changes = ['convo_id', 'consent', 'transfer_consent'].filter((k) => k in body)
+  const subject = 'convo_id' in body ? boundedSubject({ op: 'set_coordinator', convo: convoId ?? '' })
+    : 'consent' in body ? { op: 'set_consent', which: 'spawns', on: String(body.consent) }
+    : { op: 'set_consent', which: 'transfers', on: String(body.transfer_consent) }
   const sender = senderOf(db, who)
   // Collected inside setCoordinatorConvoId's own transaction (via append(),
   // the journal's non-broadcasting half) so the setting and both event rows
@@ -49,19 +50,49 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   // of leaving it switched with no event committed (CodeRabbit finding: the
   // old emitRole ran after the setting had already committed, so the PUT
   // still returned 200 and a repeat PUT of the same value was a no-op,
-  // permanently hiding `assigned` from the new owning bridge).
+  // permanently hiding `assigned` from the new owning bridge). That
+  // transaction nests in the guard's, so the switches, the role and the
+  // approval's nonce commit or roll back together.
   const appended = []
-  let out
-  try {
-    out = setCoordinatorConvoId(db, who.userId, convoId, Date.now(), {
-      appendEvent: (evtConvoId, role) => {
-        const r = append(db, { userId: who.userId, convoId: evtConvoId, sender, type: COORDINATOR_EVENT_TYPE, payload: { role } })
-        appended.push({ convoId: evtConvoId, role, seq: r.seq, ts: r.ts })
-      },
-    })
-  } catch (err) {
-    if (err.message === 'no_convo') return notFound(res)
-    throw err
+  let out = null
+  // Which switches the write actually turned (the security log).
+  const switched = []
+  const g = guardedAccountAction({ db, journalHost }, who, body, subject, {
+    check: () => {
+      if (changes.length > 1 && hasActiveKey(db, who.userId)) refuse(400, { error: 'bad_request', detail: 'one_change_per_approval' })
+    },
+    write: () => {
+      if ('convo_id' in body) {
+        try {
+          out = setCoordinatorConvoId(db, who.userId, convoId, Date.now(), {
+            appendEvent: (evtConvoId, role) => {
+              const r = append(db, { userId: who.userId, convoId: evtConvoId, sender, type: COORDINATOR_EVENT_TYPE, payload: { role } })
+              appended.push({ convoId: evtConvoId, role, seq: r.seq, ts: r.ts })
+            },
+          })
+        } catch (err) {
+          if (err.message === 'no_convo') refuse(404, { error: 'not_found' })
+          throw err
+        }
+      }
+      if ('consent' in body) {
+        if (getConsentEnabled(db, who.userId) !== body.consent) switched.push('spawns')
+        setConsentEnabled(db, who.userId, body.consent, Date.now())
+      }
+      if ('transfer_consent' in body) {
+        if (getTransferConsentEnabled(db, who.userId) !== body.transfer_consent) switched.push('transfers')
+        setTransferConsentEnabled(db, who.userId, body.transfer_consent, Date.now())
+      }
+    },
+  })
+  if (!g.ok) { json(res, g.status, g.body); return true }
+  // Committed: each real change, once.
+  const record = (event, target) => securityLogOf(ctx).record(who.userId, event, { deviceId: who.deviceId, deviceName: who.name, target, decidedBy: 'user' })
+  if (out?.changed) record('coordinator_changed', out.current == null ? null : convoTarget(out.current))
+  for (const which of switched) record('consent_switch_changed', which)
+  if (!out) {
+    json(res, 200, view())
+    return true
   }
   // Broadcast only now: everything above already committed.
   for (const e of appended) {
@@ -78,7 +109,6 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (out.current) {
     try { seedRoutines(db, who.userId, Date.now()) } catch (err) { console.error('coordinator: routine seeding failed (the role stands)', err) }
   }
-  saveSwitches()
   json(res, 200, { convo_id: out.current, ...settings() })
   return true
 }

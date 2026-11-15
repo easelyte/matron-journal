@@ -29,7 +29,7 @@ export function normalizeCode(input) {
 // display code instead — bounded by maxPending (≤64) and only reachable
 // with an authenticated client bearer, so the scan is fine.
 export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
-  const pairs = new Map() // pollToken -> { code, userId, agentName, approved, requesterIp, expiresAt }
+  const pairs = new Map() // pollToken -> { code, userId, agentName, approved, approvedBy, requesterIp, expiresAt }
 
   const sweep = (now) => {
     for (const [k, p] of pairs) if (now >= p.expiresAt) pairs.delete(k)
@@ -61,7 +61,8 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
       }
       return null
     },
-    approve(codeInput, { userId, agentName, tagChar = null }) {
+    // `approvedBy`: the approving client device, for the security log.
+    approve(codeInput, { userId, agentName, tagChar = null, approvedBy = null }) {
       const now = Date.now()
       const code = normalizeCode(codeInput)
       for (const p of pairs.values()) {
@@ -72,6 +73,7 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
         p.userId = userId
         p.agentName = agentName
         p.tagChar = tagChar
+        p.approvedBy = approvedBy
         return 'approved'
       }
       return 'not_found'
@@ -84,7 +86,15 @@ export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
       }
       if (!p.approved) return { status: 'pending' }
       pairs.delete(pollToken) // one-shot: the pair is gone before the caller sees the identity
-      return { status: 'approved', userId: p.userId, agentName: p.agentName, tagChar: p.tagChar ?? null }
+      return { status: 'approved', userId: p.userId, agentName: p.agentName, tagChar: p.tagChar ?? null, approvedBy: p.approvedBy ?? null }
+    },
+    // A panic lock (src/panic-lock.js): every pair approved for the user is
+    // dropped, so a box that holds back its claim until after the clear gets
+    // 404, not a device. → how many.
+    dropApproved(userId) {
+      let n = 0
+      for (const [k, p] of pairs) if (p.approved && p.userId === userId) { pairs.delete(k); n += 1 }
+      return n
     },
     size() { return pairs.size },
   }

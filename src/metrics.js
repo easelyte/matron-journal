@@ -34,6 +34,8 @@ export function buildMetrics(db, { hub, pushPipeline, dbPath, userId, excludePri
   // this must not throw either way.
   const counters = (pushPipeline && pushPipeline.counters) || { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
+  const web = pushPipeline?.webCounters || { sent: 0, failed: 0, pruned: 0, byReason: {} }
+
   // POST /summarise usage (src/summarise.js): global totals like `push`,
   // plus per-device spend for the caller's own user's devices only, with
   // private devices dropped for a filtered caller exactly as `devices` is.
@@ -46,7 +48,8 @@ export function buildMetrics(db, { hub, pushPipeline, dbPath, userId, excludePri
     sockets_connected: socketsConnected,
     journal_row_count: journalRowCount,
     db_file_size_bytes: dbFileSizeBytes,
-    push: { sent: counters.sent, failed: counters.failed, pruned: counters.pruned, by_reason: counters.byReason },
+    push: { sent: counters.sent, failed: counters.failed, pruned: counters.pruned, by_reason: counters.byReason,
+      web: { sent: web.sent, failed: web.failed, pruned: web.pruned, by_reason: web.byReason } },
     summarise,
   }
 }

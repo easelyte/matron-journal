@@ -37,7 +37,7 @@ export const QUOTE = '> '
 export const ALERT_NAME_RE = /^[A-Za-z_:][A-Za-z0-9_:]*$/
 
 export const DISK_ALERT_RE = /Disk|Zpool/
-export const DISK_HINT = "Check the box's disk (agent_boxes). Below 20% free, start a safe clean-up session per the standing rule."
+export const DISK_HINT = "Check the box's disk (agent_boxes). If free space is low, follow your playbook and the user's memories on freeing it."
 
 const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
 const field = (v, max = FIELD_CAP) => (typeof v === 'string' || typeof v === 'number' ? sanitizePeerText(v, max) : '')

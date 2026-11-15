@@ -671,3 +671,23 @@ test('block: an operator block that lands while the inviter\'s journal fetches t
   assert.deepEqual(w.a.db.prepare('SELECT host, state, key_pub FROM fed_peers').all(), [{ host: 'b.example', state: 'blocked', key_pub: '' }])
   assert.deepEqual(await contactsOf(w.phones.alice), [])
 })
+
+test('an invite opened or accepted by a caller whose account is locked while the other journal answers: refused before anything is written', async (t) => {
+  const w = await world(t)
+  const { link } = await invite(w)
+  // b.example knows a.example under another key: opening the link would
+  // mark it key_changed.
+  w.b.db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES('a.example','https://a.example','an-older-key','active',1)").run()
+  const peer = () => w.b.db.prepare("SELECT key_pub, state FROM fed_peers WHERE host='a.example'").get()
+  const lock = (name) => () => w.b.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.users[name].id, Date.now())
+  w.hooks.afterFetch = lock('bob')
+  const opened = await w.phones.bob('/contacts/invites/open', post({ link }))
+  assert.equal(opened.status, 423)
+  assert.equal(opened.json.error, 'account_locked')
+  assert.deepEqual(peer(), { key_pub: 'an-older-key', state: 'active' })
+  w.hooks.afterFetch = lock('carol')
+  const accepted = await w.phones.carol('/contacts/invites/accept', post({ link }))
+  assert.equal(accepted.status, 423)
+  assert.deepEqual(peer(), { key_pub: 'an-older-key', state: 'active' })
+  assert.equal(w.b.db.prepare('SELECT COUNT(*) AS n FROM contacts WHERE user_id=?').get(w.users.carol.id).n, 0)
+})

@@ -1,0 +1,14 @@
+{
+  "type": "http.post.login.429",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "01_login.json#step[7]",
+      "frame": {
+        "error": "locked_out",
+        "retry_after": 1
+      }
+    }
+  ]
+}

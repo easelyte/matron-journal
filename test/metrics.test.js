@@ -33,7 +33,7 @@ test('GET /metrics: shape, and any valid device (client or agent) can call it', 
   assert.equal(typeof r.json.sockets_connected, 'number')
   assert.equal(typeof r.json.journal_row_count, 'number')
   assert.equal(typeof r.json.db_file_size_bytes, 'number')
-  assert.deepEqual(Object.keys(r.json.push).sort(), ['by_reason', 'failed', 'pruned', 'sent'])
+  assert.deepEqual(Object.keys(r.json.push).sort(), ['by_reason', 'failed', 'pruned', 'sent', 'web'])
 
   const dev = r.json.user.devices.find((d) => d.device_id === login.json.device_id)
   assert.ok(dev, 'caller device missing from user.devices')
@@ -127,5 +127,5 @@ test('GET /metrics: db_file_size_bytes reflects a real db file (non-zero) and pu
   const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
   const r = await s.http('/metrics', { token: login.json.token })
   assert.ok(r.json.db_file_size_bytes > 0)
-  assert.deepEqual(r.json.push, { sent: 0, failed: 0, pruned: 0, by_reason: {} })
+  assert.deepEqual(r.json.push, { sent: 0, failed: 0, pruned: 0, by_reason: {}, web: { sent: 0, failed: 0, pruned: 0, by_reason: {} } })
 })

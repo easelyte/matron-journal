@@ -1,6 +1,7 @@
 {
   "name": "snapshot: ordering is by last message time, so a later non-message event does not resurface an idle conversation",
   "description": "c1 gets an early agent message, then c2 gets a later agent message, then c1 receives a session_status event (higher last_seq, but not a message). Under the retired last_seq DESC order c1 would sort first; under COALESCE(last_ts, created_at) DESC, id DESC it must sort AFTER c2, whose last message is newer. Pins the non-message-does-not-resurface contract for every conformance consumer.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-2" }],
     "conversations": [
@@ -14,12 +15,12 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-2", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": {
         "coordinator_convo_id": null,
         "pins": [],

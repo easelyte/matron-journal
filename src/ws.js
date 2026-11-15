@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
-import { authToken, authorizeAgentWrite } from './auth.js'
+import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked, deviceLocked } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
 import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -14,11 +14,16 @@ import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpa
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
 import { answerSpawnAsk } from './consent-answer.js'
+import { isProtectedDevice, consentSubject } from './consent-subject.js'
+import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
+import { securityLogFor, boxTarget, convoTarget } from './security-log.js'
+import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
+import { sweepMemoryProposals } from './memory-proposals-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
 import { fedRoomsOf, fedLinked, isFedGuestRoom } from './federation-rooms.js'
@@ -33,14 +38,28 @@ import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from 
 import { archiveChanges, sendArchiveFrame } from './archive.js'
 import { coordinatorFor, getCoordinatorConvoId } from './coordinator.js'
 import { forwardPeopleMessage, isPeopleConvo } from './people-replies.js'
+import { forwardInboundMessage, isInboundConvo } from './inbound-replies.js'
 import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
-import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { recordBoxUsage, recordSessionUsage } from './usage-history.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame, carryOnUserOnlyRefused, WHY_CARRY_ON_USER_ONLY } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
+import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
+
+// A box's locked report changed (hello, status, box_status): the user's
+// client sockets hear it as `device_meta`, the frame that carries a
+// device's full current meta (as a rename or a tag change sends it), so an
+// app need not poll GET /devices. Store first; → whether it changed.
+function applyDeviceLocked(db, hub, userId, deviceId, locked) {
+  if (!setDeviceLocked(db, deviceId, locked)) return false
+  const d = db.prepare('SELECT name, tag_char FROM devices WHERE id=?').get(deviceId)
+  if (d) hub.sendToClients(userId, { kind: 'device_meta', device_id: deviceId, name: sanitizePeerText(d.name, PEER_NAME_CAP), tag_char: d.tag_char, locked: deviceLocked(db, deviceId) })
+  return true
+}
 
 // file/image sends carry a blob_ref pointing at a prior POST /media upload;
 // the payload mirrors the agent-publish shape ({blob_ref, name, content_type,
@@ -343,6 +362,7 @@ export function attachWs({
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
   perMessageDeflate = false,
+  journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db),
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -356,7 +376,23 @@ export function attachWs({
   const vitalsCache = makeVitalsCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
-  const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
+  const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
+  // Alive = the row exists and, for a client, it has not idled out. A live
+  // check is also a use of the device, so an open socket keeps it signed in.
+  // A client socket of a locked account met after its hello (mid-replay,
+  // or as it registers): a frozen device's is closed as the lock closes
+  // them, the device left as it is; any other is signed out and closed as
+  // a revoked one.
+  const closeLockedClient = (ws, who, lock) => {
+    const frozen = refuseLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+    if (ws.readyState !== 1) return
+    if (frozen) closeFrozenSocket(ws, lock)
+    else closeLockedSocket(ws, lock)
+  }
+  const deviceAlive = (id) => {
+    const row = deviceRowStmt.get(id)
+    return !!row && touchDevice(db, row, { now: clientIdleClock(), clientIdleMs })
+  }
   const interval = setInterval(() => {
     const now = Date.now()
     for (const ws of wss.clients) {
@@ -375,6 +411,16 @@ export function attachWs({
   // next-frame or ≤ one sweep interval (60s default), whichever comes
   // first. unref'd — never keeps the process alive on its own.
   const sweep = setInterval(() => {
+    // Panic locks cleared on the host (matron-admin panic clear, a separate
+    // process): the clear frame to each of the account's bridge sockets that
+    // was told it was locked, once, within one sweep interval
+    // (src/panic.js). First and on its own, so nothing else in this sweep
+    // can skip it.
+    try {
+      announcePanicClears(db, hub)
+    } catch (err) {
+      console.error('panic: clear announcement failed', err)
+    }
     // Whole-body guard: this callback now does DB work (expireInvites below
     // plus a per-expired-row lookup) ahead of the connection-count
     // early-return, so any SQLite error here (a shutdown race, SQLITE_BUSY)
@@ -471,6 +517,12 @@ export function attachWs({
       } catch (err) {
         console.error('handover: expiry sweep failed', err)
       }
+      // Memory proposals nobody answered in 7 days (src/memory-proposals.js).
+      try {
+        sweepMemoryProposals({ db, hub, pushPipeline })
+      } catch (err) {
+        console.error('memory proposals: expiry sweep failed', err)
+      }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never
       // settled — a restart in the gap before approveSpawn resolves it, or a
@@ -504,12 +556,13 @@ export function attachWs({
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
-      const existing = new Set(
-        db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
-          .all(...ids).map((r) => r.id)
-      )
+      const rows = db.prepare(`SELECT id, kind, created_at, last_seen_at FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids)
+      const now = clientIdleClock()
+      // Gone or idled out: both close the socket as revoked. A live one is
+      // in use, so its clock is kept fresh (at most hourly, see touchDevice).
+      const alive = new Set(rows.filter((r) => touchDevice(db, r, { now, clientIdleMs })).map((r) => r.id))
       for (const c of conns) {
-        if (existing.has(c.deviceId)) continue
+        if (alive.has(c.deviceId) && !c.authDead?.()) continue
         if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
         c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
         c.ws.close(4001)
@@ -550,11 +603,26 @@ export function attachWs({
       try {
         if (!conn) {
           if (msg.op !== 'hello') { ws.close(); return }
-          const who = msg.token && authToken(db, msg.token)
+          const authAt = Date.now()
+          const who = msg.token && authToken(db, msg.token, { now: clientIdleClock(), clientIdleMs })
           if (!who) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
             ws.close()
             return
+          }
+          // A client of a panic-locked account (src/panic.js): the auth
+          // error's shape with account_locked and since, the usual close,
+          // and the device is signed out, or, frozen (an approval key
+          // attached), left as it is and told `unlock: true`. Agents of the
+          // account connect as ever (hello_ok then carries `panic`).
+          if (who.kind === 'client') {
+            const lock = panicLock(db, who.userId)
+            if (lock) {
+              const frozen = refuseLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+              ws.send(JSON.stringify(lockedError(lock, frozen)))
+              ws.close()
+              return
+            }
           }
           // Same shape as ack's own cursor validation below (`!Number.isInteger(msg.cursor)
           // || msg.cursor < 0`) — a negative cursor is exactly as invalid here as a
@@ -582,6 +650,14 @@ export function attachWs({
           // Absent field = asserts visible: an unpinned flag follows the env
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
+          // Locked mode (a bridge setting, src/db.js parseLocked): the box's
+          // own report, kept as sent for the device list. A hello without it,
+          // or with locked: null, says the box is not locked; a malformed one
+          // changes nothing.
+          if (who.kind === 'agent') {
+            const locked = msg.locked === undefined ? null : parseLocked(msg.locked)
+            if (locked !== undefined) applyDeviceLocked(db, hub, who.userId, who.deviceId, locked)
+          }
           // Optional client sync scope (src/sync-scope.js). Same reject shape
           // as a bad cursor. Agents' delivery is already scoped by
           // membership, so they ignore it.
@@ -598,6 +674,15 @@ export function attachWs({
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
           conn = { ws, ...who, viewingConvoIds: new Set(), syncScope: who.kind === 'client' ? syncScope : null }
+          // A client's socket is as dead as its token: once an unlock has
+          // replaced the device's token, or a panic lock of the account has
+          // ended since this hello, it is closed as a revoked one (checked
+          // where the device row is: mid-replay, at registration, on every
+          // frame and in the sweep).
+          if (who.kind === 'client') {
+            const auth = { userId: who.userId, deviceId: who.deviceId, token: msg.token, at: authAt }
+            Object.defineProperty(conn, 'authDead', { value: () => clientAuthDead(db, auth) })
+          }
           // Kept on the device row for the push pipeline's wakes, which
           // decide for devices that have no socket.
           if (who.kind === 'client') setDeviceSyncScope(db, who.deviceId, conn.syncScope)
@@ -634,6 +719,12 @@ export function attachWs({
             ? archiveChanges(db, who.userId, msg.archive_since)
             : null
           conn.archiveAt = archive?.at ?? null
+          // panic: on every agent hello while the account is locked, read
+          // from the database (so a restart cannot forget it); absent
+          // otherwise, which a bridge reads as "not locked".
+          const helloLock = who.kind === 'agent' ? panicLock(db, who.userId) : null
+          if (helloLock) panicAnnounced(hub).add(who.userId)
+          markPanicTold(conn, !!helloLock)
           ws.send(JSON.stringify({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
@@ -644,6 +735,7 @@ export function attachWs({
             ...(who.kind === 'client' && msg.sync != null ? { sync: conn.syncScope ?? 'everything' } : {}),
             ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
+            ...panicHelloField(helloLock),
           }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
@@ -700,7 +792,9 @@ export function attachWs({
                 // replay-path half of that guarantee; fanOut below is the
                 // live half.
                 if (who.kind === 'agent' && isClientOnlyEvent(e.type, e.payload)) continue
-                ws.send(JSON.stringify(journalFrame(e)))
+                // History does not say which device sent it: a user's event
+                // replays to an agent with approval_key_id null.
+                ws.send(JSON.stringify(who.kind === 'agent' ? agentJournalFrame(journalFrame(e)) : journalFrame(e)))
               }
               if (batch.length < 500) break
               cursor = batch[batch.length - 1].seq
@@ -734,6 +828,19 @@ export function attachWs({
               // finishing the replay and registering would insert a permanently-dead
               // conn into the hub that nothing ever prunes. Bail out instead.
               if (conn.closed) return
+              // Locked (a client's account) or signed out while the loop
+              // yielded: no more history. Closed as the lock or a revoke
+              // closes a registered socket, before the next batch.
+              const replayLock = who.kind === 'client' ? panicLock(db, who.userId) : null
+              if (replayLock) {
+                closeLockedClient(ws, who, replayLock)
+                return
+              }
+              if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
+                ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+                ws.close(4001)
+                return
+              }
             }
           }
           // INVARIANT (live-event gap): no yield between the final eventsAfter call (the
@@ -756,16 +863,39 @@ export function attachWs({
           }
           hub.register(conn)
           conn.registered = true
+          // A lock set or cleared while the replay above yielded reached
+          // registered sockets only: tell this one now.
+          if (who.kind === 'agent') {
+            const lockNow = panicLock(db, who.userId)
+            if (lockNow && lockNow.since !== helloLock?.since) {
+              panicAnnounced(hub).add(who.userId)
+              ws.send(JSON.stringify(panicOnFrame(lockNow)))
+              markPanicTold(conn, true)
+            } else if (!lockNow && conn.panicTold) {
+              ws.send(JSON.stringify(PANIC_OFF_FRAME))
+              markPanicTold(conn, false)
+            }
+          } else {
+            // A client: locked or signed out while the replay above yielded,
+            // when the lock's own close could not see this unregistered
+            // socket. Closed now, as the lock closes the others.
+            const lockNow = panicLock(db, who.userId)
+            if (lockNow) {
+              closeLockedClient(ws, who, lockNow)
+              return
+            }
+            if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
+              ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+              ws.close(4001)
+              return
+            }
+          }
           // Host-vitals paint-on-connect: a fresh client gets the last host
           // sample immediately. host_vitals is host-global and never
-          // journaled, so it is not part of the cursor replay above — without
-          // this a reconnecting client would show a blank vitals gauge until
-          // the bridge's next ~5s tick.
+          // journaled, so it is not part of the cursor replay above.
           if (conn.kind === 'client') {
             const cachedVitals = vitalsCache.get(conn.userId)
-            if (cachedVitals) {
-              ws.send(JSON.stringify({ kind: 'ephemeral', host_vitals: cachedVitals }))
-            }
+            if (cachedVitals) ws.send(JSON.stringify({ kind: 'ephemeral', host_vitals: cachedVitals }))
           }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
           if (yielded && conn.archiveAt != null) {
@@ -785,17 +915,35 @@ export function attachWs({
         // (hello itself already does the equivalent check via authToken's
         // token-hash lookup, so this must only run post-hello or a revoked
         // token's hello would get checked twice for no benefit).
-        if (!deviceExistsStmt.get(conn.deviceId)) {
+        if (!deviceAlive(conn.deviceId) || conn.authDead?.()) {
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return
+        }
+        // A client socket of a panic-locked account still open (a race, or
+        // a device made by a path the lock missed): the frame is refused
+        // with account_locked (its ref and request_id echoed, so an RPC
+        // caller can correlate it), the device is signed out and the socket
+        // closed as a revoked one is. A frozen device's: the same refusal
+        // with `unlock: true`, an ordinary close, and the device stays.
+        if (conn.kind === 'client') {
+          const lock = panicLock(db, conn.userId)
+          if (lock) {
+            // The refusal first: the sign-out closes the device's sockets.
+            const frozen = isFrozenDevice(db, conn.userId, conn.deviceId, lock)
+            conn.ws.send(JSON.stringify(lockedError(lock, frozen, { ref: msg.op, ...requestIdEcho(msg) })))
+            if (!frozen) signOutLockedClient({ db, hub, securityLog }, conn.userId, conn.deviceId, lock)
+            if (frozen) conn.ws.close()
+            else if (conn.ws.readyState === 1) closeLockedSocket(conn.ws, lock)
+            return
+          }
         }
         // frameBytes = the inbound frame's size as received on the wire —
         // the RPC ops cap THAT (spec: whole inbound frame <= 16 KiB), not a
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -851,12 +999,23 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, log = console.log }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
       ...roomIdEcho(msg), ...requestIdEcho(msg), ...(detail ? { detail } : {}),
     }))
+  }
+  // A bridge's locked-mode report on a later frame (box_status, status), for
+  // its own device only: absent or malformed changes nothing, an object is
+  // stored as sent (on:false too), null clears it (src/db.js parseLocked).
+  // → whether it carried a valid one.
+  const applyLocked = () => {
+    if (conn.kind !== 'agent' || msg.locked === undefined) return false
+    const locked = parseLocked(msg.locked)
+    if (locked === undefined) return false
+    applyDeviceLocked(db, hub, conn.userId, conn.deviceId, locked)
+    return true
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
   // conversations of this conn's user; children (sub-chats) are silenced
@@ -918,7 +1077,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     // stored in the event row, so consumers must fall back to sender-name
     // matching for replayed history.
     frame.sender_device_id = conn.deviceId
-    hub.broadcastJournal(conn.userId, frame, targets)
+    // A user's event reaches an agent stamped with the approval key of the
+    // client device that sent it (hub.js agentJournalFrame).
+    const keyIdOf = conn.kind === 'client' ? () => approvalKeyIdOfDevice(db, conn.userId, conn.deviceId) : null
+    hub.broadcastJournal(conn.userId, frame, targets, keyIdOf)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
@@ -1105,8 +1267,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // The People conversation has no agent (people-convo.js), so a file
         // sent there would reach no one: refused, where text is passed on.
         if (type !== 'text' && isPeopleConvo(db, conn.userId, msg.convo_id)) return fail('bad_request', 'files and images are not passed on from People')
+        // The same goes for an inbound source's conversation (src/inbound.js).
+        const inboundConvo = isInboundConvo(db, conn.userId, msg.convo_id)
+        if (type !== 'text' && inboundConvo) return fail('bad_request', 'files and images are not passed on from this conversation')
         const sent = appendAndFan(sendArgs)
         copyOut(sendArgs, sent)
+        if (type === 'text' && sent.seq != null && inboundConvo) {
+          forwardInboundMessage(personCtx, emitMarker, { kind: 'client', userId: conn.userId, deviceId: conn.deviceId }, { convoId: msg.convo_id, seq: sent.seq, text: typeof msg.payload.body === 'string' ? msg.payload.body : '' })
+        }
         // ...and text there goes to the user's Coordinator, with a line in
         // People saying so (src/people-replies.js).
         // A replay runs it again: its writes are keyed to the message, so a
@@ -1175,17 +1343,66 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
-        // Single-consumer delivery (see hub.sendRpcRequest): false means no
-        // live socket — no queueing, the client hears it immediately.
-        const delivered = hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
+        // A panic-locked account (src/panic.js): nothing goes to its boxes.
+        // The socket check above signs such a client out first; a backstop.
+        const rpcLock = panicLock(db, conn.userId)
+        if (rpcLock) {
+          conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, ref: msg.op, request_id: rid, since: rpcLock.since }))
+          return
+        }
+        // approval_key_id: the approval key attached to the calling client
+        // device, or null, stamped from the journal's own tables like a
+        // user's journal event (hub.js agentJournalFrame); never the
+        // client's. A locked box binds its unlock window to it.
+        const send = () => hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
           kind: 'rpc',
-          request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
+          request: {
+            request_id: rid, from_device_id: conn.deviceId, approval_key_id: approvalKeyIdOfDevice(db, conn.userId, conn.deviceId),
+            method: msg.method, params: msg.params ?? null,
+          },
         })
+        // A direct `start` on a protected box (src/consent-subject.js) is an
+        // account action once the account has an approval key: the client
+        // signs {op:'start', box, workdir, prompt_sha256} and sends it as
+        // params.approval; the params go to the box unchanged, approval
+        // included, for the box to check itself. Checked and sent in one
+        // transaction: a refusal, or a box with no live socket, leaves the
+        // nonce unspent. Every other request, and every request of an
+        // account with no key, is today's.
+        let delivered
+        if (msg.method === 'start' && isProtectedDevice(db, conn.userId, msg.agent_device_id) && hasActiveKey(db, conn.userId)) {
+          const p = msg.params
+          const isText = (v) => v === undefined || typeof v === 'string'
+          if (p === null || typeof p !== 'object' || Array.isArray(p) || !isText(p.workdir) || !isText(p.prompt)) return failRpc('bad_request', 'bad params')
+          const box = db.prepare('SELECT name FROM devices WHERE id=?').get(msg.agent_device_id).name
+          const subject = consentSubject('start', { box, workdir: p.workdir ?? '', prompt: p.prompt ?? '' })
+          try {
+            delivered = db.transaction(() => {
+              const g = requireApproval({ db, journalHost }, conn, { approval: p.approval }, { type: 'account', subject })
+              if (!g.ok) refuse(g.status, g.body)
+              if (!send()) throw new Error('undelivered')
+              return true
+            })()
+          } catch (err) {
+            if (err instanceof ApprovalRefused) return failRpc(err.refusal.body.error, err.refusal.body.reason)
+            if (err?.message !== 'undelivered') throw err
+            delivered = false
+          }
+        } else {
+          // Single-consumer delivery (see hub.sendRpcRequest): false means no
+          // live socket — no queueing, the client hears it immediately.
+          delivered = send()
+        }
         if (!delivered) {
           // Still refused — no RPC queueing — but the box starts booting, so
           // the caller's retry lands on a live bridge.
           wakeIfOffline(msg.agent_device_id)
           return failRpc('agent_unreachable')
+        }
+        // A session started on a box directly, not through a consent ask:
+        // once it has gone to the box (the security log).
+        if (msg.method === 'start') {
+          securityLog.record(conn.userId, 'session_started_direct', { deviceId: conn.deviceId, target: boxTarget(db, msg.agent_device_id), decidedBy: 'user' })
         }
         break
       }
@@ -2329,26 +2546,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               // session_outcome on session_status) so it agrees with the
               // snapshot; omitted-null when the bridge sent no kind.
               agent_kind: convo.agent_kind ?? null,
-              // summary rides convo_meta so the operator's pinned-summary
-              // surface refreshes live instead of only at /snapshot (spec:
-              // pinned-summary surface). Read back from the stored
-              // row like agent_kind, so the event can never disagree with the
-              // snapshot — this event also fires for a title-only change, and
-              // then it simply restates the summary already stored.
-              //
-              // Always present (like title/agent_kind, unlike session_status's
-              // omitted-when-absent session_outcome) for two reasons: it makes
-              // the payload self-describing for field-presence feature
-              // detection — the only mechanism available, since /snapshot
-              // advertises no capabilities array — and it lets a bridge CLEAR
-              // a summary (upsert `summary: ""`) and have the clear actually
-              // reach live clients instead of being indistinguishable from
-              // "this event carries no summary news".
-              summary: convo.summary ?? '',
-              summary_updated_at: convo.summary_updated_at ?? 0,
               repo: convo.repo ?? null,
             },
           })
+        }
+        // A changed summary is client-only live state: no journal event, no
+        // last_seq movement, no replay. Catch-up is /snapshot's summary and
+        // summary_updated_at.
+        if (convo.summaryChanged) {
+          try {
+            hub.sendToClients(conn.userId, { kind: 'summary', convo_id: msg.convo_id, summary: convo.summary, summary_updated_at: convo.summary_updated_at })
+          } catch (err) { console.error('summary: live frame failed (saved)', err) }
         }
         break
       }
@@ -2492,7 +2700,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sanitisers as the recent_folders capacity blocks, so a bridge
         // sends the one payload for both.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // `locked` (the box's locked mode) rides here too, kept on the
+        // device row apart from the report: a report without it leaves it,
+        // a malformed one is ignored. A valid `locked` alone is a report;
+        // a frame with nothing valid in it is the bad_request it always was.
+        const lockedOk = applyLocked()
         const status = sanitizeBoxStatus(msg)
+        if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
         // box_status is a full replacement, except `restart`: a restart's
         // state is kept until the next one, so a report that does not
@@ -2503,6 +2717,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // The same reading, filed in the usage history (best effort: a
+        // failed write must not cost the live report).
+        try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
+        catch (e) { console.warn(`box_status: usage history write failed: ${e.message}`) }
         hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
         break
       }
@@ -2516,11 +2734,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (conn.kind !== 'agent') return fail('forbidden')
         if (!conn.registered) return fail('not_ready')
         const v = validateSessionControl(msg)
-        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
-          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}) }))
+        const failRpc = (code, detail, extra = {}) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}), ...extra }))
         if (!v.ok) return failRpc(v.code, v.detail)
-        const auth = authorizeSessionControl(db, conn, msg)
-        if (auth.code) return failRpc(auth.code, auth.detail)
+        // When the request arrived: a carry-on to a user-only box rests on
+        // a user event recent at this moment (and again after a wake).
+        const arrivedAt = Date.now()
+        const auth = authorizeSessionControl(db, conn, msg, { causes: v.causes, now: arrivedAt })
+        if (auth.code) return failRpc(auth.code, auth.detail, { ...(auth.since != null ? { since: auth.since } : {}), ...(auth.why ? { why: auth.why } : {}) })
         const { target } = auth
         // Each op parks a wake waiter (minutes) and a broker entry; bound
         // them per connection so a looping Coordinator cannot stack them.
@@ -2529,6 +2750,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const waking = !online && wakeIfOffline(target.device_id)
         if (!online && !waking) return failRpc('agent_unreachable')
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
+        // The security log's coordinator_carry_on is recorded below, once the
+        // carry-on has actually gone to the box: a refusal after the wait
+        // sends nothing and records nothing.
+        const recordCarryOnEvent = () => {
+          if (v.params.action === 'carry_on') securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
+        }
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
         // A carry-on is recorded before it is relayed, so the target's turn
@@ -2548,8 +2775,27 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           let frame
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
-            const r = await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
-            frame = sessionControlResultFrame(rid, r)
+            // Locked, or the box protected, while it was being woken:
+            // nothing is sent. Nor is a carry-on to a box that is user-only
+            // now (made so meanwhile, or all along) unless its causes still
+            // resolve to the user's own message or tap. The age of that
+            // event is measured from when the request arrived, not from
+            // now: the wake can take minutes, and the user's word was
+            // recent when the Coordinator acted on it.
+            const refusal = isPanicLocked(db, conn.userId) ? ACCOUNT_LOCKED
+              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device'
+                : carryOnUserOnlyRefused(db, conn, { deviceId: target.device_id, action: v.params.action, fromConvoId: msg.from_convo_id, causes: v.causes, at: arrivedAt }) ? 'user_only' : null
+            let r
+            if (refusal) r = { ok: false, error: { code: 'forbidden', detail: refusal } }
+            else {
+              // broker.issue hands the frame to the box's live socket at once
+              // (none: agent_unreachable); recorded when it went.
+              const live = hub.connsOf(conn.userId).some((c) => c.deviceId === target.device_id && c.ws.readyState === 1)
+              const issued = broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+              if (live) recordCarryOnEvent()
+              r = await issued
+            }
+            frame = sessionControlResultFrame(rid, r, refusal === 'user_only' ? WHY_CARRY_ON_USER_ONLY : null)
           } catch (err) {
             console.error(`session_control: ${err?.message || err}`)
             frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
@@ -2569,6 +2815,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // a size-capped object, so the bridge can evolve the shape without
         // a server deploy.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // The box's locked mode, as on box_status: about the device, not the
+        // conversation, so applied whatever the rest of the frame says.
+        applyLocked()
         if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         let encoded
@@ -2585,6 +2834,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (persisted) {
           try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
           catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
+          // Codex's weekly meters only arrive on a session's status.
+          try { recordSessionUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status: persisted, now: reportedAt }) }
+          catch (e) { console.warn(`status: usage history write failed: ${e.message}`) }
         }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,

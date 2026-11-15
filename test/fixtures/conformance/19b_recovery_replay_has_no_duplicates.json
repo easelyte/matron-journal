@@ -1,0 +1,432 @@
+{
+  "name": "recovery: a replay of rows the client already holds adds no duplicates",
+  "description": "After a drop the client reconnects from a cursor behind what it holds (a cursor lost with a lost write). The journal replays from there, the client's model keeps each row once and ends at the head; a second drop and a reconnect from the client's own cursor replays nothing. The virtual clock moves across the gap, which changes nothing.",
+  "protocol": 1,
+  "seed": {
+    "users": [
+      {
+        "as": "alice",
+        "name": "alice",
+        "password": "fixture-pw-19b"
+      }
+    ],
+    "agents": [
+      {
+        "as": "bridge",
+        "user": "alice",
+        "name": "box-2"
+      }
+    ],
+    "conversations": [
+      {
+        "id": "c1",
+        "owner": "alice",
+        "title": "recovery",
+        "agent": "bridge"
+      }
+    ],
+    "events": [
+      {
+        "convo": "c1",
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      },
+      {
+        "convo": "c1",
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "role": "client",
+      "kind": "http",
+      "method": "POST",
+      "path": "/login",
+      "body": {
+        "username": "alice",
+        "password": "fixture-pw-19b",
+        "device_name": "mac"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "token": {
+            "$bind": "alice_token"
+          },
+          "device_id": {
+            "$type": "integer"
+          },
+          "user_id": {
+            "$ref": "alice.user_id"
+          }
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_open",
+      "conn": "agent"
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "bridge.token"
+        },
+        "cursor": null
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 2,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "box-2"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_open",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "alice_token"
+        },
+        "cursor": 0
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 2,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 2,
+        "app": "foreground",
+        "muted": false,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 2,
+              "type": "text",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    },
+    {
+      "role": "client",
+      "kind": "disconnect",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "advance_clock",
+      "ms": 45000
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "reconnect_from_cursor",
+      "conn": "client",
+      "cursor": 1
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 3,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect_none",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 3,
+        "app": "foreground",
+        "muted": false,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 2,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 3,
+              "type": "text",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    },
+    {
+      "role": "client",
+      "kind": "disconnect",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "reconnect_from_cursor",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 3,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect_none",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 3,
+        "app": "foreground",
+        "muted": false,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 2,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 3,
+              "type": "text",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    }
+  ]
+}

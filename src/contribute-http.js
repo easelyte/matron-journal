@@ -135,8 +135,10 @@ export function forwardToContributor(ctx, who, item, { action, comment = null })
     const owner = db.prepare('SELECT id, name FROM users WHERE id=?').get(row.user_id)
     const sender = personSender(owner.name)
     const via = who.kind === 'agent' ? 'agent' : 'user'
+    // A signed tap's approval is the owner's alone (shared reads null it
+    // too): the marker crosses without `signed` or `key_id`.
     const payload = {
-      ...itemMarkerPayload({ item: shared, action, by: via, comment }),
+      ...itemMarkerPayload({ item: shared, action, by: via, comment: comment && { ...comment, approval: null } }),
       person: { name: owner.name, via }, shared_by: { user_id: owner.id, name: owner.name }, mission_id: row.mission_id,
     }
     const r = appendAndBroadcast(db, hub, { userId: to, convoId: row.contributor_convo_id, sender, type: ITEM_EVENT_TYPE, payload })

@@ -1,18 +1,19 @@
 {
   "name": "snapshot: a brand-new user has an empty conversation list",
   "description": "GET /snapshot for a user with no conversations returns {conversations: [], seq: 0}.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-1" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-1", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" },
         "device_id": { "$type": "integer" },
         "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "coordinator_convo_id": null, "pins": [], "conversations": [], "agents": [], "seq": 0 } } }
   ]
 }

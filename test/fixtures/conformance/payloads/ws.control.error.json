@@ -1,0 +1,98 @@
+{
+  "type": "ws.control.error",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "03a_ws_hello_bad_token.json#step[2]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "auth"
+      }
+    },
+    {
+      "source": "06a_agent_publish_types.json#step[12]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "bad_request",
+        "ref": "publish"
+      }
+    },
+    {
+      "source": "06b_agent_finalize_idem_prefix_reject.json#step[4]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "bad_request",
+        "ref": "publish",
+        "detail": "idem_key prefix fin: is reserved"
+      }
+    },
+    {
+      "source": "10_activity.json#step[20]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "bad_request",
+        "ref": "activity"
+      }
+    },
+    {
+      "source": "10_activity.json#step[22]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "forbidden",
+        "ref": "activity"
+      }
+    },
+    {
+      "source": "12_revocation.json#step[8]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "revoked"
+      }
+    },
+    {
+      "source": "13_tool_stream.json#step[22]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "forbidden",
+        "ref": "stream_append"
+      }
+    },
+    {
+      "source": "13_tool_stream.json#step[24]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "bad_request",
+        "ref": "stream_append",
+        "detail": "sample-detail"
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[20]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "forbidden",
+        "ref": "host_vitals"
+      }
+    },
+    {
+      "source": "16_viewing_set.json#step[9]",
+      "frame": {
+        "kind": "control",
+        "op": "error",
+        "code": "bad_request",
+        "ref": "viewing",
+        "detail": "convo_ids must be an array of at most 4 non-empty convo id strings"
+      }
+    }
+  ]
+}

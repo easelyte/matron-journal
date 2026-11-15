@@ -1,0 +1,13 @@
+{
+  "type": "http.post.login.403",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "01_login.json#step[0]",
+      "frame": {
+        "error": "bad_credentials"
+      }
+    }
+  ]
+}

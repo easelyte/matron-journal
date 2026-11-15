@@ -33,6 +33,8 @@ test('agent_request reaches the agent with stamped from_device_id and opaque par
     kind: 'rpc',
     request: {
       request_id: 'r1', from_device_id: login.json.device_id,
+      // The calling device's approval key, stamped by the journal: none here.
+      approval_key_id: null,
       method: 'recent_folders', params: { anything: ['goes', 42] },
     },
   })

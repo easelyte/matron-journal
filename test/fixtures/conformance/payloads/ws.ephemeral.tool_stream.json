@@ -1,0 +1,38 @@
+{
+  "type": "ws.ephemeral.tool_stream",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "13_tool_stream.json#step[13]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "message_ref": "tu1",
+        "tool_stream": {
+          "event": "append",
+          "offset": 0,
+          "chunk": "$ make\n"
+        }
+      }
+    },
+    {
+      "source": "13_tool_stream.json#step[18]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "message_ref": "tu1",
+        "tool_stream": {
+          "event": "sync",
+          "meta": {
+            "tool": "Bash",
+            "command": "make"
+          },
+          "offset": 0,
+          "content": "$ make\n",
+          "head_truncated": false
+        }
+      }
+    }
+  ]
+}

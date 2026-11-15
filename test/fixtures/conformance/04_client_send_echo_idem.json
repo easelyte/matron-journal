@@ -1,50 +1,51 @@
 {
   "name": "client send: journal echo to all of the user's devices, idempotent via local_id, never bumps own unread",
   "description": "A client 'send' becomes a journal row with sender user:<name>, broadcast to every one of that user's connections (including the sender's own). A resend with the same local_id is deduped — no second frame, and the NEXT distinct send's seq proves no seq was consumed by the duplicate. The sender's own conversation unread_count stays 0.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-7" }],
     "conversations": [{ "id": "c1", "owner": "alice" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "client": "mac", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-7", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "mac_token" }, "device_id": { "$bind": "mac_device_id" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "client": "phone", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-7", "device_name": "phone" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "phone_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "ws_open", "conn": "mac" },
-    { "kind": "ws_send", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
-    { "kind": "ws_open", "conn": "phone" },
-    { "kind": "ws_send", "conn": "phone", "frame": { "op": "hello", "token": { "$ref": "phone_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
+    { "kind": "ws_open", "role": "client", "client": "mac", "conn": "mac" },
+    { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "client": "mac", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_open", "role": "client", "client": "phone", "conn": "phone" },
+    { "kind": "ws_send", "role": "client", "client": "phone", "conn": "phone", "frame": { "op": "hello", "token": { "$ref": "phone_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "client": "phone", "conn": "phone", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "phone" } },
 
-    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
-    { "kind": "ws_expect", "conn": "mac", "frame": {
+    { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
+    { "kind": "ws_expect", "role": "client", "client": "mac", "conn": "mac", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "do it" }
     } },
-    { "kind": "ws_expect", "conn": "phone", "frame": {
+    { "kind": "ws_expect", "role": "client", "client": "phone", "conn": "phone", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "do it" }
     } },
 
-    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
-    { "kind": "ws_expect_none", "conn": "mac", "ms": 150 },
-    { "kind": "ws_expect_none", "conn": "phone", "ms": 150 },
+    { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it" }, "local_id": "x1" } },
+    { "kind": "ws_expect_none", "role": "client", "client": "mac", "conn": "mac", "ms": 150 },
+    { "kind": "ws_expect_none", "role": "client", "client": "phone", "conn": "phone", "ms": 150 },
 
-    { "kind": "ws_send", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it again" }, "local_id": "x2" } },
-    { "kind": "ws_expect", "conn": "phone", "frame": {
+    { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "do it again" }, "local_id": "x2" } },
+    { "kind": "ws_expect", "role": "client", "client": "phone", "conn": "phone", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "text", "payload": { "body": "do it again" }
     } },
 
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "mac_token" },
+    { "kind": "http", "role": "client", "client": "mac", "method": "GET", "path": "/snapshot", "token": { "$ref": "mac_token" },
       "expect": { "status": 200, "body": { "coordinator_convo_id": null, "pins": [], "seq": 2, "agents": [], "conversations": [
         { "id": "c1", "title": "", "auto_title": "", "session_state": "running", "session_outcome": null, "last_seq": 2, "unread_count": 0, "snippet": "do it again", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "mission_id": null, "mission_count": 0, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }

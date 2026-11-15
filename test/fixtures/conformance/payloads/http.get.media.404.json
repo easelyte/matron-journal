@@ -1,0 +1,13 @@
+{
+  "type": "http.get.media.404",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "09a_media_roundtrip.json#step[4]",
+      "frame": {
+        "error": "not_found"
+      }
+    }
+  ]
+}

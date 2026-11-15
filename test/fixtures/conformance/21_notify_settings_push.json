@@ -1,0 +1,184 @@
+{
+  "name": "notify settings: a conversation level written over HTTP is pushed to the user's client sockets",
+  "description": "PUT /notify setting a conversation's level to none answers 200 and the journal pushes a notify frame carrying the mode, the event switches and the conversations with an override; clearing the level pushes the frame again without it. This is the frame an app's notifier applies when the user silences a conversation on another device (a timed mute rides the same frame; its end time depends on the clock, so it is not fixed here).",
+  "protocol": 1,
+  "seed": {
+    "users": [
+      {
+        "as": "alice",
+        "name": "alice",
+        "password": "fixture-pw-21"
+      }
+    ],
+    "conversations": [
+      {
+        "id": "c1",
+        "owner": "alice"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "role": "client",
+      "kind": "http",
+      "method": "POST",
+      "path": "/login",
+      "body": {
+        "username": "alice",
+        "password": "fixture-pw-21",
+        "device_name": "mac"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "token": {
+            "$bind": "alice_token"
+          },
+          "device_id": {
+            "$type": "integer"
+          },
+          "user_id": {
+            "$ref": "alice.user_id"
+          }
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_open",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "alice_token"
+        },
+        "cursor": 0
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 0,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "http",
+      "method": "PUT",
+      "path": "/notify",
+      "token": {
+        "$ref": "alice_token"
+      },
+      "body": {
+        "convo": {
+          "convo_id": "c1",
+          "level": "none"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "$ignore": true
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": [
+            {
+              "convo_id": "c1",
+              "level": "none",
+              "mute_until": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "http",
+      "method": "PUT",
+      "path": "/notify",
+      "token": {
+        "$ref": "alice_token"
+      },
+      "body": {
+        "convo": {
+          "convo_id": "c1",
+          "level": null
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "$ignore": true
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": []
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect_none",
+      "conn": "client"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "type": "ws.control.snapshot_required",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "03e_ws_hello_snapshot_required.json#step[4]",
+      "frame": {
+        "kind": "control",
+        "op": "snapshot_required"
+      }
+    }
+  ]
+}

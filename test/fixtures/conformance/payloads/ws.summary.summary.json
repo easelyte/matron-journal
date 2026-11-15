@@ -1,0 +1,16 @@
+{
+  "type": "ws.summary.summary",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "05b_agent_convo_upsert_summary.json#step[8]",
+      "frame": {
+        "kind": "summary",
+        "convo_id": "sess-sum",
+        "summary": "Fixing the build",
+        "summary_updated_at": 1700000000000
+      }
+    }
+  ]
+}

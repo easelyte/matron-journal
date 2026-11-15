@@ -130,7 +130,9 @@ export function fileMirror({ db, hub }, { userId, convoId, deviceId, sender, con
 // contacts they need to read but not decide (another journal's answer, a
 // changed key). It awaits the user with the built-in Seen button. Like a
 // mirror, its marker never wakes an agent; `idemKey` makes it once only.
-export function fileNotice({ db, hub }, { userId, title, body, idemKey }) {
+// `push`: it also pushes to every one of the user's devices, as an item an
+// agent files for the user does (an approval key added or removed).
+export function fileNotice({ db, hub, pushPipeline }, { userId, title, body, idemKey, push = false }) {
   return safely('notice', () => {
     const convoId = peopleConvo({ db, hub }, userId)
     const { item, duplicate } = createItem(db, {
@@ -138,10 +140,11 @@ export function fileNotice({ db, hub }, { userId, title, body, idemKey }) {
       originConvoId: convoId, originDeviceId: 0, createdBy: 'agent', idemKey,
     })
     if (!duplicate) {
-      appendAndBroadcast(db, hub, {
-        userId, convoId, sender: JOURNAL, type: ITEM_EVENT_TYPE,
-        payload: itemMarkerPayload({ item, action: 'created', by: 'agent' }),
-      })
+      const payload = itemMarkerPayload({ item, action: 'created', by: 'agent' })
+      const r = appendAndBroadcast(db, hub, { userId, convoId, sender: JOURNAL, type: ITEM_EVENT_TYPE, payload })
+      if (push && pushPipeline && !r.duplicate) {
+        safely('notice push', () => pushPipeline.onAppend(userId, toEventShape({ seq: r.seq, convo_id: convoId, ts: r.ts, sender: JOURNAL, type: ITEM_EVENT_TYPE, payload }), null))
+      }
     }
     return item
   })

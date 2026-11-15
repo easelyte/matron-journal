@@ -1,6 +1,7 @@
 {
   "name": "items: agent files a question; client reads, answers, agent closes; markers land in the origin convo",
   "description": "Exercises POST/GET /items, POST /items/:id/comments, POST /items/:id/close and the 'item' marker events a client sees on the WS/HTTP read, including the old-client fallback 'text' event the journal mirrors right after each card-worthy marker. Per-user numbering starts at 1; a user comment flips awaiting to agent; close clears it and comment_count only ever counts kind='comment' rows, never the status comments close/reopen write.",
+  "protocol": 1,
   "server": { "tmpDb": true },
   "seed": {
     "users": [ { "as": "alice", "name": "alice", "password": "fixture-pw-15" } ],
@@ -8,32 +9,32 @@
     "conversations": [ { "id": "c1", "owner": "alice", "title": "Session", "sessionState": "running", "agent": "bridge" } ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-15", "device_name": "mac" },
       "expect": { "status": 200, "body": { "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" } } } },
 
-    { "kind": "http", "method": "POST", "path": "/items", "token": { "$ref": "bridge.token" },
+    { "kind": "http", "role": "agent", "method": "POST", "path": "/items", "token": { "$ref": "bridge.token" },
       "body": { "kind": "question", "title": "Which auth library?", "body": "A or B?", "convo_id": "c1" },
       "expect": { "status": 201, "body": { "item": {
         "id": { "$bind": "item_id" }, "user_id": { "$ref": "alice.user_id" }, "num": 1, "kind": "question",
         "state": "open", "resolution": null, "awaiting": "user", "rank": 1024,
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
+        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
         "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } } } },
 
-    { "kind": "http", "method": "GET", "path": "/items?awaiting=user", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/items?awaiting=user", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "items": [ {
         "id": { "$ref": "item_id" }, "user_id": { "$ref": "alice.user_id" }, "num": 1, "kind": "question",
         "state": "open", "resolution": null, "awaiting": "user", "rank": 1024,
         "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
+        "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
         "comment_count": 0, "last_comment_at": null, "last_user_input_at": null, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } } ], "next_cursor": null } } },
 
-    { "kind": "http", "method": "POST", "path": "/items/${item_id}/comments", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "POST", "path": "/items/${item_id}/comments", "token": { "$ref": "alice_token" },
       "body": { "body": "Use A" },
       "expect": { "status": 201, "body": {
         "item": {
@@ -41,18 +42,18 @@
           "state": "open", "resolution": null, "awaiting": "agent", "rank": 1024,
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
           "id": { "$bind": "comment_id" }, "item_id": { "$ref": "item_id" },
           "author": "user", "device_id": { "$type": "integer" }, "kind": "comment", "body": "Use A",
           "created_at": { "$type": "integer" }, "attachments": [], "meta": null, "action": null,
-          "reply_to": null, "actions": [], "chosen_action": null,
+          "reply_to": null, "actions": [], "chosen_action": null, "step_up": false, "subject": null, "approval": null,
           "device_name": null, "convo_id": null, "convo_title": null }
       } } },
 
-    { "kind": "http", "method": "POST", "path": "/items/${item_id}/close", "token": { "$ref": "bridge.token" },
+    { "kind": "http", "role": "agent", "method": "POST", "path": "/items/${item_id}/close", "token": { "$ref": "bridge.token" },
       "body": { "resolution": "answered" },
       "expect": { "status": 200, "body": {
         "item": {
@@ -60,20 +61,20 @@
           "state": "closed", "resolution": "answered", "awaiting": null, "rank": 1024,
           "title": "Which auth library?", "body": "A or B?", "labels": [], "links": [], "supersedes": null,
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
-          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "device_name": "box-2", "handover": null,
+          "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
           "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
         "comment": {
           "id": { "$type": "string" }, "item_id": { "$ref": "item_id" },
           "author": "agent", "device_id": { "$ref": "bridge.device_id" }, "kind": "status", "body": "",
           "created_at": { "$type": "integer" }, "attachments": [], "action": null,
-          "reply_to": null, "actions": [], "chosen_action": null,
+          "reply_to": null, "actions": [], "chosen_action": null, "step_up": false, "subject": null, "approval": null,
           "device_name": "box-2", "convo_id": null, "convo_title": null,
           "meta": { "from": { "state": "open", "resolution": null, "awaiting": "agent" },
                      "to": { "state": "closed", "resolution": "answered", "awaiting": null } } }
       } } },
 
-    { "kind": "http", "method": "GET", "path": "/convo/c1/messages?limit=10", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/convo/c1/messages?limit=10", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "events": [
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:box-2", "type": "item",
           "payload": { "item_id": { "$ref": "item_id" }, "num": 1, "kind": "question", "title": "Which auth library?",

@@ -329,100 +329,6 @@ test('summary: set via upsert, kept when omitted, returned by snapshot', async (
   assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
 })
 
-// The load-bearing guarantee of the pinned-summary surface (spec).
-// The stamp feeds an "updated Nm ago" label; if a re-sent identical summary
-// moved it, a bridge backfilling its saved digests on reconnect would stamp
-// every old digest as fresh — the surface would confidently report the exact
-// staleness the field exists to disclose. Date.now is pinned per call so the
-// assertions test the guard, not the clock's millisecond resolution.
-test('summary_updated_at: advances only on a real content change', async () => {
-  const db = openDb(':memory:')
-  const dan = await createUser(db, 'dan', 'pw')
-  const ag = createAgent(db, dan.id, 'dev-a')
-  const realNow = Date.now
-  const at = (ms, fn) => { Date.now = () => ms; try { return fn() } finally { Date.now = realNow } }
-  const stamp = () => db.prepare('SELECT summary_updated_at FROM conversations WHERE id=?').get('s1').summary_updated_at
-
-  // Creation with no summary: never-set sentinel, not "now".
-  at(1000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't', sessionState: 'running', agentDeviceId: ag.deviceId }))
-  assert.equal(stamp(), 0, 'a summary-less creation must read "never"')
-
-  // First real summary stamps.
-  const first = at(2000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a' }))
-  assert.equal(stamp(), 2000)
-  assert.equal(first.metaChanged, true, 'a summary change must fan a convo_meta')
-
-  // Byte-identical re-send: no move, no event. This is the requirement.
-  const resend = at(3000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a' }))
-  assert.equal(stamp(), 2000, 're-sending the same summary must not move the stamp')
-  assert.equal(resend.metaChanged, false, 're-sending the same summary must not fan an event')
-
-  // Summary-omitting upsert (a title change, a state-only housekeeping
-  // upsert): don't-clobber applies to the stamp as well as the text.
-  const titleOnly = at(4000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't2', agentDeviceId: ag.deviceId }))
-  assert.equal(stamp(), 2000, 'an upsert that omits the summary must not move the stamp')
-  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, '• a')
-  assert.equal(titleOnly.metaChanged, true, 'the title still changed')
-
-  // A genuine change moves it.
-  at(5000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• a\n• b' }))
-  assert.equal(stamp(), 5000)
-
-  // Clearing is a change too — otherwise a cleared surface would keep an
-  // age label describing text that is gone.
-  const cleared = at(6000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' }))
-  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, '')
-  assert.equal(stamp(), 6000)
-  assert.equal(cleared.metaChanged, true)
-
-  // ...and clearing an already-empty summary is not.
-  at(7000, () => upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' }))
-  assert.equal(stamp(), 6000)
-
-  assert.equal(Date.now, realNow, 'clock must be restored')
-})
-
-test('summary_updated_at: stamped at creation when the insert carries a summary, and exposed by snapshot', async () => {
-  const db = openDb(':memory:')
-  const dan = await createUser(db, 'dan', 'pw')
-  const ag = createAgent(db, dan.id, 'dev-a')
-  const before = Date.now()
-  upsertConversation(db, { id: 'born', ownerUserId: dan.id, title: 't', agentDeviceId: ag.deviceId, summary: '• born with one' })
-  upsertConversation(db, { id: 'bare', ownerUserId: dan.id, title: 't', agentDeviceId: ag.deviceId })
-  const rows = snapshot(db, dan.id).conversations
-  const born = rows.find((c) => c.id === 'born')
-  const bare = rows.find((c) => c.id === 'bare')
-  assert.ok(born.summary_updated_at >= before, 'a summary-carrying insert stamps now')
-  assert.equal(born.summary, '• born with one')
-  // A conversation that never had a summary reads ''/0 — the same values
-  // every row predating the column reads, so the web surface renders nothing.
-  assert.equal(bare.summary, '')
-  assert.equal(bare.summary_updated_at, 0)
-})
-
-// Regression: a conversation minted by a summary-only
-// upsert — no title, no parent, no state — used to append no event at all, so
-// live clients could not learn the conversation OR its digest existed until
-// their next /snapshot. "The bridge always sends a title first" is a property
-// of today's producer, not of this contract.
-test('summary_updated_at: a titleless summary-only creation still counts as meta-changed', async () => {
-  const db = openDb(':memory:')
-  const dan = await createUser(db, 'dan', 'pw')
-  const ag = createAgent(db, dan.id, 'dev-a')
-
-  const born = upsertConversation(db, { id: 'quiet', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '• minted by a digest' })
-  assert.equal(born.metaChanged, true, 'a summary-only creation must fan a convo_meta')
-  assert.equal(born.title, '')
-  assert.ok(born.summary_updated_at > 0)
-
-  // An EMPTY summary is not news, so a bare creation stays silent exactly as
-  // it did before — the only way to create without an event.
-  const silent = upsertConversation(db, { id: 'silent', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: '' })
-  assert.equal(silent.metaChanged, false)
-  const alsoSilent = upsertConversation(db, { id: 'silent2', ownerUserId: dan.id, agentDeviceId: ag.deviceId })
-  assert.equal(alsoSilent.metaChanged, false)
-})
-
 test('agent_chat permission_request is client-only; everything else is not', () => {
   assert.equal(isClientOnlyEvent('permission_request', { kind: 'agent_chat' }), true)
   assert.equal(isClientOnlyEvent('permission_request', { kind: 'tool_use' }), false)
@@ -507,4 +413,34 @@ test('a silent event never counts as unread, at append or when a read recomputes
   append(db, { userId: u.id, convoId: 'c1', sender: 'agent:box-a', type: 'prompt', payload: { question: 'Reminder set', options: [], silent: true } })
   assert.equal(row().unread_count, 2)
   assert.equal(row().snippet, '? Reminder set')
+})
+
+test('summary freshness: stamped on change only, null and identical resends keep it, legacy rows are 0, no event is appended', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw')
+  const ag = createAgent(db, alice.id, 'box-a')
+  const stamp = () => db.prepare('SELECT summary_updated_at t FROM conversations WHERE id=?').get('s1').t
+  const bare = upsertConversation(db, { id: 's0', ownerUserId: alice.id, agentDeviceId: ag.deviceId })
+  assert.equal(bare.summaryChanged, false)
+  assert.equal(bare.summary_updated_at, 0)
+  const created = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: 'one' })
+  assert.equal(created.summaryChanged, true)
+  assert.equal(created.metaChanged, false, 'a summary alone is not a convo_meta')
+  const t1 = stamp()
+  assert.ok(t1 > 0)
+  db.prepare('UPDATE conversations SET summary_updated_at=5 WHERE id=?').run('s1')
+  for (const summary of ['one', null, undefined]) {
+    const r = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary })
+    assert.equal(r.summaryChanged, false)
+    assert.equal(stamp(), 5)
+  }
+  const changed = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: 'two' })
+  assert.equal(changed.summaryChanged, true)
+  assert.ok(stamp() > 5)
+  const cleared = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: '' })
+  assert.equal(cleared.summaryChanged, true)
+  assert.equal(cleared.summary, '')
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM events').get().c, 0)
+  const row = snapshot(db, alice.id).conversations.find((c) => c.id === 's1')
+  assert.equal(row.summary_updated_at, stamp())
 })

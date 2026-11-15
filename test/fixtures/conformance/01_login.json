@@ -1,6 +1,7 @@
 {
   "name": "login: happy path, bad credentials, per-username lockout",
   "description": "POST /login issues a device token on success; wrong password is 403 bad_credentials; 5 consecutive failures for one username (from distinct IPs, so the per-IP limiter never trips) locks that username out with 429 locked_out, independent of the per-IP rate limiter.",
+  "protocol": 1,
   "seed": {
     "users": [
       { "as": "alice", "name": "alice", "password": "correcthorsebatterystaple" },
@@ -8,12 +9,12 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.1.1.1" },
       "body": { "username": "alice", "password": "wrong-password", "device_name": "alices-mac" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
 
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.1.1.2" },
       "body": { "username": "alice", "password": "correcthorsebatterystaple", "device_name": "alices-mac" },
       "expect": { "status": 200, "body": {
@@ -22,28 +23,28 @@
         "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.1" },
       "body": { "username": "flo", "password": "wrong-1", "device_name": "x" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.2" },
       "body": { "username": "flo", "password": "wrong-2", "device_name": "x" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.3" },
       "body": { "username": "flo", "password": "wrong-3", "device_name": "x" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.4" },
       "body": { "username": "flo", "password": "wrong-4", "device_name": "x" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.5" },
       "body": { "username": "flo", "password": "wrong-5", "device_name": "x" },
       "expect": { "status": 403, "body": { "error": "bad_credentials" } } },
 
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "headers": { "cf-connecting-ip": "10.2.2.6" },
       "body": { "username": "flo", "password": "another-fake-pw-99", "device_name": "x" },
       "expect": {

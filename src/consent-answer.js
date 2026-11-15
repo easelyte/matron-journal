@@ -15,8 +15,45 @@ import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } fro
 import { wakeIfOffline } from './wake.js'
 import { appendAndBroadcast } from './journal.js'
 import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js'
+import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
+import { ApprovalRefused } from './approval-keys.js'
+import { securityLogOf, boxTarget } from './security-log.js'
+import { lockedApprovalRefusal } from './panic.js'
+
+// Approvals of an ask aimed at a protected box (src/consent-subject.js):
+// the signature check and the state change it guards run in ONE
+// transaction, so a refusal writes nothing (the nonce stays unspent) and a
+// check that passed cannot be left without its change, nor a change
+// without its check. `apply(approval)` makes the change and answers whether
+// it won; a lost race is the 409 and rolls the nonce back too. → null when
+// applied, else the {status, body} to answer. Exported for the transfer
+// kind (src/transfer-consent.js).
+export const CONFLICT = Object.freeze({ ok: false, status: 409, body: { error: 'conflict' } })
+export function guardedApprove(db, check, apply) {
+  try {
+    db.transaction(() => {
+      const g = check()
+      if (!g.ok) throw new ApprovalRefused(g)
+      if (!apply(g.approval)) throw new ApprovalRefused(CONFLICT)
+    })()
+    return null
+  } catch (err) {
+    if (err instanceof ApprovalRefused) return err.refusal
+    throw err
+  }
+}
 
 const byCoordinator = (decidedBy) => decidedBy?.kind === 'coordinator'
+
+// An approval that has committed (the security log): by the user's tap or
+// the Coordinator's answer, from the device that sent it. `target` names
+// what it lets through: the box by its current name (box:<name>), or the
+// transfer (transfer:<id>). Exported for the transfer kind.
+export function recordApproved(ctx, userId, event, decidedBy, target) {
+  securityLogOf(ctx).record(userId, event, {
+    deviceId: decidedBy?.deviceId ?? null, target, decidedBy: byCoordinator(decidedBy) ? 'coordinator' : 'user',
+  })
+}
 const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordinator', answerReason: decidedBy.reason } : {})
 
 // Exported for the transfer kind (src/transfer-consent.js), which answers
@@ -45,7 +82,10 @@ export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, 
   }
 }
 
-export function answerChatAsk({ db, hub, waker }, { userId, roomId, targetDeviceId, decision, decidedBy }) {
+// `approval` (the user's signed approval, src/consent-subject.js) counts
+// only on an approval of an ask aimed at a protected box; it is ignored on
+// a decline and on every other ask.
+export function answerChatAsk({ db, hub, waker, journalHost = null, securityLog }, { userId, roomId, targetDeviceId, decision, decidedBy, approval = null }) {
   const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(roomId)
   // Unknown room and a room owned by someone else are indistinguishable
   // (404, never 403) — same anti-enumeration stance as GET /convo/:id/messages.
@@ -66,7 +106,20 @@ export function answerChatAsk({ db, hub, waker }, { userId, roomId, targetDevice
     })
     return { status: 200, body: { ok: true } }
   }
-  answerParkedInvite(db, { convoId: roomId, agentDeviceId: targetDeviceId, approve: true, ...stamp(decidedBy) })
+  const refused = guardedApprove(db,
+    () => {
+      // A panic-locked account (src/panic.js): no approval, whoever gives it.
+      const locked = lockedApprovalRefusal(db, userId)
+      if (locked) return locked
+      // Re-read inside the transaction: an ask answered meanwhile is the
+      // 409 a lost race gives, before any signature is looked at.
+      const now = chatAskRow(db, userId, roomId, targetDeviceId)
+      if (now?.state !== 'awaiting_user') return CONFLICT
+      return consentApproval({ db, journalHost }, userId, decidedBy, 'chat', now, approval)
+    },
+    (signed) => answerParkedInvite(db, { convoId: roomId, agentDeviceId: targetDeviceId, approve: true, ...stamp(decidedBy), approval: approvalColumn(signed) }))
+  if (refused) return refused
+  recordApproved({ db, securityLog }, userId, 'chat_approved', decidedBy, boxTarget(db, targetDeviceId))
   closeChatConsentItem({ db, hub }, roomId, targetDeviceId, { outcome: 'approved', answeredByDeviceId })
   recordAndAnnounce({ db, hub }, { userId, kind: 'chat', askId: `${roomId}/${targetDeviceId}`, decision, decidedBy, convoId: roomId, payload: { room_id: roomId, target_device_id: targetDeviceId } })
   // Join requests self-target (row.initiator_device_id === targetDeviceId,
@@ -90,7 +143,7 @@ export function answerChatAsk({ db, hub, waker }, { userId, roomId, targetDevice
   return { status: 200, body: { ok: true, delivered } }
 }
 
-export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, { userId, requestId, decision, decidedBy }) {
+export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost = null, securityLog }, { userId, requestId, decision, decidedBy, approval = null }) {
   const row = getSpawn(db, requestId)
   // Unknown id and another user's row are indistinguishable.
   if (!row || row.user_id !== userId) return { status: 404, body: { error: 'not_found' } }
@@ -106,7 +159,21 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   // The answer CLAIMS the row; a zero row-count means another answer
   // already won — 409, and nothing expensive has started (spec failure
   // table: two approve taps spawn once).
-  if (!claimApprove(db, requestId, Date.now(), stamp(decidedBy))) return { status: 409, body: { error: 'conflict' } }
+  // For a spawn onto a protected box the claim also checks and stores the
+  // user's signed approval, which the `start` params then carry.
+  const refused = guardedApprove(db,
+    () => {
+      const locked = lockedApprovalRefusal(db, userId)
+      if (locked) return locked
+      // An ask already answered is the 409 a lost claim gives, before any
+      // signature is looked at.
+      const now = getSpawn(db, requestId)
+      if (now?.state !== 'awaiting_user') return CONFLICT
+      return consentApproval({ db, journalHost }, userId, decidedBy, 'spawn', now, approval)
+    },
+    (signed) => claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed }))
+  if (refused) return refused
+  recordApproved({ db, securityLog }, userId, 'spawn_approved', decidedBy, boxTarget(db, row.target_device_id))
   // The ask stopped waiting at the claim, so its tracker item closes now —
   // not at the outcome, which can be minutes away when the target box has
   // to be woken first. Left open, the item sits in the user's Decisions
@@ -137,19 +204,19 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
 // link, so a tap answers exactly the ask the item was filed for. A row no
 // longer waiting is 409 whatever the label says, with a message an app can
 // show as it is ("already answered").
-export function consentItemTapAnswer(ctx, who, item, action) {
+export function consentItemTapAnswer(ctx, who, item, action, approval = null) {
   if (who.kind !== 'client') return { status: 403, body: { error: 'forbidden' } }
   const { db } = ctx
   if (item.consent === 'spawn') {
     const row = db.prepare('SELECT id, state FROM agent_spawn_requests WHERE item_id=? AND user_id=?').get(item.id, who.userId)
     if (!row || row.state !== 'awaiting_user') return staleTap(row?.state)
     if (!CONSENT_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
-    return withStaleMessage(answerSpawnAsk(ctx, { userId: who.userId, requestId: row.id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId } }), () => getSpawn(db, row.id)?.state)
+    return withStaleMessage(answerSpawnAsk(ctx, { userId: who.userId, requestId: row.id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId }, approval }), () => getSpawn(db, row.id)?.state)
   }
   const row = db.prepare('SELECT convo_id, agent_device_id, state FROM convo_agents WHERE item_id=?').get(item.id)
   if (!row || row.state !== 'awaiting_user') return staleTap(row ? CHAT_STALE[row.state] : undefined)
   if (!CONSENT_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
-  return withStaleMessage(answerChatAsk(ctx, { userId: who.userId, roomId: row.convo_id, targetDeviceId: row.agent_device_id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId } }), () => CHAT_STALE[getParticipant(db, row.convo_id, row.agent_device_id)?.state])
+  return withStaleMessage(answerChatAsk(ctx, { userId: who.userId, roomId: row.convo_id, targetDeviceId: row.agent_device_id, decision: tapDecision(action), decidedBy: { kind: 'user', deviceId: who.deviceId }, approval }), () => CHAT_STALE[getParticipant(db, row.convo_id, row.agent_device_id)?.state])
 }
 
 const tapDecision = (action) => (action === 'Decline' ? 'decline' : 'approve')

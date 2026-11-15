@@ -12,7 +12,7 @@
 //   DELETE /contacts/invites/:id           withdraw an open invite
 //   POST   /contacts/invites/open {link}   who the link is from (nothing is sent)
 //   POST   /contacts/invites/accept {link} add them: queues the answer → 202 {contact}
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { contactRow, DECISIONS } from './contacts.js'
 import { writableConvo } from './missions-http.js'
@@ -74,8 +74,13 @@ export async function handleInviteRoute(ctx, req, res, url, who) {
       if (req.method !== 'POST') return false
       const body = await readBody(req)
       if (typeof body.link !== 'string') return badRequest(res)
-      if (path.endsWith('/open')) { json(res, 200, await fed.preview(who.userId, body.link)); return true }
-      const row = await fed.accept(who.userId, body.link)
+      if (path.endsWith('/open')) {
+        json(res, 200, await fed.preview(who.userId, body.link, { beforeSave: () => recheckCaller(req) }))
+        return true
+      }
+      // The other journal is asked first; signed out, or the account
+      // locked, meanwhile: the contact is not made here.
+      const row = await fed.accept(who.userId, body.link, { beforeSave: () => recheckCaller(req) })
       json(res, 202, { contact: contactRow(row), pending: 'peer' })
       return true
     }

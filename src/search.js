@@ -60,6 +60,11 @@ export function ftsAnyQueryFor(raw) {
 // a pasted paragraph is not run as a phrase. The terms come from parseQuery
 // and the match string from matchExact, the same pair the tracker tiers use.
 const MAX_PHRASE_TERMS = 8
+
+// excludeInbound: an inbound source's conversation (src/inbound.js) holds
+// text an outside tool wrote. No agent caller's search returns it, private
+// or not: a report reaches an agent only when the user passes it on.
+const NOT_INBOUND = "(c.system IS NULL OR c.system NOT LIKE 'inbound:%')"
 function phraseMatchFor(parsed) {
   return parsed && parsed.terms.length >= 2 && parsed.terms.length <= MAX_PHRASE_TERMS ? matchExact(parsed) : null
 }
@@ -73,7 +78,7 @@ function phraseMatchFor(parsed) {
 // already uses — never a plain LEFT JOIN — so a filtered agent caller
 // never learns a private-origin mission's number even for an otherwise
 // visible hit.
-function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount = 0, proseOnly = false }) {
+function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeInbound = false, excludeSeqsCount = 0, proseOnly = false }) {
   return `
     SELECT sm.convo_id, c.title, sm.seq, sm.ts, sm.sender, c.session_state,
            snippet(search_fts, 0, '**', '**', '…', 12) AS snippet,
@@ -84,6 +89,7 @@ function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqs
     WHERE search_fts MATCH ? AND sm.user_id = ?${convoId != null ? ' AND sm.convo_id = ?' : ''}
     ${excludeSubagents ? 'AND c.parent_convo_id IS NULL' : ''}
     ${proseOnly ? 'AND sm.is_diff = 0' : ''}
+    ${excludeInbound ? `AND ${NOT_INBOUND}` : ''}
     ${excludePrivateOwned
       ? `AND (c.agent_device_id IS NULL OR NOT EXISTS(
             SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`
@@ -114,7 +120,7 @@ function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqs
 // already shares — quoted, carries a digit, id-like, or a single word —
 // reused here rather than re-implemented, because a person who quoted
 // their query or typed an id wanted an exact match, not loose noise.
-export function searchMessages(db, userId, { query, limit = 20, convoId = null, excludePrivateOwned = false, excludeSubagents = false } = {}) {
+export function searchMessages(db, userId, { query, limit = 20, convoId = null, excludePrivateOwned = false, excludeSubagents = false, excludeInbound = false } = {}) {
   const match = ftsQueryFor(query)
   if (match == null) return { badQuery: true }
   const toHit = (r, why) => ({
@@ -129,7 +135,7 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null, 
     const remaining = limit - hits.length
     if (remaining <= 0) return
     const excludeSeqs = hits.map((h) => h.seq)
-    const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqsCount: excludeSeqs.length, proseOnly })
+    const sql = rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeInbound, excludeSeqsCount: excludeSeqs.length, proseOnly })
     const args = [matchStr, userId, ...(convoId != null ? [convoId] : []), ...excludeSeqs, remaining]
     hits.push(...db.prepare(sql).all(...args).map((r) => toHit(r, why)))
   }
@@ -192,11 +198,12 @@ export function typedQuery(raw) {
 
 // WHERE fragment + arguments shared by the typed modes: FTS match, user
 // scope, optional conversation / subagent / privacy filters.
-function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOwned }) {
+function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOwned, excludeInbound = false }) {
   const clauses = ['search_fts_plain MATCH ?', 'sm.user_id = ?']
   const args = [match, userId]
   if (convoId != null) { clauses.push('sm.convo_id = ?'); args.push(convoId) }
   if (excludeSubagents) clauses.push('c.parent_convo_id IS NULL')
+  if (excludeInbound) clauses.push(NOT_INBOUND)
   if (excludePrivateOwned) {
     clauses.push(`(c.agent_device_id IS NULL OR NOT EXISTS(
       SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`)
@@ -210,10 +217,10 @@ function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOw
 // (spec 2026-10-12 unified search): same sieved scalar subquery
 // searchChats and searchMessages use — see the mission_num comment on
 // rankedSql above for why a plain LEFT JOIN is wrong here.
-export function searchRecent(db, userId, { query, limit = 50, convoId = null, excludeSubagents = false, excludePrivateOwned = false } = {}) {
+export function searchRecent(db, userId, { query, limit = 50, convoId = null, excludeSubagents = false, excludePrivateOwned = false, excludeInbound = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
-  const where = typedWhere({ match: typed.allTermsMatch, userId, convoId, excludeSubagents, excludePrivateOwned })
+  const where = typedWhere({ match: typed.allTermsMatch, userId, convoId, excludeSubagents, excludePrivateOwned, excludeInbound })
   let rows
   try {
     rows = db.prepare(`
@@ -246,11 +253,11 @@ export function searchRecent(db, userId, { query, limit = 50, convoId = null, ex
 // How many of the newest matching messages searchChats groups (see there).
 export const CHAT_SCAN_CAP = 2000
 
-export function searchChats(db, userId, { query, limit = 20, excludeSubagents = false, excludePrivateOwned = false } = {}) {
+export function searchChats(db, userId, { query, limit = 20, excludeSubagents = false, excludePrivateOwned = false, excludeInbound = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
   const groups = (match, convoIds, n) => {
-    const where = typedWhere({ match, userId, excludeSubagents, excludePrivateOwned })
+    const where = typedWhere({ match, userId, excludeSubagents, excludePrivateOwned, excludeInbound })
     let scope = ''
     if (convoIds) {
       scope = ` AND sm.convo_id IN (${convoIds.map(() => '?').join(',')})`

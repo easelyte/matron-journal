@@ -1,0 +1,55 @@
+{
+  "type": "ws.notify.settings",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "21_notify_settings_push.json#step[5]",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": [
+            {
+              "convo_id": "c1",
+              "level": "none",
+              "mute_until": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "source": "21_notify_settings_push.json#step[7]",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": []
+        }
+      }
+    }
+  ]
+}

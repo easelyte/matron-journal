@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { openDb } from '../src/db.js'
+import { openDb, setDeviceProtected } from '../src/db.js'
 import { FRESH_ROOM_SQL } from '../src/person-rooms.js'
 
 // Rooms between two people's agents (spec 2026-10-02 matron-to-matron
@@ -308,6 +308,27 @@ test('bob declining tells alice\'s agent no, as a refusal', async (t) => {
   assert.equal(no.accept, false)
   assert.equal(no.reason, 'refused')
   assert.equal(w.ws.bobBox.frames.filter((f) => f.kind === 'invite').length, 0)
+})
+
+test('a protected guest box: bob\'s Accept is refused protected_device, nothing reaches the box, and the ask stays for a Decline', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  await shareTimSession(w)
+  setDeviceProtected(w.s.db, w.bobBoxId, true)
+  invite(w)
+  await w.ws.aliceBox.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await settle()
+  const [own] = await consentItems(w.alicePhone, 'room')
+  assert.equal((await w.alicePhone(`/items/${own.id}/comments`, post({ action: 'Approve' }))).status, 200)
+  await settle()
+  const [theirs] = await consentItems(w.bobPhone, 'room')
+  const r = await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'Accept' }))
+  assert.deepEqual([r.status, r.json.error, r.json.blocked_by], [409, 'conflict', 'protected_device'])
+  await settle()
+  assert.equal(w.ws.bobBox.frames.filter((f) => f.kind === 'invite').length, 0)
+  const link = w.s.db.prepare('SELECT state, guest_room_id FROM person_rooms').get()
+  assert.deepEqual(link, { state: 'awaiting_guest', guest_room_id: null })
+  assert.equal((await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'Decline' }))).status, 200)
 })
 
 test('alice declining her own agent\'s ask sends nothing to bob', async (t) => {

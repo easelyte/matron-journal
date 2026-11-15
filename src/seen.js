@@ -204,6 +204,7 @@ export function listUnseen(db, userId, {
         AND e.type IN (${UNSEEN_TYPES_SQL}) AND e.sender NOT LIKE 'user:%'
         AND ${notSilentSql('e')}
         AND c.parent_convo_id IS NULL AND c.session_state!='archived'
+        AND (c.system IS NULL OR c.system NOT LIKE 'inbound:%')
         ${where.join(' ')}
         AND NOT EXISTS(SELECT 1 FROM seen_ranges s WHERE s.user_id=e.user_id AND s.convo_id=e.convo_id
                         AND s.from_seq<=e.seq AND s.to_seq>=e.seq)

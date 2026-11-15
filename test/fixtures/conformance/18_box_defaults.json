@@ -1,44 +1,45 @@
 {
   "name": "box defaults: GET/PUT /devices/:id/defaults, the box_defaults frame, and hello_ok's box_defaults",
   "description": "A box starts with all three defaults null, in GET and in its hello_ok. An app sets agent, model and effort in one PUT; the 200 carries the full state, and the app and the box itself each get one box_defaults frame. A later PUT naming a new agent without a model clears the model. A bad agent is 400 bad_agent and sends no frame (the next frames on both connections are the following PUT's). The box's next hello_ok carries the stored values. The second PUT's frame on the bridge connection is the causal barrier before it reconnects.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-18" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "opal" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-18", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "http", "method": "GET", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "bridge.token" },
+    { "kind": "http", "role": "agent", "method": "GET", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "bridge.token" },
       "expect": { "status": 200, "body": { "device_id": { "$ref": "bridge.device_id" }, "default_agent": null, "default_model": null, "default_effort": null } } },
 
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } },
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "coordinator_convo_id": null, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } },
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "coordinator_convo_id": null, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
-    { "kind": "http", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "alice_token" },
       "body": { "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" },
       "expect": { "status": 200, "body": { "device_id": { "$ref": "bridge.device_id" }, "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" } } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "codex", "default_model": "gpt-5.1-codex", "default_effort": "high" } },
 
-    { "kind": "http", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "alice_token" },
       "body": { "default_agent": "gpt" },
       "expect": { "status": 400, "body": { "error": "bad_agent" } } },
-    { "kind": "http", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "bridge.token" },
+    { "kind": "http", "role": "agent", "method": "PUT", "path": "/devices/${bridge.device_id}/defaults", "token": { "$ref": "bridge.token" },
       "body": { "default_agent": "claude" },
       "expect": { "status": 200, "body": { "device_id": { "$ref": "bridge.device_id" }, "default_agent": "claude", "default_model": null, "default_effort": "high" } } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "claude", "default_model": null, "default_effort": "high" } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "claude", "default_model": null, "default_effort": "high" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "claude", "default_model": null, "default_effort": "high" } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "box_defaults", "device_id": { "$ref": "bridge.device_id" }, "default_agent": "claude", "default_model": null, "default_effort": "high" } },
 
-    { "kind": "ws_open", "conn": "agent2" },
-    { "kind": "ws_send", "conn": "agent2", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent2", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": "claude", "default_model": null, "default_effort": "high" }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } }
+    { "kind": "ws_open", "role": "agent", "conn": "agent2" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent2", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent2", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": "claude", "default_model": null, "default_effort": "high" }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$ref": "bridge.device_id" }, "name": "opal" } }
   ]
 }

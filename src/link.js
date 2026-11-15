@@ -58,7 +58,10 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
     // there is no other device to tap on). With a db handle the code lives
     // in link_preapprovals INSTEAD of the map (one source of truth) so a
     // long-lived hand-off code survives a restart; only its hash is stored.
-    startPreapproved(userId, { ttlMs: requestedTtlMs } = {}) {
+    //
+    // `by` says who minted it, for the security log when it is used:
+    // 'admin_cli' (the host's route) or 'admin' (a web admin).
+    startPreapproved(userId, { ttlMs: requestedTtlMs, by = null } = {}) {
       const now = Date.now()
       // Only an explicit per-call override is clamped to [1min, 24h] — the
       // factory-configured preapprovedTtlMs default is trusted as-is (it's
@@ -72,7 +75,7 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         let code
         do { code = randomCode() } while ([...sessions.values()].some((s) => s.code === code))
         sessions.set(`preapproved:${crypto.randomBytes(8).toString('hex')}`, {
-          code, userId, status: 'waiting', preapproved: true, claimToken: null, deviceName: null, requesterIp: null, expiresAt: now + ttl,
+          code, userId, status: 'waiting', preapproved: true, preapprovedBy: by, claimToken: null, deviceName: null, requesterIp: null, expiresAt: now + ttl,
         })
         return { linkCode: `${code.slice(0, 4)}-${code.slice(4)}`, expiresIn: Math.floor(ttl / 1000) }
       }
@@ -88,9 +91,36 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         [...sessions.values()].some((s) => s.code === code) ||
         db.prepare('SELECT 1 FROM link_preapprovals WHERE code_hash=?').get(hashCode(code))
       )
-      db.prepare('INSERT INTO link_preapprovals(user_id, code_hash, expires_at, created_at) VALUES(?,?,?,?)')
-        .run(userId, hashCode(code), now + ttl, now)
+      db.prepare('INSERT INTO link_preapprovals(user_id, code_hash, expires_at, created_at, minted_by) VALUES(?,?,?,?,?)')
+        .run(userId, hashCode(code), now + ttl, now, by)
       return { linkCode: `${code.slice(0, 4)}-${code.slice(4)}`, expiresIn: Math.floor(ttl / 1000) }
+    },
+    // A panic lock (src/panic-lock.js): every link of the user is dropped,
+    // a starter's (waiting, claimed or approved) and a pre-approved code's,
+    // claimed or still in the database, so none mints a device after the
+    // clear. → how many.
+    dropUser(userId) {
+      let n = 0
+      for (const [k, s] of sessions) if (s.userId === userId) { sessions.delete(k); n += 1 }
+      if (db) n += db.prepare('DELETE FROM link_preapprovals WHERE user_id=?').run(userId).changes
+      return n
+    },
+    // The account a code that claim() would accept belongs to, without
+    // claiming it (a waiting starter's code, or a pre-approved one that has
+    // not expired); null otherwise. For the panic lock's refusal
+    // (src/panic.js), which must leave the code as it was.
+    ownerOf(codeInput) {
+      const now = Date.now()
+      const code = normalizeCode(codeInput)
+      if (!code) return null
+      for (const s of sessions.values()) {
+        if (s.code === code && s.status === 'waiting' && now < s.expiresAt) return s.userId
+      }
+      if (db) {
+        const row = db.prepare('SELECT user_id FROM link_preapprovals WHERE code_hash=? AND expires_at > ?').get(hashCode(code), now)
+        if (row) return row.user_id
+      }
+      return null
     },
     claim(codeInput, { deviceName, requesterIp = null }) {
       const now = Date.now()
@@ -116,7 +146,7 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         // between claim and poll burns the code unused; the alternative
         // would leave an already-scanned code replayable after a crash.
         const row = db.prepare(
-          'DELETE FROM link_preapprovals WHERE code_hash=? AND expires_at > ? RETURNING user_id'
+          'DELETE FROM link_preapprovals WHERE code_hash=? AND expires_at > ? RETURNING user_id, minted_by'
         ).get(hashCode(code), now)
         if (row) {
           // Synthetic approved session: from here the existing poll()
@@ -127,7 +157,7 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
           // would hit it and return 'conflict' instead of 'not_found'.
           const claimToken = crypto.randomBytes(32).toString('hex')
           sessions.set(`preapproved:${crypto.randomBytes(8).toString('hex')}`, {
-            code: null, userId: row.user_id, status: 'approved', preapproved: true, claimToken,
+            code: null, userId: row.user_id, status: 'approved', preapproved: true, preapprovedBy: row.minted_by ?? null, claimToken,
             deviceName, requesterIp, expiresAt: now + claimExtensionMs,
           })
           return { status: 'claimed', claimToken, expiresIn: Math.ceil(claimExtensionMs / 1000) }
@@ -145,7 +175,12 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         // (one-shot — the identity is gone before the caller sees it).
         sessions.delete(k)
         if (s.status === 'denied') return { status: 'denied' }
-        return { status: 'approved', userId: s.userId, deviceName: s.deviceName }
+        // Who approved it (the security log): the starter device's user, or
+        // for a pre-approved code no device and whoever minted it.
+        return {
+          status: 'approved', userId: s.userId, deviceName: s.deviceName,
+          approvedBy: s.preapproved ? null : k, decidedBy: s.preapproved ? (s.preapprovedBy ?? null) : 'user',
+        }
       }
       return { status: 'not_found' }
     },

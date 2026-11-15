@@ -1,6 +1,7 @@
 {
   "name": "ws hello: a cursor beyond the journal head replays nothing and stays connected",
   "description": "head_seq is 3; hello with cursor:10 (beyond head) is not an error and does not trip snapshot_required (the gap is negative) — it just replays zero events and still registers live: a subsequent live publish is delivered normally.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-5" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "box-2" }],
@@ -12,23 +13,23 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-5", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 10 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 3, "device_id": { "$type": "integer" }, "name": "mac" } },
-    { "kind": "ws_expect_none", "conn": "client", "ms": 150 },
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 10 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 3, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect_none", "role": "client", "conn": "client", "ms": 150 },
 
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 3, "device_id": { "$type": "integer" }, "name": "box-2" } },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "still alive" } } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 3, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "still alive" } } },
 
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "still alive" }
     } }

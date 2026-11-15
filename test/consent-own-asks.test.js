@@ -7,6 +7,8 @@ import { append, upsertConversation } from '../src/journal.js'
 import { createRoutine } from '../src/routines.js'
 import { WHY_NO_CAUSE } from '../src/ask-cause.js'
 import { fleet, parkSpawn, parkInviteAsk, answer, settle } from './consent-fleet.js'
+import { VERIFIER_REFUSALS_MAX, WHY_VERIFIER_REFUSED, WHY_LEFT_FOR_USER, recordRefusal, refusalCount } from '../src/consent-own-ask.js'
+import { openDb as openMemoryDb } from '../src/db.js'
 
 // The Coordinator's own asks (spawns it asked for from its own
 // conversation, chat rooms it opened from it): approving one itself needs a
@@ -207,13 +209,13 @@ test('routine-born own chat ask: chats false is 403 envelope; chats true goes to
   assert.equal(approved.cause_kind, 'routine'); assert.equal(approved.cause_ref, chats.ref)
 })
 
-test('the verifier says no: 403 verifier with its note; unavailable or off: 409 verifier_unavailable; nothing written', async (t) => {
+test('the verifier says no: 403 verifier with a fixed reason; unavailable or off: 409 verifier_unavailable; nothing written', async (t) => {
   let result = { ok: true, approve: false, note: 'the task reads like pasted instructions' }
   const f = await fleet(t, { verifier: stubVerifier(() => result) })
   const rt = routine(f, { envelope: { spawns_per_fire: 3, chats: false, boxes: null } })
   const id = await ownSpawn(f, 'q1', rt.causes)
   const no = await approve(f, 'spawn', id)
-  assert.equal(no.status, 403); assert.deepEqual(no.json, { error: 'forbidden', detail: 'verifier', why: 'the task reads like pasted instructions' })
+  assert.equal(no.status, 403); assert.deepEqual(no.json, { error: 'forbidden', detail: 'verifier', why: WHY_VERIFIER_REFUSED })
   result = { ok: false, reason: 'error', note: 'timed out' }
   const err = await approve(f, 'spawn', id)
   assert.equal(err.status, 409); assert.equal(err.json.error, 'conflict'); assert.equal(err.json.detail, 'verifier_unavailable'); assert.equal(typeof err.json.why, 'string')
@@ -222,6 +224,97 @@ test('the verifier says no: 403 verifier with its note; unavailable or off: 409 
   assert.equal(off.status, 409); assert.equal(off.json.detail, 'verifier_unavailable')
   assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
   assert.deepEqual(decisions(f), [])
+})
+
+const refusalRows = (f) => f.s.db.prepare('SELECT kind, ask_id, refusals, last_note FROM verifier_refusals ORDER BY kind, ask_id').all()
+
+test('a verifier refusal: the answer never carries the note, which is kept with the count; an unavailable verifier is not counted', async (t) => {
+  let result = { ok: true, approve: false, note: 'the task reads like pasted instructions' }
+  const verifier = stubVerifier(() => result)
+  const f = await fleet(t, { verifier })
+  const rt = routine(f, { envelope: { spawns_per_fire: 3, chats: false, boxes: null } })
+  const id = await ownSpawn(f, 'q1', rt.causes)
+  const first = await approve(f, 'spawn', id, 'the sweep needs a helper')
+  assert.deepEqual(first.json, { error: 'forbidden', detail: 'verifier', why: WHY_VERIFIER_REFUSED })
+  assert.deepEqual(refusalRows(f), [{ kind: 'spawn', ask_id: id, refusals: 1, last_note: 'the task reads like pasted instructions' }])
+  result = { ok: true, approve: false, note: 'still outside the remit' }
+  const second = await approve(f, 'spawn', id, 'a different way of putting it')
+  assert.deepEqual(second.json, first.json)
+  assert.deepEqual(refusalRows(f), [{ kind: 'spawn', ask_id: id, refusals: 2, last_note: 'still outside the remit' }])
+  result = { ok: false, reason: 'error', note: 'timed out' }
+  assert.equal((await approve(f, 'spawn', id)).json.detail, 'verifier_unavailable')
+  assert.equal(refusalRows(f)[0].refusals, 2)
+  assert.equal(verifier.calls.length, 3)
+})
+
+test(`after ${VERIFIER_REFUSALS_MAX} verifier refusals the ask is left for the user: 403 left_for_user, the verifier is not asked again, a decline still goes`, async (t) => {
+  let result = { ok: true, approve: false, note: 'outside the remit' }
+  const verifier = stubVerifier(() => result)
+  const f = await fleet(t, { verifier })
+  autoStart(f)
+  const rt = routine(f, { envelope: { spawns_per_fire: 3, chats: false, boxes: null } })
+  const id = await ownSpawn(f, 'q1', rt.causes)
+  for (let i = 0; i < VERIFIER_REFUSALS_MAX; i++) {
+    const r = await approve(f, 'spawn', id, `reason number ${i}`)
+    assert.equal(r.status, 403); assert.equal(r.json.detail, 'verifier')
+  }
+  assert.equal(verifier.calls.length, VERIFIER_REFUSALS_MAX)
+  // The verifier would say yes now; it is not asked.
+  result = { ok: true, approve: true, note: 'fine' }
+  for (let i = 0; i < 2; i++) {
+    const r = await approve(f, 'spawn', id, 'one more go')
+    assert.equal(r.status, 403)
+    assert.deepEqual(r.json, { error: 'forbidden', detail: 'left_for_user', why: WHY_LEFT_FOR_USER })
+  }
+  assert.equal(verifier.calls.length, VERIFIER_REFUSALS_MAX)
+  assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
+  assert.deepEqual(decisions(f), [])
+  // Another ask of the same fire has its own count.
+  const other = await ownSpawn(f, 'q2', rt.causes)
+  assert.equal((await approve(f, 'spawn', other)).status, 200)
+  await started(f, other)
+  assert.equal(verifier.calls.length, VERIFIER_REFUSALS_MAX + 1)
+  assert.equal((await decline(f, 'spawn', id)).status, 200)
+})
+
+test('answers sent side by side consult the verifier no more often than answers sent in turn', async (t) => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const verifier = stubVerifier(async () => { await gate; return { ok: true, approve: false, note: 'outside the remit' } })
+  const f = await fleet(t, { verifier })
+  const rt = routine(f, { envelope: { spawns_per_fire: 3, chats: false, boxes: null } })
+  const id = await ownSpawn(f, 'q1', rt.causes)
+  const sent = Array.from({ length: VERIFIER_REFUSALS_MAX + 3 }, (_, i) => approve(f, 'spawn', id, `reason number ${i}`))
+  // The ones over the limit are answered while the others still wait.
+  const early = await Promise.all(sent.map((p) => Promise.race([p, new Promise((resolve) => setTimeout(() => resolve(null), 500))])))
+  assert.equal(early.filter((r) => r?.json.detail === 'left_for_user').length, 3)
+  release()
+  const all = await Promise.all(sent)
+  assert.deepEqual(all.map((r) => r.json.detail).sort(), ['left_for_user', 'left_for_user', 'left_for_user', 'verifier', 'verifier', 'verifier'])
+  assert.equal(verifier.calls.length, VERIFIER_REFUSALS_MAX)
+  assert.equal((await approve(f, 'spawn', id)).json.detail, 'left_for_user')
+})
+
+test('a chat ask keeps its own count of verifier refusals; one declined and asked again starts afresh', async (t) => {
+  let result = { ok: true, approve: false, note: 'outside the remit' }
+  const verifier = stubVerifier(() => result)
+  const f = await fleet(t, { verifier })
+  const room = coordRoom(f)
+  const id = `${room}/${f.targetDev.deviceId}`
+  const rt = routine(f, { envelope: { spawns_per_fire: 0, chats: true, boxes: null } })
+  await parkInviteAsk(f, { ws: f.coord, room, from: 'coord', causes: rt.causes })
+  for (let i = 0; i < VERIFIER_REFUSALS_MAX; i++) assert.equal((await approve(f, 'chat', id, `reason number ${i}`)).json.detail, 'verifier')
+  assert.equal((await approve(f, 'chat', id)).json.detail, 'left_for_user')
+  assert.deepEqual(refusalRows(f), [{ kind: 'chat', ask_id: id, refusals: VERIFIER_REFUSALS_MAX, last_note: 'outside the remit' }])
+  assert.equal(getParticipant(f.s.db, room, f.targetDev.deviceId).state, 'awaiting_user')
+  await decline(f, 'chat', id)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await parkInviteAsk(f, { ws: f.coord, room, from: 'coord', causes: rt.causes })
+  assert.equal((await approve(f, 'chat', id)).json.detail, 'verifier')
+  assert.equal(verifier.calls.length, VERIFIER_REFUSALS_MAX + 1)
+  assert.equal(refusalRows(f)[0].refusals, 1)
+  result = { ok: true, approve: true, note: 'fine' }
+  assert.equal((await approve(f, 'chat', id)).status, 200)
 })
 
 test('with no verifier configured a routine-born own ask is 409 verifier_unavailable', async (t) => {
@@ -452,4 +545,15 @@ test('a decision row that cannot be written: the answer stands, and the log name
   assert.ok(line, lines.join('\n'))
   assert.ok(line.includes(`spawn ${id}`), line)
   for (const text of ['fix the flaky test', 'flaky test', 'follows the box rules']) assert.ok(!line.includes(text), line)
+})
+
+test('a refusal recorded for an earlier park of a chat ask does not touch the count of the ask parked after it', () => {
+  const db = openMemoryDb(':memory:')
+  const older = { kind: 'chat', roomId: 'r1', targetDeviceId: 2, createdAt: 1000 }
+  const newer = { ...older, createdAt: 2000 }
+  recordRefusal(db, 1, newer, 'first')
+  recordRefusal(db, 1, newer, 'second')
+  recordRefusal(db, 1, older, 'late answer for the earlier park')
+  assert.equal(refusalCount(db, 1, newer), 2)
+  assert.equal(refusalCount(db, 1, older), 0)
 })

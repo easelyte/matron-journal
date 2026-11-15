@@ -21,6 +21,7 @@
 import { createItem, closeItem, addComment, TITLE_MAX } from './items.js'
 import { emitMarker } from './items-http.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
+import { consentStepUp, chatAskRow } from './consent-subject.js'
 
 export const CONSENT_LABEL = 'consent'
 // The item's own buttons: a tap on one answers the ask exactly as the card
@@ -206,8 +207,12 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
     // item write keeps it (items-http.js: never advertise a write that
     // then rolls back).
     const item = db.transaction(() => {
+      // Aimed at a protected box (src/consent-subject.js): the item says
+      // the approval needs a signature, and over what.
+      const su = consentStepUp(db, userId, 'spawn', db.prepare('SELECT * FROM agent_spawn_requests WHERE id=?').get(spawnId))
       const { item } = createItem(db, {
         userId, kind: 'question', ...fields, actions: [...CONSENT_ACTIONS], awaiting: 'user',
+        stepUp: !!su, subject: su?.subject ?? null,
         // A time-limited ask belongs at the top of the list, not under
         // everything the user has been putting off.
         position: 'top',
@@ -363,8 +368,10 @@ export function fileChatConsentItem({ db, hub }, { userId, fromDeviceId, fromNam
     const item = db.transaction(() => {
       const row = db.prepare("SELECT created_at FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").get(roomId, agentDeviceId)
       if (!row) throw new Error(`no parked row for ${roomId}/${agentDeviceId}`)
+      const su = consentStepUp(db, userId, 'chat', chatAskRow(db, userId, roomId, agentDeviceId))
       const { item } = createItem(db, {
         userId, kind: 'question', ...fields, actions: [...CONSENT_ACTIONS], awaiting: 'user', position: 'top',
+        stepUp: !!su, subject: su?.subject ?? null,
         originConvoId: roomId, originDeviceId: fromDeviceId, createdBy: 'agent', consent: 'chat',
         idemKey: `consent:chat:${roomId}:${agentDeviceId}:${row.created_at}`,
       })

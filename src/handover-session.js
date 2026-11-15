@@ -24,6 +24,8 @@ import { markerTitleAllowed } from './privacy.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { wakeIfOffline } from './wake.js'
 import { coordinatorTarget, PICK_MAX, LABEL_MAX } from './talk-requests.js'
+import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 export const HANDOVER_CHOICE = { accept: 'Accept', new: 'New session', pick: 'Pick a box', decline: 'Decline' }
 const JOURNAL = 'journal'
@@ -61,15 +63,24 @@ export function handoverChoices(db, userId) {
 
 // Where a session would start, from what the recipient chose: 'coordinator'
 // (the button) or {device_id, workdir?} (a box they named). {deviceId,
-// workdir} or {refused: reason}.
+// workdir} or {refused: reason}. A protected box (src/consent-subject.js)
+// is refused, 'protected_device': its sessions start only on a signed
+// approval, which this path does not carry.
 export function startTarget(db, userId, request) {
+  let target
   if (request === 'coordinator') {
     const t = coordinatorTarget(db, userId)
-    return t ? { deviceId: t.deviceId, workdir: null } : { refused: 'no_coordinator' }
+    if (!t) return { refused: 'no_coordinator' }
+    target = { deviceId: t.deviceId, workdir: null }
+  } else {
+    const d = db.prepare("SELECT id FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(request.device_id, userId)
+    if (!d) return { refused: 'not_your_box' }
+    target = { deviceId: d.id, workdir: request.workdir ?? null }
   }
-  const d = db.prepare("SELECT id FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(request.device_id, userId)
-  if (!d) return { refused: 'not_your_box' }
-  return { deviceId: d.id, workdir: request.workdir ?? null }
+  if (isProtectedDevice(db, userId, target.deviceId)) return { refused: 'protected_device' }
+  // A panic-locked account (src/panic.js): no session starts on its boxes.
+  if (isPanicLocked(db, userId)) return { refused: 'account_locked' }
+  return target
 }
 
 // The new session's first-turn task.
@@ -124,14 +135,19 @@ async function startHandoverSession(ctx, { g, copy, target, itemId }) {
       try { waking = wakeIfOffline(ctx, userId, target.deviceId) === true } catch (err) { console.error('hand-over session: wake threw', err) }
       if (waking) await hub.waitForDevice(userId, target.deviceId, spawnWakeWaitMs)
     }
-    const params = {
-      workdir: target.workdir ?? '', ...(target.workdir ? {} : { talk: true }),
-      prompt: handoverTask(g, copy), agent: 'claude', mission_num: copy.num,
+    // Checked again after the wait: a box protected meanwhile gets no start.
+    if (isProtectedDevice(db, userId, target.deviceId)) code = 'protected_device'
+    else if (isPanicLocked(db, userId)) code = 'account_locked'
+    else {
+      const params = {
+        workdir: target.workdir ?? '', ...(target.workdir ? {} : { talk: true }),
+        prompt: handoverTask(g, copy), agent: 'claude', mission_num: copy.num,
+      }
+      const r = await broker.issue(hub, userId, target.deviceId, 'start', params, { timeoutMs: spawnStartTimeoutMs })
+      const id = r.ok ? r.result?.convo_id : null
+      if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id
+      else code = r.ok ? 'bad_start_reply' : sanitizePeerText(r.error?.code, 64) || 'unknown'
     }
-    const r = await broker.issue(hub, userId, target.deviceId, 'start', params, { timeoutMs: spawnStartTimeoutMs })
-    const id = r.ok ? r.result?.convo_id : null
-    if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id
-    else code = r.ok ? 'bad_start_reply' : sanitizePeerText(r.error?.code, 64) || 'unknown'
   } catch (err) {
     console.error('hand-over session: start threw', err)
     code = 'internal'

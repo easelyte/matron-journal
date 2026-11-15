@@ -1,6 +1,7 @@
 {
   "name": "ws hello: a replay gap over MATRON_MAX_REPLAY sends snapshot_required and closes 4009",
   "description": "With the valve forced small (maxReplay:5) and a 10-event backlog, hello with cursor:0 (gap 10 > 5) gets hello_ok, then {kind:'control', op:'snapshot_required'} instead of any journal replay, then the socket closes with code 4009 — never registered live (spec §6 efficiency valve).",
+  "protocol": 1,
   "server": { "maxReplay": 5 },
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-6" }],
@@ -19,16 +20,16 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-6", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 10, "device_id": { "$type": "integer" }, "name": "mac" } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "snapshot_required" } },
-    { "kind": "ws_expect_close", "conn": "client", "code": 4009 }
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 10, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "snapshot_required" } },
+    { "kind": "ws_expect_close", "role": "client", "conn": "client", "code": 4009 }
   ]
 }

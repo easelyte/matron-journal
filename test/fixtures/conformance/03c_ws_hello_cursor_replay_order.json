@@ -1,6 +1,7 @@
 {
   "name": "ws hello: an integer cursor replays only events after it, strictly in seq order",
   "description": "5 pre-existing events (seq 1..5); hello with cursor:2 replays exactly seq 3, 4, 5, in that order.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-4" }],
     "conversations": [{ "id": "c1", "owner": "alice" }],
@@ -13,27 +14,27 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-4", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 2 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 5, "device_id": { "$type": "integer" }, "name": "mac" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 2 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 5, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "type": "text", "payload": { "body": "m2" }
     } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "type": "text", "payload": { "body": "m3" }
     } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 5, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "type": "text", "payload": { "body": "m4" }
     } },
-    { "kind": "ws_expect_none", "conn": "client", "ms": 150 }
+    { "kind": "ws_expect_none", "role": "client", "conn": "client", "ms": 150 }
   ]
 }

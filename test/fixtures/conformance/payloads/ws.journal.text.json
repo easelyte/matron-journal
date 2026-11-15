@@ -1,0 +1,361 @@
+{
+  "type": "ws.journal.text",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "03b_ws_hello_cursor_null_live_only.json#step[9]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "live now"
+        }
+      }
+    },
+    {
+      "source": "03c_ws_hello_cursor_replay_order.json#step[4]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m2"
+        }
+      }
+    },
+    {
+      "source": "03c_ws_hello_cursor_replay_order.json#step[5]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m3"
+        }
+      }
+    },
+    {
+      "source": "03c_ws_hello_cursor_replay_order.json#step[6]",
+      "frame": {
+        "kind": "journal",
+        "seq": 5,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m4"
+        }
+      }
+    },
+    {
+      "source": "03d_ws_hello_cursor_beyond_head.json#step[9]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "still alive"
+        }
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[9]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "text",
+        "payload": {
+          "body": "do it"
+        }
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[15]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "text",
+        "payload": {
+          "body": "do it again"
+        }
+      }
+    },
+    {
+      "source": "06a_agent_publish_types.json#step[4]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "hello"
+        }
+      }
+    },
+    {
+      "source": "06a_agent_publish_types.json#step[14]",
+      "frame": {
+        "kind": "journal",
+        "seq": 5,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "after the reject"
+        }
+      }
+    },
+    {
+      "source": "06b_agent_finalize_idem_prefix_reject.json#step[6]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "done"
+        }
+      }
+    },
+    {
+      "source": "06b_agent_finalize_idem_prefix_reject.json#step[10]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "another"
+        }
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[15]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "building..."
+        }
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[19]",
+      "frame": {
+        "kind": "journal",
+        "seq": 6,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "done"
+        }
+      }
+    },
+    {
+      "source": "08_ack_advances_cursor.json#step[7]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 8226,
+        "type": "text",
+        "payload": {
+          "body": "barrier: ack applied"
+        }
+      }
+    },
+    {
+      "source": "10_activity.json#step[13]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "text",
+        "payload": {
+          "body": "barrier: viewing applied"
+        },
+        "approval_key_id": null
+      }
+    },
+    {
+      "source": "10_activity.json#step[14]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "text",
+        "payload": {
+          "body": "barrier: viewing applied"
+        }
+      }
+    },
+    {
+      "source": "12_revocation.json#step[5]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 8226,
+        "type": "text",
+        "payload": {
+          "body": "pre-revocation"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[7]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[10]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "live"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[15]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "away one"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[20]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "away one"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[8]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[13]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[17]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    }
+  ]
+}

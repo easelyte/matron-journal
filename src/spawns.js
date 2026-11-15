@@ -19,6 +19,8 @@ import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
 import { recordSpawnStart } from './cause-hops.js'
+import { storedApproval, approvalColumn } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -91,10 +93,14 @@ export function denySpawn(db, id, now = Date.now(), { answeredBy = null, answerR
 // The approve tap CLAIMS the row — state-scoped so exactly one caller wins
 // and everything expensive (room, live agent on another box) starts at most
 // once. The loser's zero row-count is the 409 the failure table promises.
-export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answerReason = null } = {}) {
+// `approval` is the user's signed approval of a spawn onto a protected box
+// ({statement, signature}, src/consent-subject.js), stored exactly as
+// received for approveSpawn to forward in the `start` params; null for
+// every other answer.
+export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answerReason = null, approval = null } = {}) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='approved', answered_at=?, answered_by=?, answer_reason=? WHERE id=? AND state='awaiting_user'"
-  ).run(now, answeredBy, answerReason, id).changes > 0
+    "UPDATE agent_spawn_requests SET state='approved', answered_at=?, answered_by=?, answer_reason=?, approval=? WHERE id=? AND state='awaiting_user'"
+  ).run(now, answeredBy, answerReason, approvalColumn(approval), id).changes > 0
 }
 
 export function markStarted(db, id, { roomId, childConvoId, now = Date.now() }) {
@@ -190,6 +196,60 @@ export function expireApproved(db, ttlMs, now = Date.now()) {
   return db.prepare(
     "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id, from_convo_id"
   ).all(now, now - ttlMs)
+}
+
+// The spawns whose `start` this process has handed to the box and whose
+// reply it is waiting for (approveSpawn), per database: in memory, as the
+// pending RPC itself is. A restart forgets both; the orphan sweep
+// (expireApproved) settles such a row.
+const startsSentByDb = new WeakMap()
+function startsSent(db) {
+  let set = startsSentByDb.get(db)
+  if (!set) { set = new Set(); startsSentByDb.set(db, set) }
+  return set
+}
+// Marked from the moment `issue` hands the start over (synchronously, in
+// the same step as the state check before it) until its reply settles.
+async function withStartSent(db, id, issue) {
+  const sent = startsSent(db)
+  sent.add(id)
+  try {
+    return await issue()
+  } finally {
+    sent.delete(id)
+  }
+}
+
+// A panic lock (src/panic-lock.js lockAccount): every spawn of the account
+// approved whose `start` has not gone to its box fails, error_code `code`,
+// told to its parent as any failed start is, with the epitaph a linked room
+// gets. An orchestration still waiting on a wake then finds its row no
+// longer approved and sends nothing (approveSpawn), so nothing approved
+// before the lock starts after the clear. A start already with the box is
+// left to its reply, which settles it as ever (the bridge's own lock deals
+// with the session). → how many.
+export function failApprovedSpawns(db, hub, userId, code) {
+  const sent = startsSent(db)
+  const fail = db.prepare(
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE id=? AND state='approved' RETURNING id, user_id, from_device_id, room_id, from_convo_id"
+  )
+  const now = Date.now()
+  const rows = db.prepare("SELECT id FROM agent_spawn_requests WHERE user_id=? AND state='approved'").all(userId)
+    .filter((r) => !sent.has(r.id)).map((r) => fail.get(now, r.id)).filter(Boolean)
+  for (const row of rows) {
+    if (row.room_id) {
+      try {
+        appendAndBroadcast(db, hub, {
+          userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+          payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
+        })
+      } catch (err) {
+        console.error('failApprovedSpawns: epitaph write failed', err)
+      }
+    }
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: code })
+  }
+  return rows.length
 }
 
 // Undo for a spawn ask whose consent card never made it out: spawn_request
@@ -480,12 +540,20 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     // Wake-and-wait before the start RPC. Only when a wake is actually under
     // way: a target that is offline with no wake possible fails fast below,
     // exactly as before, rather than holding the row for the whole window.
+    // A panic-locked account (src/panic.js): no box of it is woken or sent
+    // a start.
+    if (isPanicLocked(db, row.user_id)) return fail('account_locked')
     if (wakeTarget && wakeWaitMs > 0) {
       let waking = false
       try { waking = wakeTarget() === true } catch (err) { console.error('approveSpawn: wake threw', err) }
       if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
     }
-    const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
+    // Checked again after the wait: locked meanwhile. A lock that came and
+    // went meanwhile failed the row (failApprovedSpawns), so a row no
+    // longer approved is never started either.
+    if (isPanicLocked(db, row.user_id)) return fail('account_locked')
+    if (getSpawn(db, row.id)?.state !== 'approved') return 'failed'
+    const r = await withStartSent(db, row.id, () => broker.issue(hub, row.user_id, row.target_device_id, 'start',
       {
         // spawn_id: the child's bridge names it on the opening turn's cause,
         // so the journal can follow the child's asks back to this spawn
@@ -499,8 +567,11 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         // And agent: only when the requester named one; otherwise the
         // target's own box default decides (docs/specs/box-defaults.md).
         ...(row.agent ? { agent: row.agent } : {}),
+        // The user's signed approval of a spawn onto a protected box, as
+        // the app sent it, for the box to check itself; absent otherwise.
+        ...storedApproval(row.approval),
       },
-      { timeoutMs: startTimeoutMs })
+      { timeoutMs: startTimeoutMs }))
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
     // reply is a bad reply, same 'bad_start_reply' the missing-field case

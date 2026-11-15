@@ -4,7 +4,8 @@
 // ephemeral frame to the Coordinator's bridge, never journaled.
 //
 // Rules, per user with a Coordinator:
-//   - only between 07:00 and 22:00 UK time;
+//   - only in the operator's daytime hours: 07:00 to 22:00 in the zone
+//     MATRON_UNSEEN_NUDGE_TZ names (default Europe/London);
 //   - at most one nudge an hour;
 //   - only for important entries unseen for 2 h or more, not yet raised
 //     (unseen_flags) and not named by an earlier nudge (unseen_nudged) — an
@@ -23,10 +24,26 @@ const FLAG_TTL_MS = 30 * 86400000
 const HOURS = { from: 7, to: 22 }
 const FRAME_ENTRIES = 5
 
-const ukHour = (now) => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: 'numeric', hourCycle: 'h23' }).format(now))
+export const DEFAULT_NUDGE_TZ = 'Europe/London'
 
-export function inNudgeHours(now) {
-  const h = ukHour(now)
+// The zone the daytime hours are read in: an IANA name from
+// MATRON_UNSEEN_NUDGE_TZ, or the default when unset or not a zone.
+export function resolveNudgeTz(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return DEFAULT_NUDGE_TZ
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: raw.trim() })
+    return raw.trim()
+  } catch {
+    console.error(`unseen-nudge: MATRON_UNSEEN_NUDGE_TZ=${JSON.stringify(raw)} is not a time zone; using ${DEFAULT_NUDGE_TZ}`)
+    return DEFAULT_NUDGE_TZ
+  }
+}
+
+const NUDGE_TZ = resolveNudgeTz(process.env.MATRON_UNSEEN_NUDGE_TZ)
+const hourIn = (now, tz) => Number(new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hourCycle: 'h23' }).format(now))
+
+export function inNudgeHours(now, tz = NUDGE_TZ) {
+  const h = hourIn(now, tz)
   return h >= HOURS.from && h < HOURS.to
 }
 

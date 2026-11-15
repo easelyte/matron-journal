@@ -1,0 +1,17 @@
+{
+  "type": "ws.control.stream_resync",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "13_tool_stream.json#step[20]",
+      "frame": {
+        "kind": "control",
+        "op": "stream_resync",
+        "convo_id": "c1",
+        "message_ref": "tu1",
+        "have": 7
+      }
+    }
+  ]
+}

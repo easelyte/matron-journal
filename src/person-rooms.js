@@ -30,6 +30,8 @@ import { getContactRaw, isMutual, isLiveRemote, peerRowOf, OWN_ASK_TTL_MS, MAX_P
 import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
+import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 export const LIVE_ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined']
 export const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
@@ -391,8 +393,15 @@ function createGuestRoom(db, link, now) {
 // The guest person accepted: the twin, and the guest agent's invite into
 // it, exactly a same-user owner invite (the guest agent is the
 // non-initiator, so it is the one that acks and answers). Caller holds the
-// transaction and has fixed the guest device and session on `link`.
+// transaction and has fixed the guest device and session on `link`. A
+// protected guest box (src/consent-subject.js) takes an invite only on a
+// signed approval, which this path does not carry: 'protected_device' is
+// thrown before anything is written, so the caller's transaction rolls
+// back and the ask stays as it was.
 export function inviteGuest(db, link, now) {
+  if (isProtectedDevice(db, link.guest_user_id, link.guest_device_id)) fail('protected_device')
+  // A panic-locked guest account (src/panic.js): no invite into its boxes.
+  if (isPanicLocked(db, link.guest_user_id)) fail('account_locked')
   const guestRoomId = createGuestRoom(db, link, now)
   db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, created_at)
     VALUES(?,?,?,'invited',?,?,?,?)`).run(guestRoomId, link.guest_device_id, link.owner_device_id, link.justification, link.topic, link.guest_convo_id, now)

@@ -1,0 +1,51 @@
+{
+  "type": "http.put.notify.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "21_notify_settings_push.json#step[4]",
+      "frame": {
+        "mode": "sample-mode",
+        "events": {
+          "prompts": true,
+          "questions": true,
+          "notices": true,
+          "coordinator_done": false,
+          "other_done": false,
+          "stopped": false,
+          "rooms": false,
+          "activity": false
+        },
+        "has_coordinator": false,
+        "device_level": "sample-device_level",
+        "convos": [
+          {
+            "convo_id": "sample-convo_id",
+            "level": "sample-level",
+            "mute_until": null
+          }
+        ]
+      }
+    },
+    {
+      "source": "21_notify_settings_push.json#step[6]",
+      "frame": {
+        "mode": "sample-mode",
+        "events": {
+          "prompts": true,
+          "questions": true,
+          "notices": true,
+          "coordinator_done": false,
+          "other_done": false,
+          "stopped": false,
+          "rooms": false,
+          "activity": false
+        },
+        "has_coordinator": false,
+        "device_level": "sample-device_level",
+        "convos": []
+      }
+    }
+  ]
+}

@@ -291,7 +291,10 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
 
   // Everything the preview and the accept check, in order. `link` is the
   // invite; the well-known is fetched once and its key must be the link's.
-  async function inspect(userId, link) {
+  // `beforeSave` runs once the other journal has answered (or failed to),
+  // before anything is written here or refused for what it served: the
+  // route's check that its caller may still act.
+  async function inspect(userId, link, beforeSave = () => {}) {
     const inv = parseInviteLink(link)
     if (!inv) fail('bad_link')
     if (inv.host === federation.host) fail('own_journal')
@@ -299,9 +302,10 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
     const user = userById(db, userId)
     if (!user || user.unlisted) fail('unlisted')
     let wk
-    try { wk = await client.fetchWellKnown(inv.host) } catch (err) {
-      fail(err.message === 'bad_well_known' ? 'bad_journal' : 'unreachable')
-    }
+    let unreachable = null
+    try { wk = await client.fetchWellKnown(inv.host) } catch (err) { unreachable = err }
+    beforeSave()
+    if (unreachable) fail(unreachable.message === 'bad_well_known' ? 'bad_journal' : 'unreachable')
     // What the journal serves is news whatever the link says: an old link
     // opened after a key change still reveals the change.
     const { seen, cut } = observeKey(db, inv.host, wk.pub, clock())
@@ -312,8 +316,8 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
   }
 
   // POST /contacts/invites/open: who the link is from, before any consent.
-  async function preview(userId, link) {
-    const { inv, address, seen } = await inspect(userId, link)
+  async function preview(userId, link, { beforeSave } = {}) {
+    const { inv, address, seen } = await inspect(userId, link, beforeSave)
     const existing = getContactRaw(db, userId, address)
     return {
       inviter: { address, name: inv.user, journal: inv.host, fingerprint: formatFingerprint(inv.fingerprint) },
@@ -324,8 +328,8 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
   }
 
   // POST /contacts/invites/accept: the user's tap. → the row, pending_out.
-  async function accept(userId, link) {
-    const { inv, wk, user, address } = await inspect(userId, link)
+  async function accept(userId, link, { beforeSave } = {}) {
+    const { inv, wk, user, address } = await inspect(userId, link, beforeSave)
     const at = clock()
     const { row, cut } = db.transaction(() => {
       const cur = remoteContactRaw(db, userId, inv.user, inv.host)

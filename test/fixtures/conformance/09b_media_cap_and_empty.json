@@ -1,22 +1,23 @@
 {
   "name": "media: an upload over MATRON_MEDIA_MAX_BYTES is 413, an empty body is 400",
   "description": "With the cap forced small (mediaMaxBytes:16), a 38-byte upload is rejected 413 too_large; a zero-byte body is rejected 400 empty. Neither persists anything.",
+  "protocol": 1,
   "server": { "tmpDb": true, "mediaMaxBytes": 16 },
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-15" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-15", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
 
-    { "kind": "http", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
       "body_base64": "bWF0cm9uLWNvbmZvcm1hbmNlLWZpeHR1cmUtbWVkaWEtYnl0ZXM=",
       "expect": { "status": 413, "body": { "error": "too_large" } } },
 
-    { "kind": "http", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
       "body_base64": "",
       "expect": { "status": 400, "body": { "error": "empty" } } }
   ]

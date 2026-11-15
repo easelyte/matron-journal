@@ -1,0 +1,16 @@
+{
+  "name": "message box keys",
+  "protocol": 1,
+  "rows": [
+    { "id": "enter-sends", "key": "Enter", "modifiers": [], "ime": "none", "pointer": "fine", "expect": "send" },
+    { "id": "shift-enter-newline", "key": "Enter", "modifiers": ["shift"], "ime": "none", "pointer": "fine", "expect": "newline" },
+    { "id": "meta-enter-sends", "key": "Enter", "modifiers": ["meta"], "ime": "none", "pointer": "fine", "expect": "send" },
+    { "id": "ctrl-enter-sends", "key": "Enter", "modifiers": ["ctrl"], "ime": "none", "pointer": "fine", "expect": "send" },
+    { "id": "ime-enter-never-sends", "key": "Enter", "modifiers": [], "ime": "composing", "pointer": "fine", "expect": "none", "note": "Enter confirms the composition." },
+    { "id": "ime-shift-enter-never-sends", "key": "Enter", "modifiers": ["shift"], "ime": "composing", "pointer": "fine", "expect": "none" },
+    { "id": "ime-meta-enter-never-sends", "key": "Enter", "modifiers": ["meta"], "ime": "composing", "pointer": "fine", "expect": "none" },
+    { "id": "touch-enter-newline", "key": "Enter", "modifiers": [], "ime": "none", "pointer": "coarse", "expect": "newline", "note": "A touch keyboard has no other way to add a line." },
+    { "id": "touch-ime-enter-never-sends", "key": "Enter", "modifiers": [], "ime": "composing", "pointer": "coarse", "expect": "none" },
+    { "id": "letter-types", "key": "a", "modifiers": [], "ime": "none", "pointer": "fine", "expect": "none" }
+  ]
+}

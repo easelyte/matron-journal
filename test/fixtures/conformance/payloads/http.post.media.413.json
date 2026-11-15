@@ -1,0 +1,13 @@
+{
+  "type": "http.post.media.413",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "09b_media_cap_and_empty.json#step[1]",
+      "frame": {
+        "error": "too_large"
+      }
+    }
+  ]
+}

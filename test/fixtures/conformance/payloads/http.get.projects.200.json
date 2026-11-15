@@ -1,0 +1,135 @@
+{
+  "type": "http.get.projects.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "17_mission_links_and_projects.json#step[8]",
+      "frame": {
+        "project": {
+          "id": "sample-id",
+          "user_id": 9544,
+          "num": 6,
+          "state": "open",
+          "title": "Promo launch",
+          "body": "",
+          "status": null,
+          "status_by": null,
+          "status_convo_id": null,
+          "status_updated_at": null,
+          "close_summary": null,
+          "closed_by": null,
+          "closed_over_open_missions": 0,
+          "closed_at": null,
+          "merged_into": null,
+          "merged_into_num": null,
+          "origin_convo_id": null,
+          "origin_device_id": 9308,
+          "created_by": "agent",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "missions": {
+            "running": 1,
+            "waiting": 0,
+            "idle": 0,
+            "quiet": 0,
+            "closed": 0
+          },
+          "needs_you": 0,
+          "open_items": 0,
+          "last_activity_at": 1700000000000
+        },
+        "missions": [
+          {
+            "id": "sample-id",
+            "user_id": 1,
+            "num": 1,
+            "state": "sample-state",
+            "title": "sample-title",
+            "body": "sample-body",
+            "close_summary": null,
+            "closed_by": null,
+            "closed_over_open_items": 1,
+            "origin_convo_id": "sample-origin_convo_id",
+            "origin_device_id": 1,
+            "created_by": "sample-created_by",
+            "created_at": 1700000000000,
+            "updated_at": 1700000000000,
+            "last_milestone_at": 1700000000000,
+            "closed_at": null,
+            "status": null,
+            "status_by": null,
+            "status_convo_id": null,
+            "status_updated_at": null,
+            "closed_convo_id": null,
+            "project_id": "sample-project_id",
+            "name": null,
+            "open_items": 1,
+            "needs_you": 1,
+            "conversations": 1,
+            "milestones": 1,
+            "project_num": 1,
+            "last_milestone": {
+              "num": 1,
+              "title": "sample-title",
+              "kind": "sample-kind",
+              "created_at": 1700000000000
+            },
+            "last_activity_at": 1700000000000,
+            "activity": "sample-activity"
+          }
+        ],
+        "needs_you": [],
+        "recent_milestones": [
+          {
+            "id": "sample-id",
+            "mission_id": "sample-mission_id",
+            "num": 1,
+            "kind": "sample-kind",
+            "title": "sample-title",
+            "body": "sample-body",
+            "convo_id": "sample-convo_id",
+            "seq": 1,
+            "device_id": 1,
+            "created_by": "sample-created_by",
+            "created_at": 1700000000000,
+            "mission_num": 1
+          }
+        ],
+        "sessions_by_box": {
+          "box-2": 1
+        },
+        "decisions": {
+          "total": 1,
+          "rows": [],
+          "next_before": null
+        },
+        "files": {
+          "total": 1,
+          "rows": [],
+          "next_before": null
+        },
+        "milestones": {
+          "total": 1,
+          "rows": [
+            {
+              "id": "sample-id",
+              "mission_id": "sample-mission_id",
+              "num": 1,
+              "kind": "sample-kind",
+              "title": "sample-title",
+              "body": "sample-body",
+              "convo_id": "sample-convo_id",
+              "seq": 1,
+              "device_id": 1,
+              "created_by": "sample-created_by",
+              "created_at": 1700000000000,
+              "mission_num": 1
+            }
+          ],
+          "next_before": null
+        }
+      }
+    }
+  ]
+}

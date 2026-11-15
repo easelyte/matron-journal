@@ -1,0 +1,50 @@
+{
+  "type": "http.patch.missions.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "17_mission_links_and_projects.json#step[7]",
+      "frame": {
+        "mission": {
+          "id": "sample-id",
+          "user_id": 1,
+          "num": 1,
+          "state": "sample-state",
+          "title": "sample-title",
+          "body": "sample-body",
+          "close_summary": null,
+          "closed_by": null,
+          "closed_over_open_items": 1,
+          "origin_convo_id": "sample-origin_convo_id",
+          "origin_device_id": 1,
+          "created_by": "sample-created_by",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "last_milestone_at": 1700000000000,
+          "closed_at": null,
+          "status": null,
+          "status_by": null,
+          "status_convo_id": null,
+          "status_updated_at": null,
+          "closed_convo_id": null,
+          "project_id": "sample-project_id",
+          "name": null,
+          "open_items": 1,
+          "needs_you": 1,
+          "conversations": 1,
+          "milestones": 1,
+          "project_num": 1,
+          "last_milestone": {
+            "num": 1,
+            "title": "sample-title",
+            "kind": "sample-kind",
+            "created_at": 1700000000000
+          },
+          "last_activity_at": 1700000000000,
+          "activity": "sample-activity"
+        }
+      }
+    }
+  ]
+}

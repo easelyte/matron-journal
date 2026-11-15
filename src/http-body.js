@@ -27,7 +27,26 @@ export const json = (res, status, obj) => {
 // chunks over to the next write instead of mangling it. For an ASCII body
 // (every JSON body the apps and bridges send in practice) bytes and
 // characters are the same number, so the default cap is unchanged there.
-export const readRawBody = (req, { maxBytes = 1e6 } = {}) => new Promise((resolve, reject) => {
+// A check to run once a request's body has arrived, before any route acts
+// on it (set by src/http.js on a client's request: the panic lock, which
+// may have committed while the body was on its way). It throws to refuse,
+// with a statusCode and a body for http.js's catch.
+export const AFTER_BODY = Symbol('afterBody')
+// The same for a route that waits on something else between the request's
+// checks and its write (a password hash, an upload, another server): the
+// caller checked again, right before the write. Set by src/http.js on a
+// client's request; throws to refuse (the device signed out meanwhile →
+// 401, its account locked → 423), with a statusCode and a body for
+// http.js's catch. Call it after the last await, before the write.
+export const RECHECK = Symbol('recheck')
+export const recheckCaller = (req) => { req[RECHECK]?.() }
+const afterBody = (req, value) => {
+  req[AFTER_BODY]?.()
+  return value
+}
+
+export const readRawBody = (req, opts) => readRawBodyOnly(req, opts).then((data) => afterBody(req, data))
+const readRawBodyOnly = (req, { maxBytes = 1e6 } = {}) => new Promise((resolve, reject) => {
   const decoder = new StringDecoder('utf8')
   let data = ''
   let bytes = 0

@@ -1,0 +1,837 @@
+{
+  "name": "notifications: the decision follows app state, the open conversation and mute",
+  "description": "In the default notification mode a prompt notifies and routine agent text does not. A prompt in the conversation open on screen in the foreground does not notify; the same prompt with the app in the background does; muted it does not; unmuted it does again. Every row is journaled and held whatever the decision.",
+  "protocol": 1,
+  "seed": {
+    "users": [
+      {
+        "as": "alice",
+        "name": "alice",
+        "password": "fixture-pw-20"
+      }
+    ],
+    "agents": [
+      {
+        "as": "bridge",
+        "user": "alice",
+        "name": "box-2"
+      }
+    ],
+    "conversations": [
+      {
+        "id": "c1",
+        "owner": "alice",
+        "title": "recovery",
+        "agent": "bridge"
+      }
+    ],
+    "events": [
+      {
+        "convo": "c1",
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "role": "client",
+      "kind": "http",
+      "method": "POST",
+      "path": "/login",
+      "body": {
+        "username": "alice",
+        "password": "fixture-pw-20",
+        "device_name": "mac"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "token": {
+            "$bind": "alice_token"
+          },
+          "device_id": {
+            "$type": "integer"
+          },
+          "user_id": {
+            "$ref": "alice.user_id"
+          }
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_open",
+      "conn": "agent"
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "bridge.token"
+        },
+        "cursor": null
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 1,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "box-2"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_open",
+      "conn": "client"
+    },
+    {
+      "role": "client",
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "alice_token"
+        },
+        "cursor": 0
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 1,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 1,
+        "app": "foreground",
+        "muted": false,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "seq": 2,
+        "shown": true,
+        "convo_id": "c1",
+        "title": {
+          "$type": "string"
+        },
+        "body": {
+          "$type": "string"
+        },
+        "silent": {
+          "$type": "boolean"
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "text",
+        "payload": {
+          "body": "working"
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "text",
+        "payload": {
+          "body": "working"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "text",
+        "payload": {
+          "body": "working"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "shown": false,
+        "convo_id": "c1",
+        "seq": 3
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "viewing",
+        "convo_id": "c1"
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "shown": false,
+        "convo_id": "c1",
+        "seq": 4
+      }
+    },
+    {
+      "role": "client",
+      "kind": "set_app_state",
+      "app": "background"
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 4,
+        "app": "background",
+        "muted": false,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 2,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 3,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 4,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 5,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 5,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "seq": 5,
+        "shown": true,
+        "convo_id": "c1",
+        "title": {
+          "$type": "string"
+        },
+        "body": {
+          "$type": "string"
+        },
+        "silent": {
+          "$type": "boolean"
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "set_app_state",
+      "muted": true
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": [
+            {
+              "convo_id": "c1",
+              "level": null,
+              "mute_until": {
+                "$type": "integer"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 6,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 6,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "shown": false,
+        "convo_id": "c1",
+        "seq": 6
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_model",
+      "expect": {
+        "cursor": 6,
+        "app": "background",
+        "muted": true,
+        "conversations": {
+          "$type": "array"
+        },
+        "events": {
+          "c1": [
+            {
+              "seq": 1,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 2,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 3,
+              "type": "text",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 4,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 5,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            },
+            {
+              "seq": 6,
+              "type": "prompt",
+              "sender": "agent:box-2"
+            }
+          ]
+        },
+        "tool_streams": {},
+        "activities": {}
+      }
+    },
+    {
+      "role": "client",
+      "kind": "set_app_state",
+      "muted": false
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "notify",
+        "settings": {
+          "mode": "coordinator",
+          "events": {
+            "prompts": true,
+            "questions": true,
+            "notices": true,
+            "coordinator_done": false,
+            "other_done": false,
+            "stopped": false,
+            "rooms": false,
+            "activity": false
+          },
+          "has_coordinator": false,
+          "convos": []
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "publish",
+        "convo_id": "c1",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "agent",
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "journal",
+        "seq": 7,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "journal",
+        "seq": 7,
+        "convo_id": "c1",
+        "ts": {
+          "$type": "integer"
+        },
+        "sender": "agent:box-2",
+        "sender_device_id": {
+          "$ref": "bridge.device_id"
+        },
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "role": "client",
+      "kind": "expect_notification",
+      "expect": {
+        "seq": 7,
+        "shown": true,
+        "convo_id": "c1",
+        "title": {
+          "$type": "string"
+        },
+        "body": {
+          "$type": "string"
+        },
+        "silent": {
+          "$type": "boolean"
+        }
+      }
+    }
+  ]
+}

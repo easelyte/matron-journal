@@ -1,0 +1,46 @@
+{
+  "type": "ws.journal.tool_output",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "06a_agent_publish_types.json#step[8]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "tool_output",
+        "payload": {
+          "snippet": "build ok",
+          "truncated": false,
+          "tool_name": "bash"
+        }
+      }
+    },
+    {
+      "source": "13_tool_stream.json#step[26]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "tool_output",
+        "payload": {
+          "message_ref": "tu1",
+          "command": "make",
+          "exit_code": 0,
+          "denied": false,
+          "truncated": false,
+          "snippet": "$ make",
+          "blob_ref": "blob-fixture",
+          "live_log": true
+        }
+      }
+    }
+  ]
+}

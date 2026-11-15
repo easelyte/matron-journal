@@ -1,10 +1,11 @@
 {
   "name": "ws hello: an invalid token gets an auth error frame and the socket closes",
   "description": "hello with a token that resolves to no device gets {kind:'control', op:'error', code:'auth'} (no ref field — this rejection happens before any op is being processed) and the connection is closed.",
+  "protocol": 1,
   "steps": [
-    { "kind": "ws_open", "conn": "c1" },
-    { "kind": "ws_send", "conn": "c1", "frame": { "op": "hello", "token": "not-a-real-token", "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "c1", "frame": { "kind": "control", "op": "error", "code": "auth" } },
-    { "kind": "ws_expect_close", "conn": "c1" }
+    { "kind": "ws_open", "role": "client", "conn": "c1" },
+    { "kind": "ws_send", "role": "client", "conn": "c1", "frame": { "op": "hello", "token": "not-a-real-token", "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "conn": "c1", "frame": { "kind": "control", "op": "error", "code": "auth" } },
+    { "kind": "ws_expect_close", "role": "client", "conn": "c1" }
   ]
 }

@@ -1,0 +1,24 @@
+{
+  "type": "ws.journal.prompt_reply",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[11]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "prompt_reply",
+        "payload": {
+          "target_seq": 4763,
+          "choice": "yes",
+          "text": null
+        }
+      }
+    }
+  ]
+}

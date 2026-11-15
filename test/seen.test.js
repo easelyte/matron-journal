@@ -10,7 +10,7 @@ import {
   validRanges, addSeenRanges, seenRanges, legacyReadAsSeen, markDeviceUsesRanges, markItemSeen,
   listUnseen, flagRefs, pruneFlags, validRef,
 } from '../src/seen.js'
-import { inNudgeHours, runUnseenNudge } from '../src/unseen-nudge.js'
+import { inNudgeHours, resolveNudgeTz, runUnseenNudge } from '../src/unseen-nudge.js'
 
 async function world() {
   const db = openDb(':memory:')
@@ -164,11 +164,15 @@ test('validRef', () => {
   for (const bad of ['msg:c1', 'msg::1', 'item:x', 'nope', 12, 'msg:c1:1x']) assert.ok(!validRef(bad), String(bad))
 })
 
-test('inNudgeHours: 07:00–22:00 UK', () => {
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59)), false) // GMT
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0)), true)
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0)), true) // 07:00 BST
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0)), false) // 22:00 BST
+test('inNudgeHours: 07:00–22:00 in the nudge zone (Europe/London by default)', () => {
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/London'), false) // GMT
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0), 'Europe/London'), true)
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0), 'Europe/London'), true) // 07:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0), 'Europe/London'), false) // 22:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/Paris'), true) // 07:59 CET
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 21, 0), 'Europe/Paris'), false) // 22:00 CET
+  assert.equal(resolveNudgeTz(undefined), 'Europe/London')
+  assert.equal(resolveNudgeTz('America/New_York'), 'America/New_York')
 })
 
 test('runUnseenNudge: once per entry, hourly at most, only when the Coordinator is connected', async () => {

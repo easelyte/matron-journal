@@ -30,7 +30,7 @@ if ! command -v cloudflared >/dev/null; then
   apt-get update -qq && apt-get install -y -qq cloudflared
 fi
 
-# --- security baseline (mirrors dev-boxer 01_security, minus postfix/exporter) ---
+# --- security baseline (firewall, fail2ban, key-only sshd, auto-upgrades) ---
 timedatectl set-timezone Etc/UTC
 
 # unattended-upgrades: installing the package is not enough — this file is

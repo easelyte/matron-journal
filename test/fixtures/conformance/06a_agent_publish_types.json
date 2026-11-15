@@ -1,51 +1,52 @@
 {
   "name": "agent publish: text/prompt/tool_output/file all land; a server-generated type is rejected",
   "description": "Agent publish accepts several native message types, each becoming a journal row verbatim. Publishing a server-generated type (session_status — only reachable via convo_upsert) is bad_request and appends nothing, proven by the next legitimate publish's seq.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-9" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "box-2" }],
     "conversations": [{ "id": "c1", "owner": "alice" }]
   },
   "steps": [
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "hello" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "hello" } } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "hello" }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
       "payload": { "question": "proceed?", "options": ["yes", "no"], "allows_free_text": false } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "prompt",
       "payload": { "question": "proceed?", "options": ["yes", "no"], "allows_free_text": false }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "tool_output",
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "tool_output",
       "payload": { "snippet": "build ok", "truncated": false, "tool_name": "bash" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "tool_output",
       "payload": { "snippet": "build ok", "truncated": false, "tool_name": "bash" }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "file",
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "file",
       "payload": { "blob_ref": "deadbeef00", "content_type": "image/png" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "file",
       "payload": { "blob_ref": "deadbeef00", "content_type": "image/png" }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "session_status", "payload": { "state": "done" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "publish" } },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "session_status", "payload": { "state": "done" } } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "publish" } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "after the reject" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "after the reject" } } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 5, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "after the reject" }
     } }

@@ -56,7 +56,7 @@ export function targetConvo(db, userId, convoId) {
 
 function deviceRow(db, userId, deviceId) {
   if (!Number.isInteger(deviceId)) return null
-  return db.prepare('SELECT id, name, private, consent_user_only FROM devices WHERE id=? AND user_id=?').get(deviceId, userId) ?? null
+  return db.prepare('SELECT id, name, private, consent_user_only, protected FROM devices WHERE id=? AND user_id=?').get(deviceId, userId) ?? null
 }
 
 // "Release notes (box-2)": the conversation's title and its box, for the
@@ -72,9 +72,10 @@ export function convoLabel(db, userId, convoId) {
 
 // Either side a user-only device: the user's tap, never an agent's (the
 // Coordinator's included), lets the offer through — the same rule as every
-// other ask such a device takes part in (src/consent.js).
+// other ask such a device takes part in (src/consent.js). A protected
+// device is user-only while it is set (src/consent-subject.js).
 export function needsUserTap(db, userId, fromDeviceId, toDeviceId) {
-  return [fromDeviceId, toDeviceId].some((d) => !!deviceRow(db, userId, d)?.consent_user_only)
+  return [fromDeviceId, toDeviceId].some((d) => { const r = deviceRow(db, userId, d); return !!(r?.consent_user_only || r?.protected) })
 }
 
 // A private box's items are withheld from ordinary agents (src/privacy.js).

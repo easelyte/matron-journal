@@ -1,0 +1,278 @@
+{
+  "type": "http.get.convo.messages.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "14_items_roundtrip.json#step[5]",
+      "frame": {
+        "events": [
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "item",
+            "payload": {
+              "item_id": "sample-item_id",
+              "num": 1,
+              "kind": "question",
+              "title": "Which auth library?",
+              "origin_convo_id": "c1",
+              "origin_convo_title": "Session",
+              "action": "created",
+              "by": "agent",
+              "awaiting": "user",
+              "resolution": null,
+              "actions": [],
+              "chosen_action": null
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "text",
+            "payload": {
+              "body": "📌 Needs you — question #1: Which auth library?\nA or B?",
+              "fallback_for": "item",
+              "item_id": "sample-item_id",
+              "num": 1,
+              "action": "created"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "user:alice",
+            "type": "item",
+            "payload": {
+              "item_id": "sample-item_id",
+              "num": 1,
+              "kind": "question",
+              "title": "Which auth library?",
+              "origin_convo_id": "c1",
+              "origin_convo_title": "Session",
+              "action": "commented",
+              "by": "user",
+              "awaiting": "agent",
+              "resolution": null,
+              "actions": [],
+              "chosen_action": null,
+              "comment": {
+                "id": "sample-comment_id",
+                "body": "Use A",
+                "action": null,
+                "attachments": [],
+                "actions": [],
+                "chosen_action": null,
+                "reply_to": null,
+                "created_at": 1700000000000
+              }
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "user:alice",
+            "type": "text",
+            "payload": {
+              "body": "📌 Question #1 \"Which auth library?\" — alice commented:\nUse A",
+              "fallback_for": "item",
+              "item_id": "sample-item_id",
+              "num": 1,
+              "action": "commented"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "item",
+            "payload": {
+              "item_id": "sample-item_id",
+              "num": 1,
+              "kind": "question",
+              "title": "Which auth library?",
+              "origin_convo_id": "c1",
+              "origin_convo_title": "Session",
+              "action": "closed",
+              "by": "agent",
+              "awaiting": null,
+              "resolution": "answered",
+              "actions": [],
+              "chosen_action": null
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "text",
+            "payload": {
+              "body": "✅ Question #1 \"Which auth library?\" closed as answered",
+              "fallback_for": "item",
+              "item_id": "sample-item_id",
+              "num": 1,
+              "action": "closed"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "source": "15_missions_roundtrip.json#step[4]",
+      "frame": {
+        "events": [
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-mission_id",
+              "num": 1,
+              "title": "Missions & milestones",
+              "action": "created",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 6208,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "milestone",
+            "payload": {
+              "milestone_id": "sample-milestone_id",
+              "num": 3,
+              "kind": "user_input",
+              "title": "Alice asked for missions",
+              "body": "the brief",
+              "mission_id": "sample-mission_id",
+              "mission_num": 1,
+              "mission_title": "Missions & milestones",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-mission_id",
+              "num": 1,
+              "title": "Missions & milestones",
+              "action": "closed",
+              "by": "agent"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "source": "17_mission_links_and_projects.json#step[9]",
+      "frame": {
+        "events": [
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-a_id",
+              "num": 1,
+              "title": "A",
+              "action": "created",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-b_id",
+              "num": 3,
+              "title": "B",
+              "action": "joined",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 6208,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "milestone",
+            "payload": {
+              "milestone_id": "sample-milestone_id",
+              "num": 5,
+              "kind": "progress",
+              "title": "Work on A",
+              "body": "",
+              "mission_id": "sample-a_id",
+              "mission_num": 1,
+              "mission_title": "A",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-b_id",
+              "num": 3,
+              "title": "B",
+              "action": "left",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-a_id",
+              "num": 1,
+              "title": "A",
+              "action": "current_changed",
+              "by": "agent"
+            }
+          },
+          {
+            "seq": 1,
+            "convo_id": "c1",
+            "ts": 1700000000000,
+            "sender": "agent:box-2",
+            "type": "mission",
+            "payload": {
+              "mission_id": "sample-a_id",
+              "num": 1,
+              "title": "A",
+              "action": "updated",
+              "by": "agent",
+              "project_changed": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

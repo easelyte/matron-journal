@@ -15,9 +15,10 @@ test('start returns a well-formed pair and claim is pending until approve', () =
 test('approve → claim returns identity exactly once, then not_found', () => {
   const store = makePairStore()
   const p = store.start()
-  assert.equal(store.approve(p.pairCode, { userId: 7, agentName: 'box-9' }), 'approved')
+  assert.equal(store.approve(p.pairCode, { userId: 7, agentName: 'box-9', approvedBy: 3 }), 'approved')
   const c = store.claim(p.pollToken)
-  assert.deepEqual(c, { status: 'approved', userId: 7, agentName: 'box-9', tagChar: null })
+  // approvedBy: the approving device, for the security log.
+  assert.deepEqual(c, { status: 'approved', userId: 7, agentName: 'box-9', tagChar: null, approvedBy: 3 })
   assert.deepEqual(store.claim(p.pollToken), { status: 'not_found' })
   assert.equal(store.size(), 0)
 })
@@ -36,7 +37,7 @@ test('second approve of the same code is conflict; unknown code is not_found', (
   assert.equal(store.approve(p.pairCode, { userId: 1, agentName: 'a' }), 'approved')
   assert.equal(store.approve(p.pairCode, { userId: 2, agentName: 'b' }), 'conflict')
   // the winning approval is untouched by the losing one
-  assert.deepEqual(store.claim(p.pollToken), { status: 'approved', userId: 1, agentName: 'a', tagChar: null })
+  assert.deepEqual(store.claim(p.pollToken), { status: 'approved', userId: 1, agentName: 'a', tagChar: null, approvedBy: null })
   assert.equal(store.approve('ZZZZ-ZZZZ', { userId: 1, agentName: 'a' }), 'not_found')
 })
 

@@ -307,7 +307,17 @@ export function completeTalkStart(db, { linkId, spawnId, deviceId, convoId, now 
       setState(db, link.id, 'awaiting_guest', now, ', spawn_id=NULL')
       return { outcome: 'start_failed', link: getPersonRoom(db, link.id), before: link }
     }
-    const r = acceptOnto(db, { ...link }, { deviceId, convoId }, now)
+    // The box protected, or the guest's account panic-locked, while the
+    // session started: the accept (a savepoint) writes nothing, and the talk
+    // goes back to the guest's choice saying why, as a failed start does.
+    let r
+    try {
+      r = db.transaction(() => acceptOnto(db, { ...link }, { deviceId, convoId }, now))()
+    } catch (err) {
+      if (err.message !== 'protected_device' && err.message !== 'account_locked') throw err
+      setState(db, link.id, 'awaiting_guest', now, ', spawn_id=NULL')
+      return { outcome: 'start_failed', code: err.message, link: getPersonRoom(db, link.id), before: link }
+    }
     return { outcome: r.outcome, contact: r.contact, link: getPersonRoom(db, link.id), before: link }
   })()
 }

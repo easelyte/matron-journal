@@ -28,7 +28,7 @@ test('db-backed startPreapproved stores a hash, not the code; claim consumes and
   t.after(() => db.close())
   seedUsers(db, [7])
   const store = makeLinkStore({ db })
-  const s = store.startPreapproved(7)
+  const s = store.startPreapproved(7, { by: 'admin_cli' })
   assert.match(s.linkCode, /^[0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4}$/)
   assert.equal(s.expiresIn, 600)
   assert.equal(rowCount(db), 1)
@@ -45,7 +45,8 @@ test('db-backed startPreapproved stores a hash, not the code; claim consumes and
   assert.equal(c.status, 'claimed')
   assert.match(c.claimToken, /^[0-9a-f]{64}$/)
   assert.equal(rowCount(db), 0) // consumed at claim time
-  assert.deepEqual(store.poll(c.claimToken), { status: 'approved', userId: 7, deviceName: 'First Phone' })
+  // Who minted it survives in the row, for the security log.
+  assert.deepEqual(store.poll(c.claimToken), { status: 'approved', userId: 7, deviceName: 'First Phone', approvedBy: null, decidedBy: 'admin_cli' })
 })
 
 test('persisted code survives a restart (fresh store on the same db file)', (t) => {
