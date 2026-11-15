@@ -1,4 +1,4 @@
-// Client tokens idle out: unused for 30 days (MATRON_CLIENT_IDLE_DAYS), the
+// Client tokens idle out: unused for 30 days when MATRON_CLIENT_IDLE_DAYS=30 (fork default: off), the
 // token stops working and the device signs in again; agent tokens never do.
 // The row stays, and the account's approval key stays enrolled for the app to
 // re-attach after signing in.
@@ -19,7 +19,7 @@ const age = (s, deviceId, days) => {
 const seen = (s, id) => s.db.prepare('SELECT last_seen_at FROM devices WHERE id=?').get(id).last_seen_at
 
 test('a client token works at 29 days idle and is refused at 31; the row stays', async (t) => {
-  const { s, token, deviceId } = await startApprovalServer(t)
+  const { s, token, deviceId } = await startApprovalServer(t, { clientIdleDays: 30 })
   age(s, deviceId, 29)
   assert.equal((await s.http('/devices', { token })).status, 200)
   age(s, deviceId, 31)
@@ -30,7 +30,7 @@ test('a client token works at 29 days idle and is refused at 31; the row stays',
 
 test('using a client token at day 29 resets the clock', async (t) => {
   let now = Date.now()
-  const { s, token } = await startApprovalServer(t, { clientIdleClock: () => now })
+  const { s, token } = await startApprovalServer(t, { clientIdleDays: 30, clientIdleClock: () => now })
   now += 29 * DAY
   assert.equal((await s.http('/devices', { token })).status, 200)
   now += 2 * DAY
@@ -40,7 +40,7 @@ test('using a client token at day 29 resets the clock', async (t) => {
 })
 
 test('use refreshes last_seen_at at most once an hour; an expired token never refreshes it', async (t) => {
-  const { s, token, deviceId } = await startApprovalServer(t)
+  const { s, token, deviceId } = await startApprovalServer(t, { clientIdleDays: 30 })
   const recent = Date.now() - 60000
   s.db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(recent, deviceId)
   await s.http('/devices', { token })
@@ -59,7 +59,7 @@ test('an agent token works after 400 days', async (t) => {
 })
 
 test('a null last_seen_at counts from created_at', async (t) => {
-  const { s, token, deviceId } = await startApprovalServer(t)
+  const { s, token, deviceId } = await startApprovalServer(t, { clientIdleDays: 30 })
   s.db.prepare('UPDATE devices SET last_seen_at=NULL, created_at=? WHERE id=?').run(Date.now() - 31 * DAY, deviceId)
   assert.equal((await s.http('/devices', { token })).status, 401)
   s.db.prepare('UPDATE devices SET last_seen_at=NULL, created_at=? WHERE id=?').run(Date.now() - 29 * DAY, deviceId)
@@ -77,18 +77,18 @@ test('MATRON_CLIENT_IDLE_DAYS=0 disables the expiry; a fraction sets it; the inj
   assert.equal((await short.s.http('/devices', { token: short.token })).status, 401)
 })
 
-test('the setting parses like its neighbours: default 30 days, invalid warns and falls back', (t) => {
+test('the setting parses like its neighbours: fork default off (0), invalid warns and falls back', (t) => {
   const savedEnv = process.env.MATRON_CLIENT_IDLE_DAYS
   delete process.env.MATRON_CLIENT_IDLE_DAYS
   t.after(() => { if (savedEnv === undefined) delete process.env.MATRON_CLIENT_IDLE_DAYS; else process.env.MATRON_CLIENT_IDLE_DAYS = savedEnv })
   const warns = []
   t.mock.method(console, 'warn', (m) => warns.push(m))
-  assert.equal(resolveClientIdleMs(undefined), 30 * DAY)
-  assert.equal(resolveClientIdleMs(null), 30 * DAY)
+  assert.equal(resolveClientIdleMs(undefined), 0)
+  assert.equal(resolveClientIdleMs(null), 0)
   assert.equal(resolveClientIdleMs(0), 0)
   assert.equal(resolveClientIdleMs('7'), 7 * DAY)
   assert.equal(warns.length, 0)
-  for (const bad of ['abc', '-1', 'NaN', 'Infinity']) assert.equal(resolveClientIdleMs(bad), 30 * DAY)
+  for (const bad of ['abc', '-1', 'NaN', 'Infinity']) assert.equal(resolveClientIdleMs(bad), 0)
   assert.equal(warns.length, 4)
 })
 
@@ -102,7 +102,7 @@ test('a short idle limit still refreshes: the hourly throttle is clamped to half
 })
 
 test('the device list marks an idle-expired client and nothing else', async (t) => {
-  const { s, alice, token, deviceId } = await startApprovalServer(t)
+  const { s, alice, token, deviceId } = await startApprovalServer(t, { clientIdleDays: 30 })
   const other = signIn(s, alice.id, 'tablet')
   const box = createAgent(s.db, alice.id, 'box-a')
   age(s, other.deviceId, 31)
@@ -113,7 +113,7 @@ test('the device list marks an idle-expired client and nothing else', async (t) 
 })
 
 test('an open socket of a device that idles out is closed as revoked at the next sweep', async (t) => {
-  const { s, token, deviceId } = await startApprovalServer(t, { revocationSweepMs: 30 })
+  const { s, token, deviceId } = await startApprovalServer(t, { clientIdleDays: 30, revocationSweepMs: 30 })
   const c = await makeWsClient(s.base, { token, cursor: 0 })
   t.after(() => c.ws.close())
   await c.waitFor((f) => f.op === 'hello_ok')
@@ -126,7 +126,7 @@ test('an open socket of a device that idles out is closed as revoked at the next
 })
 
 test('after expiry, a fresh sign-in plus attach lets the same key sign a tap; another device\'s key stays wrong_device', async (t) => {
-  const w = await startWithKey(t)
+  const w = await startWithKey(t, { clientIdleDays: 30 })
   const { s, alice, key } = w
   const box = createAgent(s.db, alice.id, 'box-a')
   upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })

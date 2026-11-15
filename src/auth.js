@@ -153,7 +153,8 @@ export function createClientDevice(db, userId, name) {
 // working and the device signs in again. Agent (bridge) tokens never do.
 // The row stays, so the device list can show it as signed out, idle, and the
 // account's approval key stays enrolled for the app to re-attach.
-export const DEFAULT_CLIENT_IDLE_DAYS = 30
+// easelyte fork: idle expiry off by default; set MATRON_CLIENT_IDLE_DAYS to turn it on
+export const DEFAULT_CLIENT_IDLE_DAYS = 0
 export const DEFAULT_CLIENT_IDLE_MS = DEFAULT_CLIENT_IDLE_DAYS * 24 * 60 * 60 * 1000
 // Using a token keeps the device alive, but the clock is only written when it
 // is this stale, so a busy client costs one write an hour, not one a request.
