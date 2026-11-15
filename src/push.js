@@ -1,5 +1,7 @@
+import crypto from 'node:crypto'
 import { snippetOf } from './journal.js'
-import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
+import { clientIdleExpired } from './auth.js'
+import { clientDevicesForPush, pruneApnsToken, pruneWebPushSubscription, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { wakesForYou } from './sync-scope.js'
 import {
@@ -10,6 +12,7 @@ import { boxPlaintext, sealBox } from './push-box.js'
 import { APS_ALERTS } from './relay.js'
 import { inlineRefsToText } from './inline-refs.js'
 import { isSilentEvent } from './message-types.js'
+import { isPanicLocked } from './panic.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
@@ -163,10 +166,11 @@ function isDeadToken({ status, reason }) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
+  const webCounters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
-  // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
+  // Coalescing state lives in memory only, keyed by `${deviceId}:${transport}:${convoId}`.
   // A process restart loses any pending trailing push — acceptable for v1;
   // the next routine event after restart just does a fresh leading-edge
   // send since no window is latched for it.
@@ -203,6 +207,16 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   }
 
   function doSend(device, userId, opts) {
+    // A panic-locked account (src/panic.js): nothing is pushed. Its only
+    // client devices left are frozen ones, which get nothing but the means
+    // to clear the lock. Checked at the send, so a push queued before the
+    // lock is dropped too.
+    if (isPanicLocked(db, userId)) return
+    // `device` is as it was when the push was built, and a queued one may
+    // be sent a while later: a device signed out since gets nothing. (One
+    // that registered another push token meanwhile still gets the push at
+    // the old one, with the fixed text only: currentKey below.)
+    if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
     // Badge must reflect unread state as of the moment we actually transmit,
     // not whenever the push was built/scheduled — a coalesced or trailing
     // push can sit queued for up to `coalesceMs`, during which more events
@@ -232,6 +246,40 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
   }
 
+  function sendTransport(device, userId, opts, transport) {
+    if (transport !== 'web') return doSend(device, userId, opts)
+    // The same send-time checks as doSend, so a push queued before a panic
+    // lock (a coalesced trailing push, a held consent push) or a sign-out is
+    // dropped on the web path too.
+    if (isPanicLocked(db, userId)) return
+    if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
+    const failed = (reason) => {
+      webCounters.failed += 1
+      webCounters.byReason[reason] = (webCounters.byReason[reason] || 0) + 1
+    }
+    // A trailing push must not use a subscription unregistered or claimed by
+    // another device while it waited in the coalescing window.
+    const current = db.prepare('SELECT endpoint, p256dh, auth FROM web_push_subscriptions WHERE device_id=?').get(device.id)
+    if (!current || current.endpoint !== device.wp_endpoint || current.p256dh !== device.wp_p256dh || current.auth !== device.wp_auth) return
+    try {
+      Promise.resolve(webPushClient.send({ endpoint: device.wp_endpoint,
+        p256dh: device.wp_p256dh, auth: device.wp_auth, ...opts }))
+        .then((result) => {
+          if (result.status >= 200 && result.status < 300) {
+            webCounters.sent += 1
+            return
+          }
+          failed(result.reason || (result.status === 0 ? 'transport' : String(result.status)))
+          if ((result.status === 404 || result.status === 410)
+            && pruneWebPushSubscription(db, device.id, device.wp_endpoint)) {
+            webCounters.pruned += 1
+            console.error(`web push: device ${device.id} subscription pruned (${new URL(device.wp_endpoint).hostname})`)
+          }
+        })
+        .catch(() => failed('internal'))
+    } catch { failed('internal') }
+  }
+
   // Trailing-edge coalescing with a leading send when idle: the first
   // routine event for a (device, convo) pair sends immediately and latches
   // a window; further routine events within `coalesceMs` are held (latest
@@ -239,8 +287,8 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // elapses. Invariant: an entry exists in coalesceState iff its window
   // timer is armed — a timer that fires with nothing pending evicts the
   // entry, so the map never grows unboundedly across (device, convo) pairs.
-  function scheduleRoutine(device, userId, convoId, buildOpts) {
-    const key = `${device.id}:${convoId}`
+  function scheduleRoutine(device, userId, convoId, buildOpts, transport = 'apns') {
+    const key = `${device.id}:${transport}:${convoId}`
     const state = coalesceState.get(key)
     if (state) {
       state.pendingBuild = buildOpts // within the window: latest wins
@@ -248,17 +296,17 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
     const fresh = { timer: null, pendingBuild: null }
     coalesceState.set(key, fresh)
-    doSend(device, userId, buildOpts()) // idle: leading send
-    armWindow(key, fresh, device, userId)
+    sendTransport(device, userId, buildOpts(), transport) // idle: leading send
+    armWindow(key, fresh, device, userId, transport)
   }
 
-  function armWindow(key, state, device, userId) {
+  function armWindow(key, state, device, userId, transport) {
     state.timer = setTimeout(() => {
       const build = state.pendingBuild
       state.pendingBuild = null
       if (build) {
-        doSend(device, userId, build()) // trailing push, then a fresh window
-        armWindow(key, state, device, userId)
+        sendTransport(device, userId, build(), transport) // trailing push, then a fresh window
+        armWindow(key, state, device, userId, transport)
       } else {
         coalesceState.delete(key) // idle window: evict
       }
@@ -314,7 +362,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // can pass through to classify(). Every other call site omits it.
   // `noHold` is internal: resumeHeldConsent's own, already-waited send.
   function onAppend(userId, event, originDeviceId, pushHint, { noHold = false } = {}) {
-    if (!apnsClient) return
+    if (!apnsClient && !webPushClient) return
+    // A panic-locked account: nothing pushed (doSend, sendTransport), nothing queued.
+    if (isPanicLocked(db, userId)) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
     // Silent children: a subagent's child conversation is exempt from APNs
@@ -324,7 +374,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // so stale app versions stay silent for children too.
     if (convo.parent_convo_id != null) return
     // kind='client' only — agent devices are never pushed to.
-    const devices = clientDevicesForPush(db, userId)
+    // A client that has idled out is signed out: no pushes until it signs in again.
+    const pushNow = now()
+    const devices = clientDevicesForPush(db, userId).filter((d) => !clientIdleExpired(d, pushNow, clientIdleMs))
     if (devices.length === 0) return
     // Badge is no longer captured here — doSend recomputes it fresh at
     // actual send time (see doSend), so a coalesced/deferred push never
@@ -333,7 +385,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     if (event.type === 'read_marker') {
       for (const device of devices) {
         if (device.id === originDeviceId) continue // never push a device its own read_marker
-        if (!device.apns_env) continue
+        if (!apnsClient || !device.apns_env) continue
         // A for_you phone has nothing to fetch for a read elsewhere, only a
         // badge to update, so its read wakes share the paced wakes' budget.
         if (device.sync_scope === 'for_you' && backgroundWakeMs && now() - (lastWakeAt.get(device.apns_token) ?? -Infinity) < backgroundWakeMs) continue
@@ -344,7 +396,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
 
     // Before the settings below can return. `noHold` is a consent card's
     // second pass through here: its first pass has already been considered.
-    if (!noHold) maybeWake(userId, event, devices, originDeviceId)
+    if (apnsClient && !noHold) maybeWake(userId, event, devices, originDeviceId)
 
     const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
     if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
@@ -393,6 +445,18 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // id at 64 bytes.
     const itemId = event.type === 'item' && typeof event.payload?.item_id === 'string' && event.payload.item_id.length <= 64
       ? event.payload.item_id : null
+    const webContent = () => {
+      try {
+        const bytes = plaintext()
+        if (bytes) return bytes
+      } catch (err) {
+        console.error('push: could not build web push content', err)
+      }
+      return Buffer.from(JSON.stringify({
+        v: 1, ...(APS_ALERTS[cls.kind] ?? APS_ALERTS.activity),
+        convo_id: event.convo_id, seq: event.seq, kind: cls.kind,
+      }))
+    }
     for (const device of devices) {
       // Origin-device exclusion, uniformly for every push type (not just
       // read_marker above): a device must never be pushed about an event it
@@ -402,7 +466,6 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       // out by classify() above) — kept here anyway so the rule holds
       // uniformly rather than being asymmetrically special-cased.
       if (device.id === originDeviceId) continue
-      if (!device.apns_env) continue
       // This device's own level ("On this device: all / needs me / off").
       if (!allowedForDevice(key, device.push_level)) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
@@ -431,6 +494,19 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
           category: cls.kind,
         }
       }
+      if (webPushClient && device.wp_endpoint) {
+        // Built inside the send path's own timers too, so it must not throw:
+        // content that cannot be built goes out as the fixed text.
+        const buildWeb = () => ({
+          payload: webContent(),
+          urgency: cls.priority === 10 ? 'high' : 'normal',
+          topic: crypto.createHash('sha256').update(itemId || event.convo_id).digest('base64url').slice(0, 32),
+          ttl: cls.kind === 'activity' ? 3600 : 86400,
+        })
+        if (cls.coalesce) scheduleRoutine(device, userId, event.convo_id, buildWeb, 'web')
+        else sendTransport(device, userId, buildWeb(), 'web')
+      }
+      if (!apnsClient || !device.apns_token || !device.apns_env) continue
       if (cls.coalesce) {
         scheduleRoutine(device, userId, event.convo_id, buildOpts)
       } else {
@@ -467,7 +543,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // The partial index idx_events_permission_request keeps this off a full
   // events scan.
   function resumeHeldConsent(now = Date.now()) {
-    if (!apnsClient) return 0
+    if (!apnsClient && !webPushClient) return 0
     const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
       WHERE type='permission_request' AND ts > ?`).all(now - consentHoldMs - resumeSlackMs)
     let n = 0
@@ -504,5 +580,5 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
 
   // _coalesceState is exposed for tests (eviction assertions) and as a
   // cheap gauge candidate for Task 5's /metrics; not part of the public API.
-  return { onAppend, resumeHeldConsent, counters, close, _coalesceState: coalesceState, _held: held }
+  return { onAppend, resumeHeldConsent, counters, webCounters, close, _coalesceState: coalesceState, _held: held }
 }

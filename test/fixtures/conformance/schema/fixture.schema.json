@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matron.example/conformance/fixture.schema.json",
+  "title": "conformance fixture",
+  "description": "One scenario: seed, then an ordered list of steps, each tagged with the role that performs it. Expected values use the $bind/$ref/$type/$ignore convention (see README.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description", "protocol", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "protocol": { "type": "integer", "minimum": 1, "description": "Protocol revision this fixture was written against." },
+    "since": { "type": "integer", "minimum": 1, "description": "First protocol revision a client must pass this fixture on; a client declaring an older revision skips it. Defaults to 1. Never greater than protocol." },
+    "server": { "$ref": "#/$defs/server" },
+    "seed": { "$ref": "#/$defs/seed" },
+    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } }
+  },
+  "$defs": {
+    "matcher": { "description": "Any JSON value; objects made only of $bind/$ref/$type/$ignore are variable nodes, every other object is a literal with an exact key set." },
+    "name": { "type": "string", "minLength": 1 },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxReplay": { "type": "integer", "minimum": 0 },
+        "mediaMaxBytes": { "type": "integer", "minimum": 0 },
+        "tmpDb": { "type": "boolean" }
+      }
+    },
+    "seed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "users": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["as", "name", "password"],
+            "properties": { "as": { "$ref": "#/$defs/name" }, "name": { "$ref": "#/$defs/name" }, "password": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["as", "user", "name"],
+            "properties": { "as": { "$ref": "#/$defs/name" }, "user": { "$ref": "#/$defs/name" }, "name": { "$ref": "#/$defs/name" } }
+          }
+        },
+        "conversations": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["id", "owner"],
+            "properties": {
+              "id": { "$ref": "#/$defs/name" }, "owner": { "$ref": "#/$defs/name" },
+              "title": { "type": "string" }, "sessionState": { "type": "string" }, "agent": { "$ref": "#/$defs/name" }
+            }
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["convo", "sender", "type", "payload"],
+            "properties": {
+              "convo": { "$ref": "#/$defs/name" }, "sender": { "type": "string" }, "type": { "type": "string" },
+              "payload": { "type": "object" }, "idemKey": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "role": { "enum": ["client", "agent", "admin"] },
+    "stepBase": {
+      "description": "Fields every step carries. role says which actor performs the step; client names the client when a fixture has more than one (client role only).",
+      "type": "object",
+      "required": ["kind", "role"],
+      "properties": {
+        "kind": true,
+        "role": { "$ref": "#/$defs/role" },
+        "client": { "$ref": "#/$defs/name" }
+      },
+      "dependentSchemas": { "client": { "properties": { "role": { "const": "client" } } } }
+    },
+    "step": {
+      "oneOf": [
+        { "$ref": "#/$defs/step_http" },
+        { "$ref": "#/$defs/step_ws_open" },
+        { "$ref": "#/$defs/step_ws_send" },
+        { "$ref": "#/$defs/step_ws_expect" },
+        { "$ref": "#/$defs/step_ws_expect_none" },
+        { "$ref": "#/$defs/step_ws_expect_close" },
+        { "$ref": "#/$defs/step_wait" },
+        { "$ref": "#/$defs/step_admin_revoke_device" },
+        { "$ref": "#/$defs/step_disconnect" },
+        { "$ref": "#/$defs/step_reconnect_from_cursor" },
+        { "$ref": "#/$defs/step_advance_clock" },
+        { "$ref": "#/$defs/step_set_app_state" },
+        { "$ref": "#/$defs/step_expect_model" },
+        { "$ref": "#/$defs/step_expect_notification" }
+      ]
+    },
+    "step_http": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "path", "expect"],
+      "properties": {
+        "kind": { "const": "http" }, "role": true, "client": true,
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+        "path": { "type": "string", "pattern": "^/" },
+        "headers": { "type": "object", "additionalProperties": true },
+        "token": { "$ref": "#/$defs/matcher" },
+        "body": { "$ref": "#/$defs/matcher" },
+        "body_base64": { "type": "string" },
+        "content_type": { "type": "string" },
+        "expect": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+            "headers": { "type": "object", "additionalProperties": true },
+            "body": { "$ref": "#/$defs/matcher" },
+            "body_base64": { "type": "string" }
+          }
+        }
+      },
+      "not": { "required": ["body", "body_base64"], "properties": { "body": true, "body_base64": true } }
+    },
+    "step_ws_open": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
+      "properties": { "kind": { "const": "ws_open" }, "role": true, "client": true, "conn": { "$ref": "#/$defs/name" } }
+    },
+    "step_ws_send": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn", "frame"],
+      "properties": { "kind": { "const": "ws_send" }, "role": true, "client": true, "conn": { "$ref": "#/$defs/name" }, "frame": { "$ref": "#/$defs/matcher" } }
+    },
+    "step_ws_expect": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn", "frame"],
+      "properties": { "kind": { "const": "ws_expect" }, "role": true, "client": true, "conn": { "$ref": "#/$defs/name" }, "frame": { "$ref": "#/$defs/matcher" } }
+    },
+    "step_ws_expect_none": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
+      "properties": { "kind": { "const": "ws_expect_none" }, "role": true, "client": true, "conn": { "$ref": "#/$defs/name" }, "ms": { "type": "integer", "minimum": 1 } }
+    },
+    "step_ws_expect_close": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
+      "properties": { "kind": { "const": "ws_expect_close" }, "role": true, "client": true, "conn": { "$ref": "#/$defs/name" }, "code": { "type": "integer" } }
+    },
+    "step_wait": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "ms"],
+      "properties": { "kind": { "const": "wait" }, "role": true, "client": true, "ms": { "type": "integer", "minimum": 1 } }
+    },
+    "step_admin_revoke_device": {
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "device_id"],
+      "properties": { "kind": { "const": "admin_revoke_device" }, "role": { "const": "admin" }, "client": true, "device_id": { "$ref": "#/$defs/matcher" } }
+    },
+    "step_disconnect": {
+      "description": "Drop the named socket as a network drop would, with no close handshake the app initiates itself. The platform runner severs its own socket.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
+      "properties": { "kind": { "const": "disconnect" }, "role": { "enum": ["client", "agent"] }, "client": true, "conn": { "$ref": "#/$defs/name" } }
+    },
+    "step_reconnect_from_cursor": {
+      "description": "Open the named socket again and send hello with a cursor: the highest journal seq the actor applied before the disconnect, unless cursor is given.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
+      "properties": { "kind": { "const": "reconnect_from_cursor" }, "role": { "enum": ["client", "agent"] }, "client": true, "conn": { "$ref": "#/$defs/name" }, "cursor": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }, { "type": "object", "required": ["$ref"], "additionalProperties": false, "properties": { "$ref": { "type": "string" } } }] } }
+    },
+    "step_advance_clock": {
+      "description": "Advance the client's virtual clock by ms (timers, backoff, grace periods). Real sockets and the server are not slowed or sped up.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "ms"],
+      "properties": { "kind": { "const": "advance_clock" }, "role": { "const": "client" }, "client": true, "ms": { "type": "integer", "minimum": 1 } }
+    },
+    "step_set_app_state": {
+      "description": "Put the app in a lifecycle state: app is foreground or background, muted toggles the conversation-mute setting. At least one is required.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role"],
+      "properties": { "kind": { "const": "set_app_state" }, "role": { "const": "client" }, "client": true, "app": { "enum": ["foreground", "background"] }, "muted": { "type": "boolean" } },
+      "anyOf": [{ "required": ["app"], "properties": { "app": true } }, { "required": ["muted"], "properties": { "muted": true } }]
+    },
+    "step_expect_model": {
+      "description": "Assert the client's model state through the platform runner's test hook. The expected shape is matched with the standard matcher.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "expect"],
+      "properties": { "kind": { "const": "expect_model" }, "role": { "const": "client" }, "client": true, "expect": { "$ref": "#/$defs/matcher" } }
+    },
+    "step_expect_notification": {
+      "description": "Assert the client's most recent notification decision through the platform runner's test hook.",
+      "allOf": [{ "$ref": "#/$defs/stepBase" }],
+      "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "expect"],
+      "properties": { "kind": { "const": "expect_notification" }, "role": { "const": "client" }, "client": true, "expect": { "$ref": "#/$defs/matcher" } }
+    }
+  }
+}

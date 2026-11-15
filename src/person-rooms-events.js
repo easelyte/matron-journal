@@ -18,10 +18,10 @@ import { append, appendAndBroadcast, toEventShape } from './journal.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { participantIds, participantConvoIds } from './participants.js'
 import { wakeIfOffline, wakeConvoAgent } from './wake.js'
-import { deliverPendingInvites } from './invite-delivery.js'
+import { deliverPendingInvites, onInviteRefusedForLock } from './invite-delivery.js'
 import { consentLink } from './consent-items.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, OWNER_ACTIONS, PEER_ACTIONS } from './sharing-events.js'
-import { linkOfRoom, setRoomItem, setShareItem, getPersonRoom, endPersonRoom, linksBetween, linksOnGrant, detachMission, PERSON_SENDER_PREFIX } from './person-rooms.js'
+import { linkOfRoom, setRoomItem, setShareItem, getPersonRoom, endPersonRoom, linksBetween, linksOnGrant, detachMission, PERSON_SENDER_PREFIX, isGuestRoom, onGuestAgentAnswer } from './person-rooms.js'
 
 export const ROOM_CARD_KIND = 'person_room'
 export const SESSION_SHARE_CARD_KIND = 'session_share'
@@ -241,6 +241,12 @@ export function onGuestAnswered(ctx, l, accept, reason = null) {
   }
   changed(ctx, l.owner_user_id, { room_link_id: l.id })
 }
+
+// A twin's invite into a panic-locked guest's box, refused before delivery
+// (src/invite-delivery.js): the owner agent hears it as the guest's refusal.
+onInviteRefusedForLock((ctx, row) => {
+  if (isGuestRoom(ctx.db, row.convo_id)) onGuestAnswered(ctx, onGuestAgentAnswer(ctx.db, { guestRoomId: row.convo_id, accept: false }), false, 'refused')
+})
 
 // The twin's invite expired unanswered.
 export function onGuestExpired(ctx, l) {

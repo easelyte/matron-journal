@@ -1,0 +1,86 @@
+{
+  "type": "ws.journal.prompt",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "06a_agent_publish_types.json#step[6]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[8]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4763,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "prompt",
+        "payload": {
+          "question": "ship it?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[17]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[21]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "prompt",
+        "payload": {
+          "question": "proceed?",
+          "options": [
+            "yes",
+            "no"
+          ],
+          "allows_free_text": false
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "type": "http.post.items.close.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "14_items_roundtrip.json#step[4]",
+      "frame": {
+        "item": {
+          "id": "sample-item_id",
+          "user_id": 9544,
+          "num": 1,
+          "kind": "question",
+          "state": "closed",
+          "resolution": "answered",
+          "awaiting": null,
+          "rank": 1024,
+          "title": "Which auth library?",
+          "body": "A or B?",
+          "labels": [],
+          "links": [],
+          "supersedes": null,
+          "origin_convo_id": "c1",
+          "origin_device_id": 9308,
+          "created_by": "agent",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "closed_at": 1700000000000,
+          "mission_id": null,
+          "mission_num": null,
+          "consent": null,
+          "actions": [],
+          "chosen_action": null,
+          "private": false,
+          "origin_convo_title": "Session",
+          "filed_convo_id": null,
+          "step_up": false,
+          "subject": null,
+          "device_name": "box-2",
+          "handover": null,
+          "comment_count": 1,
+          "last_comment_at": 1700000000000,
+          "last_user_input_at": 1700000000000,
+          "attachments": [],
+          "has_image": false,
+          "working": {
+            "state": "running",
+            "since": 1,
+            "until": null
+          }
+        },
+        "comment": {
+          "id": "sample-id",
+          "item_id": "sample-item_id",
+          "author": "agent",
+          "device_id": 9308,
+          "kind": "status",
+          "body": "",
+          "created_at": 1700000000000,
+          "attachments": [],
+          "action": null,
+          "reply_to": null,
+          "actions": [],
+          "chosen_action": null,
+          "step_up": false,
+          "subject": null,
+          "approval": null,
+          "device_name": "box-2",
+          "convo_id": null,
+          "convo_title": null,
+          "meta": {
+            "from": {
+              "state": "open",
+              "resolution": null,
+              "awaiting": "agent"
+            },
+            "to": {
+              "state": "closed",
+              "resolution": "answered",
+              "awaiting": null
+            }
+          }
+        }
+      }
+    }
+  ]
+}

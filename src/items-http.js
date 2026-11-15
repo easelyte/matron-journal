@@ -11,7 +11,7 @@ import { joinedAgentIds } from './participants.js'
 import { json, readBody } from './http-body.js'
 import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import {
-  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
+  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, resolveStepUp, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
   markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
   requestTurn,
@@ -29,8 +29,11 @@ import { forwardMirrorReply, isPeopleConvo } from './people-replies.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
+import { handleMemoryProposalTap, declineOnClose, proposerOwnsMirror, MEMORY_CONSENT } from './memory-proposals-http.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
+import { requireApproval, hasActiveKey, refuse, ApprovalRefused } from './approval-keys.js'
+import { promptDigest } from './approvals.js'
 
 const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 
@@ -145,6 +148,9 @@ function visibleItem(db, who, idOrNum) {
 // for this one: client-only.
 function replyReachesAsker(db, item) {
   if (item.consent === 'spawn') return true
+  // A memory proposal's mirror on the proposing conversation: a reply there
+  // is how the user says "word it differently".
+  if (item.consent === MEMORY_CONSENT) return proposerOwnsMirror(db, item)
   if (item.consent === 'handover') {
     return !!db.prepare(`SELECT 1 FROM grants g JOIN conversations c ON c.id = g.origin_convo_id
       WHERE g.owner_item_id = ? AND g.origin_convo_id = ? AND c.agent_device_id = g.origin_device_id`).get(item.id, item.origin_convo_id)
@@ -202,6 +208,9 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // marker carries no comment at all (src/withdrawn-comments.js).
   const payload = itemMarkerPayload({ item, action, by: author, comment: presentWithdrawn(comment), extra })
   const sender = senderOf(db, who)
+  // The user's own write reaches the agent stamped with the approval key of
+  // the device that made it (hub.js agentJournalFrame).
+  const senderDeviceId = who.kind === 'client' ? who.deviceId : null
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing), marker
   // or no marker. Never for a consent mirror — the grantee's reads do not
@@ -215,7 +224,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   }
   let r
   try {
-    r = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: ITEM_EVENT_TYPE, payload })
+    r = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: ITEM_EVENT_TYPE, payload, senderDeviceId })
   } catch (err) {
     // The table write already committed; a marker on a since-deleted
     // conversation must not fail the request (same stance as spawns.js).
@@ -240,7 +249,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
     if (text != null) {
       const fbPayload = { body: text, fallback_for: 'item', item_id: item.id, num: item.num, action }
       try {
-        const fr = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: 'text', payload: fbPayload })
+        const fr = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: 'text', payload: fbPayload, senderDeviceId })
         try {
           pushPipeline.onAppend(who.userId, toEventShape({ seq: fr.seq, convo_id: item.origin_convo_id, ts: fr.ts, sender, type: 'text', payload: fbPayload }), who.deviceId)
         } catch (err) {
@@ -379,6 +388,8 @@ async function handleCreate(ctx, req, res, who) {
   if (!v.ok) return badFields(res, v)
   if (strayRef(res, v.value.body, v.value.attachments)) return true
   if (body.kind === 'notice' && !noticeActionsOk(v.value.actions)) return badFields(res, { error: 'invalid_actions' })
+  // A notice has one built-in button and nothing to sign.
+  if (body.kind === 'notice' && v.value.step_up === true) return badFields(res, { error: 'invalid_actions' })
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
   // `position` is exclusive: given alongside either neighbour, the intent is
@@ -397,6 +408,10 @@ async function handleCreate(ctx, req, res, who) {
   if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
+  // step_up only counts for an owner who has an approval key.
+  const su = resolveStepUp(db, who.userId, v.value)
+  delete v.value.step_up
+  delete v.value.subject
   // Every body-only rule is settled above, so a malformed field answers 400
   // even when the conversation is one this caller may not see.
   //
@@ -428,6 +443,7 @@ async function handleCreate(ctx, req, res, who) {
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
       supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
+      stepUp: su.stepUp, subject: su.subject,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true
@@ -442,7 +458,7 @@ async function handleCreate(ctx, req, res, who) {
       for (const blobRef of bodyAudio) ctx.itemTranscription.enqueue({ commentId: out.bodyComment.id, userId: who.userId, blobRef })
     }
   }
-  replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item })
+  replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, ...(su.ignored && { step_up_ignored: true }) })
   return true
 }
 
@@ -460,6 +476,15 @@ async function handlePatch(ctx, req, res, who, item) {
   // A notice's one button is built in (createItem); it cannot be swapped.
   if (item.kind === 'notice' && !noticeActionsOk(v.value.actions)) return badFields(res, { error: 'invalid_actions' })
   const fields = { ...v.value }
+  // Approval keys: a subject belongs to a step-up item (this write's or the
+  // stored one); a notice never is one.
+  if (fields.subject !== undefined && !(fields.step_up ?? item.step_up)) return badFields(res, { error: 'invalid_subject' })
+  if (item.kind === 'notice' && fields.step_up === true) return badFields(res, { error: 'invalid_actions' })
+  let stepUpIgnored = false
+  if (fields.step_up === true) {
+    const su = resolveStepUp(db, who.userId, fields)
+    if (su.ignored) { stepUpIgnored = true; delete fields.step_up; delete fields.subject }
+  }
   // Whatever an allowed list said, a notice keeps its built-in one as stored;
   // a patch of nothing else changes nothing.
   if (item.kind === 'notice' && 'actions' in fields) {
@@ -492,19 +517,53 @@ async function handlePatch(ctx, req, res, who, item) {
       missionTarget = target.id
     }
   }
-  if (Object.keys(fields).length === 0 && body.mission === undefined) return badRequest(res)
+  if (Object.keys(fields).length === 0 && body.mission === undefined) {
+    if (!stepUpIgnored) return badRequest(res)
+    replyItems(who, res, 200, { item, step_up_ignored: true })
+    return true
+  }
   // Fields and the mission move are ONE write with ONE `updated_at` (final
   // review minor): they used to be two statements in two transactions, so a
   // `{title, mission}` patch could half-apply and stamped two timestamps.
-  const result = updateItem(db, { userId: who.userId, itemId: item.id, fields, missionId: missionTarget })
-  // Only reachable if the item vanished between the read and the write.
-  if (!result) return notFound(res)
+  //
+  // Approval keys: lowering the mark, or changing what it shows, on a step-up
+  // item of an account with an approval key. Otherwise any token that can
+  // patch the item could switch the signature off and tap unsigned. No agent
+  // may (403: an item's origin box moves on a hand-over, and a stolen client
+  // token could ask the filing agent to do it; an agent that mis-marked an
+  // item closes it and files a new one); a client never changes the subject
+  // (lower, then raise with the new one) and lowers only with a signed
+  // {op:'item_step_up', item, on:'false'}. Raising stays open to anyone who
+  // can patch. Decided on the row as this transaction reads it, not the one
+  // read before the body arrived, so a patch held open across an agent's
+  // raise cannot lower it unsigned; a refusal rolls everything back, the
+  // nonce included.
+  const lowering = fields.step_up === false
+  const resubject = fields.subject !== undefined
+  let result
+  try {
+    db.transaction(() => {
+      const now = db.prepare('SELECT step_up FROM items WHERE id=? AND user_id=?').get(item.id, who.userId)
+      if (now?.step_up && (lowering || resubject) && hasActiveKey(db, who.userId)) {
+        if (who.kind === 'agent') refuse(403, { error: 'forbidden' })
+        if (resubject) refuse(400, { error: 'invalid_subject' })
+        const g = requireApproval({ db, journalHost: ctx.journalHost }, who, body, { type: 'account', subject: { op: 'item_step_up', item: item.id, on: 'false' } })
+        if (!g.ok) refuse(g.status, g.body)
+      }
+      result = updateItem(db, { userId: who.userId, itemId: item.id, fields, missionId: missionTarget })
+      // Only reachable if the item vanished between the read and the write.
+      if (!result) refuse(404, { error: 'not_found' })
+    })()
+  } catch (err) {
+    if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
+    throw err
+  }
   // Every mutating route appends a marker, this one included: a retitle or a
   // hand-moved `awaiting` is a change connected clients must see without
   // re-polling. It is a quiet action though — no wake, no push (see
   // ITEM_ACTIONS in items-marker.js).
   emitMarker(ctx, who, { item: result, action: 'updated', from: item.mission_id })
-  replyItems(who, res, 200, { item: result })
+  replyItems(who, res, 200, { item: result, ...(stepUpIgnored && { step_up_ignored: true }) })
   return true
 }
 
@@ -592,6 +651,35 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   return handleItemSubRoute(ctx, req, res, who, item, sub, subId)
 }
 
+// Approval keys: the check on a tap, run inside addComment's transaction
+// (its `approve`) on the rows as they stand there. A tap needs a signature
+// when the item is step-up (the mark covers every button on it, a follow-up's
+// included) or the follow-up comment it answers is; an `approval` sent on any
+// other tap is verified the same way and stored. With neither, and for an
+// account with no active key (requireApproval), the tap is today's. The
+// statement commits to the item, the button, the comment it answers, the
+// question's words as they stand (the item's title and body, or that
+// comment's body) and the subject: a step-up comment's own, else the item's,
+// else {}. A refusal throws ApprovalRefused, so nothing is written; its
+// `refusal` is the answer to send. The journal's handover question
+// (handleApprovalTap) is answered through the same check.
+const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
+function tapApprover(ctx, who, approval, action) {
+  return ({ row, asked }) => {
+    if (!row.step_up && !asked?.step_up && approval == null) return null
+    // Decided once more inside requireApproval; asked first here so that
+    // nothing below can fail a keyless account's tap.
+    if (!hasActiveKey(ctx.db, who.userId)) return null
+    const subject = storedSubject(asked?.step_up ? asked.subject : row.subject)
+    const prompt_digest = asked ? promptDigest({ body: asked.body ?? '' }) : promptDigest({ title: row.title, body: row.body ?? '' })
+    const r = requireApproval({ db: ctx.db, journalHost: ctx.journalHost }, who, { approval }, {
+      type: 'item_tap', item: { id: row.id, num: row.num, reply_to: asked ? asked.id : null }, action, prompt_digest, subject,
+    })
+    if (!r.ok) refuse(r.status, r.body)
+    return r.approval
+  }
+}
+
 // A status/close/reopen note is optional but, when present, bounded like any
 // other body the user writes.
 const okNote = (v) => v === undefined || (typeof v === 'string' && v.length <= BODY_MAX)
@@ -648,12 +736,19 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // consent-answer.js).
       if (item.consent === 'transfer' || item.consent === 'spawn' || item.consent === 'chat') {
         if (body.reply_to != null) { json(res, 400, { error: 'unknown_action' }); return true }
-        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action) : consentItemTapAnswer(ctx, who, item, action)
+        // `approval`: a consent statement, needed to approve an ask aimed
+        // at a protected box once the account has a key
+        // (src/consent-subject.js); never an item_tap one.
+        const approval = body.approval ?? null
+        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action, approval) : consentItemTapAnswer(ctx, who, item, action, approval)
         if (r.status !== 200) { json(res, r.status, r.body); return true }
         json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, ...r.body })
         return true
       }
       if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
+      // A memory proposal's question (src/memory-proposals-http.js): the tap
+      // saves, deletes or declines, applied by the journal itself.
+      if (item.consent === MEMORY_CONSENT) return handleMemoryProposalTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment
     // whose button was tapped — a follow-up question in this thread. It only
@@ -666,7 +761,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // The journal's own "Hand this item over?" question (item handover):
       // its tap is the journal's to act on, not a turn for the owner.
       const handoverId = approvalQuestionOf(db, item.id, replyTo)
-      if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey })
+      // Its buttons are the item's too: on a step-up item the tap is signed
+      // like any other (tapApprover).
+      if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey, approve: tapApprover(ctx, who, body.approval, action) })
     }
     // `replaces`: the id of the user's own withdrawn reply this one is the
     // edited version of (addComment decides whether it counts). A client's
@@ -680,8 +777,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // refused like an agent's `action` is. `[]` is "none", same as absent.
     const offers = body.actions != null && !(Array.isArray(body.actions) && body.actions.length === 0)
     if (offers && who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
-    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined }, { partial: true })
+    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined, step_up: body.step_up, subject: body.subject }, { partial: true })
     if (!v.ok) return badFields(res, v)
+    // Signing applies to the buttons a comment offers; a subject needs it.
+    if (v.value.step_up === true && !offers) return badFields(res, { error: 'invalid_actions' })
+    if (v.value.subject !== undefined && v.value.step_up !== true) return badFields(res, { error: 'invalid_subject' })
+    const su = resolveStepUp(db, who.userId, v.value)
     if (strayRef(res, v.value.body, v.value.attachments)) return true
     // An empty body on a tap reads as the label: an old client, the fallback
     // text and the agent's turn all see exactly what the user chose.
@@ -708,8 +809,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
+      // A tap's approval-key check runs inside the write (tapApprover); a
+      // typed reply is never a tap, and its `approval` is ignored.
+      const approve = action != null ? tapApprover(ctx, who, body.approval, action) : null
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null, approve })
     } catch (err) {
+      if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
       if (answerKnownError(res, err)) return true
       throw err
     }
@@ -778,6 +883,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       forwardMirrorReply(ctx, emitMarker, who, item, out.comment)
     }
     const reply = { item: out.item, comment: seenBy(out.comment) }
+    if (su.ignored) reply.step_up_ignored = true
     if (ownerNotice === true) reply.owner_notified = true
     else if (ownerNotice != null) { reply.owner_notified = false; reply.owner_notice = ownerNotice }
     replyItems(who, res, out.duplicate ? 200 : 201, reply)
@@ -824,6 +930,8 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!out) return conflict(res)
     // As for a notice's Seen close above: the offer goes first.
     out.item = withdrawOnClose(ctx, who.userId, item.id) ?? out.item
+    // A memory proposal's question closed by hand is a "no" to it.
+    declineOnClose(ctx, who.userId, item)
     emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.comment })
     replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true

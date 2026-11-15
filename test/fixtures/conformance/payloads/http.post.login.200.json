@@ -1,0 +1,95 @@
+{
+  "type": "http.post.login.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "01_login.json#step[1]",
+      "frame": {
+        "token": "sample-alice_token",
+        "device_id": 1,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "03f_ws_hello_client_max_replay.json#step[0]",
+      "frame": {
+        "token": "sample-token",
+        "device_id": 1,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[0]",
+      "frame": {
+        "token": "sample-mac_token",
+        "device_id": 2713,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[1]",
+      "frame": {
+        "token": "sample-phone_token",
+        "device_id": 1,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[0]",
+      "frame": {
+        "token": "sample-alice_token",
+        "device_id": 2713,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "08_ack_advances_cursor.json#step[0]",
+      "frame": {
+        "token": "sample-alice_token",
+        "device_id": 8226,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "09a_media_roundtrip.json#step[1]",
+      "frame": {
+        "token": "sample-pat_token",
+        "device_id": 1,
+        "user_id": 8893
+      }
+    },
+    {
+      "source": "10_activity.json#step[1]",
+      "frame": {
+        "token": "sample-ipad_token",
+        "device_id": 1,
+        "user_id": 9544
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[0]",
+      "frame": {
+        "token": "sample-mac_token",
+        "device_id": 1,
+        "user_id": 6955
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[1]",
+      "frame": {
+        "token": "sample-ipad_token",
+        "device_id": 1,
+        "user_id": 6955
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[2]",
+      "frame": {
+        "token": "sample-late_token",
+        "device_id": 1,
+        "user_id": 6955
+      }
+    }
+  ]
+}

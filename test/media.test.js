@@ -31,6 +31,46 @@ function listMediaFiles(mediaDir) {
   return out
 }
 
+test('default media limit accepts 100 MB, rejects one byte more, and removes the partial file', async (t) => {
+  const dbPath = tmpDbPath()
+  const s = await startTestServer({ dbPath })
+  t.after(async () => {
+    await s.close()
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true })
+  })
+  const token = await loginToken(s, 'alice', 'pw')
+  const mediaDir = path.join(path.dirname(dbPath), 'media')
+  // Stream a real boundary-sized body without allocating a 100 MB buffer.
+  async function* body(size) {
+    const chunk = Buffer.alloc(64 * 1024, 0x5a)
+    for (let remaining = size; remaining > 0; remaining -= chunk.length) {
+      yield chunk.subarray(0, Math.min(remaining, chunk.length))
+    }
+  }
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'video/quicktime' }
+  const accepted = await fetch(s.base + '/media', {
+    method: 'POST', headers, body: body(100000000), duplex: 'half',
+  })
+  assert.equal(accepted.status, 200)
+  const uploaded = await accepted.json()
+  assert.equal(uploaded.size, 100000000)
+  const downloaded = await fetch(s.base + `/media/${uploaded.media_id}`, { headers })
+  assert.equal(downloaded.status, 200)
+  let received = 0
+  const hash = crypto.createHash('sha256')
+  for await (const chunk of downloaded.body) { received += chunk.length; hash.update(chunk) }
+  assert.equal(received, 100000000)
+  assert.equal(hash.digest('hex'), uploaded.sha256)
+
+  const refused = await fetch(s.base + '/media', {
+    method: 'POST', headers, body: body(100000001), duplex: 'half',
+  })
+  assert.equal(refused.status, 413)
+  assert.deepEqual(await refused.json(), { error: 'too_large' })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 1)
+  assert.deepEqual(listMediaFiles(mediaDir), [path.join(uploaded.media_id.slice(0, 2), uploaded.media_id)])
+})
+
 test('media upload/download roundtrip: binary body, sha256, sharded layout, tmp cleanup', async (t) => {
   const dbPath = tmpDbPath()
   const s = await startTestServer({ dbPath })

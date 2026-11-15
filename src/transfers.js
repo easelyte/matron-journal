@@ -57,7 +57,7 @@ const TRANSITIONS = {
   },
 }
 // Columns a patch may set besides the three state axes.
-const PATCH_COLUMNS = new Set(['item_id', 'decided_by', 'decided_reason', 'approved_at', 'uploaded_at', 'released_at', 'delivered_at', 'deleted_at'])
+const PATCH_COLUMNS = new Set(['item_id', 'decided_by', 'decided_reason', 'approval', 'approved_at', 'uploaded_at', 'released_at', 'delivered_at', 'deleted_at'])
 
 const ID_RE = /^tr_[0-9a-f]{32}$/
 export const isTransferId = (id) => typeof id === 'string' && ID_RE.test(id)
@@ -158,6 +158,16 @@ export function recipientCandidates(db, roomId, senderDeviceId) {
 export function transferRecipients(db, row) {
   if (row.recipient_device_id != null) return [row.recipient_device_id]
   return recipientDevices(db, row.room_id, row.sender_device_id)
+}
+
+// An approved transfer not released yet, declined by the journal (a panic
+// lock, src/panic.js): consent and phase both `declined`, as a decline
+// leaves them, with decided_by 'journal'. The one move from `approved`
+// back to `declined`; setTransferState's table never allows it. → true
+// when this call made it.
+export function declineApprovedTransfer(db, id, { reason, now = Date.now() }) {
+  return db.prepare(`UPDATE transfers SET consent='declined', phase='declined', decided_by='journal', decided_reason=?, deleted_at=?
+    WHERE id=? AND consent='approved' AND phase='open'`).run(reason, now, id).changes === 1
 }
 
 // A guarded update. `patch` may set consent / upload / phase (each moved

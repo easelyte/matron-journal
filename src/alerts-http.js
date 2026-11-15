@@ -29,12 +29,14 @@
 // something a retry storm fixes. The 202 body says which:
 // {accepted:true}, {delivered:false, reason:'no_coordinator'|'busy'}.
 // The outcome of an accepted delivery is logged (one line), never returned.
-import crypto from 'node:crypto'
 import { json, readBody } from './http-body.js'
+import { sharedTokenMatches } from './auth.js'
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { isAlertmanagerPayload, formatAlertMessage, alertName } from './alerts.js'
+import { isPanicLocked } from './panic.js'
 
 export const ALERT_PATH = '/alerts/alertmanager'
 export const ALERT_TOKEN_MIN = 32
@@ -42,13 +44,8 @@ export const ALERT_BODY_MAX = 256 * 1024
 export const ALERT_MAX_INFLIGHT = 4
 export const ALERT_FROM_NAME = 'Alertmanager'
 
-const digest = (s) => crypto.createHash('sha256').update(String(s)).digest()
-
-// Both sides hashed first: equal-length buffers for timingSafeEqual, and no
-// early return that would leak the configured token's length.
-export function alertTokenMatches(expected, given) {
-  return crypto.timingSafeEqual(digest(expected), digest(given ?? ''))
-}
+// The shared-secret compare (auth.js), also the security feed's.
+export const alertTokenMatches = sharedTokenMatches
 
 // The route is on only with a long-enough token AND a username; the user
 // row itself is looked up per request (a user created after boot works, a
@@ -102,9 +99,23 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
     if (!isAlertmanagerPayload(body)) { json(res, 400, { error: 'bad_request' }); return true }
     const coord = coordinatorDevice(db, user.id)
     const label = `${sanitizePeerText(body.status, 10) || '?'} ${alertName(body)} (${body.alerts.length})`
+    // A panic-locked account (src/panic.js): its boxes get no new work,
+    // whatever else is true of its Coordinator.
+    if (isPanicLocked(db, user.id)) {
+      console.log(`alerts: ${label} not delivered: the account is panic-locked, for ${username}`)
+      json(res, 202, { delivered: false, reason: 'account_locked' })
+      return true
+    }
     if (!coord) {
       console.log(`alerts: ${label} not delivered: no Coordinator (or it has no box) for ${username}`)
       json(res, 202, { delivered: false, reason: 'no_coordinator' })
+      return true
+    }
+    // A protected box is out of the Coordinator's session control
+    // (src/session-control.js), the journal's own included.
+    if (isProtectedDevice(db, user.id, coord.deviceId)) {
+      console.log(`alerts: ${label} not delivered: the Coordinator's box is protected, for ${username}`)
+      json(res, 202, { delivered: false, reason: 'protected_device' })
       return true
     }
     if (inflight >= ALERT_MAX_INFLIGHT) {
@@ -123,9 +134,16 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
       try {
         const waking = wakeIfOffline({ db, hub, waker }, user.id, coord.deviceId)
         if (waking && wakeWaitMs > 0) await hub.waitForDevice(user.id, coord.deviceId, wakeWaitMs)
-        const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
-        // The reply is the bridge's text: sieved before it reaches the log.
-        outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        // Checked again after the wait: a box protected meanwhile gets nothing.
+        if (isProtectedDevice(db, user.id, coord.deviceId)) {
+          outcome = 'not delivered: the Coordinator\'s box is protected'
+        } else if (isPanicLocked(db, user.id)) {
+          outcome = 'not delivered: the account is panic-locked'
+        } else {
+          const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
+          // The reply is the bridge's text: sieved before it reaches the log.
+          outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        }
         if (waking) outcome += ' (after wake)'
       } catch (err) {
         outcome = `failed internal (${err?.message || err})`

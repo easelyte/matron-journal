@@ -10,6 +10,10 @@ import { sanitizePeerText } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
 import { causesFromFrame } from './ask-causes.js'
+import { resolveAskCause } from './ask-cause.js'
+import { isProtectedDevice } from './consent-subject.js'
+import { userOnlyDevice } from './consent.js'
+import { panicLock } from './panic.js'
 
 export const SESSION_CONTROL_ACTIONS = new Set(['set_model', 'compact', 'carry_on'])
 export const SESSION_CONTROL_AGENTS = new Set(['claude', 'codex'])
@@ -20,6 +24,12 @@ export const SESSION_CONTROL_MODEL_MAX = 64
 export const SESSION_CONTROL_EFFORT_MAX = 16
 export const SESSION_CONTROL_MESSAGE_MAX = 2000
 export const SESSION_CONTROL_REASON_MAX = 200
+// How old the user's message, item comment or tap may be when a carry-on
+// to a user-only box rests on it (see carryOnUserOnlyRefused below).
+export const CARRY_ON_USER_ONLY_WINDOW_MS = 10 * 60 * 1000
+// What the Coordinator is told with a user_only refusal. Fixed text: nothing
+// of the request is echoed in it.
+export const WHY_CARRY_ON_USER_ONLY = 'a carry-on to a user-only box needs the user\'s own message or tap in the turn that sends it'
 const ID_MAX = 128
 
 class BadParam extends Error {
@@ -93,7 +103,17 @@ export function validateSessionControl(msg) {
 //   - target_convo_id must exist, belong to the same user, be top-level,
 //     have a box, and that box must not be a private device hidden from an
 //     ordinary caller — all indistinguishable not_found (anti-enumeration).
-export function authorizeSessionControl(db, conn, msg) {
+//   - a protected box (src/consent-subject.js) is out of the Coordinator's
+//     reach, whether or not the account has an approval key: forbidden /
+//     protected_device.
+//   - a carry-on into a session on a user-only box (src/consent.js), unless
+//     the turn that sent it was the user's own: forbidden / user_only, with
+//     a fixed why. See carryOnUserOnlyRefused below.
+//   - an account under a panic lock (src/panic.js): forbidden /
+//     account_locked, with since.
+// `causes` are the request's, as validateSessionControl returned them, and
+// `now` the time the request arrived.
+export function authorizeSessionControl(db, conn, msg, { causes = null, now = Date.now() } = {}) {
   const from = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(msg.from_convo_id)
   if (!from || from.owner_user_id !== conn.userId || from.agent_device_id !== conn.deviceId || from.parent_convo_id != null) return { code: 'not_found' }
   if (getCoordinatorConvoId(db, conn.userId) !== msg.from_convo_id) return { code: 'forbidden', detail: 'not_coordinator' }
@@ -102,14 +122,57 @@ export function authorizeSessionControl(db, conn, msg) {
   if (isPrivateDevice(db, tgt.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) return { code: 'not_found' }
   const dev = db.prepare("SELECT id AS device_id, name FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(tgt.agent_device_id, conn.userId)
   if (!dev) return { code: 'not_found' }
+  if (isProtectedDevice(db, conn.userId, dev.device_id)) return { code: 'forbidden', detail: 'protected_device' }
+  if (carryOnUserOnlyRefused(db, conn, { deviceId: dev.device_id, action: msg.action, fromConvoId: msg.from_convo_id, causes, at: now })) {
+    return { code: 'forbidden', detail: 'user_only', why: WHY_CARRY_ON_USER_ONLY }
+  }
+  // A panic-locked account (src/panic.js): no box of it gets new work.
+  const lock = panicLock(db, conn.userId)
+  if (lock) return { code: 'forbidden', detail: 'account_locked', since: lock.since }
   return { target: dev }
 }
 
+// A user-only box (devices.consent_user_only) takes new work only on the
+// user's own say. A carry-on's message becomes a turn in the target session,
+// now or after a limit reset, so it is held to that rule: the Coordinator
+// cannot send one there on its own. set_model and compact stay allowed: the
+// journal relays no turn text for them, only a model, agent and effort name
+// (short, sanitised settings) and the optional reason, which the target
+// bridge shows as a notice in the session's chat.
+export function sessionControlUserOnly(db, userId, deviceId, action) {
+  return action === 'carry_on' && userOnlyDevice(db, userId, deviceId)
+}
+
+// The user's own say can come through the Coordinator: a carry-on goes to a
+// user-only box when the Coordinator turn that sent it was started by the
+// user. The request's causes (the turn's, stamped by the bridge and so peer
+// data) must resolve, by the journal's own record (src/ask-cause.js), to a
+// message the user typed or spoke in the Coordinator's conversation, or to
+// a comment or tap of theirs on an item that conversation owns, and that
+// event must be at most CARRY_ON_USER_ONLY_WINDOW_MS older than `at`, the
+// time the request arrived. Everything else is refused: no causes, a
+// routine fire, a cause of a kind that cannot carry the user's authority
+// beside the user's (a room message, a reminder, an alert, another
+// carry-on), a user cause that does not check out or is in another
+// conversation. A spawn outcome is refused here too, though the resolver
+// would follow it to the ask behind it: the turn it starts is the
+// outcome's, not the user's.
+// → true when the carry-on must be refused (user_only).
+export function carryOnUserOnlyRefused(db, conn, { deviceId, action, fromConvoId, causes, at }) {
+  if (!sessionControlUserOnly(db, conn.userId, deviceId, action)) return false
+  if (!Array.isArray(causes) || causes.some((c) => c.kind === 'spawn_outcome')) return true
+  const who = { kind: conn.kind, userId: conn.userId, deviceId: conn.deviceId }
+  const res = resolveAskCause(db, { who, userId: conn.userId, causes, createdAt: at, fromConvoId })
+  if (!res.ok || (res.root.kind !== 'user' && res.root.kind !== 'item')) return true
+  return !(res.root.at >= at - CARRY_ON_USER_ONLY_WINDOW_MS)
+}
+
 // The result frame relayed to the Coordinator's bridge, from the broker's
-// settled reply. Error codes/details are bridge-originated peer text.
-export function sessionControlResultFrame(rid, r) {
+// settled reply. Error codes/details are bridge-originated peer text; `why`
+// is the journal's own fixed text for a refusal it made itself.
+export function sessionControlResultFrame(rid, r, why = null) {
   if (r.ok) return { kind: 'session_control', event: 'result', request_id: rid, ok: true, result: r.result ?? null }
   const code = sanitizePeerText(String(r.error?.code || 'unknown'), 64) || 'unknown'
   const detail = r.error?.detail != null ? sanitizePeerText(String(r.error.detail), 300) : ''
-  return { kind: 'session_control', event: 'result', request_id: rid, ok: false, error: { code, ...(detail ? { detail } : {}) } }
+  return { kind: 'session_control', event: 'result', request_id: rid, ok: false, error: { code, ...(detail ? { detail } : {}), ...(why ? { why } : {}) } }
 }

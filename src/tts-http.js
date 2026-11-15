@@ -7,7 +7,7 @@
 // synthesiser configured both routes answer 501 tts_unconfigured, which is
 // also how an app learns to use the on-device voice (an older journal
 // answers 404).
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { TtsError } from './cloud-tts.js'
 
 export async function handleTtsRoute({ tts }, req, res, url, who) {
@@ -35,6 +35,8 @@ export async function handleTtsRoute({ tts }, req, res, url, who) {
   // The caller hung up while Azure was working: the clip is cached for its
   // retry, and there is nobody to write to.
   if (res.writableEnded || res.destroyed) return true
+  // Signed out, or the account locked, while the clip was made.
+  recheckCaller(req)
   res.writeHead(200, {
     'content-type': clip.contentType,
     'content-length': String(clip.bytes.length),

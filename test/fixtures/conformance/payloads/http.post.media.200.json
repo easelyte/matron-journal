@@ -1,0 +1,16 @@
+{
+  "type": "http.post.media.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "09a_media_roundtrip.json#step[2]",
+      "frame": {
+        "media_id": "sample-media_id",
+        "size": 38,
+        "content_type": "image/png",
+        "sha256": "2ad75e005159688ce2631353bf6769a5cf2cddc2689549d35306c9faddd96074"
+      }
+    }
+  ]
+}

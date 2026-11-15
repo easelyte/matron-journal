@@ -1,0 +1,38 @@
+{
+  "type": "ws.ephemeral.activity",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "10_activity.json#step[17]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "activity": {
+          "state": "thinking",
+          "detail": "analyzing files"
+        }
+      }
+    },
+    {
+      "source": "16_viewing_set.json#step[15]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "activity": {
+          "state": "thinking"
+        }
+      }
+    },
+    {
+      "source": "16_viewing_set.json#step[17]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c2",
+        "activity": {
+          "state": "tool"
+        }
+      }
+    }
+  ]
+}

@@ -31,6 +31,7 @@ import { badRequest } from './http-who.js'
 import { getItem, addComment } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { getCoordinatorConvoId } from './coordinator.js'
+import { ApprovalRefused } from './approval-keys.js'
 import {
   HANDOVER_NOTE_MAX, APPROVE_LABEL, KEEP_LABEL, APPROVAL_ROLE,
   offerHandover, answerApproval, acceptHandover, settleHandover, refusedLine, expireHandovers, pendingHandover, getHandover, convoLabel,
@@ -268,7 +269,10 @@ export function approvalQuestionOf(db, itemId, replyTo) {
 // like any other (and marks the button chosen), but it is the journal's to act
 // on, not a turn for the owner's agent: a quiet `updated` marker carries it,
 // then the offer goes on to the target or is settled as kept.
-export function handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey }) {
+// `approve` is the items route's approval-key check (items-http.js
+// tapApprover): on a step-up item the tap needs a signature like any other,
+// checked in the same write, and a refusal settles nothing.
+export function handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey, approve = null }) {
   const { db } = ctx
   const userId = who.userId
   if (action !== APPROVE_LABEL && action !== KEEP_LABEL) { json(res, 400, { error: 'unknown_action' }); return true }
@@ -280,12 +284,13 @@ export function handleApprovalTap(ctx, res, who, item, { handoverId, action, rep
   let tap, settled, comment
   try {
     db.transaction(() => {
-      tap = addComment(db, { userId, itemId: item.id, author: 'user', deviceId: who.deviceId, body: action, action, replyTo, idemKey, keepStatus: true })
+      tap = addComment(db, { userId, itemId: item.id, author: 'user', deviceId: who.deviceId, body: action, action, replyTo, idemKey, keepStatus: true, approve })
       if (!tap || tap.duplicate) return
       settled = answerApproval(db, { userId, handoverId, approve: action === APPROVE_LABEL })
       comment = settled.state === 'refused' ? refusedLine(db, { userId, handover: settled }) : tap.comment
     })()
   } catch (err) {
+    if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
     if (err?.message === 'unknown_action') { json(res, 400, { error: 'unknown_action' }); return true }
     if (err?.message === 'idem_key_conflict') { json(res, 409, { error: 'conflict' }); return true }
     if (answerError(res, err)) return true

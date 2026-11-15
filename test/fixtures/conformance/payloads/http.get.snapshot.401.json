@@ -1,0 +1,13 @@
+{
+  "type": "http.get.snapshot.401",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "12_revocation.json#step[10]",
+      "frame": {
+        "error": "unauthenticated"
+      }
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import { authorize } from './auth.js'
+import { approvalKeyIdOfDevice } from './approval-keys.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
 import { getMission, ORIGIN_SIEVE } from './missions.js'
@@ -194,25 +195,17 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
+  let summaryChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     // The journal's own conversations (people-convo.js) are never an
     // agent's to title, adopt or re-state.
     if (existing.system != null) throw new Error('not authorized: system conversation')
     if (title != null && title !== existing.auto_title) metaChanged = true
-    // A summary change is metadata a live client must learn mid-conversation,
-    // not just roster-read material (spec: pinned-summary surface).
-    // The operator's pinned digest would otherwise only refresh at /snapshot,
-    // i.e. show the first five messages of a six-hour session. It rides the
-    // existing convo_meta event rather than a new type — see docs/protocol.md.
-    //
-    // Compared against the STORED value, not merely against null: the bridge
-    // republishes its digest on reconnect and on every pass that did not grow
-    // a bullet, and an unchanged value is not a change. This guard is what
-    // keeps summary_updated_at honest and keeps convo_meta off the wire when
-    // nothing happened.
-    const summaryChanged = summary != null && summary !== existing.summary
-    if (summaryChanged) metaChanged = true
+    // A summary change is NOT metadata: it is pushed as an ephemeral client
+    // frame (see ws.js) and rides /snapshot, never a stored event. Reconnect
+    // resends must neither emit a frame nor refresh the timestamp.
+    summaryChanged = summary != null && summary !== existing.summary
     if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
@@ -239,9 +232,6 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && existing.agent_device_id !== agentDeviceId
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
-    // summary_updated_at binds null — i.e. COALESCE keeps the stored stamp —
-    // on every upsert that did not actually change the summary, including an
-    // identical re-send. Only a real change moves it.
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
@@ -269,8 +259,6 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     const createdAt = Date.now()
     // The row and its inherited link are one write: the invariant "a
     // non-null mission_id has an active link" must hold from birth.
-    // A creation that carries a summary stamps it now; one that doesn't gets
-    // 0 ("never"), the same value every pre-existing row has.
     db.transaction(() => {
       db.prepare(
         'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
@@ -281,16 +269,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
       recomputeConvoTitle(db, id)
     })()
-    // A non-empty creation summary counts, for the same reason a creation
-    // title does: without it, a conversation minted by a summary-only upsert
-    // (no title, no parent, no state) appends NO event at all, so live clients
-    // would not learn the conversation — let alone its digest — exists until
-    // their next /snapshot. "The bridge always sends a title first" is true of
-    // today's producer, but it is a property of the caller, not a guarantee of
-    // this contract, and relying on it reintroduces exactly the snapshot-only
-    // staleness this change exists to remove. An empty summary is not a
-    // change and stays silent.
-    if (initialTitle || parentConvoId || summary) metaChanged = true
+    if (initialTitle || parentConvoId) metaChanged = true
     if (repoCols && repoCols.repo) {
       db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
       metaChanged = true
@@ -298,7 +277,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   if (existing && convo.title !== existing.title) metaChanged = true
-  return { ...convo, metaChanged, prevSessionState }
+  return { ...convo, metaChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
 }
 
 // Fan a convo_meta for each conversation the journal itself retitled — a
@@ -395,11 +374,14 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 // both deliberate: no sender_device_id (there is no producing connection)
 // and no push pipeline (a journal-authored room line is not an
 // attention-worthy push).
-export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
+// `senderDeviceId`: the client device whose request this is, for a user's
+// event an agent hears as a turn (an item tap or comment): it reaches the
+// agent stamped with that device's approval key (hub.js agentJournalFrame).
+export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload, senderDeviceId = null }) {
   const hinted = pinHintBeforeAppend(db, userId, convoId, type)
   const r = append(db, { userId, convoId, sender, type, payload })
   if (r.duplicate) return r
-  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload, senderDeviceId })
   if (hinted) sendPinsFrame(db, hub, userId)
   if (r.unarchived) sendArchiveFrame(hub, userId, [r.unarchived], r.ts)
   return r
@@ -408,10 +390,10 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
 // The fan-out half of appendAndBroadcast, for callers that must append
 // INSIDE their own transaction (a milestone's marker seq is the row's
 // anchor) and broadcast only after it commits. Same targeting rules.
-export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload, senderDeviceId = null }) {
   const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
   const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
-  hub.broadcastJournal(userId, frame, targets)
+  hub.broadcastJournal(userId, frame, targets, senderDeviceId == null ? null : () => approvalKeyIdOfDevice(db, userId, senderDeviceId))
 }
 
 // The agent devices allowed to see a conversation's traffic — hub's
@@ -460,20 +442,6 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // has no message events (just created, or history pruned by retention) —
   // clients fall back to created_at. The (convo_id, seq) index keeps the
   // subquery a backwards seek to the first message row.
-  // Ordering is by that last-message time (COALESCE(last_ts, created_at)), not
-  // raw last_seq — every meta/status/read_marker event advances last_seq, so a
-  // last_seq ordering resurfaced a stale conversation to the top on non-message
-  // activity. The tie-break is the immutable `id`, NOT last_seq: a last_seq
-  // tie-break would reintroduce the exact bug on a same-millisecond last_ts
-  // collision (the non-message event still advanced last_seq), and id also
-  // gives message-less rows sharing a created_at a total, flicker-free order.
-  // The ordering is done in JS, not a SQL ORDER BY: referencing the correlated
-  // last_ts subquery in ORDER BY makes SQLite evaluate it a SECOND time per row
-  // (re-walking each conversation's non-message suffix — measured ~2x on a
-  // pathological history), and better-sqlite3 runs synchronously, so that would
-  // block the event loop. Sorting the already-fetched rows costs nothing at
-  // per-user conversation counts, and uses the exact comparator the web client
-  // applies (database.ts), keeping server and client order identical.
   // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
   // a fetch — the current mission and how many missions this conversation
   // ever touched; a filtered caller never counts or names a private-origin

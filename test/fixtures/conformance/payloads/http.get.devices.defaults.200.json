@@ -1,0 +1,16 @@
+{
+  "type": "http.get.devices.defaults.200",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "18_box_defaults.json#step[1]",
+      "frame": {
+        "device_id": 9308,
+        "default_agent": null,
+        "default_model": null,
+        "default_effort": null
+      }
+    }
+  ]
+}

@@ -40,6 +40,22 @@ function agentMayReceive(conn, agentTargets) {
   return conn.kind !== 'agent' || agentTargets == null || agentTargets.has(conn.deviceId)
 }
 
+// What an agent connection is sent for a journal frame. A user's event
+// (sender `user:*`) carries approval_key_id: the approval key attached to
+// the client device that sent it, stamped by the journal from its own
+// tables (src/approval-keys.js approvalKeyIdOfDevice), or null when there is
+// none or the journal cannot say which device sent it (replayed history, a
+// copy from another person). A locked box binds an unlock window to it.
+// Every other frame, and every frame to a client, is unchanged. The stamp
+// is set last, so nothing in `frame` can supply it. `keyIdOf` is asked only
+// for a user's event. Only frames delivered over the socket carry it: an
+// agent reading history over HTTP gets events with no approval_key_id, and
+// absent means the same as null (the journal cannot say which key).
+export function agentJournalFrame(frame, keyIdOf = null) {
+  if (typeof frame?.sender !== 'string' || !frame.sender.startsWith('user:')) return frame
+  return { ...frame, approval_key_id: keyIdOf?.() ?? null }
+}
+
 export function makeHub({ coalesceMs = 200 } = {}) {
   const byUser = new Map() // userId -> Set<conn>
   let regCounter = 0
@@ -138,14 +154,25 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     // A client connection with a for_you sync scope (src/sync-scope.js)
     // receives only the frames that scope carries. It follows the
     // Coordinator role first, so the role's own frames reach it either way.
-    broadcastJournal(userId, frame, agentTargets = null) {
+    //
+    // `approvalKeyId`: () => the approval key of the device that sent a
+    // user's event (agentJournalFrame), asked at most once and only when an
+    // agent connection receives the frame. Omitted: null.
+    broadcastJournal(userId, frame, agentTargets = null, approvalKeyId = null) {
+      let agentText
       for (const c of byUser.get(userId) || []) {
         if (!agentMayReceive(c, agentTargets)) continue
         if (c.syncScope) {
           noteCoordinator(c, frame)
           if (!scopeCarries(c, frame)) continue
         }
-        if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+        if (c.ws.readyState !== 1) continue
+        if (c.kind === 'agent') {
+          agentText ??= JSON.stringify(agentJournalFrame(frame, approvalKeyId))
+          c.ws.send(agentText)
+        } else {
+          c.ws.send(JSON.stringify(frame))
+        }
       }
     },
     // Host-global vitals fan-out (host_vitals op): the bridge samples the

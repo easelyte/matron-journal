@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 
@@ -24,7 +24,19 @@ async function fleet(t) {
   const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
   return { s, alice, pat, agent, priv, patAgent, client: login.json.token, wakeCalls: calls }
 }
-const put = (s, token, name, body) => s.http(`/memories/${encodeURIComponent(name)}`, { method: 'PUT', token, body: { description: 'Never use opal.', ...body } })
+// An agent's write applies at once only in a turn the user started
+// (test/memory-proposals.test.js covers the rest). These tests are about the
+// write itself, so a PUT naming one of alice's conversations cites her own
+// words there, the way the bridge stamps a turn's causes.
+const said = (s, convoId) => {
+  const owner = s.db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId).owner_user_id
+  const { seq } = append(s.db, { userId: owner, convoId, sender: 'user:alice', type: 'text', payload: { body: 'remember that' } })
+  return [{ kind: 'user_message', ref: `${convoId}:${seq}` }]
+}
+const put = (s, token, name, body) => {
+  const causes = ['c1', 'coord', 'pc'].includes(body.convo_id) && body.causes === undefined ? { causes: said(s, body.convo_id) } : {}
+  return s.http(`/memories/${encodeURIComponent(name)}`, { method: 'PUT', token, body: { description: 'Never use opal.', ...body, ...causes } })
+}
 const markers = (s) => s.db.prepare("SELECT convo_id, sender, payload FROM events WHERE type='memory' ORDER BY seq").all().map((r) => ({ ...r, payload: JSON.parse(r.payload) }))
 
 test('PUT /memories/:name: agent creates (201) then updates (200); marker on the writer convo; 400s on junk', async (t) => {

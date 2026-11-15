@@ -21,6 +21,8 @@ import { setRoomItem, getPersonRoom, guestSees, expirePersonRoomAsks } from './p
 import {
   OWNER_TALK_ACTIONS, CHOICE, guestChoices, contactPending, completeTalkStart, failTalkStart, expireTalkAsks, TALK_GUEST_TTL_MS,
 } from './talk-requests.js'
+import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 const JOURNAL = 'journal'
 const DAYS = Math.round(TALK_GUEST_TTL_MS / (24 * 60 * 60 * 1000))
@@ -214,7 +216,7 @@ export async function startTalkSession(ctx, l, target, spawnId, who) {
   if (convoId) {
     const done = safely('talk start complete', () => completeTalkStart(db, { linkId: l.id, spawnId, deviceId: target.deviceId, convoId }))
     if (done?.outcome === 'start_failed') {
-      offerAgain(ctx, done.link, "Couldn't start a session: bad_start_reply. Pick another option.")
+      offerAgain(ctx, done.link, `Couldn't start a session: ${done.code ?? 'bad_start_reply'}. Pick another option.`)
       return 'failed'
     }
     if (done) { onTalkGuestOutcome(ctx, who, done); return 'started' }
@@ -234,12 +236,21 @@ export async function issueTalkStart(ctx, l, target) {
   let convoId = null
   try {
     if (!broker) code = 'unavailable'
+    // A protected box (src/consent-subject.js) starts a session only on a
+    // signed approval, which a talk's start does not carry: refused before
+    // anything is sent to it.
+    else if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) code = 'protected_device'
+    // A panic-locked account (src/panic.js): no session starts on its boxes.
+    else if (isPanicLocked(db, l.guest_user_id)) code = 'account_locked'
     else {
       if (spawnWakeWaitMs > 0) {
         let waking = false
         try { waking = wakeIfOffline(ctx, l.guest_user_id, target.deviceId) === true } catch (err) { console.error('talk request: wake threw', err) }
         if (waking) await hub.waitForDevice(l.guest_user_id, target.deviceId, spawnWakeWaitMs)
       }
+      // Checked again after the wait: a box protected meanwhile gets no start.
+      if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) return { convoId: null, code: 'protected_device' }
+      if (isPanicLocked(db, l.guest_user_id)) return { convoId: null, code: 'account_locked' }
       const r = await broker.issue(hub, l.guest_user_id, target.deviceId, 'start', { workdir: '', talk: true, prompt: talkTask(l), agent: 'claude' }, { timeoutMs: spawnStartTimeoutMs })
       const id = r.ok ? r.result?.convo_id : null
       if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id

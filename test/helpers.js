@@ -2,12 +2,14 @@ import WebSocket from 'ws'
 import { startServer } from '../src/server.js'
 
 export async function startTestServer(opts = {}) {
-  // fileOwnerUserId: 1 is the first user a test creates in a fresh :memory:
-  // DB — the file viewer reads owner gate fails closed without one, so suites that
-  // exercise /files as "the operator" get it by default. Owner-gate tests
-  // override it (a different id, or null for the unconfigured case).
-  // Search: no embedder (never load a real model), background work unpaced.
-  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, backgroundPace: 0, retentionInitialDelayMs: 0, ...opts })
+  // Unified search's similar tier (spec 2026-10-12 §5): default to no
+  // embedder so the suite never tries to load (or download) a real model;
+  // a test that wants the tier passes its own (e.g. `fakeEmbedder()`).
+  // Background work starts at once and runs unpaced, so tests that await
+  // it don't sit out the production startup delay.
+  // Security events (src/security-log.js): no line on stdout and none in a
+  // real MATRON_SECURITY_LOG; a test that reads them passes its own sinks.
+  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, retentionInitialDelayMs: 0, backgroundPace: 0, securityLog: { out: () => {}, file: null }, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,

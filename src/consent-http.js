@@ -5,15 +5,16 @@
 // conversation this device owns AND the user's Coordinator — the same gate
 // session_control applies. Checks, in order (every failure is a bare error
 // body): client → 403 forbidden; bad shape → 400; convo not this device's →
-// 404; not the Coordinator → 403 not_coordinator; switch off → 403
+// 404; not the Coordinator → 403 not_coordinator; an answer while the
+// account is panic-locked → 403 account_locked (with since); switch off → 403
 // consent_disabled; then per answer: the ask must exist (404) and still be
 // awaiting (409 conflict); an approval of an ask a user-only box takes part
 // in is 403 user_only (declines stay allowed); a spawn approval into an
 // offline, unwakeable box is 409 target_offline; an approval of the
 // Coordinator's OWN ask — or of another session's ask the Coordinator had
 // it make — is refused unless its cause checks out
-// (src/consent-own-ask.js: own_ask_unverified, envelope, verifier,
-// verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
+// (src/consent-own-ask.js: own_ask_unverified, envelope, left_for_user,
+// verifier, verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
 // 409 daily_cap (a cap of 0 is no cap). Declines skip every approval check.
 // An ordinary (non-private) Coordinator neither lists nor answers an ask a
 // private device takes part in: such an ask is left out of the list and is
@@ -23,6 +24,7 @@
 import { json, readBody } from './http-body.js'
 import { sanitizePeerText } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
+import { panicLock } from './panic.js'
 import {
   CONSENT_REASON_MAX, CONSENT_DAILY_CAP_DEFAULT, CONSENT_TRANSFER_DAILY_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS, CONSENT_KINDS, CONSENT_DECISIONS,
   getConsentEnabled, getTransferConsentEnabled, listPendingAsks, parseChatAskId, coordinatorApprovalsSince, deviceState,
@@ -41,11 +43,15 @@ const forbidden = (res, detail) => { json(res, 403, { error: 'forbidden', ...(de
 
 // Ownership and role, in that order so a caller who is not the
 // Coordinator learns nothing beyond "not yours".
-function coordinatorCaller(db, who, convoId) {
+// `answering`: an answer (not the list), which a panic-locked account
+// (src/panic.js) refuses ahead of the switch, which the lock turned off.
+function coordinatorCaller(db, who, convoId, { answering = false } = {}) {
   if (typeof convoId !== 'string' || !convoId || convoId.length > 128) return { status: 400 }
   const convo = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId || convo.agent_device_id !== who.deviceId || convo.parent_convo_id != null) return { status: 404 }
   if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403, detail: 'not_coordinator' }
+  const lock = answering ? panicLock(db, who.userId) : null
+  if (lock) return { status: 403, detail: 'account_locked', since: lock.since }
   if (!getConsentEnabled(db, who.userId)) return { status: 403, detail: 'consent_disabled' }
   return { ok: true }
 }
@@ -53,6 +59,7 @@ function coordinatorCaller(db, who, convoId) {
 function refuse(res, gate) {
   if (gate.status === 400) { json(res, 400, { error: 'bad_request' }); return true }
   if (gate.status === 404) { json(res, 404, { error: 'not_found' }); return true }
+  if (gate.since != null) { json(res, 403, { error: 'forbidden', detail: gate.detail, since: gate.since }); return true }
   return forbidden(res, gate.detail)
 }
 
@@ -68,7 +75,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   }
   if (req.method !== 'POST' || url.pathname !== '/consent/answer') return false
   const body = await readBody(req)
-  const gate = coordinatorCaller(db, who, body.convo_id)
+  const gate = coordinatorCaller(db, who, body.convo_id, { answering: true })
   if (!gate.ok) return refuse(res, gate)
   if (!CONSENT_KINDS.has(body.kind) || !CONSENT_DECISIONS.has(body.decision)) { json(res, 400, { error: 'bad_request' }); return true }
   if (typeof body.reason !== 'string' || body.reason.length > CONSENT_REASON_MAX) { json(res, 400, { error: 'bad_request' }); return true }

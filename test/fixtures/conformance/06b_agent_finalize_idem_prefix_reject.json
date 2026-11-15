@@ -1,34 +1,35 @@
 {
   "name": "agent publish: a fin:-prefixed idem_key is rejected (reserved for finalize); finalize itself is idempotent",
   "description": "A bare publish may not forge finalize's internal fin:<ref> idem-key namespace — rejected as bad_request with a detail message, appending nothing (proven by the next finalize's seq). finalize's own retries are deduped the same way client send's local_id is.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-10" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "box-2" }],
     "conversations": [{ "id": "c1", "owner": "alice" }]
   },
   "steps": [
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": {
       "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "x" }, "idem_key": "fin:sneaky"
     } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "control", "op": "error", "code": "bad_request", "ref": "publish", "detail": "idem_key prefix fin: is reserved"
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "done" }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
-    { "kind": "ws_expect_none", "conn": "agent", "ms": 150 },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m1", "payload": { "body": "done" } } },
+    { "kind": "ws_expect_none", "role": "agent", "conn": "agent", "ms": 150 },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m2", "payload": { "body": "another" } } },
-    { "kind": "ws_expect", "conn": "agent", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "finalize", "convo_id": "c1", "message_ref": "m2", "payload": { "body": "another" } } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "another" }
     } }

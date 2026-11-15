@@ -4,7 +4,7 @@
 // Bearer auth; the callback is authenticated by the single-use `state` the
 // journal minted for the flow row, so the browser's session is ignored.
 import { randomBytes } from 'node:crypto'
-import { json, readBody, readRawBody } from './http-body.js'
+import { json, readBody, readRawBody, recheckCaller } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { GithubError } from './github.js'
 import {
@@ -13,6 +13,7 @@ import {
   githubIdentityBoundElsewhere, createLinkConfirm, takeLinkConfirm,
 } from './github-accounts.js'
 import { PLAIN_BOX, tokenHash } from './token-box.js'
+import { isPanicLocked } from './panic.js'
 
 const FLOWS = ['device', 'web']
 const notConfigured = (res) => { json(res, 404, { error: 'not_configured' }); return true }
@@ -21,8 +22,11 @@ const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true
 
 // Turns a fresh token into a stored link. Shared by the poll and the
 // callback so the two flows cannot drift.
-export async function finishLink(db, github, { userId, token, now = Date.now(), box = PLAIN_BOX }) {
+// `beforeSave` runs once GitHub has answered, before anything is written
+// (a route's check that its caller may still act).
+export async function finishLink(db, github, { userId, token, now = Date.now(), box = PLAIN_BOX, beforeSave = () => {} }) {
   const identity = await github.fetchIdentity(token)
+  beforeSave()
   return saveGithubIdentity(db, { userId, host: github.host, identity, token, now, box })
 }
 
@@ -33,7 +37,7 @@ export async function finishLink(db, github, { userId, token, now = Date.now(), 
 // a different token (re-linked) by the time GitHub answers — the update is
 // scoped to that exact token so a stale write can never resurrect or
 // clobber the row that replaced it (final review, revoke/re-link race).
-export async function refreshGithubAccount(db, github, userId, now = Date.now(), { box = PLAIN_BOX } = {}) {
+export async function refreshGithubAccount(db, github, userId, now = Date.now(), { box = PLAIN_BOX, beforeSave = () => {} } = {}) {
   const row = db.prepare('SELECT token, token_hash FROM github_accounts WHERE user_id=?').get(userId)
   if (!row) return null
   let token
@@ -45,8 +49,14 @@ export async function refreshGithubAccount(db, github, userId, now = Date.now(),
     return { view: githubAccountView(db, userId), outcome: 'unchanged', error: { code: err.message } }
   }
   const hash = row.token_hash ?? tokenHash(token)
+  // GitHub's answer, good or bad, then the caller's check, before any
+  // write: the update below, and the stale mark in the catch.
+  let identity
+  let failed = null
+  try { identity = await github.fetchIdentity(token) } catch (err) { failed = err }
+  beforeSave()
   try {
-    const identity = await github.fetchIdentity(token)
+    if (failed) throw failed
     const view = updateGithubIdentity(db, { userId, tokenHash: hash, identity, now })
     if (!view) return { view: githubAccountView(db, userId), outcome: 'unchanged' }
     return { view, outcome: 'ok' }
@@ -86,6 +96,8 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
     if (!github.deviceFlow) return badRequest(res)
     let start
     try { start = await github.startDeviceFlow() } catch (err) { if (err instanceof GithubError) return upstream(res); throw err }
+    // Signed out, or the account locked, while GitHub answered.
+    recheckCaller(req)
     // GitHub's expires_in has no upper bound; the spec caps every link flow
     // at LINK_FLOW_TTL_MS (10 min), so the row and the value we hand back
     // to the client must agree, or the client would keep polling a row that
@@ -105,12 +117,13 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
     if (!row) return notFound(res)
     let poll
     try { poll = await github.pollDeviceFlow(row.device_code) } catch (err) { if (err instanceof GithubError) return upstream(res); throw err }
+    recheckCaller(req)
     if (poll.status === 'pending') { json(res, 200, poll.interval ? { status: 'pending', interval: poll.interval } : { status: 'pending' }); return true }
     // Every other answer ends the flow, so consume the row now.
     takeLinkFlow(db, { id: row.id })
     if (poll.status !== 'ok') { json(res, 200, { status: poll.status }); return true }
     try {
-      const view = await finishLink(db, github, { userId: who.userId, token: poll.token, box: tokenBox })
+      const view = await finishLink(db, github, { userId: who.userId, token: poll.token, box: tokenBox, beforeSave: () => recheckCaller(req) })
       json(res, 200, { status: 'linked', github: view })
     } catch (err) {
       if (err.message === 'github_conflict') return conflict(res)
@@ -127,7 +140,7 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
   }
 
   if (path === '/github/refresh' && req.method === 'POST') {
-    const r = await refreshGithubAccount(db, github, who.userId, Date.now(), { box: tokenBox })
+    const r = await refreshGithubAccount(db, github, who.userId, Date.now(), { box: tokenBox, beforeSave: () => recheckCaller(req) })
     if (!r) return notFound(res)
     if (r.outcome === 'unchanged') return upstream(res)
     json(res, 200, { github: r.view })
@@ -198,6 +211,9 @@ export async function handleGithubCallback(ctx, req, res, url) {
     if (!parked) return redirect('/app/account?link_error=expired')
     if (body.decision !== 'link') return redirect('/app/account?link_error=denied')
     if (!github || !github.enabled) return redirect('/app/account?link_error=not_configured')
+    // A link flow started before a panic lock does not finish during it
+    // (src/panic.js); the parked row is already spent.
+    if (isPanicLocked(db, parked.user_id)) return redirect('/app/account?link_error=denied')
     try {
       saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token, box: tokenBox })
     } catch (err) {

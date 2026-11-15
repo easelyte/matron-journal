@@ -1,8 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
+import { setDeviceConsentUserOnly } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
+import { append } from '../src/journal.js'
+import { WHY_CARRY_ON_USER_ONLY } from '../src/session-control.js'
 
 // Coordinator session control (spec: matron-bridge
 // 2026-09-29-coordinator-session-control-design.md, "Decisions"): the
@@ -73,4 +76,75 @@ test('session_control: a wake that never completes relays agent_unreachable as t
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'w2')
   const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'w2', 3000)
   assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'w2', ok: false, error: { code: 'agent_unreachable' } })
+})
+
+test('session_control: a box made user-only while it is being woken gets no carry-on; a compact still goes', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { s, parent, targetDev } = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  parent.send({ op: 'session_control', request_id: 'k1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on' })
+  parent.send({ op: 'session_control', request_id: 'k2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'k2')
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  const target = await makeWsClient(s.base, { token: targetDev.token, cursor: null })
+  t.after(() => target.close())
+  await target.waitFor((f) => f.op === 'hello_ok')
+  const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'k1', 4000)
+  assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'k1', ok: false, error: { code: 'forbidden', detail: 'user_only', why: WHY_CARRY_ON_USER_ONLY } })
+  const req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control', 4000)
+  assert.equal(req.request.params.action, 'compact')
+  assert.equal(target.frames.filter((f) => f.kind === 'rpc').length, 1)
+})
+
+// The user's words in the Coordinator's conversation, as a carry-on's cause.
+const userSays = (f, ago = 0) => {
+  const { seq } = append(f.s.db, { userId: f.alice.id, convoId: 'parent-convo', sender: 'user:alice', type: 'text', payload: { body: 'yes, tell it to carry on' } })
+  if (ago) f.s.db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - ago, f.alice.id, seq)
+  return { seq, causes: [{ kind: 'user_message', ref: `parent-convo:${seq}` }] }
+}
+
+test('session_control: a carry-on on the user\'s own word reaches an asleep user-only box once it wakes; the window is measured from the request, not the wake', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const f = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  const { s, parent, targetDev } = f
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  // Nine and a half minutes old on arrival: inside the window then, and it
+  // would be outside it if the wait were counted.
+  const said = userSays(f, 10 * 60 * 1000 - 1500)
+  parent.send({ op: 'session_control', request_id: 'v1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on', causes: said.causes })
+  const sent = await parent.waitFor((x) => x.kind === 'session_control' && x.event === 'sent' && x.request_id === 'v1')
+  assert.equal(sent.target_waking, true)
+  await new Promise((r) => setTimeout(r, 2000))
+  const target = await makeWsClient(s.base, { token: targetDev.token, cursor: null })
+  t.after(() => target.close())
+  await target.waitFor((x) => x.op === 'hello_ok')
+  const req = await target.waitFor((x) => x.kind === 'rpc' && x.request?.method === 'session_control', 4000)
+  assert.equal(req.request.params.message, 'carry on')
+  target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  const res = await parent.waitFor((x) => x.kind === 'session_control' && x.event === 'result' && x.request_id === 'v1')
+  assert.equal(res.ok, true)
+})
+
+test('session_control: a box made user-only during the wake takes a carry-on that has the user\'s word behind it, and none whose cause no longer checks out', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const f = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  const { s, parent, targetDev, alice } = f
+  const kept = userSays(f)
+  const gone = userSays(f)
+  parent.send({ op: 'session_control', request_id: 'y1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'with the word', causes: kept.causes })
+  parent.send({ op: 'session_control', request_id: 'y2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'without it', causes: gone.causes })
+  await parent.waitFor((x) => x.kind === 'session_control' && x.event === 'sent' && x.request_id === 'y2')
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  // The second carry-on's cited message is no longer the user's by the
+  // journal's record when the wait ends.
+  s.db.prepare("UPDATE events SET sender='agent:box-6' WHERE user_id=? AND seq=?").run(alice.id, gone.seq)
+  const target = await makeWsClient(s.base, { token: targetDev.token, cursor: null })
+  t.after(() => target.close())
+  await target.waitFor((x) => x.op === 'hello_ok')
+  const res = await parent.waitFor((x) => x.kind === 'session_control' && x.event === 'result' && x.request_id === 'y2', 4000)
+  assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'y2', ok: false, error: { code: 'forbidden', detail: 'user_only', why: WHY_CARRY_ON_USER_ONLY } })
+  const req = await target.waitFor((x) => x.kind === 'rpc' && x.request?.method === 'session_control', 4000)
+  assert.equal(req.request.params.message, 'with the word')
+  assert.equal(target.frames.filter((x) => x.kind === 'rpc').length, 1)
+  target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  await parent.waitFor((x) => x.kind === 'session_control' && x.event === 'result' && x.request_id === 'y1')
 })

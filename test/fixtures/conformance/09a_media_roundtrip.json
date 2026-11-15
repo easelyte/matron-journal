@@ -1,6 +1,7 @@
 {
   "name": "media: upload returns {media_id,size,content_type,sha256}; download roundtrips byte-for-byte; unowned/unknown are 404",
   "description": "POST /media streams the raw request body to disk and returns its identity/hash; GET /media/:id streams it back with matching headers. A blob is scoped to its uploader: a different user's GET, and a GET for an unknown id, both get 404 not_found (never 403 — see README/spec: existence is not revealed).",
+  "protocol": 1,
   "server": { "tmpDb": true },
   "seed": {
     "users": [
@@ -9,18 +10,18 @@
     ]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-13", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "pat", "password": "fixture-pw-14", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "pat_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "pat.user_id" }
       } } },
 
-    { "kind": "http", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "POST", "path": "/media", "token": { "$ref": "alice_token" },
       "headers": { "content-type": "image/png" },
       "body_base64": "bWF0cm9uLWNvbmZvcm1hbmNlLWZpeHR1cmUtbWVkaWEtYnl0ZXM=",
       "expect": { "status": 200, "body": {
@@ -30,7 +31,7 @@
         "sha256": "2ad75e005159688ce2631353bf6769a5cf2cddc2689549d35306c9faddd96074"
       } } },
 
-    { "kind": "http", "method": "GET", "path": "/media/${media_id}", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/media/${media_id}", "token": { "$ref": "alice_token" },
       "expect": {
         "status": 200,
         "headers": {
@@ -41,10 +42,10 @@
         "body_base64": "bWF0cm9uLWNvbmZvcm1hbmNlLWZpeHR1cmUtbWVkaWEtYnl0ZXM="
       } },
 
-    { "kind": "http", "method": "GET", "path": "/media/${media_id}", "token": { "$ref": "pat_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/media/${media_id}", "token": { "$ref": "pat_token" },
       "expect": { "status": 404, "body": { "error": "not_found" } } },
 
-    { "kind": "http", "method": "GET", "path": "/media/00000000000000000000000000000000", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/media/00000000000000000000000000000000", "token": { "$ref": "alice_token" },
       "expect": { "status": 404, "body": { "error": "not_found" } } }
   ]
 }

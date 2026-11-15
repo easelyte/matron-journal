@@ -48,7 +48,8 @@ test('approve → poll returns identity exactly once, then not_found (one-shot)'
   const s = store.start(10, 7)
   const c = store.claim(s.linkCode, { deviceName: 'Pixel 9' })
   assert.equal(store.approve(10, s.linkCode), 'approved')
-  assert.deepEqual(store.poll(c.claimToken), { status: 'approved', userId: 7, deviceName: 'Pixel 9' })
+  // approvedBy/decidedBy: who approved it, for the security log.
+  assert.deepEqual(store.poll(c.claimToken), { status: 'approved', userId: 7, deviceName: 'Pixel 9', approvedBy: 10, decidedBy: 'user' })
   assert.deepEqual(store.poll(c.claimToken), { status: 'not_found' })
   assert.equal(store.size(), 0)
 })
@@ -149,14 +150,14 @@ test('cap: start returns null at maxPending; expired sessions free slots; replac
 
 test('preapproved: claim jumps straight to approved — first poll releases the identity, once', () => {
   const links = makeLinkStore()
-  const r = links.startPreapproved(42)
+  const r = links.startPreapproved(42, { by: 'admin' })
   assert.match(r.linkCode, /^[0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4}$/)
   assert.equal(r.expiresIn, 600) // pairing-store pacing, not the 120 s link TTL
 
   const c = links.claim(r.linkCode, { deviceName: 'First Phone' })
   assert.equal(c.status, 'claimed') // same shape the claimant flow already handles
   const p = links.poll(c.claimToken)
-  assert.deepEqual(p, { status: 'approved', userId: 42, deviceName: 'First Phone' })
+  assert.deepEqual(p, { status: 'approved', userId: 42, deviceName: 'First Phone', approvedBy: null, decidedBy: 'admin' })
   assert.deepEqual(links.poll(c.claimToken), { status: 'not_found' }) // one-shot
 })
 

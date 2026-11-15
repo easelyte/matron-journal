@@ -755,3 +755,72 @@ test('coordinator transfers on|off: the user\'s switch for Coordinator file appr
   await assert.rejects(() => runAdmin(db, ['coordinator', 'transfers', 'alice']), /usage/i)
   db.close()
 })
+
+// Approval keys from the host: an orphaned key (attached to no device after
+// a reset or a sign-out) cannot otherwise be removed once the authenticator
+// is lost too. Every removal files the usual notice item.
+async function keyedAccount() {
+  const { generateApprovalKey } = await import('./approval-helpers.js')
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw')
+  const s = await login(db, { username: 'alice', password: 'pw', deviceName: 'phone' })
+  const addKey = (name, deviceId) => {
+    const k = generateApprovalKey()
+    db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+      VALUES(?,?,?,'ES256',?,?,'password',NULL,?)`).run(alice.id, k.keyId, k.publicKey, name, deviceId, Date.now())
+    return k
+  }
+  const notices = () => db.prepare("SELECT title FROM items WHERE user_id=? AND kind='notice' ORDER BY created_at, id").all(alice.id).map((r) => r.title)
+  const revokedAt = (k) => db.prepare('SELECT revoked_at FROM approval_keys WHERE key_id=?').get(k.keyId).revoked_at
+  return { db, alice, s, addKey, notices, revokedAt }
+}
+
+test('admin CLI: approval-key list shows every key with its device and state', async () => {
+  const { db, s, addKey } = await keyedAccount()
+  const phone = addKey('phone', s.deviceId)
+  const orphan = addKey('old phone', null)
+  db.prepare('UPDATE approval_keys SET revoked_at=? WHERE key_id=?').run(Date.now(), orphan.keyId)
+  const out = await runAdmin(db, ['approval-key', 'list', 'alice'])
+  assert.match(out, new RegExp(`^${phone.keyId} name=phone device=${s.deviceId} via=password created=\\S+ active$`, 'm'))
+  assert.match(out, new RegExp(`^${orphan.keyId} name=old phone device=none via=password created=\\S+ revoked=\\S+$`, 'm'))
+  await assert.rejects(runAdmin(db, ['approval-key', 'list', 'ghost']), /no such user: ghost/)
+  await createUser(db, 'bob', 'pw')
+  assert.match(await runAdmin(db, ['approval-key', 'list', 'bob']), /no approval keys for bob/)
+  db.close()
+})
+
+test('admin CLI: approval-key revoke removes one key or all, each with a notice', async () => {
+  const { db, s, addKey, notices, revokedAt } = await keyedAccount()
+  const a = addKey('phone', s.deviceId)
+  const b = addKey('old phone', null)
+  const c = addKey('tablet', null)
+  const out = await runAdmin(db, ['approval-key', 'revoke', 'alice', b.keyId])
+  assert.match(out, new RegExp(`revoked approval key ${b.keyId.slice(0, 8)} \\(old phone\\) for alice`))
+  assert.ok(revokedAt(b) > 0)
+  assert.equal(revokedAt(a), null)
+  assert.deepEqual(notices(), [`Approval key removed: old phone ${b.keyId.slice(0, 8)}`])
+  await assert.rejects(runAdmin(db, ['approval-key', 'revoke', 'alice', b.keyId]), /no active approval key/)
+  await assert.rejects(runAdmin(db, ['approval-key', 'revoke', 'alice', 'f'.repeat(64)]), /no active approval key/)
+  await assert.rejects(runAdmin(db, ['approval-key', 'revoke', 'alice']), /usage/i)
+  await assert.rejects(runAdmin(db, ['approval-key', 'revoke', 'ghost', '--all']), /no such user: ghost/)
+  const all = await runAdmin(db, ['approval-key', 'revoke', 'alice', '--all'])
+  assert.match(all, /revoked 2 approval keys for alice/)
+  assert.ok(revokedAt(a) > 0 && revokedAt(c) > 0)
+  assert.equal(notices().length, 3)
+  assert.match(await runAdmin(db, ['approval-key', 'revoke', 'alice', '--all']), /no active approval keys for alice/)
+  // Another user's key is not this user's to name.
+  const bob = await createUser(db, 'bob', 'pw')
+  assert.ok(bob)
+  await assert.rejects(runAdmin(db, ['approval-key', 'revoke', 'bob', a.keyId]), /no active approval key/)
+  db.close()
+})
+
+test('admin CLI: device revoke files the notice for each key it revokes', async () => {
+  const { db, s, addKey, notices, revokedAt } = await keyedAccount()
+  const k = addKey('phone', s.deviceId)
+  const out = await runAdmin(db, ['device', 'revoke', String(s.deviceId)])
+  assert.match(out, new RegExp(`device ${s.deviceId} revoked`))
+  assert.ok(revokedAt(k) > 0)
+  assert.deepEqual(notices(), [`Approval key removed: phone ${k.keyId.slice(0, 8)}`])
+  db.close()
+})

@@ -1,0 +1,443 @@
+{
+  "type": "ws.control.hello_ok",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "03b_ws_hello_cursor_null_live_only.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 1,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "03b_ws_hello_cursor_null_live_only.json#step[7]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 1,
+        "device_id": 1,
+        "name": "box-2"
+      }
+    },
+    {
+      "source": "03c_ws_hello_cursor_replay_order.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 5,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "03d_ws_hello_cursor_beyond_head.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 3,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "03d_ws_hello_cursor_beyond_head.json#step[7]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 3,
+        "device_id": 1,
+        "name": "box-2"
+      }
+    },
+    {
+      "source": "03e_ws_hello_snapshot_required.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 10,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "03f_ws_hello_client_max_replay.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 2,
+        "device_id": 1,
+        "name": "test"
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[4]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 0,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "04_client_send_echo_idem.json#step[7]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 0,
+        "device_id": 1,
+        "name": "phone"
+      }
+    },
+    {
+      "source": "05_agent_convo_upsert.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 1,
+        "name": "box-2"
+      }
+    },
+    {
+      "source": "10_activity.json#step[10]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 0,
+        "device_id": 1,
+        "name": "ipad"
+      }
+    },
+    {
+      "source": "13_tool_stream.json#step[16]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 1,
+        "device_id": 1,
+        "name": "ipad"
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[5]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 1,
+        "name": "dev-2"
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[8]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[11]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 1,
+        "name": "ipad"
+      }
+    },
+    {
+      "source": "14_host_vitals.json#step[17]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 1,
+        "name": "phone"
+      }
+    },
+    {
+      "source": "18_box_defaults.json#step[4]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 9308,
+        "name": "opal"
+      }
+    },
+    {
+      "source": "18_box_defaults.json#step[7]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 0,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "18_box_defaults.json#step[17]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": "claude",
+          "default_model": null,
+          "default_effort": "high"
+        },
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": 9308,
+        "name": "opal"
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[6]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 1,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[19]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 4,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[3]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 2,
+        "device_id": 1,
+        "name": "box-2"
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[6]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 2,
+        "device_id": 1,
+        "name": "mac"
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[15]",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_approve_coordinator_spawns": false,
+          "auto_archive_days": 30
+        },
+        "coordinator_convo_id": null,
+        "pins": [],
+        "seq": 3,
+        "device_id": 1,
+        "name": "mac"
+      }
+    }
+  ]
+}

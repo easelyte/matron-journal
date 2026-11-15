@@ -1,0 +1,67 @@
+{
+  "type": "ws.journal.convo_meta",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "05_agent_convo_upsert.json#step[8]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "sess-cm",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "convo_meta",
+        "payload": {
+          "title": "first title",
+          "auto_title": "first title",
+          "parent_convo_id": null,
+          "agent_device_id": 9308,
+          "agent_kind": null,
+          "repo": null
+        }
+      }
+    },
+    {
+      "source": "05_agent_convo_upsert.json#step[10]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "sess-cm",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "convo_meta",
+        "payload": {
+          "title": "renamed",
+          "auto_title": "renamed",
+          "parent_convo_id": null,
+          "agent_device_id": 9308,
+          "agent_kind": null,
+          "repo": null
+        }
+      }
+    },
+    {
+      "source": "05_agent_convo_upsert.json#step[16]",
+      "frame": {
+        "kind": "journal",
+        "seq": 4,
+        "convo_id": "sess-cm",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "convo_meta",
+        "payload": {
+          "title": "final title",
+          "auto_title": "final title",
+          "parent_convo_id": null,
+          "agent_device_id": 9308,
+          "agent_kind": null,
+          "repo": null
+        }
+      }
+    }
+  ]
+}

@@ -10,7 +10,10 @@
   "scripts": {
     "start": "bin/matron-journal",
     "test": "node --test --test-timeout=30000 'test/**/*.js'",
-    "loadtest": "node tools/load-test.js"
+    "loadtest": "node tools/load-test.js",
+    "conformance:extracts": "node tools/conformance-extracts.js",
+    "conformance:check": "node tools/conformance-extracts.js --check",
+    "conformance:pack": "node tools/conformance-pack.js"
   },
   "engines": {
     "node": ">=20"
@@ -29,5 +32,8 @@
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0"
   }
 }

@@ -41,7 +41,7 @@ import { remoteContactRaw, getContactRaw, isLiveRemote, OWN_ASK_TTL_MS } from '.
 import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { participantIds } from './participants.js'
-import { deliverPendingInvites } from './invite-delivery.js'
+import { deliverPendingInvites, onInviteRefusedForLock } from './invite-delivery.js'
 import { wakeIfOffline, wakeConvoAgent } from './wake.js'
 import { sanitizePeerText, sanitizeConsentText, plainText as plain } from './peer-text.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, fileNotice } from './sharing-events.js'
@@ -53,6 +53,8 @@ import {
   OWNER_TALK_ACTIONS, CHOICE, TALK_GUEST_TTL_MS, TALK_START_STUCK_MS, guestChoices, coordinatorTarget, pickableSessions, sessionLabels, isTalkTarget,
 } from './talk-requests.js'
 import { guestQuestion, issueTalkStart, talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
+import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 export const INVITE_OP = 'room.invite'
 export const ANSWER_OP = 'room.answer'
@@ -109,6 +111,13 @@ export function fedRoomOfRoom(db, roomId) {
   return db.prepare(`SELECT * FROM fed_rooms WHERE room_id=? AND (state IN ${LIVE_SQL} OR role='guest') ORDER BY updated_at DESC LIMIT 1`).get(roomId) ?? null
 }
 export const isFedGuestRoom = (db, roomId) => !!(typeof roomId === 'string' && db.prepare("SELECT 1 FROM fed_rooms WHERE room_id=? AND role='guest'").get(roomId))
+
+// A guest room's invite into a panic-locked guest's box, refused before
+// delivery (src/invite-delivery.js): the other journal hears it as the
+// guest agent's refusal.
+onInviteRefusedForLock(({ db }, row) => {
+  if (isFedGuestRoom(db, row.convo_id)) fedRoomsOf(db)?.onGuestAgentAnswer(row.convo_id, false)
+})
 // Holds just the two agents: no other invite, join or file.
 export function fedLinked(db, roomId) {
   const r = fedRoomOfRoom(db, roomId)
@@ -418,6 +427,11 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       const cur = reread(db, r.id)
       if (!['awaiting_guest', 'starting'].includes(cur.state)) fail('not_pending')
       if (!isTalkTarget(db, cur.user_id, target.convoId, target.deviceId)) fail('not_available')
+      // As on one journal (person-rooms.js inviteGuest): no invite into a
+      // protected box without a signed approval.
+      if (isProtectedDevice(db, cur.user_id, target.deviceId)) fail('protected_device')
+      // Nor into a panic-locked account's (src/panic.js).
+      if (isPanicLocked(db, cur.user_id)) fail('account_locked')
       if (!contactLive(db, cur)) {
         setState(db, cur.id, 'withdrawn', at, ", ended_by='contact_removed'")
         return 'unavailable'
@@ -455,13 +469,18 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
 
   // A new session for the talk, on the guest's Coordinator box.
   async function startSession(ctx, who, r, target, spawnId) {
-    const { convoId, code } = await issueTalkStart(ctx, asLink(r), target)
+    const started = await issueTalkStart(ctx, asLink(r), target)
+    const { convoId } = started
+    let { code } = started
     const cur = reread(db, r.id)
     if (!cur || cur.state !== 'starting' || cur.spawn_id !== spawnId) return 'stale'
     if (convoId) {
       let out
       try { out = acceptOnto(cur, { deviceId: target.deviceId, convoId }, clock()) } catch (err) {
-        if (err.message !== 'not_available') throw err
+        // The box became unavailable, protected or panic-locked while the
+        // session started: back to the guest's choice, nothing invited.
+        if (!['not_available', 'protected_device', 'account_locked'].includes(err.message)) throw err
+        code = err.message === 'not_available' ? code : err.message
         out = null
       }
       if (out) { afterAccepted(ctx, who, cur, out); return 'started' }
@@ -525,7 +544,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     if (!target) return { status: 409, body: { error: 'conflict', blocked_by: 'not_available' } }
     let out
     try { out = acceptOnto(r, target, at) } catch (err) {
-      if (err.message === 'not_available' || err.message === 'not_pending') return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+      if (['not_available', 'not_pending', 'protected_device', 'account_locked'].includes(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
       throw err
     }
     const closed = afterAccepted(ctx, who, r, out)

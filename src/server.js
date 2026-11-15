@@ -1,10 +1,14 @@
+import { makeWebPushClient, webPushConfigFromEnv } from './webpush.js'
 import http from 'node:http'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
-import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { installApprovalLockdown } from './approval-keys-http.js'
+import { makeSecurityLog, installSecurityLog, resolveSecurityFeed, sweepSecurityEvents } from './security-log.js'
+import { resolvePanic } from './panic.js'
+import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
 import { ensurePreapproveKey } from './preapprove-key.js'
@@ -40,7 +44,7 @@ import { makeOutbox, pruneOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
-import { makeConfiguredMailer } from './mailer.js'
+import { makeConfiguredMailer, parsePublicUrl } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
@@ -60,7 +64,7 @@ import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
 import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
-export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+export const DEFAULT_MEDIA_MAX_BYTES = 100000000 // 100 MB (decimal bytes)
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
 // user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
 // a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the
@@ -72,6 +76,22 @@ const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // let the reconnect burst afte
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
+
+// MATRON_CLIENT_IDLE_DAYS / the clientIdleDays option: days a client (app)
+// token may sit unused before it stops working (agent tokens never expire).
+// A non-negative number, fractions allowed; 0 turns the expiry off; anything
+// else warns and falls back to the default. Returns milliseconds (0 = off).
+export function resolveClientIdleMs(override) {
+  const fromEnv = override === undefined || override === null
+  const raw = fromEnv ? process.env.MATRON_CLIENT_IDLE_DAYS : override
+  if (raw === undefined || raw === '') return DEFAULT_CLIENT_IDLE_MS
+  const n = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw)
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`auth: ${fromEnv ? 'MATRON_CLIENT_IDLE_DAYS' : 'clientIdleDays'}=${JSON.stringify(raw)} is invalid — using the default of ${DEFAULT_CLIENT_IDLE_DAYS} days`)
+    return DEFAULT_CLIENT_IDLE_MS
+  }
+  return n * 24 * 60 * 60 * 1000
+}
 
 // Shared validator for small numeric env knobs that guard a size/gap check
 // (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
@@ -367,6 +387,14 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
     } catch (err) {
       console.error('retention: transfer expiry run failed', err)
     }
+    yield
+    // Security events past their 30 days (src/security-log.js), always on
+    // like the transfers: the per-account numbers stay, never reused.
+    try {
+      sweepSecurityEvents(db)
+    } catch (err) {
+      console.error('retention: security event sweep failed', err)
+    }
   }
   // The first pass waits retentionInitialDelayMs (a restart is when every
   // client reconnects at once); 0 keeps the synchronous run-at-boot for
@@ -510,16 +538,22 @@ function warnIfBindTrustsSpoofableIp(bind) {
   }
 }
 
+// Injected clients belong to the caller; configured clients belong to the server.
+export function resolveWebPushClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const config = webPushConfigFromEnv(process.env)
+  return config ? { client: makeWebPushClient(config), owned: true } : { client: undefined, owned: false }
+}
+
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
-  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
-  // incus start + bridge start + journal dial is ~3 minutes on the shared
-  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
-  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
-  // pays it.
+  // before issuing `start` (wake-before-spawn). Sized for a cold box boot:
+  // starting the box, then the bridge starting and dialling the journal,
+  // can take a few minutes. Only ever waited when a wake is actually under
+  // way, so a journal without MATRON_WAKE_CMD never pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
@@ -529,6 +563,8 @@ export function startServer({
   // from the daily cap above. 0 = no cap.
   consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
   agentCommentClock = Date.now,
+  // Client-token idle expiry (resolveClientIdleMs); the clock is a test seam.
+  clientIdleDays, clientIdleClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -538,7 +574,8 @@ export function startServer({
   stallWakeIntervalMs = null,
   autoArchiveIntervalMs = null,
   autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
-  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it
+  // off; MATRON_UNSEEN_NUDGE_TZ names the zone its daytime hours are in.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
   // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
@@ -558,9 +595,23 @@ export function startServer({
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
   federationEnv, federationOps, federationClient, federationLimits,
+  // The journal's public URL for approval keys (src/approval-keys.js): a
+  // signed statement names its host, so without one they are off. The
+  // option is the test seam (`null` forces it off); MATRON_PUBLIC_URL
+  // otherwise.
+  publicUrl,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
+  // Security events (src/security-log.js): `securityLog` is the test seam
+  // for the log's sinks, {out?, file?, now?} (MATRON_SECURITY_LOG
+  // otherwise); `securityFeed` for GET /security-events, {token, account}
+  // or null for off (MATRON_SECURITY_FEED_TOKEN, MATRON_SECURITY_FEED_ACCOUNT
+  // otherwise).
+  securityLog, securityFeed,
+  // Panic lock (src/panic.js): {token, account} for POST/GET /panic, or
+  // null for off; MATRON_PANIC_TOKEN and MATRON_PANIC_ACCOUNT otherwise.
+  panic,
   // POST /summarise (src/summarise.js): the test seam; `null` forces it
   // off. Undefined resolves from MATRON_SUMMARY_ANTHROPIC_KEY(_FILE).
   summariser,
@@ -581,6 +632,7 @@ export function startServer({
   backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
   backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
+  const { client: resolvedWebPushClient, owned: ownsWebPushClient } = resolveWebPushClient(webPushClient)
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -675,7 +727,15 @@ export function startServer({
     ...(toolStreamOpts || {}),
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS })
+  const clientIdleMs = resolveClientIdleMs(clientIdleDays)
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  // A device signed out for invalid approval signatures: its notice and push.
+  installApprovalLockdown({ db, hub, pushPipeline })
+  // The security event log, one per journal: handed to the HTTP and
+  // WebSocket handlers, and installed for the code that has only the
+  // database (the approval guard, the lockdown).
+  const resolvedSecurityLog = makeSecurityLog({ db, ...(securityLog || {}) })
+  installSecurityLog(db, resolvedSecurityLog)
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
@@ -769,8 +829,24 @@ export function startServer({
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  const resolvedSecurityFeed = securityFeed !== undefined ? (securityFeed && resolveSecurityFeed(securityFeed)) : resolveSecurityFeed({
+    token: process.env.MATRON_SECURITY_FEED_TOKEN || null,
+    account: process.env.MATRON_SECURITY_FEED_ACCOUNT || null,
+  })
+  if (resolvedSecurityFeed && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedSecurityFeed.account)) {
+    console.warn('security feed: MATRON_SECURITY_FEED_ACCOUNT names no user; GET /security-events answers 404 until it exists')
+  }
+  const resolvedPanic = panic !== undefined ? (panic && resolvePanic(panic)) : resolvePanic({
+    token: process.env.MATRON_PANIC_TOKEN || null,
+    account: process.env.MATRON_PANIC_ACCOUNT || null,
+  })
+  if (resolvedPanic && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedPanic.account)) {
+    console.warn('panic: MATRON_PANIC_ACCOUNT names no user; /panic answers 404 until it exists')
+  }
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
+  const approvalBaseUrl = parsePublicUrl(publicUrl !== undefined ? publicUrl : process.env.MATRON_PUBLIC_URL)
+  const journalHost = approvalBaseUrl ? new URL(approvalBaseUrl).host.toLowerCase() : null
   // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
   // `.embedder` start null — /search/all answers `semantic: 'off'` until
   // (if ever) the embedder loads and the first index pass finishes, below.
@@ -788,12 +864,13 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
-    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    hub, pushPipeline, webPushClient: resolvedWebPushClient, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     fileReads,
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
+    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog, securityFeed: resolvedSecurityFeed, panic: resolvedPanic,
   })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
@@ -818,6 +895,7 @@ export function startServer({
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
     broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
+    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
@@ -997,6 +1075,7 @@ export function startServer({
             for (const c of wss.clients) c.terminate()
             pushPipeline.close()
             if (ownsApnsClient) resolvedApnsClient.close()
+            if (ownsWebPushClient) resolvedWebPushClient.close()
             // The transcription queue touches the DB between awaits: abort its
             // child and let it drain before the handle closes.
             const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])

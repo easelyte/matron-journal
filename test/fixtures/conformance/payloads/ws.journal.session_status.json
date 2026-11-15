@@ -1,0 +1,22 @@
+{
+  "type": "ws.journal.session_status",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "05_agent_convo_upsert.json#step[12]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "sess-cm",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "session_status",
+        "payload": {
+          "state": "waiting"
+        }
+      }
+    }
+  ]
+}

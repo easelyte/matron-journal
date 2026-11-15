@@ -203,6 +203,23 @@ test('refreshGithubAccount: a concurrent unlink is never resurrected once GitHub
   db.close()
 })
 
+test('refreshGithubAccount: the caller is checked again once GitHub has answered, before a stale mark as before an update', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw')
+  saveGithubIdentity(db, { userId: alice.id, host: 'github.com', identity: { github_id: 1, login: 'alice', scopes: ['github.com/matronhq'] }, token: 't1', now: 1 })
+  const refused = new Error('refused')
+  const beforeSave = () => { throw refused }
+  const unauthorized = { host: 'github.com', fetchIdentity: async () => { throw new GithubError('unauthorized') } }
+  await assert.rejects(refreshGithubAccount(db, unauthorized, alice.id, 5, { beforeSave }), refused)
+  assert.equal(githubAccountView(db, alice.id).state, 'ok', 'not marked stale')
+  const ok = { host: 'github.com', fetchIdentity: async () => ({ github_id: 1, login: 'alice', scopes: ['github.com/otherorg'] }) }
+  await assert.rejects(refreshGithubAccount(db, ok, alice.id, 5, { beforeSave }), refused)
+  assert.deepEqual(db.prepare('SELECT COUNT(*) n FROM github_orgs WHERE user_id=?').get(alice.id).n, 1)
+  // Allowed: as ever.
+  assert.equal((await refreshGithubAccount(db, unauthorized, alice.id, 6)).outcome, 'stale')
+  db.close()
+})
+
 test('refreshGithubAccount: a concurrent re-link is never clobbered by the old token going unauthorized', async () => {
   const db = openDb(':memory:')
   const alice = await createUser(db, 'alice', 'pw')

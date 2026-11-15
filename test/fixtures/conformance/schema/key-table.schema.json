@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matron.example/conformance/key-table.schema.json",
+  "title": "message-box key table (keys/message-box.json)",
+  "description": "Rows of keyboard input and the outcome every message box must produce. Each platform runs every row against every message box it has.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "protocol", "rows"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "protocol": { "type": "integer", "minimum": 1 },
+    "rows": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "key", "modifiers", "ime", "pointer", "expect"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9_-]+$", "description": "Unique within the table." },
+          "key": { "type": "string", "minLength": 1, "description": "The KeyboardEvent.key value." },
+          "modifiers": { "type": "array", "uniqueItems": true, "items": { "enum": ["shift", "ctrl", "alt", "meta"] } },
+          "ime": { "enum": ["none", "composing"], "description": "Whether an input-method composition is in progress." },
+          "pointer": { "enum": ["fine", "coarse"], "description": "Primary pointer: a mouse or trackpad (fine), or a touch screen (coarse)." },
+          "expect": { "enum": ["send", "newline", "none"], "description": "none means this key press produces neither a send nor a newline." },
+          "note": { "type": "string" }
+        }
+      }
+    }
+  }
+}

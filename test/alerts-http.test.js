@@ -5,6 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { alertTokenMatches, ALERT_MAX_INFLIGHT } from '../src/alerts-http.js'
 import { formatAlertMessage } from '../src/alerts.js'
+import { setDeviceProtected } from '../src/db.js'
 
 // POST /alerts/alertmanager (src/alerts-http.js): Alertmanager's webhook,
 // authenticated by a shared secret, delivered to the user's Coordinator as
@@ -99,6 +100,14 @@ test('202 no_coordinator when none is set or its conversation has no box', async
   assert.deepEqual(await post(s), { status: 202, json: { delivered: false, reason: 'no_coordinator' } })
 })
 
+test('202 protected_device when the Coordinator is on a protected box: nothing is sent to it', async (t) => {
+  const { s, coord, coordDev } = await fleet(t)
+  setDeviceProtected(s.db, coordDev.deviceId, true)
+  assert.deepEqual(await post(s), { status: 202, json: { delivered: false, reason: 'protected_device' } })
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
+})
+
 test('happy path: the Coordinator box receives session_control {convo_id, action:alert, message, from_name}', async (t) => {
   const { s, coord } = await fleet(t)
   assert.deepEqual(await post(s), { status: 202, json: { accepted: true } })
@@ -126,6 +135,18 @@ test('an asleep Coordinator box is woken and the alert goes out once it attaches
   const req = await coord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control', 4000)
   assert.equal(req.request.params.action, 'alert')
   coord.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'deferred' } })
+})
+
+test('a box protected while it is being woken gets no alert once it attaches', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { s, coordDev } = await fleet(t, { connect: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  assert.deepEqual(await post(s), { status: 202, json: { accepted: true } })
+  setDeviceProtected(s.db, coordDev.deviceId, true)
+  const coord = await makeWsClient(s.base, { token: coordDev.token, cursor: null })
+  t.after(() => coord.close())
+  await coord.waitFor((f) => f.op === 'hello_ok')
+  await new Promise((r) => setTimeout(r, 200))
+  assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
 })
 
 test(`at most ${ALERT_MAX_INFLIGHT} deliveries in flight; the next is 202 busy`, async (t) => {

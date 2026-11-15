@@ -1,0 +1,27 @@
+{
+  "type": "ws.box_defaults.default_agent",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "18_box_defaults.json#step[9]",
+      "frame": {
+        "kind": "box_defaults",
+        "device_id": 9308,
+        "default_agent": "codex",
+        "default_model": "gpt-5.1-codex",
+        "default_effort": "high"
+      }
+    },
+    {
+      "source": "18_box_defaults.json#step[13]",
+      "frame": {
+        "kind": "box_defaults",
+        "device_id": 9308,
+        "default_agent": "claude",
+        "default_model": null,
+        "default_effort": "high"
+      }
+    }
+  ]
+}

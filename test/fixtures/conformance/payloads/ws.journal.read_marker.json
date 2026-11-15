@@ -1,0 +1,55 @@
+{
+  "type": "ws.journal.read_marker",
+  "surface": "ws",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[13]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "read_marker",
+        "payload": {
+          "convo_id": "c1",
+          "up_to_seq": 4763
+        }
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[17]",
+      "frame": {
+        "kind": "journal",
+        "seq": 5,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "user:alice",
+        "sender_device_id": 2713,
+        "type": "read_marker",
+        "payload": {
+          "convo_id": "c1",
+          "up_to_seq": 4
+        }
+      }
+    },
+    {
+      "source": "07_prompt_reply_and_read_marker.json#step[21]",
+      "frame": {
+        "kind": "journal",
+        "seq": 7,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "read_marker",
+        "payload": {
+          "convo_id": "c1",
+          "up_to_seq": 6
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "type": "http.post.projects.201",
+  "surface": "http",
+  "protocol": 1,
+  "samples": [
+    {
+      "source": "17_mission_links_and_projects.json#step[6]",
+      "frame": {
+        "project": {
+          "id": "sample-id",
+          "user_id": 1,
+          "num": 1,
+          "state": "sample-state",
+          "title": "sample-title",
+          "body": "sample-body",
+          "status": null,
+          "status_by": null,
+          "status_convo_id": null,
+          "status_updated_at": null,
+          "close_summary": null,
+          "closed_by": null,
+          "closed_over_open_missions": 1,
+          "closed_at": null,
+          "merged_into": null,
+          "origin_convo_id": null,
+          "origin_device_id": 1,
+          "created_by": "sample-created_by",
+          "created_at": 1700000000000,
+          "updated_at": 1700000000000,
+          "merged_into_num": null,
+          "missions": {
+            "running": 1,
+            "waiting": 1,
+            "idle": 1,
+            "quiet": 1,
+            "closed": 1
+          },
+          "needs_you": 1,
+          "open_items": 1,
+          "last_activity_at": 1700000000000
+        }
+      }
+    }
+  ]
+}

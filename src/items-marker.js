@@ -11,6 +11,16 @@ export const ITEM_EVENT_TYPE = 'item'
 // learns of the change without re-polling /items.
 export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reordered', 'updated']
 
+// The stored approval was verified when it was written; its key_id is read
+// back from the statement.
+function signedTap(comment) {
+  const statement = comment.approval?.statement
+  if (typeof statement !== 'string') return {}
+  let keyId = null
+  try { keyId = JSON.parse(statement).key_id ?? null } catch { /* stored as verified */ }
+  return { signed: true, key_id: typeof keyId === 'string' ? keyId : null }
+}
+
 //
 // Journal-side transcription adds two optional things (src/items-transcribe.js).
 // An audio attachment the journal is transcribing carries
@@ -66,6 +76,11 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
       // app that draws the thread from markers can leave that one out.
       ...(comment.replaces != null ? { replaces: comment.replaces } : {}),
       reply_to: comment.reply_to ?? null,
+      // A tap signed with an approval key (src/approval-keys.js): `signed`
+      // and the `key_id` that signed, so a bridge can say so in the turn.
+      // Absent on every other comment. The statement itself is read from the
+      // item (GET /items/:num), never from a marker.
+      ...signedTap(comment),
       attachments: (comment.attachments || []).map((a) => ({
         blob_ref: a.blob_ref, mime: a.mime, name: a.name, size: a.size, transcript: a.transcript ?? null,
         ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),

@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process'
 import { joinedAgentIds } from './participants.js'
 
-// Wake-on-message for idle-stopped agent boxes. The infra host winds down dev VMs idle for 90 minutes; the
-// bridge inside a stopped VM cannot reconnect on its own, so the journal —
-// the one component that always sees the traffic — fires the wake. The
-// command is an operator-provided argv prefix (MATRON_WAKE_CMD), typically
-// an ssh invocation whose key is bound to a forced command on the incus
-// host; the target box name is appended as the single trailing argument.
+// Wake-on-message for idle-stopped agent boxes. A host may stop boxes that
+// have been idle for a while; the bridge inside a stopped box cannot
+// reconnect on its own, so the journal — the one component that always sees
+// the traffic — fires the wake. The command is an operator-provided argv
+// prefix (MATRON_WAKE_CMD), e.g. an ssh invocation whose key is bound to a
+// forced command; the target box name is appended as the single trailing
+// argument.
 // The journal never decides HOW to wake, only WHEN.
 //
 // Fire-and-forget by design: the caller's op (send / agent_request /
@@ -18,8 +19,7 @@ const DEFAULT_DEBOUNCE_MS = 60000
 // After a wake command fails, how long before the next message may retry.
 // Exit 2 is the wake command's own verdict that the box cannot be woken
 // (unknown box, refused by every host), so it keeps the full debounce
-// window: retrying a refusal on every message is a storm, not a retry
-// (dev-j on 2026-09-09: 179 refused wakes in 2.5 h, one per message). Any
+// window: retrying a refusal on every message is a storm, not a retry. Any
 // other failure (ssh could not connect, killed) is treated as transient.
 const DEFAULT_FAIL_BACKOFF_MS = 10000
 const REFUSED_EXIT_CODE = 2

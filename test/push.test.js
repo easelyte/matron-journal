@@ -97,6 +97,36 @@ test('agent devices are never pushed to', async (t) => {
   assert.equal(stub.calls.length, 0)
 })
 
+test('an idle-expired client device gets no push; a live one does', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const stale = registerDevice(db, alice.id, 'old-phone')
+  registerDevice(db, alice.id, 'phone')
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000
+  db.prepare('UPDATE devices SET created_at=?, last_seen_at=? WHERE id=?').run(old, old, stale)
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  await pipeline.close()
+  assert.deepEqual([...new Set(stub.calls.map((c) => c.deviceToken ?? c.token ?? c.apnsToken))], ['phone-token'])
+})
+
+test('a push queued for a device that is signed out before it is sent goes nowhere', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 40 })
+  const phone = registerDevice(db, alice.id, 'phone')
+  const say = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:bridge', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:bridge', type: 'text', payload: { body } }, null)
+  }
+  // The first goes at once; the second waits out the window.
+  say('one')
+  say('two')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  db.prepare('DELETE FROM devices WHERE id=?').run(phone)
+  await new Promise((res) => setTimeout(res, 120))
+  assert.equal(stub.calls.length, 1, 'nothing sent to a device that is gone')
+})
+
 test('child conversations (parent_convo_id set) are silent: onAppend never pushes', async (t) => {
   const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, alice.id, 'phone')

@@ -1,72 +1,73 @@
 {
   "name": "prompt_reply shape, read_marker (explicit seq and null-to-head), unread reset, agent read_marker allowed",
   "description": "A client prompt_reply carries {target_seq, choice, text} (text defaults to null when omitted). read_marker with an explicit up_to_seq resets unread for everything up to that seq; up_to_seq:null resolves server-side to the conversation's current head. An agent connection may also send read_marker on the user's behalf (sender agent:<name> instead of user:<name>) — e.g. after mirroring the user's own message.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-11" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "box-2" }],
     "conversations": [{ "id": "c1", "owner": "alice" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-11", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$bind": "mac_device_id" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "prompt",
       "payload": { "question": "ship it?", "options": ["yes", "no"], "allows_free_text": false } } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": { "$bind": "prompt_seq" }, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "prompt",
       "payload": { "question": "ship it?", "options": ["yes", "no"], "allows_free_text": false }
     } },
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "coordinator_convo_id": null, "pins": [], "seq": { "$ref": "prompt_seq" }, "agents": [{ "device_id": { "$type": "integer" }, "name": "box-2", "tag_char": null }], "conversations": [
         { "id": "c1", "title": "", "auto_title": "", "session_state": "running", "session_outcome": null, "last_seq": { "$ref": "prompt_seq" },
           "unread_count": 1, "snippet": "? ship it?", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "mission_id": null, "mission_count": 0, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } },
 
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "prompt_reply", "payload": { "target_seq": { "$ref": "prompt_seq" }, "choice": "yes", "text": null }
     } },
 
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": { "$ref": "prompt_seq" } } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": { "$ref": "prompt_seq" } } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "read_marker", "payload": { "convo_id": "c1", "up_to_seq": { "$ref": "prompt_seq" } }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "building..." } } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "building..." } } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "building..." }
     } },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": null } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": null } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 5, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "user:alice", "sender_device_id": { "$ref": "mac_device_id" }, "type": "read_marker", "payload": { "convo_id": "c1", "up_to_seq": 4 }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "done" } } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "done" } } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 6, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "text", "payload": { "body": "done" }
     } },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": null } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "read_marker", "convo_id": "c1", "up_to_seq": null } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 7, "convo_id": "c1", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "read_marker", "payload": { "convo_id": "c1", "up_to_seq": 6 }
     } },
 
-    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
+    { "kind": "http", "role": "client", "method": "GET", "path": "/snapshot", "token": { "$ref": "alice_token" },
       "expect": { "status": 200, "body": { "coordinator_convo_id": null, "pins": [], "seq": 7, "agents": [{ "device_id": { "$type": "integer" }, "name": "box-2", "tag_char": null }], "conversations": [
         { "id": "c1", "title": "", "auto_title": "", "session_state": "running", "session_outcome": null, "last_seq": 7,
           "unread_count": 0, "snippet": "done", "parent_convo_id": null, "summary": "", "summary_updated_at": 0, "repo": null, "agent_device_id": null, "agent_kind": null, "mission_id": null, "mission_count": 0, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }

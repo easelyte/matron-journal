@@ -1,48 +1,49 @@
 {
   "name": "agent convo_upsert: create, title change -> convo_meta, state change -> session_status, no-op emits nothing",
   "description": "convo_upsert creating a convo with a title appends convo_meta; a later title change appends another convo_meta; a session_state-only upsert appends session_status instead; an upsert with neither field is a true no-op — the following title-change's seq proves it consumed no seq at all.",
+  "protocol": 1,
   "seed": {
     "users": [{ "as": "alice", "name": "alice", "password": "fixture-pw-8" }],
     "agents": [{ "as": "bridge", "user": "alice", "name": "box-2" }]
   },
   "steps": [
-    { "kind": "http", "method": "POST", "path": "/login",
+    { "kind": "http", "role": "client", "method": "POST", "path": "/login",
       "body": { "username": "alice", "password": "fixture-pw-8", "device_name": "mac" },
       "expect": { "status": 200, "body": {
         "token": { "$bind": "alice_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "alice.user_id" }
       } } },
-    { "kind": "ws_open", "conn": "agent" },
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
-    { "kind": "ws_open", "conn": "client" },
-    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_open", "role": "agent", "conn": "agent" },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_open", "role": "client", "conn": "client" },
+    { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "alice_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "auto_title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
+      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "first title", "auto_title": "first title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "repo": null }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "auto_title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
+      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "renamed", "auto_title": "renamed", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "repo": null }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 3, "convo_id": "sess-cm", "ts": { "$type": "integer" },
       "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "session_status", "payload": { "state": "waiting" }
     } },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm" } },
-    { "kind": "ws_expect_none", "conn": "client", "ms": 150 },
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm" } },
+    { "kind": "ws_expect_none", "role": "client", "conn": "client", "ms": 150 },
 
-    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
-    { "kind": "ws_expect", "conn": "client", "frame": {
+    { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "auto_title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "summary": "", "summary_updated_at": 0, "repo": null }
+      "sender": "agent:box-2", "sender_device_id": { "$ref": "bridge.device_id" }, "type": "convo_meta", "payload": { "title": "final title", "auto_title": "final title", "parent_convo_id": null, "agent_device_id": { "$ref": "bridge.device_id" }, "agent_kind": null, "repo": null }
     } }
   ]
 }

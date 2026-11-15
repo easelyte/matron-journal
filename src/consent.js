@@ -14,6 +14,7 @@ import { parseCauses } from './ask-causes.js'
 import { isPrivateDevice } from './db.js'
 import { privateOwnedConvo } from './privacy.js'
 import { transferRecipients, parseFindings } from './transfers.js'
+import { consentStepUp, chatAskRow } from './consent-subject.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -89,10 +90,11 @@ export function deviceState({ db, hub, waker }, userId, deviceId) {
 // Coordinator's. For a spawn that is the target box or the asking box; for
 // a chat ask, the invitee (or joiner), the asker and the room's owner. Meant
 // for a box that handles something only the user should sign off on, such
-// as one that reads their private mail.
-function userOnlyDevice(db, userId, deviceId) {
+// as one that reads their private mail. A protected device
+// (devices.protected, src/consent-subject.js) is user-only while it is set.
+export function userOnlyDevice(db, userId, deviceId) {
   if (!Number.isInteger(deviceId)) return false
-  return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=? AND consent_user_only=1').get(deviceId, userId)
+  return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=? AND (consent_user_only=1 OR protected=1)').get(deviceId, userId)
 }
 
 export function isUserOnlySpawn(db, userId, row) {
@@ -189,6 +191,9 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
     ...(r.mission_num ? { mission_num: r.mission_num } : {}),
     ...(r.item_num != null ? { item_num: r.item_num } : {}),
     ...(isUserOnlySpawn(db, userId, r) ? { user_only: true } : {}),
+    // Aimed at a protected box, for an account with an approval key: the
+    // approval needs a consent statement over `subject`.
+    ...consentStepUp(db, userId, 'spawn', r),
     ...causesField(r.causes),
   }))
   const chats = db.prepare(`
@@ -219,6 +224,7 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
       topic: r.topic || '', justification: r.justification,
       ...(r.item_num != null ? { item_num: r.item_num } : {}),
       ...(isUserOnlyChat(db, userId, r.convo_id, r.agent_device_id) ? { user_only: true } : {}),
+      ...consentStepUp(db, userId, 'chat', chatAskRow(db, userId, r.convo_id, r.agent_device_id)),
       ...causesField(r.causes),
     }
   })
@@ -239,6 +245,7 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
     name: r.name, size: r.size, sha256: r.sha256, scan_verdict: r.scan_verdict, scan_findings: parseFindings(r.scan_findings),
     reason: r.reason, item_num: r.item_num ?? null,
     ...(isUserOnlyTransfer(db, userId, r) ? { user_only: true } : {}),
+    ...consentStepUp(db, userId, 'transfer', r),
     ...causesField(r.causes),
   }))
   return [...spawns, ...chats, ...transfers].sort((a, b) => a.created_at - b.created_at)

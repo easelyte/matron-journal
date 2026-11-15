@@ -14,11 +14,11 @@ test('schema: items, item_comments, item_counters exist with the expected column
   assert.deepEqual(cols('items'), [
     'id', 'user_id', 'num', 'kind', 'state', 'resolution', 'awaiting', 'rank', 'title', 'body',
     'labels', 'links', 'supersedes', 'origin_convo_id', 'origin_device_id', 'created_by',
-    'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent', 'actions', 'chosen_action', 'private', 'filed_convo_id', 'turn_requested_at',
+    'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent', 'actions', 'chosen_action', 'private', 'filed_convo_id', 'step_up', 'subject', 'turn_requested_at',
     'contributor_user_id', 'contributor_convo_id', 'contributor_name', 'contributor_via', 'contributor_grant_id',
   ])
   assert.deepEqual(cols('item_comments'), [
-    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id', 'withdrawn_at',
+    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id', 'withdrawn_at', 'step_up', 'subject', 'approval',
   ])
   assert.deepEqual(cols('item_counters'), ['user_id', 'next_num'])
   // (user_id, num) is unique
@@ -119,7 +119,7 @@ test('rowToItem / rowToComment do not expose internal columns', async () => {
   assert.ok(!('idem_key' in c), 'comment shape must not carry idem_key')
   assert.ok(!('user_id' in c), 'comment shape must not carry user_id')
   assert.equal(db.prepare('SELECT idem_key FROM item_comments WHERE id=?').get(c.id).idem_key, 'c1')
-  assert.deepEqual(Object.keys(c).sort(), ['action', 'actions', 'attachments', 'author', 'body', 'chosen_action', 'convo_id', 'convo_title', 'created_at', 'device_id', 'device_name', 'id', 'item_id', 'kind', 'meta', 'reply_to'])
+  assert.deepEqual(Object.keys(c).sort(), ['action', 'actions', 'approval', 'attachments', 'author', 'body', 'chosen_action', 'convo_id', 'convo_title', 'created_at', 'device_id', 'device_name', 'id', 'item_id', 'kind', 'meta', 'reply_to', 'step_up', 'subject'])
 })
 
 test('createItem idempotency returns the original row', async () => {

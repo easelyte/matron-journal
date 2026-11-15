@@ -9,7 +9,8 @@
 //  - a fire of one of the user's routines: only inside that routine's
 //    envelope (spawns per fire, chats, boxes), only when the verifier
 //    (src/verifier.js) finds the ask within the routine's remit and not
-//    injected, and only under the rolling 24 h routine cap.
+//    injected, and only under the rolling 24 h routine cap. The verifier
+//    is consulted a few times per ask at most (VERIFIER_REFUSALS_MAX).
 // Every check is a read; nothing is written until all of them pass.
 // Declines are never gated and never come here.
 //
@@ -110,6 +111,44 @@ function changedWhileVerifying(ctx, who, ask) {
 }
 const conflict = () => ({ ok: false, status: 409, body: { error: 'conflict' } })
 
+// The verifier's no. Its note is the user's to read, not the asker's: the
+// answer carries a fixed reason, and the note is kept with the count
+// (verifier_refusals.last_note). After VERIFIER_REFUSALS_MAX refusals of
+// one ask the verifier is not consulted about it again: the approval is
+// answered left_for_user and the ask stays on the user's card. One ask is
+// one spawn request, or one chat ask as parked (a declined chat row asked
+// again in place has a new created_at, and starts afresh).
+export const VERIFIER_REFUSALS_MAX = 3
+export const WHY_VERIFIER_REFUSED = 'the verifier did not confirm this ask; it stays for the user'
+export const WHY_LEFT_FOR_USER = 'the verifier has not confirmed this ask; it is left for the user to answer'
+const REFUSAL_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+const askKey = (ask) => (ask.kind === 'spawn' ? ask.id : `${ask.roomId}/${ask.targetDeviceId}`)
+
+export function refusalCount(db, userId, ask) {
+  const row = db.prepare('SELECT ask_created_at, refusals FROM verifier_refusals WHERE user_id=? AND kind=? AND ask_id=?').get(userId, ask.kind, askKey(ask))
+  return row && row.ask_created_at === ask.createdAt ? row.refusals : 0
+}
+
+export function recordRefusal(db, userId, ask, note, now = Date.now()) {
+  // A call that outlived its ask (a chat ask declined and parked again while
+  // the verifier was still answering) says nothing about the newer one.
+  const stored = db.prepare('SELECT ask_created_at FROM verifier_refusals WHERE user_id=? AND kind=? AND ask_id=?').get(userId, ask.kind, askKey(ask))
+  if (stored && stored.ask_created_at > ask.createdAt) return
+  const refusals = refusalCount(db, userId, ask) + 1
+  db.prepare(`
+    INSERT INTO verifier_refusals(user_id, kind, ask_id, ask_created_at, refusals, last_note, updated_at) VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(user_id, kind, ask_id) DO UPDATE SET ask_created_at=excluded.ask_created_at, refusals=excluded.refusals,
+      last_note=excluded.last_note, updated_at=excluded.updated_at
+  `).run(userId, ask.kind, askKey(ask), ask.createdAt, refusals, note || null, now)
+  db.prepare('DELETE FROM verifier_refusals WHERE updated_at < ?').run(now - REFUSAL_TTL_MS)
+}
+
+// Verifier calls in flight, per ask (memory only: a call does not outlive
+// the process). Counted with the refusals on record, so answers sent side
+// by side cannot consult the verifier more often than one after another.
+const inFlight = new Map()
+
 async function askVerifier(verifier, args) {
   if (!verifier?.verify) return { ok: false, reason: 'disabled' }
   try {
@@ -126,9 +165,9 @@ async function askVerifier(verifier, args) {
 // whatever changed during the wait (the ask answered or renewed, the
 // switch, user_only, the target going offline, another approval of the
 // same fire) is seen, and two approvals cannot both pass a count.
-// Refusals, in order: own_ask_unverified, envelope, verifier_unavailable /
-// verifier, then the re-checks, envelope again, routine_cap. `who` is the
-// route's authenticated caller.
+// Refusals, in order: own_ask_unverified, envelope, left_for_user,
+// verifier_unavailable / verifier, then the re-checks, envelope again,
+// routine_cap. `who` is the route's authenticated caller.
 //
 // For another session's ask: null when the Coordinator had no hand in it
 // (nothing to check), else the same verdict an own ask gets.
@@ -150,12 +189,29 @@ export async function verifyOwnAsk(ctx, { who, convoId, reason, ask }) {
   // The routine's name and prompt only: the title is editable without the
   // user's ask, the prompt is the remit.
   const { name, prompt } = root.routine
-  const verdict = await askVerifier(ctx.verifier, { routine: { name, prompt }, ask: ask.verifier, reason })
+  const flightKey = `${who.userId}:${ask.kind}:${askKey(ask)}:${ask.createdAt}`
+  const flying = inFlight.get(flightKey) ?? 0
+  if (refusalCount(db, who.userId, ask) + flying >= VERIFIER_REFUSALS_MAX) return refusal(403, 'left_for_user', { why: WHY_LEFT_FOR_USER })
+  inFlight.set(flightKey, flying + 1)
+  let verdict
+  try {
+    verdict = await askVerifier(ctx.verifier, { routine: { name, prompt }, ask: ask.verifier, reason })
+  } finally {
+    const left = inFlight.get(flightKey) - 1
+    if (left > 0) inFlight.set(flightKey, left)
+    else inFlight.delete(flightKey)
+  }
   if (!verdict.ok) {
     const why = verdict.reason === 'disabled' ? 'no verifier is configured' : `the verifier could not answer${verdict.note ? ` (${verdict.note})` : ''}`
     return refusal(409, 'verifier_unavailable', { why })
   }
-  if (!verdict.approve) return refusal(403, 'verifier', { why: verdict.note || 'the verifier refused the ask' })
+  if (!verdict.approve) {
+    try { recordRefusal(db, who.userId, ask, verdict.note) } catch (err) {
+      // Fails closed either way: the answer below is a refusal.
+      console.error(`journal: verifier refusal not recorded (${err?.name})`)
+    }
+    return refusal(403, 'verifier', { why: WHY_VERIFIER_REFUSED })
+  }
   return { ok: true, root, cause: { causeKind: 'routine', causeRef: root.ref, verifierNote: verdict.note ?? '' } }
 }
 
