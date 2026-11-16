@@ -249,34 +249,6 @@ test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it;
   agent.close(); client.close()
 })
 
-// The 1000-char cap is a backstop the producer is expected never to reach
-// (the bridge clamps first). Guard it anyway: it rejects the WHOLE frame, so
-// a regression here silently drops the title and session_state riding along.
-test('convo_upsert: an over-cap summary is rejected whole, mutating nothing', async (t) => {
-  const s = await startTestServer()
-  t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  const ag = createAgent(s.db, dan.id, 'dev-2')
-  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
-  await agent.waitFor((f) => f.op === 'hello_ok')
-
-  agent.send({ op: 'convo_upsert', convo_id: 'capped', title: 'established', summary: 'ok' })
-  await agent.waitFor((f) => f.kind === 'journal' && f.convo_id === 'capped' && f.type === 'convo_meta')
-  const before = s.db.prepare("SELECT title, summary, summary_updated_at FROM conversations WHERE id='capped'").get()
-
-  agent.send({ op: 'convo_upsert', convo_id: 'capped', title: 'SHOULD NOT LAND', summary: 'x'.repeat(1001) })
-  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'convo_upsert')
-  const after = s.db.prepare("SELECT title, summary, summary_updated_at FROM conversations WHERE id='capped'").get()
-  assert.deepEqual(after, before, 'a rejected frame must mutate nothing — title included')
-
-  // Exactly at the cap is accepted (off-by-one guard on the boundary).
-  agent.send({ op: 'convo_upsert', convo_id: 'capped', summary: 'y'.repeat(1000), title: 'at the cap' })
-  await agent.waitFor((f) => f.kind === 'journal' && f.convo_id === 'capped' && f.type === 'convo_meta' && f.payload.title === 'at the cap')
-  assert.equal(s.db.prepare("SELECT summary FROM conversations WHERE id='capped'").get().summary.length, 1000)
-  assert.equal(agent.ws.readyState, 1)
-  agent.close()
-})
-
 test('convo_upsert rejects a malformed agent_kind with bad_request, connection survives', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

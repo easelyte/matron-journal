@@ -1099,21 +1099,15 @@ Rows from before the stamp carry neither, and don't count.
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, summary,
-  summary_updated_at, repo}`, sender = the agent device, e.g.
+  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, repo}`, sender = the agent device, e.g.
   `agent:box-2`) whenever it changes an existing conversation's title or
   `auto_title` (see *Mission-named conversations*), sets
-  a non-empty title at creation, changes the stored `summary` (see
-  "`convo_upsert` accepts an optional `summary`" below), or creates a child (`parent_convo_id` set,
+  a non-empty title at creation, or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
   list the child as a normal conversation until its next `/snapshot`) — so
-  other devices learn renames, summary refreshes and child linkage live
-  instead of only via
-  `/snapshot`. No event otherwise (unchanged/omitted title AND
-  unchanged/omitted summary, state-only
-  upserts on existing conversations) — in particular, a bridge that
-  re-sends the summary it already stored appends nothing, so a reconnect
-  backfill is not an event storm. `agent_device_id` is the upserting
+  other devices learn renames and child linkage live instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
+  upserts on existing conversations). `agent_device_id` is the upserting
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
@@ -1992,7 +1986,7 @@ Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_w
 }
 ```
 
-Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, self?, online, wakeable?, folders: [{path, last_used}], activity?, limits?, defaults?}]}`. `defaults` is `{agent, model, effort}` a new session on the box starts with when the ask names none: the bridge's own effective block (the live `recent_folders` reply's `defaults`, else its last `box_status` one), else the journal's stored box defaults; omitted when neither says anything (see *Box defaults*). Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Nor can a name check tell a Mac called `alice-mac` from a dev VM, so the journal also remembers the wake command's own verdict: when it exits 2 ("not a box I can start") the device row is marked (`devices.wake_refused_at`, matched by name, persistent), and from then on the box is listed without `wakeable`, `wakeIfOffline` skips it and a spawn to it fails `agent_unreachable` at once. The mark stands for a day (`WAKE_REFUSAL_TTL_MS`), after which the box is tried again and re-marked if refused again, so a dev VM refused by mistake recovers on its own; a later exit 0 for that name, or renaming the device, clears it at once. The first wake to a box never refused before is still attempted, so that one spawn parks until the refusal comes back (`isWakeableDevice` in `src/wake.js`). Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, wakeable?, folders: [{path, last_used}], activity?, limits?, defaults?}]}`. `defaults` is `{agent, model, effort}` a new session on the box starts with when the ask names none: the bridge's own effective block (the live `recent_folders` reply's `defaults`, else its last `box_status` one), else the journal's stored box defaults; omitted when neither says anything (see *Box defaults*). Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Nor can a name check tell a Mac called `alice-mac` from a dev VM, so the journal also remembers the wake command's own verdict: when it exits 2 ("not a box I can start") the device row is marked (`devices.wake_refused_at`, matched by name, persistent), and from then on the box is listed without `wakeable`, `wakeIfOffline` skips it and a spawn to it fails `agent_unreachable` at once. The mark stands for a day (`WAKE_REFUSAL_TTL_MS`), after which the box is tried again and re-marked if refused again, so a dev VM refused by mistake recovers on its own; a later exit 0 for that name, or renaming the device, clears it at once. The first wake to a box never refused before is still attempted, so that one spawn parks until the refusal comes back (`isWakeableDevice` in `src/wake.js`). Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
 
 Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
 
