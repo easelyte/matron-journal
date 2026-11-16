@@ -4,7 +4,7 @@
   "protocol": 1,
   "samples": [
     {
-      "source": "13_tool_stream.json#step[13]",
+      "source": "13_tool_stream.json#step[14]",
       "frame": {
         "kind": "ephemeral",
         "convo_id": "c1",
@@ -17,7 +17,7 @@
       }
     },
     {
-      "source": "13_tool_stream.json#step[18]",
+      "source": "13_tool_stream.json#step[19]",
       "frame": {
         "kind": "ephemeral",
         "convo_id": "c1",

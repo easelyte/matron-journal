@@ -27,6 +27,7 @@
     { "kind": "ws_expect", "role": "client", "client": "mac", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_expect", "role": "client", "client": "mac", "conn": "mac", "frame": { "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "idle" } } },
     { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },
     { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "c1", "ts": { "$type": "integer" },
@@ -51,6 +52,7 @@
       "kind": "ephemeral", "convo_id": "c1", "message_ref": "tu1",
       "tool_stream": { "event": "sync", "meta": { "tool": "Bash", "command": "make" }, "offset": 0, "content": "$ make\n", "head_truncated": false }
     } },
+    { "kind": "ws_expect", "role": "client", "client": "ipad", "conn": "ipad", "frame": { "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "idle" } } },
 
     { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "stream_append", "convo_id": "c1", "message_ref": "tu1", "offset": 999, "chunk": "lost" } },
     { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": {
@@ -73,6 +75,7 @@
     } },
 
     { "kind": "ws_send", "role": "client", "client": "mac", "conn": "mac", "frame": { "op": "viewing", "convo_id": "c1" } },
+    { "kind": "ws_expect", "role": "client", "client": "mac", "conn": "mac", "frame": { "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "idle" } } },
     { "kind": "ws_expect_none", "role": "client", "client": "mac", "conn": "mac", "ms": 250 }
   ]
 }

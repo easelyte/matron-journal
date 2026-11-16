@@ -4,7 +4,17 @@
   "protocol": 1,
   "samples": [
     {
-      "source": "10_activity.json#step[17]",
+      "source": "10_activity.json#step[12]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "activity": {
+          "state": "idle"
+        }
+      }
+    },
+    {
+      "source": "10_activity.json#step[18]",
       "frame": {
         "kind": "ephemeral",
         "convo_id": "c1",
@@ -15,7 +25,17 @@
       }
     },
     {
-      "source": "16_viewing_set.json#step[15]",
+      "source": "16_viewing_set.json#step[9]",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c2",
+        "activity": {
+          "state": "idle"
+        }
+      }
+    },
+    {
+      "source": "16_viewing_set.json#step[17]",
       "frame": {
         "kind": "ephemeral",
         "convo_id": "c1",
@@ -25,7 +45,7 @@
       }
     },
     {
-      "source": "16_viewing_set.json#step[17]",
+      "source": "16_viewing_set.json#step[19]",
       "frame": {
         "kind": "ephemeral",
         "convo_id": "c2",

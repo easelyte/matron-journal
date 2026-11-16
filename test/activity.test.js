@@ -28,7 +28,8 @@ test('agent activity reaches only the viewing client, carrying state+detail', as
   await new Promise((r) => setTimeout(r, 50))
 
   agent.send({ op: 'activity', convo_id: 'sess-act', state: 'thinking', detail: 'analyzing files' })
-  const frame = await viewer.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'sess-act')
+  // (viewing first sends an idle catch-up; see viewing-activity-replay.test.js)
+  const frame = await viewer.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'sess-act' && f.activity?.state === 'thinking')
   assert.deepEqual(frame.activity, { state: 'thinking', detail: 'analyzing files' })
 
   // the non-viewing client of the same user gets nothing for this convo.
@@ -122,7 +123,7 @@ test('activity detail is truncated at 200 chars, not rejected', async (t) => {
 
   const longDetail = 'x'.repeat(250)
   agent.send({ op: 'activity', convo_id: 'sess-act-trunc', state: 'tool', detail: longDetail })
-  const frame = await client.waitFor((f) => f.kind === 'ephemeral')
+  const frame = await client.waitFor((f) => f.kind === 'ephemeral' && f.activity?.state === 'tool')
   assert.equal(frame.activity.detail.length, 200)
   assert.equal(frame.activity.detail, 'x'.repeat(200))
   agent.close(); client.close()
