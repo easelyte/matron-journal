@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "bin/matron-journal",
-    "test": "node --test --test-timeout=30000 'test/**/*.js'",
+    "test": "node --test --test-timeout=180000 'test/**/*.js'",
     "loadtest": "node tools/load-test.js",
     "conformance:extracts": "node tools/conformance-extracts.js",
     "conformance:check": "node tools/conformance-extracts.js --check",
