@@ -87,9 +87,6 @@ export const isAutoArchiveDays = (v) => Number.isInteger(v) && v >= 0 && v <= AU
 // a session still running or waiting, the Coordinator, a pin, an open
 // tracker item filed from it, any link to an open mission, or a sub-chat
 // still running or with a message since the cutoff (its parent's work).
-// A sub-chat's newest message is one backward probe on (convo_id, seq); the
-// older form (any event with ts >= cutoff) scanned every event of every
-// sub-chat and blocked the loop for 35-40 s on a cold cache.
 export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
   if (!days) return []
   const cutoff = now - days * DAY_MS

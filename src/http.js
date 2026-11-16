@@ -703,10 +703,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // Stored defaults for new sessions, as GET /devices.
           defaults: boxDefaults.get(d.device_id),
         }))
-        // Ordered by last message time then id — same rule and same JS
-        // comparator as /snapshot (byLastMessageThenId, see journal.js); sorting
-        // in JS avoids re-evaluating the correlated last_ts subquery in a SQL
-        // ORDER BY.
         const rows = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT m.num FROM missions m WHERE m.id = conversations.mission_id${filtered ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num,
