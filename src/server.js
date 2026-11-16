@@ -19,7 +19,7 @@ import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
-import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
+import { makePushPipeline, BACKGROUND_WAKE_MS, CONSENT_HOLD_MS, FOR_YOU_HOLD_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { startStallLog, timed, logSlowRequests } from './stall-log.js'
@@ -160,20 +160,18 @@ const resolveToolLogTtlHours = (override) =>
 const resolveVoiceNoteTtlDays = (override) =>
   resolveWindow(override, { env: 'MATRON_VOICE_NOTE_TTL_DAYS', opt: 'voiceNoteTtlDays', fallback: DEFAULT_VOICE_NOTE_TTL_DAYS, what: 'voice-note expiry' })
 
-export const DEFAULT_ORPHAN_BLOB_GRACE_HOURS = 168
-
-// Grace window for the orphan-blob reaper (runReapOrphanBlobs):
-// how old an unreferenced blob must be before it is deleted. `override` is
-// startServer's `orphanBlobGraceHours` opt and beats MATRON_ORPHAN_BLOB_GRACE_HOURS,
-// mirroring the other retention resolvers: unset means ENABLED at 7 days
-// (168h — see runReapOrphanBlobs for why not 24h); `0`
-// disables; anything that is not a non-negative integer disables with one
-// warn line (this pass deletes data — fail closed means off). Returns hours
-// or null.
+// Grace window for the orphan-blob reaper (reapOrphanBlobsPass): how old an
+// unreferenced blob must be before it is deleted. OFF unless configured:
+// `override` is startServer's `orphanBlobGraceHours` opt and beats
+// MATRON_ORPHAN_BLOB_GRACE_HOURS; unset, empty or `0` disables, and so does
+// anything that is not a non-negative integer (with one warn line; this pass
+// deletes data, so fail closed means off). A week or more is sensible: a
+// client outbox can resend a pending attachment days later. Returns hours or
+// null.
 export function resolveOrphanBlobGraceHours(override) {
   const fromEnv = override === undefined
   const raw = fromEnv ? process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS : override
-  if (raw === undefined) return DEFAULT_ORPHAN_BLOB_GRACE_HOURS
+  if (raw === undefined) return null
   const name = fromEnv ? 'MATRON_ORPHAN_BLOB_GRACE_HOURS' : 'orphanBlobGraceHours'
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0) {
@@ -555,6 +553,10 @@ export function startServer({
   agentCommentClock = Date.now,
   // Client-token idle expiry (resolveClientIdleMs); the clock is a test seam.
   clientIdleDays, clientIdleClock = Date.now,
+  // How long a push about an item that needs the user waits, so items
+  // settled within it never notify (push.js FOR_YOU_HOLD_MS). 0 sends at
+  // once. A consent card's hold is this too, but never under 30 s.
+  pushHoldMs = resolveZeroableEnv('MATRON_PUSH_HOLD_MS', process.env.MATRON_PUSH_HOLD_MS, FOR_YOU_HOLD_MS),
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -718,7 +720,7 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const clientIdleMs = resolveClientIdleMs(clientIdleDays)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, itemHoldMs: pushHoldMs, consentHoldMs: Math.max(CONSENT_HOLD_MS, pushHoldMs), clientIdleMs, now: clientIdleClock })
   // A device signed out for invalid approval signatures: its notice and push.
   installApprovalLockdown({ db, hub, pushPipeline })
   // The security event log, one per journal: handed to the HTTP and
@@ -726,8 +728,9 @@ export function startServer({
   // database (the approval guard, the lockdown).
   const resolvedSecurityLog = makeSecurityLog({ db, ...(securityLog || {}) })
   installSecurityLog(db, resolvedSecurityLog)
-  // A consent-card push whose 30 s hold a restart swallowed still goes out.
+  // A consent-card or item push whose hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
+  try { pushPipeline.resumeHeldItems() } catch (err) { console.error('push: item resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
   // cloud one (MATRON_STT_AZURE_KEY; src/cloud-transcribe.js), or whisper
   // (MATRON_WHISPER_MODEL; src/transcribe.js). Neither: off, and the origin

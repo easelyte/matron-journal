@@ -19,6 +19,14 @@ const ROUTINE_COALESCE_MS = 10000
 // How long a consent card's push waits for the Coordinator to decide it, in
 // Coordinator mode (notification settings).
 export const CONSENT_HOLD_MS = 30000
+// How long a push about a tracker item that needs the user waits before it
+// goes out (MATRON_PUSH_HOLD_MS; 0 sends at once). Many such items are
+// settled within seconds of being filed: the Coordinator decides a card, an
+// agent closes what it filed or hands it back to itself. The push goes out
+// only if the item is still open and still awaiting the user when the hold
+// ends, so those never buzz a phone. The server uses this for the consent
+// hold too, so one knob says how long the user's pocket waits.
+export const FOR_YOU_HOLD_MS = 60 * 1000
 // At startup, an ask whose hold had not run out by the time the process went
 // down gets the push the restart swallowed. Older asks either got theirs
 // before the restart or were never held; resuming them would push twice.
@@ -144,6 +152,36 @@ export function pushContent(event, convo, cls, itemBody = () => null) {
   }
 }
 
+// A push about a tracker item that needs the user (classify: an agent's
+// create, comment or reopen leaving it awaiting the user). These are the
+// pushes the item hold delays.
+function isHeldItem(event, cls) {
+  return event.type === 'item' && !!cls && cls.question === true
+    && typeof event.payload?.item_id === 'string' && event.payload.item_id !== ''
+}
+
+// Is the item still open and still waiting on the user? Anything else (closed,
+// handed back to an agent, deleted) means the push would be stale.
+function itemStillNeedsUser(db, userId, itemId) {
+  return !!db.prepare("SELECT 1 FROM items WHERE id=? AND user_id=? AND state='open' AND awaiting='user'").get(itemId, userId)
+}
+
+// A held item marker as it reads now: the buttons the item and the comment
+// offer at send time, not at filing time, so a notification never offers a
+// button that has already been tapped or replaced.
+export function freshItemEvent(db, userId, event) {
+  const p = event.payload
+  const row = db.prepare('SELECT actions, chosen_action FROM items WHERE id=? AND user_id=?').get(p.item_id, userId)
+  if (!row) return event
+  const parse = (json) => { try { const v = JSON.parse(json); return Array.isArray(v) ? v : [] } catch { return [] } }
+  let comment = p.comment
+  if (comment && typeof comment === 'object' && typeof comment.id === 'string') {
+    const c = db.prepare('SELECT actions, chosen_action FROM item_comments WHERE id=? AND item_id=?').get(comment.id, p.item_id)
+    if (c) comment = { ...comment, actions: c.chosen_action == null ? parse(c.actions) : [] }
+  }
+  return { ...event, payload: { ...p, actions: parse(row.actions), chosen_action: row.chosen_action ?? null, ...(comment !== undefined ? { comment } : {}) } }
+}
+
 // APNs answers that mean the token itself will never be delivered to: 410
 // Unregistered (the app was removed or the token retired) and 400
 // BadDeviceToken (not a token APNs knows in that environment). A
@@ -166,7 +204,7 @@ function isDeadToken({ status, reason }) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, itemHoldMs = 0, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
   const webCounters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
@@ -175,9 +213,39 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // the next routine event after restart just does a fresh leading-edge
   // send since no window is latched for it.
   const coalesceState = new Map()
-  // Consent-card pushes waiting out their hold (memory only; see
-  // resumeHeldConsent for the restart case).
+  // Consent-card and item pushes waiting out their hold (memory only; see
+  // resumeHeldConsent and resumeHeldItems for the restart case).
   const held = new Set()
+
+  // The newest held push per item, `${userId}:${itemId}` -> seq: a later
+  // marker about the same item replaces an earlier one still waiting, so
+  // only the newest goes out (it would replace the older on screen anyway).
+  const heldItems = new Map()
+
+  // Holds an item push, then sends it only if it is still the item's newest
+  // and the item still needs the user.
+  function holdItem(ms, userId, event, send, what) {
+    const key = `${userId}:${event.payload.item_id}`
+    // Seq order, not arrival order: an older marker never displaces a newer one.
+    if ((heldItems.get(key) ?? -Infinity) > event.seq) return
+    heldItems.set(key, event.seq)
+    hold(ms, () => {
+      if (heldItems.get(key) !== event.seq) return
+      heldItems.delete(key)
+      if (itemStillNeedsUser(db, userId, event.payload.item_id)) send()
+    }, what)
+  }
+
+  // Runs `fn` once `ms` have passed, unless close() comes first. Never keeps
+  // the process alive, and never lets a throw escape the timer.
+  function hold(ms, fn, what) {
+    const timer = setTimeout(() => {
+      held.delete(timer)
+      try { fn() } catch (err) { console.error(`push: ${what} failed`, err) }
+    }, ms)
+    timer.unref()
+    held.add(timer)
+  }
 
   // APNs token -> when it was last sent a background wake. Keyed by token so a
   // reused device id or a reinstall starts fresh. Memory only, like the
@@ -360,7 +428,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // `pushHint` is optional, in-memory-only extra context a caller (today:
   // ws.js's convo_upsert handler, for session_status's prevSessionState)
   // can pass through to classify(). Every other call site omits it.
-  // `noHold` is internal: resumeHeldConsent's own, already-waited send.
+  // `noHold` is internal: a held push's own, already-waited send.
   function onAppend(userId, event, originDeviceId, pushHint, { noHold = false } = {}) {
     if (!apnsClient && !webPushClient) return
     // A panic-locked account: nothing pushed (doSend, sendTransport), nothing queued.
@@ -394,7 +462,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
       return
     }
 
-    // Before the settings below can return. `noHold` is a consent card's
+    // Before the settings below can return. `noHold` is a held push's
     // second pass through here: its first pass has already been considered.
     if (apnsClient && !noHold) maybeWake(userId, event, devices, originDeviceId)
 
@@ -414,16 +482,17 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
     const p = event.payload
     if (!noHold && event.type === 'permission_request' && p && (p.kind === 'agent_spawn' || p.kind === 'agent_chat')
       && holdsConsent(db, userId, mode, p.from_device_id)) {
-      const timer = setTimeout(() => {
-        held.delete(timer)
-        try {
-          if (consentStillPending(db, p)) sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
-        } catch (err) {
-          console.error('push: held consent push failed', err)
-        }
-      }, consentHoldMs)
-      timer.unref()
-      held.add(timer)
+      hold(consentHoldMs, () => {
+        if (consentStillPending(db, p)) sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
+      }, 'held consent push')
+      return
+    }
+    // An item that needs the user waits too, and goes out only if it still
+    // does. The second pass runs the whole decision again, so the devices,
+    // the settings and what each device has already seen are as they are
+    // then: a phone that opened the app meanwhile gets nothing.
+    if (!noHold && itemHoldMs > 0 && isHeldItem(event, cls)) {
+      holdItem(itemHoldMs, userId, event, () => onAppend(userId, freshItemEvent(db, userId, event), originDeviceId, pushHint, { noHold: true }), 'held item push')
       return
     }
     sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
@@ -539,7 +608,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // gets its push, if the ask is still pending. Only cards young enough to
   // have been mid-hold, and only where the hold applies now (the same gate
   // onAppend uses) — a card that pushed at once must not push again. Held
-  // again for whatever is left of its 30 s; sent now if that has passed.
+  // again for whatever is left of its hold; sent now if that has passed.
   // The partial index idx_events_permission_request keeps this off a full
   // events scan.
   function resumeHeldConsent(now = Date.now()) {
@@ -554,16 +623,34 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
       if (!consentStillPending(db, payload)) continue
       if (!holdsConsent(db, r.user_id, effectiveEvents(db, r.user_id).mode, payload.from_device_id)) continue
       const event = { seq: r.seq, convo_id: r.convo_id, ts: r.ts, sender: r.sender, type: r.type, payload }
-      const timer = setTimeout(() => {
-        held.delete(timer)
-        try {
-          if (consentStillPending(db, payload)) onAppend(r.user_id, event, null, undefined, { noHold: true })
-        } catch (err) {
-          console.error('push: resumed consent push failed', err)
-        }
-      }, Math.max(0, r.ts + consentHoldMs - now))
-      timer.unref()
-      held.add(timer)
+      hold(Math.max(0, r.ts + consentHoldMs - now), () => {
+        if (consentStillPending(db, payload)) onAppend(r.user_id, event, null, undefined, { noHold: true })
+      }, 'resumed consent push')
+      n += 1
+    }
+    return n
+  }
+
+  // After a restart: an item push whose hold the restart swallowed still
+  // goes out, if the item still needs the user. Same window and rule as
+  // resumeHeldConsent: only markers young enough to have been mid-hold.
+  // A consent mirror's marker never pushes (it carries `consent`), so it is
+  // skipped here too. The partial index idx_events_item keeps this off a
+  // full events scan.
+  function resumeHeldItems(now = Date.now()) {
+    if ((!apnsClient && !webPushClient) || itemHoldMs <= 0) return 0
+    const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
+      WHERE type='item' AND ts > ? ORDER BY seq`).all(now - itemHoldMs - resumeSlackMs)
+    let n = 0
+    for (const r of rows) {
+      let payload
+      try { payload = JSON.parse(r.payload) } catch { continue }
+      if (!payload || typeof payload !== 'object' || payload.consent != null) continue
+      const event = { seq: r.seq, convo_id: r.convo_id, ts: r.ts, sender: r.sender, type: r.type, payload }
+      const cls = classifyEvent(event.type, payload, event.sender)
+      if (!isHeldItem(event, cls) || !itemStillNeedsUser(db, r.user_id, payload.item_id)) continue
+      holdItem(Math.max(0, r.ts + itemHoldMs - now), r.user_id, event,
+        () => onAppend(r.user_id, freshItemEvent(db, r.user_id, event), null, undefined, { noHold: true }), 'resumed item push')
       n += 1
     }
     return n
@@ -576,9 +663,10 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
     coalesceState.clear()
     for (const timer of held) clearTimeout(timer)
     held.clear()
+    heldItems.clear()
   }
 
   // _coalesceState is exposed for tests (eviction assertions) and as a
   // cheap gauge candidate for Task 5's /metrics; not part of the public API.
-  return { onAppend, resumeHeldConsent, counters, webCounters, close, _coalesceState: coalesceState, _held: held }
+  return { onAppend, resumeHeldConsent, resumeHeldItems, counters, webCounters, close, _coalesceState: coalesceState, _held: held }
 }
