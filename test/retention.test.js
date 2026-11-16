@@ -1,8 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
+import os from 'node:os'
 import http from 'node:http'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
@@ -114,7 +114,7 @@ test('server.js retention: runs at boot, offloads old tool_output rows, retrieva
   preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, alice.id, r.seq)
   preDb.close()
 
-  const s = await startTestServer({ dbPath, retentionDays: 30, retentionInitialDelayMs: 0 })
+  const s = await startTestServer({ dbPath, retentionDays: 30 })
   t.after(() => s.close())
   const row = s.db.prepare('SELECT payload, blob_ref FROM events WHERE seq=?').get(r.seq)
   assert.ok(row.blob_ref, 'boot-time retention run did not offload the old row')
@@ -139,7 +139,7 @@ test('MATRON_RETENTION_DAYS=0 (retentionDays: 0) disables retention — no offlo
   preDb.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 400 * 86400000, alice.id, r.seq)
   preDb.close()
 
-  const s = await startTestServer({ dbPath, retentionDays: 0, retentionInitialDelayMs: 0 })
+  const s = await startTestServer({ dbPath, retentionDays: 0 })
   t.after(() => s.close())
   const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
   assert.equal(row.blob_ref, null)
@@ -159,7 +159,7 @@ test('an invalid retentionDays override (negative/non-integer) disables retentio
     preDb.close()
 
     const mute = t.mock.method(console, 'warn', () => {}) // expected one disabled-log line; keep output clean
-    const s = await startTestServer({ dbPath, retentionDays: badDays, retentionInitialDelayMs: 0 })
+    const s = await startTestServer({ dbPath, retentionDays: badDays })
     const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
     await s.close()
     mute.mock.restore()
@@ -322,7 +322,6 @@ test('runExpireLogs leaves the convo preview alone when a newer message exists',
   runExpireLogs(db, { hours: 24, mediaDir })
   assert.equal(db.prepare('SELECT snippet FROM conversations WHERE id=?').get('c1').snippet, 'newer message')
 })
-
 
 test('runExpireLogs scrubs the preview even when a read_marker bumped last_seq after the purged event (read_marker never owns the preview)', async () => {
   const { db, alice } = await setup()

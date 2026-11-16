@@ -21,9 +21,9 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { resolveFileReads } from './files-read-http.js'
-import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { startStallLog, timed, logSlowRequests } from './stall-log.js'
+import { resolveFileReads } from './files-read-http.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -102,18 +102,6 @@ export function resolveClientIdleMs(override) {
 // and a garbage MATRON_MAX_REPLAY would make the snapshot_required valve
 // never fire. Fails closed to `defaultValue` instead, with one warn log
 // naming the var, so a misconfiguration is loud rather than invisible.
-// On/off env flag: 1/true/on/yes and 0/false/off/no (case-insensitive);
-// unset -> default; anything else warns and falls back to the default, the
-// same fail-visible stance as resolveNumericEnv.
-export function resolveBooleanEnv(name, raw, defaultValue) {
-  if (raw === undefined) return defaultValue
-  const v = String(raw).trim().toLowerCase()
-  if (['1', 'true', 'on', 'yes'].includes(v)) return true
-  if (['0', 'false', 'off', 'no'].includes(v)) return false
-  console.warn(`${name}=${JSON.stringify(raw)} is invalid (expected 1/0, true/false, on/off, yes/no) — using default ${defaultValue}`)
-  return defaultValue
-}
-
 export function resolveNumericEnv(name, raw, defaultValue) {
   if (raw === undefined) return defaultValue
   const n = Number(raw)

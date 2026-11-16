@@ -67,8 +67,8 @@ import { createAgent } from '../src/auth.js'
 import { createMission, joinMission } from '../src/missions.js'
 import Database from 'better-sqlite3'
 import fs from 'node:fs'
-import path from 'node:path'
 import os from 'node:os'
+import path from 'node:path'
 
 function seedUserAndConvo(db, { userId = 1, convoId = 'c1' } = {}) {
   db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(?, ?, 'x', 0)")
@@ -799,38 +799,6 @@ test('startServer starts the background backfills only after backgroundDelayMs, 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
-})
-
-// Phrase tier: a message holding the typed words adjacent and in order beats
-// a shorter one that merely contains each word (bm25 alone prefers short
-// bodies), and a diff holding the phrase never jumps above prose.
-test('ranked: an adjacent-phrase match outranks a scattered all-words match and is tagged exact', async () => {
-  const s = await startTestServer()
-  await createUser(s.db, 'alice', 'password-123')
-  const { token, user_id } = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'password-123' } })).json
-  upsertConversation(s.db, { id: 'c', ownerUserId: user_id, title: 'C', sessionState: 'done' })
-  const scattered = append(s.db, { userId: user_id, convoId: 'c', sender: 'user:alice', type: 'text', payload: { body: 'lantern festival export' } })
-  const phrase = append(s.db, { userId: user_id, convoId: 'c', sender: 'user:alice', type: 'text', payload: { body: 'we agreed the lantern export should run nightly after the harbour backup finishes and the report is mailed' } })
-  const diff = append(s.db, { userId: user_id, convoId: 'c', sender: 'agent:kit', type: 'diff', payload: { diff: '+ lantern export' } })
-  const r = await s.http('/search?q=lantern+export', { token })
-  assert.equal(r.status, 200)
-  assert.deepEqual(r.json.hits.map((h) => [h.seq, h.why]), [
-    [phrase.seq, 'exact'],
-    [scattered.seq, 'words'],
-    [diff.seq, 'words'],
-  ])
-  await s.close()
-})
-
-test('ranked: a single-word query gets no phrase tier', async () => {
-  const s = await startTestServer()
-  await createUser(s.db, 'alice', 'password-123')
-  const { token, user_id } = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'password-123' } })).json
-  upsertConversation(s.db, { id: 'c', ownerUserId: user_id, title: 'C', sessionState: 'done' })
-  append(s.db, { userId: user_id, convoId: 'c', sender: 'user:alice', type: 'text', payload: { body: 'lantern' } })
-  const r = await s.http('/search?q=lantern', { token })
-  assert.deepEqual(r.json.hits.map((h) => h.why), ['words'])
-  await s.close()
 })
 
 test('searchChats groups only the newest CHAT_SCAN_CAP matches, so a common word stays fast', async () => {

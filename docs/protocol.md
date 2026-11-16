@@ -1099,21 +1099,15 @@ Rows from before the stamp carry neither, and don't count.
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, summary,
-  summary_updated_at, repo}`, sender = the agent device, e.g.
+  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, repo}`, sender = the agent device, e.g.
   `agent:box-2`) whenever it changes an existing conversation's title or
   `auto_title` (see *Mission-named conversations*), sets
-  a non-empty title at creation, changes the stored `summary` (see
-  "`convo_upsert` accepts an optional `summary`" below), or creates a child (`parent_convo_id` set,
+  a non-empty title at creation, or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
   list the child as a normal conversation until its next `/snapshot`) — so
-  other devices learn renames, summary refreshes and child linkage live
-  instead of only via
-  `/snapshot`. No event otherwise (unchanged/omitted title AND
-  unchanged/omitted summary, state-only
-  upserts on existing conversations) — in particular, a bridge that
-  re-sends the summary it already stored appends nothing, so a reconnect
-  backfill is not an event storm. `agent_device_id` is the upserting
+  other devices learn renames and child linkage live instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
+  upserts on existing conversations). `agent_device_id` is the upserting
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
