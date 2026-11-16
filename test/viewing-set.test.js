@@ -34,7 +34,8 @@ async function barrier(client) {
 }
 
 const act = (convoId) => ({ op: 'activity', convo_id: convoId, state: 'thinking' })
-const gotActivity = (client, convoId) => client.frames.some((f) => f.kind === 'ephemeral' && f.convo_id === convoId && f.activity)
+// `idle` is the catch-up every newly viewed convo gets, not a live frame.
+const gotActivity = (client, convoId) => client.frames.some((f) => f.kind === 'ephemeral' && f.convo_id === convoId && f.activity && f.activity.state !== 'idle')
 const pause = (ms = 150) => new Promise((r) => setTimeout(r, ms))
 
 test('two convos viewed on one connection both receive ephemerals', async (t) => {
@@ -69,13 +70,19 @@ test('an empty set views nothing; a later single convo_id replaces the set', asy
   await pause()
   assert.equal(gotActivity(client, 'va'), false)
 
+  // The thinking frame sent to va above is cached and replays when va is
+  // viewed; only frames after this point say whether va stayed in the set.
+  const seen = client.frames.length
   client.send({ op: 'viewing', convo_ids: ['va', 'vb'] })
   client.send({ op: 'viewing', convo_id: 'vb' })
   await barrier(client)
   agent.send(act('va')); agent.send(act('vb'))
   await client.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'vb' && f.activity)
   await pause()
-  assert.equal(gotActivity(client, 'va'), false, 'old single convo_id means exactly {convo_id}')
+  // One frame: the catch-up from the transient set. The live thinking frame
+  // sent after viewing narrowed to {vb} must not arrive as a second one.
+  const vaAfter = client.frames.slice(seen).filter((f) => f.kind === 'ephemeral' && f.convo_id === 'va' && f.activity)
+  assert.equal(vaAfter.length, 1, 'old single convo_id means exactly {convo_id}')
 })
 
 test('catch-up (status + tool-stream sync) replays only for newly added convos', async (t) => {

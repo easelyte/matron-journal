@@ -220,6 +220,11 @@ test('a room between two people: both consent, the twin is created, and messages
   w.ws.aliceBox.send({ op: 'publish', convo_id: 'room', type: 'image', payload: { blob_ref: 'b1', name: 'x.png' }, blob_ref: 'b1' })
   const err = await w.ws.aliceBox.waitFor((f) => f.op === 'error' && f.ref === 'publish')
   assert.equal(err.code, 'bad_request')
+  // finalize is refused the same way, naming the person rule.
+  w.ws.aliceBox.send({ op: 'finalize', convo_id: 'room', message_ref: 'm9', type: 'image', payload: { blob_ref: 'b1', name: 'x.png' }, blob_ref: 'b1' })
+  const errFin = await w.ws.aliceBox.waitFor((f) => f.op === 'error' && f.ref === 'finalize')
+  assert.equal(errFin.code, 'bad_request')
+  assert.match(errFin.detail, /another person/)
 })
 
 test('a person room holds exactly the two agents: no further invite or join on either side', async (t) => {

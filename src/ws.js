@@ -99,6 +99,14 @@ const AGENT_PUBLISH_TYPES = new Set([
 // so should start a joined peer whose box is asleep. Status, streams,
 // summaries and prompts are the publishing agent's own bookkeeping.
 const ROOM_WAKE_PUBLISH_TYPES = new Set(['text', 'file', 'image'])
+// A plain `file` or `image` frame from an agent into a room would skip the
+// user's approval card (nothing checks that an `image` blob is an image). A
+// file reaches a room only through a transfer (POST /transfers): the journal
+// writes the room's `file` event itself on release (transfer-consent.js),
+// never through publish or finalize.
+const ROOM_FILE_TYPES = new Set(['file', 'image'])
+const ROOM_FILE_REFUSAL = 'a file or image reaches a room only through an approved file transfer (POST /transfers), not a plain file or image frame'
+const PERSON_FILE_REFUSAL = 'files and images do not cross to another person'
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only
 // states a bridge may broadcast. Anything else is bad_request.
@@ -260,6 +268,9 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
     get(userId, convoId) {
       return map.get(`${userId}:${convoId}`)
     },
+    delete(userId, convoId) {
+      map.delete(`${userId}:${convoId}`)
+    },
   }
 }
 
@@ -291,29 +302,35 @@ export function makeVitalsCache(max = VITALS_CACHE_MAX) {
 
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
-// permessage-deflate (RFC 7692), negotiated per connection: a client that
-// does not offer the extension gets plain frames exactly as before, so this is
-// wire-compatible with every existing client. Only frames of >= 1 KiB are
-// compressed (tool_output / diff rows; short text and control frames are not
-// worth the zlib call). No context takeover on either side, so no per-socket
-// zlib window outlives a message — flat memory per connection at the cost of
-// some ratio. Measured over a day of the live journal's frames: 29.5 MB ->
-// 12.5 MB (2.4x) for ~1 s of deflate CPU per connected client.
-// Memory: ws keeps a socket's (reset) zlib stream allocated until the socket
-// closes, so each socket that has received a large frame retains one deflate
-// state; memLevel 7 makes that ~192 KiB instead of zlib's default ~256 KiB.
-// Deliberately NO serverMaxWindowBits / clientMaxWindowBits: with either set,
-// ws REJECTS (HTTP 400, no plain fallback) a valid offer that does not carry
-// the matching parameter or asks for a smaller window — e.g. Firefox's bare
-// `permessage-deflate` offer. Negotiation must only ever add compression,
-// never cost a client its connection.
-export const WS_DEFLATE_OPTIONS = Object.freeze({
+// Compress larger messages only for peers offering permessage-deflate. Avoid
+// cross-message history and bound zlib work; ws keeps the (reset) streams
+// until the socket closes, so each compressed connection holds a few tens to
+// a couple of hundred KiB of zlib state. A 2 KiB window (serverMaxWindowBits
+// 11) roughly halves that and still compresses JSON well. Client window bits
+// stay negotiable so bare offers and peers requesting smaller windows can
+// still connect.
+const WS_DEFLATE_OPTIONS = {
   threshold: 1024,
   zlibDeflateOptions: { level: 6, memLevel: 7 },
   serverNoContextTakeover: true,
+  serverMaxWindowBits: 11,
   clientNoContextTakeover: true,
   concurrencyLimit: 10,
-})
+}
+
+// An offer with `server_max_window_bits=N` for N below ours cannot be
+// accepted. Browsers and ws do not send the parameter; this only guards
+// unusual clients.
+function dropUnsatisfiableDeflateOffer(req) {
+  const header = req.headers['sec-websocket-extensions']
+  if (!header || !header.includes('server_max_window_bits')) return
+  const offers = header.split(',').map((offer) => offer.trim()).filter((offer) => {
+    const m = /server_max_window_bits\s*=\s*"?(\d+)"?/.exec(offer)
+    return !(m && Number(m[1]) < WS_DEFLATE_OPTIONS.serverMaxWindowBits)
+  })
+  if (offers.length === 0) delete req.headers['sec-websocket-extensions']
+  else req.headers['sec-websocket-extensions'] = offers.join(',')
+}
 
 // Between replay batches, a slow/paused reader must not let the server
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
@@ -361,19 +378,25 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
-  perMessageDeflate = false,
   journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db),
+  perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
   // since wake-before-spawn, the wake wait that may precede it.
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
+  // ws rejects the whole handshake (400) when a deflate offer asks for a
+  // server window smaller than ours. Drop such an offer so that client
+  // connects uncompressed instead. Registered before ws's own listener.
+  if (perMessageDeflate) server.on('upgrade', dropUnsatisfiableDeflateOffer)
   const wss = new WebSocketServer({
     server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES,
     perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
   })
   const statusCache = makeStatusCache()
   const vitalsCache = makeVitalsCache()
+  // Last non-idle activity per convo, replayed on `viewing` (see that case).
+  const activityCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
@@ -943,7 +966,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, activityCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -979,6 +1002,12 @@ export function attachWs({
       for (const ev of toolStreams.closeForProducer(conn)) {
         notifyStale(db, hub, ev, 'disconnected')
       }
+      // A producer that vanished mid-turn never sends its idle: forget the
+      // activity it left (unless a newer connection has since replaced it),
+      // so a later `viewing` catch-up does not replay a stale indicator.
+      for (const [convoId, entry] of conn._activityConvos ?? []) {
+        if (activityCache.get(conn.userId, convoId) === entry) activityCache.delete(conn.userId, convoId)
+      }
     })
   })
   return wss
@@ -999,7 +1028,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), activityCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1132,6 +1161,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const hit = linkOfRoom(db, roomId)
     return !!hit && LIVE_ROOM_STATES.includes(hit.link.state)
   }
+  // The detail to refuse an agent's file/image frame into `convoId` with, or
+  // null when the frame may go on. Shared by publish and finalize.
+  const roomFileRefusal = (type, convoId) => {
+    if (!ROOM_FILE_TYPES.has(type)) return null
+    if (personLinked(convoId)) return PERSON_FILE_REFUSAL
+    return hasParticipants(db, convoId) ? ROOM_FILE_REFUSAL : null
+  }
   // After an append into a room joined to another person's: their copy.
   const copyOut = (args, r) => {
     if (!r || r.duplicate) return
@@ -1205,7 +1241,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
           prev = new Set()
         }
+        const wasViewing = conn.viewingConvoIds
         conn.viewingConvoIds = next
+        // A coalesced activity frame still pending for a convo no longer on
+        // screen would flush after the client cleared its live state, and
+        // nothing would end it. Drop it; the catch-up below covers re-views.
+        for (const convoId of wasViewing) if (!next.has(convoId)) hub.discardPendingActivity(conn, convoId)
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -1235,6 +1276,18 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
             }))
           }
+          // Activity catch-up: activity is latest-wins, so a client that was
+          // not viewing (tracker open, tab hidden) missed the frame that
+          // would have ended or changed its indicator. Send the current
+          // state, or `idle` (the frame clients already treat as "clear the
+          // indicator") when none is cached. Sent directly, after any
+          // still-pending older frame for this convo is dropped, so the
+          // replay is the last word on this socket.
+          hub.discardPendingActivity(conn, convoId)
+          conn.ws.send(JSON.stringify({
+            kind: 'ephemeral', convo_id: convoId,
+            activity: activityCache.get(conn.userId, convoId) ?? { state: 'idle' },
+          }))
         }
         break
       }
@@ -2581,9 +2634,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
-        if (msg.type !== 'text' && ROOM_WAKE_PUBLISH_TYPES.has(msg.type) && personLinked(msg.convo_id)) {
-          return fail('bad_request', 'files and images do not cross to another person')
-        }
+        const publishRefusal = roomFileRefusal(msg.type, msg.convo_id)
+        if (publishRefusal) return fail('bad_request', publishRefusal)
         const publishArgs = {
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -2683,6 +2735,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
+        // Cached for the catch-up on `viewing`; idle is the absence of an
+        // entry. Remembered per agent connection so its close can clear it.
+        if (msg.state === 'idle') {
+          activityCache.delete(conn.userId, msg.convo_id)
+          conn._activityConvos?.delete(msg.convo_id)
+        }
+        else {
+          const entry = { state: msg.state, detail }
+          activityCache.set(conn.userId, msg.convo_id, entry)
+          ;(conn._activityConvos ??= new Map()).set(msg.convo_id, entry)
+        }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
@@ -2887,6 +2950,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
+        const finalizeRefusal = roomFileRefusal(type, msg.convo_id)
+        if (finalizeRefusal) return fail('bad_request', finalizeRefusal)
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,

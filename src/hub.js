@@ -133,6 +133,16 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       for (const set of byUser.values()) for (const c of set) out.push(c)
       return out
     },
+    // Drop a pending (not yet flushed) activity frame for one convo on one
+    // connection. Used on `viewing`: a frame queued before the client left a
+    // convo must not land after the client cleared its state, or after the
+    // catch-up that replaced it.
+    discardPendingActivity(conn, convoId) {
+      if (!conn._pending) return
+      for (const [key, f] of conn._pending) {
+        if (f.activity && f.convo_id === convoId) conn._pending.delete(key)
+      }
+    },
     // Per-device "is this device connected AND looking at this convo right
     // now" — the push pipeline's suppression rule. A connection views a SET
     // of convos (conn.viewingConvoIds, set by the `viewing` op). conn.deviceId

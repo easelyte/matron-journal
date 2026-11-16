@@ -80,11 +80,23 @@ test('create: 201 with chunk_bytes and chunks = ceil(size / chunk_bytes); row st
   assert.equal(r.json.chunk_bytes, CHUNK)
   assert.equal(r.json.chunks, 3)
   const row = getTransfer(s.db, r.json.transfer_id)
+  // The approval item's id: the card exists once the create has answered.
+  assert.match(r.json.item_id, /^it_/)
+  assert.equal(r.json.item_id, row.item_id)
   assert.equal(row.phase, 'open')
   assert.equal(row.consent, 'awaiting_user')
   assert.equal(row.upload, 'uploading')
   assert.equal(row.scan_verdict, 'clean')
   assert.deepEqual(JSON.parse(row.scan_findings), [])
+})
+
+test('create: item_id is null when the approval card could not be filed, and the transfer stands', async (t) => {
+  const { s, a } = await fleet(t)
+  s.db.exec("CREATE TRIGGER no_items BEFORE INSERT ON items BEGIN SELECT RAISE(ABORT, 'no items'); END")
+  const r = await create(s, a.token)
+  assert.equal(r.status, 201)
+  assert.equal(r.json.item_id, null)
+  assert.equal(getTransfer(s.db, r.json.transfer_id).phase, 'open')
 })
 
 test('create: a client device is refused 403', async (t) => {

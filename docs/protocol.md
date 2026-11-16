@@ -1072,6 +1072,18 @@ Rows from before the stamp carry neither, and don't count.
     It still sends the catch-up on every `viewing`, even for the
     conversation already viewed: clients re-send it to force a resync.
   When both keys are present, `convo_ids` defines the set.
+  - The catch-up also carries the conversation's current `activity`: the
+    last non-idle `{kind:'ephemeral', convo_id, activity:{state, detail}}`
+    the agent sent (held in memory in the same bounded cache as `status`,
+    dropped when that agent's connection closes; best effort, so an entry
+    evicted by the bound replays as idle), or `activity:{state:'idle'}` when there is none. Activity is
+    latest-wins and never journaled, so a client that was not viewing (a
+    tracker open over the chat, a hidden tab) would otherwise never learn
+    that its "thinking" indicator ended. The frame is sent directly, after
+    the `status` frame, and after any activity frame still queued for that
+    conversation on the connection is dropped, so it is the last word on
+    the socket. Likewise, an activity frame queued for a conversation when
+    the client stops viewing it is dropped rather than flushed afterwards.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test
@@ -1176,6 +1188,9 @@ Rows from before the stamp carry neither, and don't count.
   ephemeral frame `{kind: 'summary', convo_id, summary, summary_updated_at}`:
   not journaled, not replayed, no `seq`, no `last_seq` movement. `/snapshot`
   conversation rows carry `summary` and `summary_updated_at` for catch-up.
+  Because summary frames are never replayed, a client that missed any (it
+  was disconnected or backgrounded) should re-read `/snapshot` after each
+  reconnect to pick up the current summaries.
   `summary_updated_at` is Unix milliseconds when the server first observed
   the changed text, including a clear; it is not the producer's generation
   time. It stays unchanged on identical resends or omitted/null summaries.
@@ -1327,7 +1342,14 @@ Rows from before the stamp carry neither, and don't count.
   `text` event, so a client can tell which reply the lines belong to). The
   caps are the bridge's. The journal stores and replays the payload as it
   arrived, and a client that predates the keys ignores them.
-- Agent `publish` of a `text`, `file` or `image` into a room may name the
+- An agent's `publish` or `finalize` of a `file` or `image` into a room (a
+  conversation with agent participants) is `bad_request`, with a `detail`
+  naming the transfer path: a file reaches a room only through
+  `POST /transfers`, the user's approval and the journal's own release
+  (*File transfers*). A room with another person answers `files and images
+  do not cross to another person`. `text`, and `file`/`image` into a
+  conversation that is not a room, are unchanged.
+- Agent `publish` of a `text` into a room may name the
   session that wrote it and that session's turn causes:
   `from_convo_id` (a conversation the publishing device owns, not the room
   itself) and `causes` (the `[{kind, ref?, at?}]` list of a `spawn_request`).
@@ -2224,6 +2246,8 @@ refuses `POST /transfers` with `403 person_room` before anything is
 reserved or written.
 
 **`POST /transfers`** `{room_id, from_convo_id, name, size, sha256, content_type?, reason?, scan?, causes?}` — `room_id` must be a room the caller's device owns or has joined; `from_convo_id` must be a conversation the caller's device owns (the session the file is "from", shown on the card). `name` is a bare file name (no `/`, `\`, `.` or `..` — it is written into a recipient's inbox verbatim) capped at 255 characters; `size` is the file's declared length in bytes, checked against the uploaded chunks and the final sha256 at `/complete` but never trusted before that. A declared size over the per-file cap (`MATRON_TRANSFER_MAX_BYTES`, default 10 GiB) is `413 too_large`; one that would push the sender's **user**, not the room's, outstanding declared bytes — summed over every transfer still `open` or `released`, plus every `delivered` one whose bytes the journal has not deleted yet, regardless of room — over the per-user quota (`MATRON_TRANSFER_USER_QUOTA_BYTES`, default 20 GiB, separate from the media/attachment quota) is `413 quota_exceeded`. The reservation is released when the journal's copy goes: at once for an expired, cancelled, declined or failed transfer, and for a delivered one when its copy is deleted an hour after the receipt (see Retention).
+
+A successful create answers `201 {transfer_id, chunk_bytes, chunks, item_id}`. `item_id` is the id of the approval item filed on the sender's conversation, or `null` when the item could not be filed (the transfer stands; it can still be answered through the Coordinator). A client that wants to tell its agent "an approval card exists" should check `item_id`; journals from before the field answer without it.
 
 **One recipient per transfer.** A transfer goes to exactly one agent device, fixed when it is created: the room's agent devices (its recorded owner and joined participants, agent devices of the room's user only) other than the sender's. When that leaves none and the sender's device is both the room's owner and a joined participant — a same-device room, two sessions of one bridge — the sender's own device is the recipient. Delivery is tracked per transfer, not per device, so a room with nobody to receive the file is `409 {error:'conflict', detail:'no_recipients'}` and a room with more than one possible recipient device is `409 {error:'conflict', detail:'multiple_recipients', message}`, both before any quota is reserved; send from a room with only the receiving box in it. A device that joins the room later is not a recipient: only the device stored at create may fetch, confirm or fail the transfer, receives its `ready` frame, finds it in `GET /transfers?for=me`, and is named on the card. A sending box may have at most `MATRON_TRANSFER_MAX_AWAITING_PER_SENDER` (default 50) transfers waiting for the user's approval at once (consent `awaiting_user`, phase `open`); the next create is `409 {error:'conflict', detail:'too_many_awaiting', message}`, until one of them is answered, cancelled or expires.
 
@@ -7244,7 +7268,7 @@ journal **copies** every `text` message appended to one room (agent
 wrote this" and restrict the turn it starts. A copy is never copied back.
 The copy wakes the receiving agent's box and pushes like any append.
 Bodies over 16,000 characters are cut, with a note. Files and images do
-not cross: a `publish` or `send` of `file`/`image` into a linked room is
+not cross: a `publish`, `finalize` or `send` of `file`/`image` into a linked room is
 `bad_request` ("files and images do not cross to another person").
 
 ### Asking, and the two consents

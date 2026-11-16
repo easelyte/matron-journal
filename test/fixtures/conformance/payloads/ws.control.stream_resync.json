@@ -4,7 +4,7 @@
   "protocol": 1,
   "samples": [
     {
-      "source": "13_tool_stream.json#step[20]",
+      "source": "13_tool_stream.json#step[22]",
       "frame": {
         "kind": "control",
         "op": "stream_resync",

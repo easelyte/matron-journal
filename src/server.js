@@ -547,7 +547,9 @@ export function resolveWebPushClient(injected) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts, wsDeflate,
+  retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  // Negotiate compression only with peers offering it; set MATRON_WS_DEFLATE=0 to disable.
+  wsDeflate = process.env.MATRON_WS_DEFLATE !== '0',
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold box boot:
@@ -883,13 +885,11 @@ export function startServer({
   server.keepAliveTimeout = resolveNumericEnv('MATRON_KEEPALIVE_TIMEOUT_MS', process.env.MATRON_KEEPALIVE_TIMEOUT_MS, 120000)
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    perMessageDeflate: wsDeflate,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
     // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
     pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
-    // permessage-deflate for clients that offer it (see WS_DEFLATE_OPTIONS);
-    // MATRON_WS_DEFLATE=0 turns it off without a code change.
-    perMessageDeflate: wsDeflate ?? resolveBooleanEnv('MATRON_WS_DEFLATE', process.env.MATRON_WS_DEFLATE, true),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never

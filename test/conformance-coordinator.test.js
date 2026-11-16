@@ -65,7 +65,7 @@ test('a runner that reports a wrong frame fails that step, not a later one', asy
     fixture, base: booted.base, bindings: booted.bindings, control: booted.control,
     runner, play: ['client'], collect,
   })
-  const firstEphemeral = fixture.steps.findIndex((s) => s.kind === 'ws_expect' && s.frame.kind === 'ephemeral')
+  const firstEphemeral = fixture.steps.findIndex((s) => s.kind === 'ws_expect' && s.frame.kind === 'ephemeral' && s.frame.tool_stream)
   assert.equal(result.status, 'fail')
   assert.equal(result.failedStep, firstEphemeral)
   assert.match(result.error, new RegExp(`^step\\[${firstEphemeral}\\]`))

@@ -169,9 +169,11 @@ async function create(ctx, req, res, who) {
   console.log(`journal: transfer created id=${row.id} room=${row.room_id} device=${who.deviceId} size=${row.size} scan=${row.scan_verdict}`)
   // The user's card, then a nudge to the Coordinator (skipped when it is
   // the sender). Both best-effort: the transfer stands without them.
-  fileTransferConsentItem(ctx, row)
+  const item = fileTransferConsentItem(ctx, row)
   nudgeCoordinator(ctx, who.userId, { kind: 'transfer', id: row.id }, { askerConvoId: row.from_convo_id })
-  json(res, 201, { transfer_id: row.id, chunk_bytes: chunkBytes, chunks: chunkCount(row.size, chunkBytes) })
+  // item_id: the approval item, null when it could not be filed (the
+  // transfer stands; the user can still answer through the Coordinator).
+  json(res, 201, { transfer_id: row.id, chunk_bytes: chunkBytes, chunks: chunkCount(row.size, chunkBytes), item_id: item?.id ?? null })
   return true
 }
 

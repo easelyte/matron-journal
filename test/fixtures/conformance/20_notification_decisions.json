@@ -345,6 +345,18 @@
       }
     },
     {
+      "role": "client",
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "ephemeral",
+        "convo_id": "c1",
+        "activity": {
+          "state": "idle"
+        }
+      }
+    },
+    {
       "role": "agent",
       "kind": "ws_send",
       "conn": "agent",
