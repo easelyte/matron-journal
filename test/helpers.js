@@ -9,7 +9,7 @@ export async function startTestServer(opts = {}) {
   // it don't sit out the production startup delay.
   // Security events (src/security-log.js): no line on stdout and none in a
   // real MATRON_SECURITY_LOG; a test that reads them passes its own sinks.
-  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, retentionInitialDelayMs: 0, backgroundPace: 0, securityLog: { out: () => {}, file: null }, ...opts })
+  const s = await startServer({ dbPath: ':memory:', port: 0, fileOwnerUserId: 1, embedder: null, backgroundDelayMs: 0, retentionInitialDelayMs: 0, backgroundPace: 0, pushHoldMs: 0, securityLog: { out: () => {}, file: null }, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,

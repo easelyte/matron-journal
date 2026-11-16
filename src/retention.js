@@ -55,8 +55,13 @@ export async function drainAsync(gen, { shouldStop = () => false, yieldFn = yiel
 // passes (each row is a file write or unlink plus a transaction), and
 // events rows read per stretch by the orphan-blob reference scan.
 export const RETENTION_ROW_BATCH = 50
+// Events rows read per stretch by the orphan-blob reference scan.
 // 500, not more: on a cold page cache a 2000-row range took ~1 s.
 export const ORPHAN_SCAN_BATCH_ROWS = 500
+// Orphan blobs deleted per pass. The delete loop cannot yield (see
+// reapOrphanBlobsPass), so a large first-run backlog is worked off over
+// several passes, oldest first, instead of in one long stretch.
+export const ORPHAN_MAX_DELETES_PER_PASS = 500
 
 // Returns true for a payload that already has the offloaded shape
 // ({type, snippet, blob_ref}) even though its row's `blob_ref` column is
@@ -680,9 +685,12 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   return { reaped, bytesFreed }
 }
 
-// Orphan-blob reaper (fourth retention pass). runReapMedia joins
-// through events, so a blob NOTHING references was never a candidate for any
-// pass and lived forever: an upload whose ws send never happened, an item
+// Orphan-blob reaper, a scheduled companion to runReapMedia. runReapMedia
+// only removes orphans (past ORPHAN_GRACE_MS) for a user who is over the
+// quota high-water mark, and only checks the events.blob_ref column and item
+// comments. This pass runs every tick regardless of quota, with a longer
+// grace and a broader reference check, so a blob NOTHING references does not
+// live forever for a user who stays under quota: an upload whose ws send never happened, an item
 // attachment abandoned mid-compose, the blob half of a crashed offload. Blob
 // ids are random (media.js), not content-addressed, so an unreferenced blob
 // can never be re-attached by content — only by an id a client or agent
@@ -694,7 +702,7 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
 //   - events.blob_ref (attachments, offloaded / live-log tool_output);
 //   - any `blob_ref` string anywhere inside an event payload, even with the
 //     column NULL: agent publishes that carry blob_ref only in the payload
-//     land that way (the live DB holds such file/image rows), and item
+//     land that way (file and image rows without the column exist), and item
 //     markers mirror comment attachments under payload.comment.attachments;
 //   - item_comments.attachments (item bodies ride on a synthetic body
 //     comment, so this covers both).
@@ -706,8 +714,8 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
 // unlink the staged file, and log one evidence line. A disk_path outside
 // `mediaDir` is never unlinked and its row is left alone.
 //
-// The payload scan reads every event that mentions a blob_ref (on the live
-// DB, most of ~900 MB), so it runs in rowid ranges of `scanBatchRows` with
+// The payload scan reads every event that mentions a blob_ref (on a large
+// journal, most of the events table), so it runs in rowid ranges of `scanBatchRows` with
 // a yield after each. A row written while the scan is paused is not lost:
 // a new event gets a rowid above the table's max at insert time, and the
 // scan tracks the lowest max it has seen (`floor`). Once the ranges are
@@ -718,15 +726,15 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
 // passes that rewrite payloads tombstone them), which keeps a blob, never
 // deletes one: offload's new blobs are fresh, far inside the grace window.
 //
-// Grace default is 7 days (MATRON_ORPHAN_BLOB_GRACE_HOURS, server.js), not
-// 24h: the web client's outbox keeps a pending attachment's blob_ref in
+// The pass is off unless MATRON_ORPHAN_BLOB_GRACE_HOURS is set (server.js); a
+// grace of a week or more is sensible, not 24h: the web client's outbox keeps a pending attachment's blob_ref in
 // IndexedDB and resends it on reconnect, so an upload whose send failed can
 // legitimately be attached days later (a tab closed over a weekend).
 export function runReapOrphanBlobs(db, opts) {
   return drainSync(reapOrphanBlobsPass(db, opts))
 }
 
-export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), scanBatchRows = ORPHAN_SCAN_BATCH_ROWS } = {}) {
+export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), scanBatchRows = ORPHAN_SCAN_BATCH_ROWS, maxDeletes = ORPHAN_MAX_DELETES_PER_PASS } = {}) {
   if (!Number.isFinite(graceMs) || graceMs <= 0) {
     console.warn(`retention: orphan-blob graceMs=${JSON.stringify(graceMs)} is invalid — orphan-blob reap skipped`)
     return { reaped: 0, bytesFreed: 0 }
@@ -738,7 +746,8 @@ export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), 
   recoverStagedOrphans(db, mediaDir)
   const candidates = db.prepare(
     `SELECT b.id, b.size, b.disk_path, b.content_type, b.created_at FROM blobs b
-     WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)`
+     WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+     ORDER BY b.created_at ASC`
   ).all(now - graceMs)
   if (candidates.length === 0) return { reaped: 0, bytesFreed: 0 }
 
@@ -776,6 +785,8 @@ export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), 
   let reaped = 0
   let bytesFreed = 0
   for (const cand of candidates) {
+    // The rest waits for the next pass (oldest first, see the candidate query).
+    if (reaped >= maxDeletes) break
     if (referenced.has(cand.id)) continue
     if (!path.resolve(cand.disk_path).startsWith(root)) {
       console.warn(`retention: orphan blob ${cand.id} lives outside the media dir (${cand.disk_path}) — left alone`)
@@ -809,7 +820,7 @@ export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), 
           console.error(`retention: orphan blob ${cand.id} row delete failed AND restoring ${staged} failed`, e)
         }
       }
-      console.error(`retention: failed to delete orphan blob row ${cand.id} — file restored, kept for retry`, err)
+      console.error(`retention: failed to delete orphan blob row ${cand.id} — ${hasStaged ? 'file restored, ' : ''}kept for retry`, err)
       continue
     }
     if (hasStaged) {
@@ -842,6 +853,7 @@ function recoverStagedOrphans(db, mediaDir) {
     return
   }
   const rowOf = db.prepare('SELECT disk_path FROM blobs WHERE id=?')
+  const root = path.resolve(mediaDir) + path.sep
   for (const shard of shards) {
     if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
     const dir = path.join(mediaDir, shard.name)
@@ -851,6 +863,13 @@ function recoverStagedOrphans(db, mediaDir) {
       if (!name.endsWith('.reaping')) continue
       const staged = path.join(dir, name)
       const row = rowOf.get(name.slice(0, -'.reaping'.length))
+      // Same containment rule as the sweep: a stored path outside the media
+      // dir (moved root, edited row) must not be written to. Leave the staged
+      // file where it is.
+      if (row && !path.resolve(row.disk_path).startsWith(root)) {
+        console.warn(`retention: staged orphan ${staged} has a stored path outside the media dir (${row.disk_path}) — left in place`)
+        continue
+      }
       try {
         if (row) fs.renameSync(staged, row.disk_path)
         else fs.unlinkSync(staged)

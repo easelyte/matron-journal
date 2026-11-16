@@ -423,12 +423,12 @@ the machine-checkable version of this page.
   `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
   render an "expired" attachment; clients that already hold the event learn
   from the 404 on `GET /media/:id`.
-  Separately from quota pressure, a scheduled orphan-blob reaper deletes any
-  blob that nothing references (no `events.blob_ref`, no `blob_ref` anywhere
-  inside an event payload, no item or item-comment attachment) once it is older
-  than `MATRON_ORPHAN_BLOB_GRACE_HOURS` (default 168 = 7 days, long enough for a
-  client outbox to resend a pending attachment after a long offline spell;
-  `0`/invalid disables).
+  Separately from quota pressure, an optional scheduled orphan-blob reaper
+  deletes any blob that nothing references (no `events.blob_ref`, no `blob_ref`
+  anywhere inside an event payload, no item or item-comment attachment) once it
+  is older than `MATRON_ORPHAN_BLOB_GRACE_HOURS`. It is off unless that is set
+  to a positive integer; use a week (168) or more, since a client outbox can
+  resend a pending attachment after a long offline spell.
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
   hand-maintained digest of this API surface (`src/help.js`), aimed at agent
   callers that arrive with a token and no repo checkout — it names the
@@ -8846,6 +8846,26 @@ report that one message as seen (read state, op `seen`). The push relay
 (`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and a sealed
 `box` (below), and omits `seq`; a device that opens the box finds the `seq`
 inside it. A client must treat a missing `seq` as "no tap receipt".
+
+### Held pushes
+
+Some alerts wait before they go out, so that an ask settled within seconds
+never buzzes a phone:
+
+- **Items that need the user.** An agent's `created`, `commented` or
+  `reopened` marker that leaves an item awaiting the user is held for
+  `MATRON_PUSH_HOLD_MS` (default 60000; `0` sends at once). When the hold
+  ends, the push goes out only if the item is still `open` and still
+  awaiting the user, and the whole decision is made again then: the
+  notification settings, the devices, and what each device has already
+  received. A phone whose app caught up during the hold gets nothing.
+- **Consent cards.** In Coordinator mode, a spawn or chat card the
+  Coordinator may decide is held for the same time, but never less than
+  30 s, and goes out only if the ask is still waiting.
+
+Silent background wakes are never held. A hold lives in memory; at startup
+the journal re-arms the holds a restart cut short (asks and item markers
+young enough to have been mid-hold), for whatever time each has left.
 
 ### Sealed notification content
 

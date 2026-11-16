@@ -1203,40 +1203,49 @@ export function openDb(path) {
   // MATRON_SQLITE_CACHE_MB.
   const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? defaultCacheMb())
   if (Number.isFinite(cacheMb) && cacheMb > 0) db.pragma(`cache_size = -${Math.floor(cacheMb * 1024)}`)
-  // Table rebuild needs foreign_keys OFF, which is a no-op inside a transaction,
-  // so it runs before the schema transaction below.
+  // Table rebuild needs foreign_keys OFF, which is a no-op inside a
+  // transaction, so it runs before the schema transaction below.
   migrateDeviceIds(db)
+  // Schema creation and the search-index bootstrap run in one immediate
+  // transaction. db.exec(SCHEMA) is a run of statements, so on its own it is
+  // not atomic: if a later statement threw after search_fts_plain had been
+  // created but before its 'rebuild', the next open would find the table,
+  // skip the rebuild, and the existing rows would never be indexed. Inside
+  // the transaction the probes, the CREATE / rebuild / seed steps and the
+  // failure rollback go together. A second process opening the same file
+  // waits for the write lock (bounded by the busy timeout) instead of
+  // interleaving with the probes.
   db.transaction(() => {
-  // The unstemmed search mirror is populated by trigger from here on; a
-  // database that predates it has rows to index. 'rebuild' reads the
-  // content table (seconds for a few hundred thousand prose rows).
-  const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
-  // Same "was this table already here" probe, for the is_diff migration
-  // below — taken before SCHEMA runs, since CREATE TABLE IF NOT EXISTS
-  // makes that the only moment a pre-existing search_messages can still be
-  // told apart from a table this call is creating for the first time.
-  const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
-  db.exec(SCHEMA)
-  if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
-  // search_messages.is_diff (spec 2026-10-12 unified search): a
-  // pre-existing table predates the column and needs the ALTER; SCHEMA's
-  // CREATE TABLE IF NOT EXISTS already includes it for a brand new one.
-  // Seed search_isdiff_state's cursor the first time either way (see the
-  // table's own comment above for the fresh-vs-migrated rule): 0 for an
-  // old table whose rows may be wrongly defaulted, or the current max
-  // events rowid for a table just created now — every row it will ever
-  // hold gets is_diff set correctly at insert time, live or via
-  // backfillSearchIndex's own INSERT, so there is nothing to fix.
-  const searchMessageCols = db.prepare('PRAGMA table_info(search_messages)').all()
-  if (!searchMessageCols.some((c) => c.name === 'is_diff')) {
-    db.exec('ALTER TABLE search_messages ADD COLUMN is_diff INTEGER NOT NULL DEFAULT 0')
-  }
-  if (!db.prepare('SELECT 1 FROM search_isdiff_state WHERE id=1').get()) {
-    const seedCursor = hadSearchMessages
-      ? 0
-      : db.prepare('SELECT COALESCE(MAX(rowid),0) AS r FROM events').get().r
-    db.prepare('INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?)').run(seedCursor)
-  }
+    // The unstemmed search mirror is populated by trigger from here on; a
+    // database that predates it has rows to index. 'rebuild' reads the
+    // content table (seconds for a few hundred thousand prose rows).
+    const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
+    // Same "was this table already here" probe, for the is_diff migration
+    // below — taken before SCHEMA runs, since CREATE TABLE IF NOT EXISTS
+    // makes that the only moment a pre-existing search_messages can still be
+    // told apart from a table this call is creating for the first time.
+    const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
+    db.exec(SCHEMA)
+    if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
+    // search_messages.is_diff (spec 2026-10-12 unified search): a
+    // pre-existing table predates the column and needs the ALTER; SCHEMA's
+    // CREATE TABLE IF NOT EXISTS already includes it for a brand new one.
+    // Seed search_isdiff_state's cursor the first time either way (see the
+    // table's own comment above for the fresh-vs-migrated rule): 0 for an
+    // old table whose rows may be wrongly defaulted, or the current max
+    // events rowid for a table just created now — every row it will ever
+    // hold gets is_diff set correctly at insert time, live or via
+    // backfillSearchIndex's own INSERT, so there is nothing to fix.
+    const searchMessageCols = db.prepare('PRAGMA table_info(search_messages)').all()
+    if (!searchMessageCols.some((c) => c.name === 'is_diff')) {
+      db.exec('ALTER TABLE search_messages ADD COLUMN is_diff INTEGER NOT NULL DEFAULT 0')
+    }
+    if (!db.prepare('SELECT 1 FROM search_isdiff_state WHERE id=1').get()) {
+      const seedCursor = hadSearchMessages
+        ? 0
+        : db.prepare('SELECT COALESCE(MAX(rowid),0) AS r FROM events').get().r
+      db.prepare('INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?)').run(seedCursor)
+    }
   }).immediate()
   // Older live DBs predate apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
@@ -2123,6 +2132,8 @@ export function openDb(path) {
   // reads recent permission_request cards; partial, so ordinary appends
   // never touch it.
   db.exec("CREATE INDEX IF NOT EXISTS idx_events_permission_request ON events(ts) WHERE type='permission_request'")
+  // The same for held item pushes (push.js resumeHeldItems).
+  db.exec("CREATE INDEX IF NOT EXISTS idx_events_item ON events(ts) WHERE type='item'")
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)

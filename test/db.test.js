@@ -945,3 +945,24 @@ test('device id migration rolls back its schema changes if the rebuild fails', (
   assert.equal(raw.prepare('SELECT COUNT(*) n FROM private_devices').get().n, 0)
   raw.close()
 })
+
+test('openDb: a failure during search-index bootstrap rolls back the whole schema step', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-db-schema-txn-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'journal.db')
+  const db = openDb(dbPath)
+  // Predate the unstemmed search mirror, and make the cursor-seed insert
+  // fail (an extra NOT NULL column the insert does not fill).
+  db.exec('DROP TABLE search_fts_plain')
+  db.exec('DROP TABLE search_isdiff_state')
+  db.exec('CREATE TABLE search_isdiff_state(id INTEGER PRIMARY KEY, last_rowid INTEGER NOT NULL, extra TEXT NOT NULL)')
+  const objects = db.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all()
+  db.close()
+  assert.throws(() => openDb(dbPath), /NOT NULL/)
+  const raw = new Database(dbPath)
+  // db.exec(SCHEMA) is not atomic. Without a transaction around the init, SCHEMA has
+  // already created search_fts_plain by the time the seed insert throws, and the next
+  // open would find that table, skip the rebuild, and never index the existing rows.
+  assert.deepEqual(raw.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all(), objects)
+  raw.close()
+})

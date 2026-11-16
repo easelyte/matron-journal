@@ -182,6 +182,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_WEBPUSH_SUBJECT` | unset | Web Push contact URL (`mailto:` or `https:`); set together with the key file |
 | `MATRON_WEBPUSH_DISABLED` | unset | `1` or `true` switches Web Push off |
 | `MATRON_WEBPUSH_EXTRA_HOSTS` | unset | Comma-separated extra push-service hosts beyond `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.push.apple.com`, and `*.notify.windows.com`; exact hosts or `*.suffix` |
+| `MATRON_PUSH_HOLD_MS` | `60000` | How long a push about an item that needs the user waits; it goes out only if the item still needs them then. `0` sends at once. Consent cards in Coordinator mode wait as long, but at least 30 s |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
 | `MATRON_FILE_READ_ROOTS` | unset (off) | Colon-separated absolute roots for file viewer reads. Owner client devices only; secret paths and journal state are refused. A root of `/` is refused; Linux `/proc/self/fd` is required |
