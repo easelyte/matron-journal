@@ -14,9 +14,6 @@ import { itemMarkerPayload } from '../src/items-marker.js'
 import { openBox } from '../src/push-box.js'
 import { RECIPIENT, keyPairFrom } from './push-box-fixture.js'
 
-// Peer_message is a routine coalesced activity push (priority 5), not an
-// attention alert and never silent — asserted explicitly, not via fallthrough.
-
 // A stub apnsClient recording every send() call. `respond` maps a call to a
 // {status, reason} result (default: 200 success); tests override it to
 // simulate 410/400/etc. Never throws, matching the real client's contract.
