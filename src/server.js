@@ -280,10 +280,8 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // expiry runs FIRST: what it tombstones the later passes skip, so an old
 // tool log of such a device is never offloaded to a blob only to be
 // deleted, and the reaper sees the bytes it freed. Its rules are logged
-// once, here, at boot. The orphan-blob reaper (runReapOrphanBlobs) runs
-// after the media reaper, on its own knob (MATRON_ORPHAN_BLOB_GRACE_HOURS).
-// The transfer-expiry pass (runExpireTransfers) runs LAST and
-// unconditionally — see the comment at its call site below.
+// once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
+// LAST and unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
 function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)

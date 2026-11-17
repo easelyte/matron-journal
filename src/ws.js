@@ -125,19 +125,6 @@ const STATUS_MAX_BYTES = 4096
 const SESSION_CONTROL_MAX_INFLIGHT = 8
 const STATUS_CACHE_MAX = 2048
 
-// host_vitals op (host-global machine sample — cpu/ram/sampled_at_ms): a
-// pure ephemeral like status, but NOT convo-scoped. The bridge emits it
-// without a convo_id at a slow cadence (~5s); the server relays it to every
-// one of the user's clients and caches the LAST sample per user so a fresh
-// client paints immediately on connect. Size-capped (same ceiling as status)
-// because it's held in server memory. Never journaled.
-const VITALS_CACHE_MAX = 2048
-// Server-side floor between accepted host_vitals frames from one agent
-// connection. Our bridge samples at ~5s so this never trips in normal
-// operation — it's a defense against a runaway/buggy agent flooding the op;
-// excess frames are dropped silently (telemetry, not a protocol error).
-const VITALS_MIN_INTERVAL_MS = 1000
-
 // Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
 // request/response relay, never journaled. Whole-frame byte cap — larger
 // payloads belong in POST /media with a blob_ref inside params.
@@ -274,32 +261,6 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
   }
 }
 
-// Last host_vitals per user. In-memory only and bounded (oldest-written
-// evicted first): host-global, so a single value per user, not per convo. A
-// lost entry just means a reconnecting client waits up to one sample interval
-// for the next tick. Exported for direct unit testing.
-//
-// KNOWN LIMITATION (single-host): keyed by userId alone, so if one user ran
-// TWO bridges on different machines their samples would collapse onto one
-// cache slot (last writer wins) and clients could not tell them apart. Our
-// deployment is single-VPS / single-bridge per user, so this does not bite.
-// True multi-bridge / multi-VPS per-host telemetry (device-keyed cache +
-// client host-selection UX) is deferred (the
-// multi-account / multi-VPS dashboard). Do NOT add device-keying here now.
-export function makeVitalsCache(max = VITALS_CACHE_MAX) {
-  const map = new Map()
-  return {
-    set(userId, vitals) {
-      if (map.has(userId)) map.delete(userId)
-      map.set(userId, vitals)
-      if (map.size > max) map.delete(map.keys().next().value)
-    },
-    get(userId) {
-      return map.get(userId)
-    },
-  }
-}
-
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
 // Compress larger messages only for peers offering permessage-deflate. Avoid
@@ -394,7 +355,6 @@ export function attachWs({
     perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
   })
   const statusCache = makeStatusCache()
-  const vitalsCache = makeVitalsCache()
   // Last non-idle activity per convo, replayed on `viewing` (see that case).
   const activityCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -913,13 +873,6 @@ export function attachWs({
               return
             }
           }
-          // Host-vitals paint-on-connect: a fresh client gets the last host
-          // sample immediately. host_vitals is host-global and never
-          // journaled, so it is not part of the cursor replay above.
-          if (conn.kind === 'client') {
-            const cachedVitals = vitalsCache.get(conn.userId)
-            if (cachedVitals) ws.send(JSON.stringify({ kind: 'ephemeral', host_vitals: cachedVitals }))
-          }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
           if (yielded && conn.archiveAt != null) {
             const missed = archiveChanges(db, who.userId, conn.archiveAt)
@@ -966,7 +919,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, vitalsCache, activityCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, activityCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -1028,7 +981,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), vitalsCache = makeVitalsCache(), activityCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), activityCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1715,10 +1668,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // AND the card is answered. Omitted (never false) when it was online.
         // mission_num: the mission the child will join, named or inherited
         // (mission_inherited: true for the latter) — omitted when none.
-        // auto_approved: the ask is being answered by the user's standing
-        // opt-in rather than waiting for a tap — omitted otherwise. Sent
-        // BEFORE the approval runs so the requester never sees an outcome
-        // ahead of its acknowledgement.
         conn.ws.send(JSON.stringify({
           kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId,
           ...(targetWaking ? { target_waking: true } : {}),
@@ -2770,13 +2719,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const status = sanitizeBoxStatus(msg)
         if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
-        // box_status is a full replacement, except `restart`: a restart's
-        // state is kept until the next one, so a report that does not
-        // mention it (usage refresh, shutdown flush) must not erase it.
-        if (!status.restart) {
-          const kept = getDeviceStatus(db, conn.userId, conn.deviceId)?.restart
-          if (kept) status.restart = kept
-        }
         const reportedAt = Date.now()
         // A report carrying only `vitals` (the bridge's frequent load sample)
         // refreshes that block and keeps the stored usage, activity and disk
@@ -2914,33 +2856,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         }, () => agentTargetsFor(db, msg.convo_id))
-        break
-      }
-      case 'host_vitals': {
-        // Host-global machine vitals (cpu/ram/sampled_at_ms) sampled by the
-        // bridge and relayed to EVERY one of the user's clients. Same
-        // agent-only stance as status, but deliberately NOT convo-scoped: the
-        // frame carries no convo_id, there is no authorize() ownership check
-        // (host vitals belong to the machine, not a conversation), and the
-        // broadcast bypasses the viewingConvoIds filter that sendEphemeral
-        // applies. Never journaled — pure ephemeral, so no appendAndFan. The
-        // last sample is cached per user and replayed on client connect.
-        // Payload is opaque to the server, validated only as a size-capped
-        // non-null object so the bridge can evolve the shape without a deploy.
-        if (conn.kind !== 'agent') return fail('forbidden')
-        if (typeof msg.vitals !== 'object' || msg.vitals === null) return fail('bad_request')
-        let encoded
-        try { encoded = JSON.stringify(msg.vitals) } catch { return fail('bad_request') }
-        if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'vitals too large')
-        // Min-interval throttle: drop (silently) frames arriving faster than
-        // the floor from this connection. Checked AFTER validation so a
-        // rejected frame never consumes the interval, and BEFORE the cache
-        // write/broadcast so a flood can neither churn the cache nor fan out.
-        const nowMs = Date.now()
-        if (conn._lastVitalsMs != null && nowMs - conn._lastVitalsMs < VITALS_MIN_INTERVAL_MS) break
-        conn._lastVitalsMs = nowMs
-        vitalsCache.set(conn.userId, msg.vitals)
-        hub.broadcastVitals(conn.userId, { kind: 'ephemeral', host_vitals: msg.vitals })
         break
       }
       case 'finalize': {

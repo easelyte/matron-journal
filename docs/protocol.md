@@ -1032,8 +1032,7 @@ Rows from before the stamp carry neither, and don't count.
     captioned frame with no batch keys. The agent gets the typed text, then
     the transcript, then the attachments, as one turn.
   Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
-  finalize, activity (ephemeral), status (ephemeral, cached), host_vitals
-  (ephemeral, cached, host-global — no convo_id). `read_marker`
+  finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
   is available to both kinds:
   an agent (bridge) connection may advance its user's read marker too —
   e.g. after mirroring the user's own message into the journal, so that
@@ -1396,23 +1395,6 @@ Rows from before the stamp carry neither, and don't count.
   row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
   conversation's `status`, so a session's model and context gauge are readable for a sleeping
   box and across a journal restart.
-- Agent `host_vitals {vitals}` publishes a host-global machine sample
-  (`vitals` = `{cpu, ram, sampled_at_ms}`, shape owned opaquely by the
-  bridge). Unlike every other agent op it carries **no `convo_id`** and has
-  **no ownership check** — vitals belong to the machine, not a conversation.
-  Agent connections only (a client gets `forbidden`); `vitals` validated only
-  as a non-null object whose JSON encoding is ≤ 4096 bytes (else
-  `bad_request`). Delivered as `{kind:'ephemeral', host_vitals:{...}}` to
-  **all** of the user's client connections regardless of what (if anything)
-  they are `viewing` — the one ephemeral that bypasses the viewing filter.
-  Never journaled. The server caches the last sample per user (in-memory,
-  bounded) and replays it to a client immediately on connect (after
-  `hello_ok`), so a fresh client paints its vitals gauge without waiting for
-  the next sample. Rate-limited server-side to one accepted frame per second
-  per agent connection (excess dropped silently); a backed-up client is
-  skipped for a sample rather than queued (latest-wins telemetry). Keyed by
-  user, so it assumes one host per user — see `makeVitalsCache` in
-  `src/ws.js` (multi-host is deferred).
 - Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
   live tool output (never journaled). `message_ref` is the tool_use_id;
   `offset` is the UTF-8 byte position of `chunk` in the command's output.
@@ -1997,8 +1979,6 @@ Folder discovery rides the RPC broker: for each *online* box the journal itself 
 `GET /usage/history?weeks=N` (bearer token, either device kind; `weeks` 1–104, default 12, else `400 bad_request`) → `{now, weeks, accounts: [{key, agent: 'claude'|'codex', email?, boxes: [name], meters: [{id, label, primary, current?: {resets_at, percent, unused, as_of}, windows: [{resets_at, percent, unused, peak, first_at, last_at}], average_unused?}]}]}`. `windows` are the finished weeks whose reset falls in the last N weeks, newest first; `unused` is `100 − percent`; `current` is the week in progress; `average_unused` is the mean over `windows` (omitted when there are none). `primary` marks the account's headline meter (`week_all` for Claude). `boxes` are the names of the boxes that reported into the listed windows and are still paired (a removed box's history stays, under no name). `key` is an opaque account id. Times are epoch milliseconds except the ISO `resets_at`. An ordinary (non-private) agent caller is not shown windows that only a private box reported, nor private boxes' names. Model-named weekly ids follow the label the agent CLI prints, so a relabel starts a new meter.
 
 **Defaults block (optional).** `defaults` is what a new session on the box starts with as the bridge resolves it — the journal's box defaults, else its own `MATRON_DEFAULT_*` env — with `source` saying which (e.g. `journal`, `env`). `agent` is required (`claude` | `codex`); `model` is null or a plain token (≤64 chars, `[A-Za-z0-9._[\]-]`); `effort` null or a short lowercase word (≤16; Codex has levels Claude lacks); `source` optional, `[a-z_]`, ≤32. All-or-nothing like the other blocks (`sanitizeBoxDefaults` in `src/spawns.js`); a report carrying only this block is valid. A `recent_folders` reply may carry it too.
-
-**Restart block (optional).** `restart` is the state of a planned restart the bridge has been asked to perform: `{id, state, requests?, pending_since?, waiting_on?, expected_sha?, results?, truncated?}`. `id` is a token of up to 64 chars (`[A-Za-z0-9._:-]`) and `state` is one of `pending`, `restarting`, `cancelling`, `cancelled`, `back` or `abandoned`; a block missing or failing either is dropped (`sanitizeBoxRestart` in `src/spawns.js`). The rest is capped rather than rejected: `requests` at 32 entries (each a short string, or an object of at most 8 scalar fields, text at 200 chars), `pending_since` an integer millisecond timestamp or a string of up to 40 chars, `expected_sha` a hex string of 7 to 64 chars, and `truncated` a map of field name to a non-negative count of entries the sender omitted. `waiting_on` is an object of at most 16 keys whose values are scalars, null, lists or nested objects (for example `quiet: {holders: [{convoId, why}], probe_error}`, `preflight: {error}`, `collect: {remaining_ms}`, `unwarned: [ids]`); nesting is bounded to 4 levels, 64 entries per list or object, 200 nodes per field and 200 chars per string, keys outside `[A-Za-z0-9._:-]` are skipped and anything past a bound is dropped. `results` keeps only `resumed`, `failed`, `possibly_delivered` and `no_note` (lists of up to 64 ids, 128 chars each), `code_mismatch` (boolean) and `verdicts` (a map of session id, up to 64 entries, to `{outcome, at}` where `outcome` is a lowercase token of up to 32 chars such as `resumed`, `failed`, `possibly_delivered` or `stale`, and `at` a non-negative millisecond timestamp; entries of any other shape are dropped); other keys are dropped. A report carrying only this block is valid. Unlike the other blocks it survives a later `box_status` that omits it: the stored `restart` is kept (and relayed with the frame) until a report carries a new one, so a usage refresh sent after the restart ended (`back`, `cancelled` or `abandoned`) does not erase its outcome. A cancelled restart is shown by reporting `cancelling` then `cancelled`, not by omitting the block.
 
 **Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
 

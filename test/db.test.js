@@ -6,9 +6,8 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, upsertDeviceStatus, deviceStatuses } from '../src/db.js'
 import { createUser, createAgent, login, revokeDevice, authorizeAgentWrite } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
-import { makeTmpDir } from './tmp-dir.js'
 import { participantConvoIds } from '../src/participants.js'
+import { upsertConversation } from '../src/journal.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')
@@ -33,7 +32,7 @@ test('events PK is (user_id, seq)', () => {
 })
 
 test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade path)', () => {
-  const dir = makeTmpDir('matron-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-migration-'))
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -69,7 +68,7 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
 })
 
 test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations table in place', () => {
-  const dir = makeTmpDir('matron-parent-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-parent-migration-'))
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -107,7 +106,7 @@ test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations 
 })
 
 test('openDb adds session_outcome to a pre-existing conversations table in place', () => {
-  const dir = makeTmpDir('matron-outcome-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-outcome-migration-'))
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -151,7 +150,7 @@ test('openDb adds session_outcome to a pre-existing conversations table in place
 })
 
 test('openDb adds agent_kind to legacy conversations and codex upserts round-trip', () => {
-  const dir = makeTmpDir('matron-agent-kind-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-agent-kind-migration-'))
   const dbPath = path.join(dir, 'pre-migration.db')
 
   const raw = new Database(dbPath)
@@ -199,7 +198,7 @@ test('openDb adds agent_kind to legacy conversations and codex upserts round-tri
 // long one-shot runs. Asserted on a file-backed DB because :memory:
 // databases silently ignore WAL mode.
 test('openDb bounds the WAL file but keeps the stock auto-checkpoint', () => {
-  const dir = makeTmpDir('matron-walpragma-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walpragma-'))
   const db = openDb(path.join(dir, 'm.db'))
   try {
     assert.equal(db.pragma('journal_mode', { simple: true }), 'wal')
@@ -258,7 +257,7 @@ test('convo_agents accepts the consent states and columns', () => {
 })
 
 test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', (t) => {
-  const dir = makeTmpDir('matron-convo-agents-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-migration-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -314,7 +313,7 @@ test('convo_agents: an unknown agent_device_id is rejected outright', () => {
 })
 
 test('convo_agents migration adds the cascade and drops rows the old revoke path stranded', (t) => {
-  const dir = makeTmpDir('matron-convo-agents-fk-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-fk-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-fk.db')
 
@@ -357,7 +356,7 @@ test('openDb: agent_chat_allowances is gone from a fresh database', () => {
 })
 
 test('openDb: an existing agent_chat_allowances table is dropped on migrate', (t) => {
-  const dir = makeTmpDir('matron-allow-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-allow-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'm.db')
   const raw = new Database(dbPath)
@@ -464,7 +463,7 @@ test('unregistering clears only the calling device row', async () => {
 // The live box-2 DB already carries 18 rows sharing one token; the fix above
 // only stops NEW duplicates, so openDb collapses the existing ones on start.
 test('openDb collapses duplicate APNs tokens, keeping the newest device row', () => {
-  const dir = makeTmpDir('matron-apns-dedupe-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-apns-dedupe-'))
   const dbPath = path.join(dir, 'dupes.db')
 
   // Seeded through a raw handle, because openDb is exactly what refuses to
@@ -501,12 +500,11 @@ test('openDb collapses duplicate APNs tokens, keeping the newest device row', ()
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-
 // Rows parked before the `link` column existed were asked under the
 // always-linked contract, so the column's DEFAULT keeps them linked; only
 // rows written by the new code carry an explicit 0.
 test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing rows', () => {
-  const dir = makeTmpDir('matron-spawn-link-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-spawn-link-migration-'))
   const dbPath = path.join(dir, 'pre-migration.db')
   const raw = new Database(dbPath)
   raw.exec(`
@@ -564,7 +562,7 @@ test('device_status: the row goes with its device on revoke, and a reused id sta
 })
 
 test('old-schema device_status (no cascade) is rebuilt in place: live rows kept, orphans dropped', (t) => {
-  const dir = makeTmpDir('matron-device-status-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-device-status-migration-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -610,7 +608,7 @@ test('schema: repo columns and github tables exist', () => {
 })
 
 test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing populated database in place', () => {
-  const dir = makeTmpDir('matron-repo-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-repo-migration-'))
   const dbPath = path.join(dir, 'pre-repo.db')
 
   // A conversations table shaped like the one before the tracker
@@ -658,7 +656,7 @@ test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing p
 })
 
 test('openDb adds users.unlisted (default 0) to a pre-existing users table in place', () => {
-  const dir = makeTmpDir('matron-unlisted-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-unlisted-migration-'))
   const dbPath = path.join(dir, 'pre-unlisted.db')
   const raw = new Database(dbPath)
   raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0)')
@@ -672,7 +670,7 @@ test('openDb adds users.unlisted (default 0) to a pre-existing users table in pl
 })
 
 test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
-  const dir = makeTmpDir('matron-admin-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-migration-'))
   const dbPath = path.join(dir, 'pre-admin.db')
   const raw = new Database(dbPath)
   raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)')
@@ -692,7 +690,7 @@ test('openDb adds users.is_admin (default 0) to a pre-existing users table in pl
 // showed, so no live room's list changes at deploy — and a room with no
 // joined row (dissolved) must not get its old owner sessions back.
 test('room_owner_convos + spawn_id backfill reproduce the pre-migration participant_convos', (t) => {
-  const dir = makeTmpDir('matron-owner-convos-migration-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-owner-convos-migration-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
@@ -723,7 +721,7 @@ test('room_owner_convos + spawn_id backfill reproduce the pre-migration particip
 // a blob the column does not. Idempotent, cheap (idx_events_media narrows
 // the scan to attachment rows), and never touches tombstones or other types.
 test('openDb backfills events.blob_ref for image/file rows that only carry payload.blob_ref', () => {
-  const dir = makeTmpDir('matron-blobref-backfill-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-blobref-backfill-'))
   const dbPath = path.join(dir, 'm.db')
   let db = openDb(dbPath)
   const ins = db.prepare('INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref) VALUES(1,?,?,?,?,?,?,?)')

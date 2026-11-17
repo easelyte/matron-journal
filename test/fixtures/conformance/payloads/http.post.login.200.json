@@ -66,30 +66,6 @@
         "device_id": 1,
         "user_id": 9544
       }
-    },
-    {
-      "source": "14_host_vitals.json#step[0]",
-      "frame": {
-        "token": "sample-mac_token",
-        "device_id": 1,
-        "user_id": 6955
-      }
-    },
-    {
-      "source": "14_host_vitals.json#step[1]",
-      "frame": {
-        "token": "sample-ipad_token",
-        "device_id": 1,
-        "user_id": 6955
-      }
-    },
-    {
-      "source": "14_host_vitals.json#step[2]",
-      "frame": {
-        "token": "sample-late_token",
-        "device_id": 1,
-        "user_id": 6955
-      }
     }
   ]
 }

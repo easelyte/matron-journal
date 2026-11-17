@@ -76,15 +76,6 @@
       }
     },
     {
-      "source": "14_host_vitals.json#step[20]",
-      "frame": {
-        "kind": "control",
-        "op": "error",
-        "code": "forbidden",
-        "ref": "host_vitals"
-      }
-    },
-    {
       "source": "16_viewing_set.json#step[11]",
       "frame": {
         "kind": "control",
