@@ -32,7 +32,6 @@ import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
 import { causesFromFrame } from './ask-causes.js'
-import { resolveAskCause } from './ask-cause.js'
 import { recordCarryOn, recordRoomPublish } from './cause-hops.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
@@ -1725,7 +1724,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           ...(targetWaking ? { target_waking: true } : {}),
           ...(missionNum ? { mission_num: missionNum } : {}),
           ...(missionInherited ? { mission_inherited: true } : {}),
-          ...(autoEligible ? { auto_approved: true } : {}),
         }))
         let autoApproved = false
         if (autoRoot) {
