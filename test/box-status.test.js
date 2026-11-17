@@ -433,15 +433,39 @@ test('box_status vitals: a vitals-only report broadcasts the full merged row and
   assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).reported_at, next.reported_at)
 })
 
-test('box_status: a plugins list of names is stored and fanned out; junk drops only that block', async (t) => {
+test('box_status: plugins as { name, methods } are stored and fanned out; bare names normalise; junk drops only that block', async (t) => {
   const { s, alice, agDev, agent, client } = await fleet(t)
-  agent.send({ op: 'box_status', disk: DISK, plugins: ['alpha', 'beta', 'alpha'] })
+  agent.send({
+    op: 'box_status',
+    disk: DISK,
+    plugins: [
+      { name: 'alpha', methods: ['x_alpha_one', 'x_alpha_two'] },
+      'beta',
+      { name: 'alpha', methods: ['x_alpha_three'] },
+      { name: 'gamma' },
+    ],
+  })
   const live = await client.waitFor((f) => f.kind === 'box_status')
-  assert.deepEqual(live.plugins, ['alpha', 'beta'])
-  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).plugins, ['alpha', 'beta'])
+  const want = [
+    { name: 'alpha', methods: ['x_alpha_one', 'x_alpha_two'] },
+    { name: 'beta', methods: [] },
+    { name: 'gamma', methods: [] },
+  ]
+  assert.deepEqual(live.plugins, want)
+  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).plugins, want)
   client.frames.length = 0
   const tooMany = Array.from({ length: 33 }, (_, i) => `p${i}`)
-  for (const junk of ['alpha', [1], ['x'.repeat(33)], [''], tooMany]) {
+  const junks = [
+    'alpha', [1], ['x'.repeat(33)], [''], tooMany, ['Alpha'], ['a-b'], [{ methods: [] }],
+    [{ name: 'alpha', methods: 'x_alpha_one' }],
+    [{ name: 'alpha', methods: [1] }],
+    [{ name: 'alpha', methods: ['x_beta_one'] }],
+    [{ name: 'alpha', methods: ['x_alpha_'] }],
+    [{ name: 'alpha', methods: ['x_alpha_' + 'm'.repeat(57)] }],
+    [{ name: 'alpha', methods: Array.from({ length: 65 }, (_, i) => `x_alpha_m${i}`) }],
+    [['alpha']],
+  ]
+  for (const junk of junks) {
     agent.send({ op: 'box_status', disk: DISK, plugins: junk })
     const f = await client.waitFor((x) => x.kind === 'box_status')
     assert.equal('plugins' in f, false, JSON.stringify(junk).slice(0, 40))
