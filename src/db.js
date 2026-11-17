@@ -1103,7 +1103,11 @@ CREATE TABLE IF NOT EXISTS inbound_sources(
   announced         INTEGER NOT NULL DEFAULT 0,
   limit_notified_at INTEGER,
   last_post_at      INTEGER,
-  created_at        INTEGER NOT NULL
+  created_at        INTEGER NOT NULL,
+  replies           INTEGER NOT NULL DEFAULT 0,
+  replies_seen_seq  INTEGER NOT NULL DEFAULT 0,
+  replies_done_seq  INTEGER NOT NULL DEFAULT 0,
+  replies_live      INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_sources_name ON inbound_sources(user_id, name COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS inbound_posts(
@@ -1113,6 +1117,22 @@ CREATE TABLE IF NOT EXISTS inbound_posts(
   bytes     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_posts_source ON inbound_posts(source_id, ts);
+-- A file an inbound source sends with a report (src/inbound-files.js): a
+-- place made first, filled by an upload, shown when a report names it.
+-- secret_hash is the hash of a one-file upload address's secret.
+CREATE TABLE IF NOT EXISTS inbound_files(
+  id           TEXT PRIMARY KEY,
+  source_id    TEXT NOT NULL,
+  secret_hash  TEXT UNIQUE,
+  name         TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  blob_id      TEXT,
+  content_type TEXT,
+  size         INTEGER,
+  used_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_files_source ON inbound_files(source_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_files_blob ON inbound_files(blob_id) WHERE blob_id IS NOT NULL;
 `
 
 // Rebuild the parent with FK actions disabled: dropping it with enforcement
@@ -2192,6 +2212,7 @@ export function openDb(path) {
   addTransferConsentSetting(db)
   addPeerFailingSince(db)
   addProtectedDevices(db)
+  addInboundReplies(db)
   addApprovalLockdown(db)
   addVerifierRefusals(db)
   addSecurityEvents(db)
@@ -2907,6 +2928,17 @@ export function addTransferRecipient(db) {
 // the ask's row until it is forwarded to the box: the spawn's `start`, the
 // chat invite (delivered later, on the box's hello, when it is asleep) and
 // the released transfer. NULL for every other answer. Idempotent.
+// Replies (src/inbound.js): whether a source may read what the user types
+// in its conversation, the newest message it has been handed, the newest
+// one its last report answered, and whether connected apps have been sent
+// the line that says replies are on. Idempotent.
+export function addInboundReplies(db) {
+  const has = (col) => db.prepare('PRAGMA table_info(inbound_sources)').all().some((c) => c.name === col)
+  for (const col of ['replies', 'replies_seen_seq', 'replies_done_seq', 'replies_live']) {
+    if (!has(col)) db.exec(`ALTER TABLE inbound_sources ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`)
+  }
+}
+
 export function addProtectedDevices(db) {
   const has = (table, col) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)
   if (!has('devices', 'protected')) db.exec('ALTER TABLE devices ADD COLUMN protected INTEGER NOT NULL DEFAULT 0')

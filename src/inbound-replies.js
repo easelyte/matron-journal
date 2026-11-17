@@ -64,9 +64,13 @@ export function forwardInboundMessage(ctx, emitMarker, who, { convoId, seq, text
       idemKey: `inbound-send:${convoId}:${seq}`,
       extra: report ? quotedReport(source, report) : null,
     })
+    // With replies on (src/inbound.js) the source itself reads the message.
+    const toSource = source.replies ? ` ${source.name} can read what you type here.` : ''
     const body = task
-      ? `Sent to your Coordinator${report ? ' with the latest report' : ''}: ${linkTo(task)}. No agent reads this conversation.`
-      : 'No agent reads this conversation, and you have no Coordinator set, so this was not passed on. Set a Coordinator, or copy the report into an agent\'s conversation.'
+      ? `Sent to your Coordinator${report ? ' with the latest report' : ''}: ${linkTo(task)}. No agent reads this conversation.${toSource}`
+      : source.replies
+        ? `${source.name} can read what you type here. No agent reads this conversation, and you have no Coordinator set, so it was not passed to one.`
+        : 'No agent reads this conversation, and you have no Coordinator set, so this was not passed on. Set a Coordinator, or copy the report into an agent\'s conversation.'
     const payload = { body }
     const r = append(db, { userId: who.userId, convoId, sender: JOURNAL, type: 'text', payload, idemKey: `inbound-send-note:${convoId}:${seq}` })
     if (!r.duplicate) broadcastAppended(db, hub, { userId: who.userId, convoId, seq: r.seq, ts: r.ts, sender: JOURNAL, type: 'text', payload })

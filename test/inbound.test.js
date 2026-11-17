@@ -10,6 +10,7 @@ import { listUnseen } from '../src/seen.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import {
   createSource, sourceForKey, setSourceEnabled, rotateSourceKey, buildReport, defuseMarkdown, acceptReport, getSource,
+  setSourceReplies, readReplies, REPLIES_PER_READ_MAX, REPLY_MAX_CHARS,
   REPORT_BODY_MAX_BYTES, INBOUND_KEY_PREFIX,
 } from '../src/inbound.js'
 
@@ -232,7 +233,7 @@ test('POST /inbound/mcp: initialize, tools/list, tools/call post_report', async 
   assert.equal(note.status, 202)
   assert.deepEqual((await w.mcp({ jsonrpc: '2.0', id: 'p', method: 'ping' })).json, { jsonrpc: '2.0', id: 'p', result: {} })
   const list = await w.mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
-  assert.deepEqual(list.json.result.tools.map((x) => x.name), ['post_report'])
+  assert.deepEqual(list.json.result.tools.map((x) => x.name), ['post_report', 'request_upload'])
   assert.deepEqual(list.json.result.tools[0].inputSchema.required, ['body'])
   const call = await w.mcp({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'post_report', arguments: { title: 'T', body: 'From the tool.' } } })
   assert.deepEqual(call.json, { jsonrpc: '2.0', id: 3, result: { content: [{ type: 'text', text: 'Posted.' }], isError: false } })
@@ -310,7 +311,7 @@ test('matron-admin inbound: add, list, limits, rotate, disable', async () => {
   const [, id] = /^source (src_[0-9a-f]{16}) "Scout" for alice: at most 5 reports an hour, 40 a day\n/.exec(out)
   const key = /\nkey: (mis_\S+)\n/.exec(out)[1]
   assert.equal(sourceForKey(db, key).id, id)
-  assert.match(await runAdmin(db, ['inbound', 'list', 'alice']), new RegExp(`^${id} name="Scout" enabled hourly=5 daily=40 last_post_at=never$`))
+  assert.match(await runAdmin(db, ['inbound', 'list', 'alice']), new RegExp(`^${id} name="Scout" enabled hourly=5 daily=40 replies=off last_post_at=never$`))
   assert.equal(await runAdmin(db, ['inbound', 'limits', id, '--hourly', '3', '--daily', '9']), `source ${id}: at most 3 reports an hour, 9 a day`)
   await assert.rejects(runAdmin(db, ['inbound', 'limits', id, '--hourly', '3']), /caps/)
   const next = /new key: (mis_\S+)\n/.exec(await runAdmin(db, ['inbound', 'rotate', id]))[1]
@@ -340,4 +341,144 @@ test('a long reply about a long report keeps the report; the user\'s words are c
   assert.ok(task.body.length <= BODY_MAX)
   assert.match(task.body, /\*\*The latest report from Scout, an outside tool\.\*\*/)
   assert.match(task.body, /\(Cut here\. The whole report is in the user's Scout conversation, which no agent can read\.\)$/)
+})
+
+// --- replies: the source reads what the user typed in its conversation ---
+
+const say = async (w, body, local) => {
+  w.ws.phone.send({ op: 'send', convo_id: w.source.convo_id, type: 'text', payload: { body }, local_id: local })
+  return w.ws.phone.waitFor((f) => f.kind === 'journal' && f.convo_id === w.source.convo_id && f.sender === 'journal' && f.type === 'text' && /Coordinator/.test(f.payload.body) && !say.seen.has(f.seq) && say.seen.add(f.seq))
+}
+say.seen = new Set()
+const getReplies = (w, id = 9) => w.mcp({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'get_replies', arguments: {} } })
+
+test('replies are off unless turned on: no tool, no route, nothing handed over', async (t) => {
+  const w = await world(t)
+  await say(w, 'Written while replies were off.', 'a1')
+  assert.deepEqual((await w.mcp({ jsonrpc: '2.0', id: 1, method: 'tools/list' })).json.result.tools.map((x) => x.name), ['post_report', 'request_upload'])
+  assert.equal((await getReplies(w)).json.error.code, -32602)
+  const rest = await w.send('/inbound/replies', {})
+  assert.equal(rest.status, 403)
+  assert.deepEqual(rest.json, { error: 'replies_off' })
+  assert.deepEqual(readReplies(w.s.db, getSource(w.s.db, w.source.id)), { status: 'replies_off' })
+  // Turned on, what was typed before stays unread by the source.
+  assert.equal(setSourceReplies(w.s.db, w.source.id, true), true)
+  const line = events(w).at(-1)
+  assert.equal(line.sender, 'journal')
+  assert.match(line.payload.body, /^Replies are on\. Scout can read what you type in this conversation from now on, and nothing else in Matron\. What you type here leaves Matron and goes to Scout\.$/)
+  // The command that turned it on told no connected app. So is what is
+  // typed before the first read, which sends them the line and hands over
+  // nothing.
+  await say(w, 'Typed before this app was told.', 'a2')
+  assert.equal(getSource(w.s.db, w.source.id).replies_live, 0)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
+  const told = await w.ws.phone.waitFor((f) => f.kind === 'journal' && f.convo_id === w.source.convo_id && f.sender === 'journal' && /^Replies are on\./.test(f.payload?.body ?? ''))
+  assert.equal(told.seq, line.seq)
+  assert.equal(getSource(w.s.db, w.source.id).replies_live, 1)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
+  await say(w, 'Typed after.', 'a3')
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Typed after.'])
+  assert.equal(setSourceReplies(w.s.db, 'src_nope', true), false)
+})
+
+test('get_replies: the user\'s messages in the source\'s conversation, listed until the next report answers them', async (t) => {
+  const w = await world(t)
+  setSourceReplies(w.s.db, w.source.id, true)
+  const init = await w.mcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  assert.match(init.json.result.instructions, /get_replies/)
+  const list = await w.mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+  assert.deepEqual(list.json.result.tools.map((x) => x.name), ['post_report', 'request_upload', 'get_replies'])
+  assert.equal((await getReplies(w)).json.result.content[0].text, 'No new messages from the user.')
+  assert.equal((await w.report({ body: 'First report.' })).status, 201)
+  // Text typed elsewhere is never part of it.
+  w.ws.phone.send({ op: 'send', convo_id: 'work', type: 'text', payload: { body: 'A secret for the work agent.' }, local_id: 'w1' })
+  const note = await say(w, 'Skip the sports posts next time.', 'b1')
+  assert.match(note.payload.body, /No agent reads this conversation\. Scout can read what you type here\.$/)
+  const first = await getReplies(w)
+  assert.equal(first.json.result.isError, false)
+  assert.match(first.json.result.content[0].text, /^1 message from the user, oldest first\. Answer them in your next report; they stay listed until it is posted\.\n\n\[\d{4}-\d\d-\d\dT[\d:.]+Z\]\nSkip the sports posts next time\.$/)
+  // Read again before any report: still listed, and one typed meanwhile joins it.
+  await say(w, 'And check the second link.', 'b2')
+  const rest = await w.send('/inbound/replies', {})
+  assert.deepEqual(rest.json.replies.map((r) => r.text), ['Skip the sports posts next time.', 'And check the second link.'])
+  assert.equal(rest.json.more, false)
+  // A message typed after the read and before the report waits for the next one.
+  await say(w, 'Typed while the report was being written.', 'b3')
+  assert.equal((await w.report({ body: 'Second report, answering.' })).status, 201)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Typed while the report was being written.'])
+  // Nor does a report whose request began before a read mark that read answered.
+  const before = getSource(w.s.db, w.source.id)
+  await say(w, 'Read while a report was on its way.', 'b4')
+  assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 2)
+  assert.equal(acceptReport({ db: w.s.db }, before, { body: 'Sent before that read.' }).status, 'accepted')
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Read while a report was on its way.'])
+  assert.equal((await w.report({ body: 'A report in between.' })).status, 201)
+  // A duplicate report answers nothing.
+  await say(w, 'One more.', 'b5')
+  assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 1)
+  assert.equal((await w.report({ body: 'Second report, answering.' })).status, 200)
+  assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 1)
+  assert.equal((await w.report({ body: 'Third report.' })).status, 201)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
+  // The Coordinator task is still filed for each message.
+  assert.equal(w.s.db.prepare("SELECT COUNT(*) n FROM items WHERE origin_convo_id='coord'").get().n, 5)
+  // Turned off: the tool is gone, and the conversation says so.
+  setSourceReplies(w.s.db, w.source.id, false)
+  assert.match(events(w).at(-1).payload.body, /^Replies are off\./)
+  assert.equal((await getReplies(w)).json.error.code, -32602)
+  // A rotated or disabled key reads nothing.
+  setSourceReplies(w.s.db, w.source.id, true)
+  const stale = getSource(w.s.db, w.source.id)
+  rotateSourceKey(w.s.db, w.source.id)
+  assert.deepEqual(readReplies(w.s.db, stale), { status: 'replies_off' })
+  assert.equal((await w.send('/inbound/replies', {})).status, 401)
+})
+
+test('get_replies: a page at a time, long messages cut, and a cap on reads', async (t) => {
+  const w = await world(t, { coordinator: false })
+  setSourceReplies(w.s.db, w.source.id, true)
+  await w.send('/inbound/replies', {})
+  const { append } = await import('../src/journal.js')
+  for (let i = 0; i < REPLIES_PER_READ_MAX + 2; i++) append(w.s.db, { userId: w.alice.id, convoId: w.source.convo_id, sender: 'user:alice', type: 'text', payload: { body: i === 0 ? 'x'.repeat(REPLY_MAX_CHARS + 50) : `m${i}` } })
+  append(w.s.db, { userId: w.alice.id, convoId: w.source.convo_id, sender: 'user:alice', type: 'image', payload: {} })
+  const page = (await w.send('/inbound/replies', {})).json
+  assert.equal(page.replies.length, REPLIES_PER_READ_MAX)
+  assert.equal(page.more, true)
+  assert.equal(page.replies[0].text, `${'x'.repeat(REPLY_MAX_CHARS)} […]`)
+  const told = (await getReplies(w)).json.result.content[0].text
+  assert.match(told, /^20 messages from the user, oldest first\..* There are more: they follow after that report\.\n\n/)
+  assert.equal((await w.report({ body: 'Answering the first page.' })).status, 201)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), [`m${REPLIES_PER_READ_MAX}`, `m${REPLIES_PER_READ_MAX + 1}`])
+  // 30 reads an hour: four so far.
+  for (let i = 0; i < 26; i++) assert.equal((await w.send('/inbound/replies', {})).status, 200)
+  const over = await w.send('/inbound/replies', {})
+  assert.equal(over.status, 429)
+  assert.ok(Number(over.headers.get('retry-after')) > 0)
+  const viaTool = await getReplies(w)
+  assert.equal(viaTool.json.result.isError, true)
+  assert.match(viaTool.json.result.content[0].text, /^Not read: too many reads\./)
+  // Reports are unaffected.
+  assert.equal((await w.report({ body: 'Still posts.' })).status, 201)
+})
+
+test('a locked account hands over no replies', async (t) => {
+  const w = await world(t, { coordinator: false })
+  setSourceReplies(w.s.db, w.source.id, true)
+  w.s.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.alice.id, Date.now())
+  const rest = await w.send('/inbound/replies', {})
+  assert.equal(rest.status, 403)
+  assert.deepEqual(rest.json, { error: 'account_locked' })
+  assert.match((await getReplies(w)).json.result.content[0].text, /^Not read: the account is locked\.$/)
+})
+
+test('matron-admin inbound replies on|off', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'alice', 'pw')
+  const id = /^source (src_[0-9a-f]{16})/.exec(await runAdmin(db, ['inbound', 'add', 'alice', 'Scout']))[1]
+  assert.match(await runAdmin(db, ['inbound', 'replies', id, 'on']), /replies are on\..*leaves Matron/)
+  assert.match(await runAdmin(db, ['inbound', 'list', 'alice']), / replies=on /)
+  assert.equal(getSource(db, id).replies, 1)
+  assert.equal(await runAdmin(db, ['inbound', 'replies', id, 'off']), `source ${id}: replies are off`)
+  assert.equal(getSource(db, id).replies, 0)
+  await assert.rejects(runAdmin(db, ['inbound', 'replies', id, 'maybe']), /matron-admin/)
 })
