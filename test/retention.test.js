@@ -12,10 +12,9 @@ import { resolveReapPcts, resolveDeviceRetention } from '../src/server.js'
 import { searchMessages, searchRecent, backfillSearchIndex } from '../src/search.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
 import { createItem, addComment, setAttachmentTranscript, finishAttachmentTranscript, listComments } from '../src/items.js'
-import { makeTmpDir } from './tmp-dir.js'
 
 function tmpMediaDir() {
-  return makeTmpDir('matron-retention-')
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-'))
 }
 
 async function setup() {
@@ -104,7 +103,7 @@ test('runOffload does not double-process a row whose payload already looks offlo
 
 test('server.js retention: runs at boot, offloads old tool_output rows, retrievable via GET /media', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-retention-boot-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-boot-'))
   const dbPath = path.join(dir, 'test.db')
   const preDb = openDb(dbPath)
   const alice = await createUser(preDb, 'alice', 'pw')
@@ -130,7 +129,7 @@ test('server.js retention: runs at boot, offloads old tool_output rows, retrieva
 
 test('MATRON_RETENTION_DAYS=0 (retentionDays: 0) disables retention — no offload at boot', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-retention-disabled-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-disabled-'))
   const dbPath = path.join(dir, 'test.db')
   const preDb = openDb(dbPath)
   const alice = await createUser(preDb, 'alice', 'pw')
@@ -148,7 +147,7 @@ test('MATRON_RETENTION_DAYS=0 (retentionDays: 0) disables retention — no offlo
 test('an invalid retentionDays override (negative/non-integer) disables retention — it must NOT compute a future cutoff and offload everything', async (t) => {
   const { startTestServer } = await import('./helpers.js')
   for (const badDays of [-5, 1.5, 'abc']) {
-    const dir = makeTmpDir('matron-retention-badopt-')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-badopt-'))
     const dbPath = path.join(dir, 'test.db')
     const preDb = openDb(dbPath)
     const alice = await createUser(preDb, 'alice', 'pw')
@@ -169,7 +168,7 @@ test('an invalid retentionDays override (negative/non-integer) disables retentio
 
 test('default retention (no override, no env) is enabled at 30 days', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-retention-default-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-default-'))
   const dbPath = path.join(dir, 'test.db')
   const preDb = openDb(dbPath)
   const alice = await createUser(preDb, 'alice', 'pw')
@@ -351,7 +350,7 @@ test('runExpireLogs never touches offload-created blobs (no live_log flag)', asy
 
 test('MATRON_TOOL_LOG_TTL_HOURS=0 (toolLogTtlHours: 0) disables the TTL pass — an old live_log row is not tombstoned at boot', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-ttl-disabled-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-disabled-'))
   const dbPath = path.join(dir, 'test.db')
   const mediaDir = resolveMediaDir(dbPath)
   const preDb = openDb(dbPath)
@@ -370,7 +369,7 @@ test('MATRON_TOOL_LOG_TTL_HOURS=0 (toolLogTtlHours: 0) disables the TTL pass —
 test('an invalid toolLogTtlHours override (negative/non-integer) disables the TTL pass — it must NOT compute a future cutoff and tombstone everything', async (t) => {
   const { startTestServer } = await import('./helpers.js')
   for (const badHours of [-5, 1.5, 'abc']) {
-    const dir = makeTmpDir('matron-ttl-badopt-')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-badopt-'))
     const dbPath = path.join(dir, 'test.db')
     const mediaDir = resolveMediaDir(dbPath)
     const preDb = openDb(dbPath)
@@ -393,7 +392,7 @@ test('an invalid toolLogTtlHours override (negative/non-integer) disables the TT
 
 test('default TTL (no override, no env) is enabled at 24h — an old live_log row IS tombstoned at boot', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-ttl-default-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-default-'))
   const dbPath = path.join(dir, 'test.db')
   const mediaDir = resolveMediaDir(dbPath)
   const preDb = openDb(dbPath)
@@ -1011,7 +1010,7 @@ test('MATRON_VOICE_NOTE_TTL_DAYS: default 7 runs at boot; 0 (voiceNoteTtlDays: 0
   const mute = t.mock.method(console, 'warn', () => {})
   t.after(() => mute.mock.restore())
   for (const [override, expectDeleted] of [[undefined, true], [0, false], [-3, false], ['soon', false], [30, false]]) {
-    const dir = makeTmpDir('matron-voice-ttl-')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-voice-ttl-'))
     const dbPath = path.join(dir, 'test.db')
     const mediaDir = resolveMediaDir(dbPath)
     const preDb = openDb(dbPath)
@@ -1053,7 +1052,7 @@ test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garb
 
 test('reap pass runs at boot when a user is over quota', async (t) => {
   const { startTestServer } = await import('./helpers.js')
-  const dir = makeTmpDir('matron-reap-boot-')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-reap-boot-'))
   const dbPath = path.join(dir, 'test.db')
   const mediaDir = resolveMediaDir(dbPath)
   const preDb = openDb(dbPath)

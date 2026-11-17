@@ -13,15 +13,13 @@ import { codeSpan } from './consent-items.js'
 
 const OFFLOAD_TYPE = 'tool_output'
 
-// The heavy passes below are generators: each `yield` marks a point where
-// the pass may hand the event loop back. The journal is one thread with a
-// synchronous SQLite driver, so a pass that runs start to finish without
-// yielding blocks every request and websocket for as long as it takes —
-// on the live DB the orphan-blob scan alone read ~900 MB of payloads and
-// held the loop for 1-5 minutes, long enough for the bridge's 30 s ping to
-// time out. The 6-hourly schedule (server.js) drives them with drainAsync;
-// the exported run* functions keep their synchronous contract with
-// drainSync, for tests and for the run-at-boot path.
+// The offload and log-expiry passes are generators: each `yield` marks a
+// point where the pass may hand the event loop back. The journal is one
+// thread with a synchronous SQLite driver, so a pass that runs start to
+// finish without yielding blocks every request and websocket for as long
+// as it takes. The 6-hourly schedule (server.js) drives them with
+// drainAsync; the exported run* functions keep their synchronous contract
+// with drainSync, for the admin CLI, tests and the run-at-boot path.
 export function drainSync(gen) {
   for (;;) {
     const r = gen.next()
@@ -52,8 +50,7 @@ export async function drainAsync(gen, { shouldStop = () => false, yieldFn = yiel
 }
 
 // Rows written per uninterrupted stretch by the offload and log-expiry
-// passes (each row is a file write or unlink plus a transaction), and
-// events rows read per stretch by the orphan-blob reference scan.
+// passes (each row is a file write or unlink plus a transaction).
 export const RETENTION_ROW_BATCH = 50
 // Events rows read per stretch by the orphan-blob reference scan.
 // 500, not more: on a cold page cache a 2000-row range took ~1 s.

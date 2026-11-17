@@ -34,12 +34,12 @@ function fakeConn({ userId, deviceId }) {
   return { userId, deviceId, viewingConvoIds: new Set(), ws: { readyState: 1 } }
 }
 
-async function setup(t, { apnsClient, coalesceMs, clientIdleMs } = {}) {
+async function setup(t, { apnsClient, coalesceMs } = {}) {
   const db = openDb(':memory:')
   const hub = makeHub()
   const alice = await createUser(db, 'alice', 'pw')
   const stub = apnsClient || makeStubApnsClient()
-  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, coalesceMs, clientIdleMs })
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, coalesceMs })
   t.after(() => pipeline.close())
   upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'convo one' })
   // Most of this file predates the notification settings and exercises
@@ -95,7 +95,7 @@ test('agent devices are never pushed to', async (t) => {
 })
 
 test('an idle-expired client device gets no push; a live one does', async (t) => {
-  const { db, alice, stub, pipeline } = await setup(t, { clientIdleMs: 30 * 24 * 60 * 60 * 1000 })
+  const { db, alice, stub, pipeline } = await setup(t)
   const stale = registerDevice(db, alice.id, 'old-phone')
   registerDevice(db, alice.id, 'phone')
   const old = Date.now() - 31 * 24 * 60 * 60 * 1000

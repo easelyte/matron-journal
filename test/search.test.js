@@ -4,7 +4,6 @@ import assert from 'node:assert/strict'
 import { indexableBody, backfillSearchIndex, backfillIsDiff, searchMessages } from '../src/search.js'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
-import { makeTmpDir } from './tmp-dir.js'
 
 test('indexableBody: text events index their body', () => {
   assert.equal(indexableBody('text', { body: 'why did we drop SQLCipher' }), 'why did we drop SQLCipher')
@@ -126,7 +125,7 @@ test('append: a failing search insert rolls back the whole append (same transact
 test('retention rewriting tool_output leaves the index untouched', () => {
   const db = openDb(':memory:')
   const { userId, convoId } = seedUserAndConvo(db)
-  const mediaDir = makeTmpDir('search-retention-')
+  const mediaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-retention-'))
   append(db, { userId, convoId, sender: 'user:alice', type: 'text', payload: { body: 'the only indexed row' } })
   append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'out', live_log: true } })
   append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'old out' } })
