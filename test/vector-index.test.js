@@ -7,6 +7,7 @@ import { seed } from './search-fixtures.js'
 import { createMission } from '../src/missions.js'
 import { upsertConversation } from '../src/journal.js'
 import { createHash } from 'node:crypto'
+import { upsertMemory } from '../src/memories.js'
 
 // createMission attaches its convoId to the new mission; a second
 // createMission call on the SAME already-attached convoId returns the
@@ -335,4 +336,19 @@ test('a stopped pass keeps what it embedded; the next pass embeds only the rest,
   assert.equal(r2.embedded, total - 2)
   assert.equal(embeddedTexts.length, total - 2, 'nothing embedded twice')
   assert.equal(pauses, Math.ceil((total - 2) / 2))
+})
+
+test('scoreDocs scores exactly the docs asked for that have a vector, in the order given', async () => {
+  const db = seed()
+  upsertMemory(db, { userId: 1, name: 'aa', description: 'A.', body: '', by: 'agent' })
+  upsertMemory(db, { userId: 1, name: 'bb', description: 'B.', body: '', by: 'agent' })
+  ensureVectorSchema(db)
+  const embedder = fakeEmbedder({ dim: 3, vectors: { 'aa A.': [1, 0, 0], 'bb B.': [0, 1, 0], q: [1, 0, 0] } })
+  await runVectorIndexer(db, embedder)
+  const store = createVectorStore(db, embedder)
+  const byName = Object.fromEntries(db.prepare("SELECT d.id, m.name FROM search_docs d JOIN memories m ON m.id=d.ref_id").all().map((r) => [r.name, r.id]))
+  const out = store.scoreDocs(1, await embedder.embedQuery('q'), [byName.bb, 9999, byName.aa])
+  assert.deepEqual(out.map((h) => h.doc_id), [byName.bb, byName.aa])
+  assert.ok(Math.abs(out[1].score - 1) < 1e-6 && Math.abs(out[0].score) < 1e-6)
+  assert.throws(() => store.scoreDocs(1, new Float32Array(2), [byName.aa]), /does not match/)
 })

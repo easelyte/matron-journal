@@ -29,7 +29,7 @@ const save = (db, userId, over = {}) => upsertMemory(db, {
 test('schema: memories table has the spec columns', async () => {
   const { db } = await seed()
   const cols = db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name)
-  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'origin_private', 'created_by', 'updated_by', 'created_at', 'updated_at', 'scope'])
+  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'origin_private', 'created_by', 'updated_by', 'created_at', 'updated_at', 'scope', 'tier', 'topic'])
 })
 
 test('schema: a pre-scope memories table is migrated in place and every existing row is global', () => {
@@ -69,8 +69,8 @@ test('validName: kebab slugs only', () => {
 
 test('validateMemoryFields: description trimmed one-liner ≤200, body ≤8192 bytes (cleared when omitted), type enum', () => {
   const ok = validateMemoryFields({ description: '  Never use opal.  ', body: 'why', type: 'user' })
-  assert.deepEqual(ok, { ok: true, value: { description: 'Never use opal.', body: 'why', type: 'user', scope: undefined } })
-  assert.deepEqual(validateMemoryFields({ description: 'x' }), { ok: true, value: { description: 'x', body: '', type: undefined, scope: undefined } })
+  assert.deepEqual(ok, { ok: true, value: { description: 'Never use opal.', body: 'why', type: 'user', scope: undefined, tier: undefined, topic: undefined } })
+  assert.deepEqual(validateMemoryFields({ description: 'x' }), { ok: true, value: { description: 'x', body: '', type: undefined, scope: undefined, tier: undefined, topic: undefined } })
   assert.equal(validateMemoryFields({ description: 'x', scope: 'repo:web-app' }).value.scope, 'repo:web-app')
   assert.equal(validateMemoryFields({ description: 'x', scope: 'coordinator' }).value.scope, 'coordinator')
   assert.equal(validateMemoryFields({ description: 'x', body: 'é'.repeat(4096) }).ok, true)

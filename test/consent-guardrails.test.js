@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { getSpawn } from '../src/spawns.js'
-import { recordConsentDecision } from '../src/consent.js'
+import { recordConsentDecision, AUTO_APPROVE_REASON } from '../src/consent.js'
 import { getParticipant } from '../src/participants.js'
 import { fleet, parkSpawn, parkInviteAsk, pending, answer, settle } from './consent-fleet.js'
 
@@ -97,4 +97,11 @@ test('nudge: another agent\'s ask sends the Coordinator\'s box a consent pending
   await parkSpawn(f, { rid: 'q3' })
   await settle()
   assert.equal(f.coord.frames.find((x) => x.kind === 'consent'), undefined)
+})
+
+test('the reason reserved for automatic approvals is refused on /consent/answer and leaves the ask parked', async (t) => {
+  const f = await fleet(t)
+  const spawnId = await parkSpawn(f)
+  assert.equal((await answer(f, f.coordDev.token, { kind: 'spawn', id: spawnId, decision: 'approve', reason: AUTO_APPROVE_REASON })).status, 400)
+  assert.equal(getSpawn(f.s.db, spawnId).state, 'awaiting_user')
 })

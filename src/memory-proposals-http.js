@@ -36,7 +36,7 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { ensurePeopleConvo, PEOPLE_TITLE, PEOPLE_SYSTEM } from './people-convo.js'
 import { sanitizePeerText, plainText as plain, PEER_NAME_CAP } from './peer-text.js'
 import { resolveAskCause } from './ask-cause.js'
-import { getMemory, upsertMemory, deleteMemory } from './memories.js'
+import { getMemory, upsertMemory, deleteMemory, DEFAULT_TIER } from './memories.js'
 import { emitMemoryMarker } from './memories-http.js'
 import {
   recordProposal, setProposalItem, settleProposal, expireProposals, pruneProposals, proposalOfItem, labelsFor, isStale, markTold, owedFollowUps,
@@ -88,6 +88,10 @@ export function fencedBlock(text) {
 const boxName = (db, userId, deviceId) => db.prepare('SELECT name FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)?.name ?? 'an agent'
 const convoTitle = (db, userId, convoId) => (convoId ? db.prepare('SELECT title FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)?.title ?? '' : '')
 
+// "always", or "on demand, topic: couriers".
+// The topic is an agent's words: escaped, so it cannot render as a link.
+const tierLine = (tier, topic) => `${tier === 'on_demand' ? 'on demand' : 'always'}${topic ? `, topic: ${plain(topic)}` : ''}`
+
 // Title, body and buttons of the question, from the proposal row and the
 // memory it was made against, read in the write that recorded it. The scope
 // and type shown are the row's own: the ones an approval applies.
@@ -102,7 +106,7 @@ export function proposalItemFields(db, p) {
     lines.push(`**${box}** proposes to delete a memory${where}.`, '')
     lines.push(`- **Name:** \`${p.name}\``)
     if (current) {
-      lines.push(`- **Scope:** ${current.scope}`, `- **Type:** ${current.type}`, '', '**The memory as it stands — description:**', '', fencedBlock(current.description), '', '**Body:**', '', fencedBlock(current.body || '(empty)'))
+      lines.push(`- **Scope:** ${current.scope}`, `- **Type:** ${current.type}`, `- **Tier:** ${tierLine(current.tier, current.topic)}`, '', '**The memory as it stands — description:**', '', fencedBlock(current.description), '', '**Body:**', '', fencedBlock(current.body || '(empty)'))
     } else {
       lines.push('', 'That memory no longer exists.')
     }
@@ -112,6 +116,10 @@ export function proposalItemFields(db, p) {
     lines.push(`- **Name:** \`${p.name}\``)
     lines.push(`- **Scope:** ${p.scope}${current && p.scope !== current.scope ? ` (now ${current.scope})` : ''}`)
     lines.push(`- **Type:** ${p.type}${current && p.type !== current.type ? ` (now ${current.type})` : ''}`)
+    const tier = p.tier ?? current?.tier ?? DEFAULT_TIER
+    const topic = p.topic || null
+    const tierNow = current && (tier !== current.tier || topic !== current.topic) ? ` (now ${tierLine(current.tier, current.topic)})` : ''
+    lines.push(`- **Tier:** ${tierLine(tier, topic)}${tierNow}`)
     lines.push('', '**Proposed description:**', '', fencedBlock(p.description))
     if (current) lines.push('', '**Current description:**', '', fencedBlock(current.description))
     lines.push('', '**Proposed body:**', '', fencedBlock(p.body || '(empty)'))
@@ -227,6 +235,7 @@ function applyProposal(db, p) {
   }
   const out = upsertMemory(db, {
     userId: p.user_id, name: p.name, description: p.description, body: p.body, type: p.type, scope: p.scope,
+    tier: p.tier ?? undefined, topic: p.topic,
     originConvoId: p.from_convo_id, originDeviceId: p.from_device_id, by: 'agent',
   })
   return {

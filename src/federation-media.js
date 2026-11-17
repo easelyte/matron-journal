@@ -50,6 +50,8 @@ const blobHeaders = (contentType, size) => ({
   'cache-control': 'private, max-age=31536000, immutable',
   'x-content-type-options': 'nosniff',
   'content-disposition': 'attachment',
+  // Should anything render it anyway, it runs with an opaque origin.
+  'content-security-policy': 'sandbox',
 })
 
 // --- The owner's journal ----------------------------------------------------

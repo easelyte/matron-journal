@@ -43,7 +43,7 @@ const newId = () => `mp_${randomBytes(8).toString('hex')}`
 
 const rowToProposal = (r) => (r ? {
   id: r.id, user_id: r.user_id, name: r.name, action: r.action,
-  description: r.description, body: r.body, type: r.type, scope: r.scope, memory_id: r.memory_id,
+  description: r.description, body: r.body, type: r.type, scope: r.scope, tier: r.tier ?? null, topic: r.topic ?? null, memory_id: r.memory_id,
   from_device_id: r.from_device_id, from_convo_id: r.from_convo_id, item_id: r.item_id,
   state: r.state, created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at,
   base_updated_at: r.base_updated_at ?? null, told_at: r.told_at ?? null,
@@ -79,6 +79,11 @@ export function recordProposal(db, { userId, name, action, fields = {}, memoryId
     const vals = {
       description: save ? fields.description : '', body: save ? (fields.body ?? '') : '',
       type: save ? (fields.type ?? base?.type ?? DEFAULT_TYPE) : null, scope: save ? (fields.scope ?? base?.scope ?? DEFAULT_SCOPE) : null,
+      // tier as asked (null = not named: an update keeps the stored tier, a
+      // create takes the default unless the cap places it on_demand); topic
+      // resolved like scope ('' = cleared).
+      tier: save ? (fields.tier ?? null) : null,
+      topic: save ? (fields.topic === undefined ? (base?.topic ?? null) : fields.topic) : null,
     }
     const old = pendingProposalFor(db, userId, name)
     if (old) {
@@ -92,9 +97,9 @@ export function recordProposal(db, { userId, name, action, fields = {}, memoryId
       if (all >= MAX_PENDING_PER_USER) throw new Error('too_many_asks')
     }
     const id = newId()
-    db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, description, body, type, scope, memory_id, base_updated_at, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`)
-      .run(id, userId, name, action, vals.description, vals.body, vals.type, vals.scope, base?.id ?? null, base?.updated_at ?? null, fromDeviceId, fromConvoId, now, now, now + PROPOSAL_TTL_MS)
+    db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, description, body, type, scope, tier, topic, memory_id, base_updated_at, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`)
+      .run(id, userId, name, action, vals.description, vals.body, vals.type, vals.scope, vals.tier, vals.topic, base?.id ?? null, base?.updated_at ?? null, fromDeviceId, fromConvoId, now, now, now + PROPOSAL_TTL_MS)
     return { proposal: getProposal(db, userId, id), replaced: old ? { ...old, state: 'replaced' } : null }
   })()
 }

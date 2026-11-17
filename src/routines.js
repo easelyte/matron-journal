@@ -58,7 +58,8 @@ export const STARTER_ROUTINES = Object.freeze([
 //                             the same, met by any tier: at least unused_pct%
 //                             of the meter left with its reset at most
 //                             hours_left away (1..4 tiers, e.g. 50% with 12 h,
-//                             25% with 2 h); still once per weekly window
+//                             25% with 2 h); each tier fires once per weekly
+//                             window, the most urgent one met when several are
 export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under', 'allowance_expiring'])
 const STALLED_DEFAULT_MINUTES = 120
 const STALLED_MAX_MINUTES = 7 * 24 * 60

@@ -289,6 +289,27 @@ export function createVectorStore(db, embedder, { idleMs = IDLE_MS, now = Date.n
         if (out.length >= k || window >= eligible) return out
       }
     },
+    // The scores of the given docs (the ones that have a vector), in the
+    // order given. For a caller that knows its small candidate set (a
+    // user's memories) and needs every score, not the best k of all docs.
+    scoreDocs(userId, qv, docIds) {
+      if (qv.length !== dim) {
+        throw new Error(`scoreDocs: queryVec length ${qv.length} does not match embedder dim ${dim}`)
+      }
+      evictIdle()
+      const entry = cache.get(userId) ?? load(userId)
+      entry.usedAt = now()
+      const out = []
+      for (const docId of docIds) {
+        const row = entry.rowOf.get(docId)
+        if (row === undefined) continue
+        let s = 0
+        const o = row * dim
+        for (let j = 0; j < dim; j++) s += entry.mat[o + j] * qv[j]
+        out.push({ doc_id: docId, score: s })
+      }
+      return out
+    },
     upsertVectors(rows) {
       evictIdle()
       for (const r of rows) {

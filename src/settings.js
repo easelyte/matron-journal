@@ -32,7 +32,7 @@ export function setAutoApproveCoordinatorSpawns(db, userId, on, now = Date.now()
     .run(userId, on ? 1 : 0, now)
 }
 
-// auto_archive_days: archive conversations idle this long (src/archive.js);
+// auto_archive_days — archive conversations idle this long (src/archive.js);
 // 0 = off.
 export const settingsView = (db, userId) => ({
   notices: getNoticesEnabled(db, userId),

@@ -242,24 +242,98 @@ test('allowance_expiring tiers: any tier met fires; the legacy band is unchanged
   assert.equal(allowanceMet({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }, 40, 3 * H), false, 'the legacy band keeps its lower bound')
 })
 
-test('allowance_expiring tiers: a window that drops between tiers does not fire again at the later tier', async () => {
+// Three tiers: 50% unused with 18 h left, 35% with 8 h,
+// 20% with 3 h. Each tier fires at most once per weekly window.
+const TIERS3 = [{ unused_pct: 50, hours_left: 18 }, { unused_pct: 35, hours_left: 8 }, { unused_pct: 20, hours_left: 3 }]
+async function tierRig(tiers = TIERS3) {
   const { db, alice, maple } = await seedDb()
   const H = 3600000
-  const reset = Math.round((NOW + 12 * H) / H) * H
-  const report = (percent, at) => upsertDeviceStatus(db, { userId: alice.id, deviceId: maple.deviceId, status: { limits: { as_of: at, lines: [{ id: 'week_all', label: 'Week (all models)', percent, resets_at: new Date(reset).toISOString() }] }, account: { email: 'shared@example.com' } }, reportedAt: at })
-  createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] } }).value, now: NOW })
+  const reset = Math.round((NOW + 20 * H) / H) * H
+  const report = (percent, at, resetAt = reset) => upsertDeviceStatus(db, { userId: alice.id, deviceId: maple.deviceId, status: { limits: { as_of: at, lines: [{ id: 'week_all', label: 'Week (all models)', percent, resets_at: new Date(resetAt).toISOString() }] }, account: { email: 'shared@example.com' } }, reportedAt: at })
+  createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', tiers } }).value, now: NOW })
   createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title: 'Backlog task', labels: ['spare-allowance'] })
   const routine = getRoutine(db, alice.id, 'spare')
-  report(40, NOW)
-  assert.equal(trippedSubjects(db, routine, { now: NOW, excludePrivateOwned: true }).fresh.length, 1, 'tier 1 fires')
-  report(60, NOW + 5 * H)
-  assert.equal(trippedSubjects(db, routine, { now: NOW + 5 * H, excludePrivateOwned: true }).matching.length, 0, 'between tiers')
-  report(70, NOW + 10.5 * H)
-  assert.equal(trippedSubjects(db, routine, { now: NOW + 10.5 * H, excludePrivateOwned: true }).fresh.length, 0, 'tier 2 is the same window')
-  // The next window is a new subject once this one has reset.
-  report(10, NOW + 14 * H)
-  trippedSubjects(db, routine, { now: NOW + 14 * H, excludePrivateOwned: true })
+  // hoursLeft before the reset, percent used: the fresh subjects' lines.
+  const sweep = (hoursLeft, used, resetAt = reset) => {
+    const at = resetAt - hoursLeft * H
+    report(used, at, resetAt)
+    return trippedSubjects(db, routine, { now: at, excludePrivateOwned: true }).fresh.map((s) => s.line)
+  }
+  return { db, routine, sweep, reset, H }
+}
+
+test('allowance_expiring tiers: one fire when the allowance is spent after the first tier', async () => {
+  const { sweep } = await tierRig()
+  assert.equal(sweep(17, 40).length, 1, 'the 18 h tier fires')
+  assert.equal(sweep(7, 70).length, 0, 'only 30% unused: the 8 h tier is not met')
+  assert.equal(sweep(2, 85).length, 0, 'only 15% unused: the 3 h tier is not met')
+})
+
+test('allowance_expiring tiers: two fires when a later tier is still met', async () => {
+  const { sweep } = await tierRig()
+  assert.equal(sweep(17, 40).length, 1, 'the 18 h tier fires')
+  assert.equal(sweep(12, 45).length, 0, 'the 18 h tier fired already')
+  const second = sweep(7, 60)
+  assert.equal(second.length, 1, 'the 8 h tier fires again in the same window')
+  assert.match(second[0], /tier: 35% unused with 8 h left/)
+  assert.equal(sweep(5, 62).length, 0, 'the 8 h tier fired already')
+  assert.equal(sweep(2, 85).length, 0, 'only 15% unused: the 3 h tier is not met')
+})
+
+test('allowance_expiring tiers: three fires, one per tier, and "Tripped by" names each tier', async () => {
+  const { sweep } = await tierRig()
+  const lines = [sweep(17, 40), sweep(7, 60), sweep(2.5, 75)]
+  assert.deepEqual(lines.map((l) => l.length), [1, 1, 1])
+  assert.match(lines[0][0], /^- Week \(all models\) at 40%, .*; tier: 50% unused with 18 h left$/)
+  assert.match(lines[1][0], /; tier: 35% unused with 8 h left$/)
+  assert.match(lines[2][0], /; tier: 20% unused with 3 h left$/)
+  assert.equal(sweep(1, 76).length, 0, 'every tier has fired')
+})
+
+test('allowance_expiring tiers: when several tiers are met at once only the most urgent fires, and the passed ones never fire later', async () => {
+  const { sweep } = await tierRig()
+  const first = sweep(7, 30)
+  assert.equal(first.length, 1, 'one fire, not two')
+  assert.match(first[0], /tier: 35% unused with 8 h left/)
+  assert.equal(sweep(6, 40).length, 0, 'the 18 h tier passed with the 8 h one')
+  assert.match(sweep(2, 70)[0], /tier: 20% unused with 3 h left/)
+  // Tiers whose percents do not fall with the hours: a later tier firing
+  // still spends every earlier one, even if the earlier one matches after.
+  const odd = await tierRig([{ unused_pct: 20, hours_left: 18 }, { unused_pct: 50, hours_left: 3 }])
+  assert.match(odd.sweep(2, 40)[0], /tier: 50% unused with 3 h left/)
+  assert.equal(odd.sweep(1, 70).length, 0, '30% unused meets the 18 h tier, but the 3 h tier fired after it')
+})
+
+test('allowance_expiring tiers: a window fired before tiers were recorded spends the tiers it could have fired', async () => {
+  const { db, routine, sweep, reset, H } = await tierRig()
+  // The old subject had no tier; it fired with 17 h left, so at the 18 h tier.
+  db.prepare('INSERT INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)').run(routine.id, `allowance:account:shared@example.com@${new Date(reset).toISOString()}`, reset - 17 * H)
+  assert.equal(sweep(15, 40).length, 0, 'the 18 h tier fired before the upgrade')
+  assert.match(sweep(7, 60)[0], /tier: 35% unused with 8 h left/)
+})
+
+test('allowance_expiring tiers: a pre-upgrade fire at a tier boundary spends that tier even when the subject rounds its reset later', async () => {
+  const { db, routine, sweep, reset, H } = await tierRig()
+  // The real reset is 25 minutes before the hour the subject rounds it to;
+  // the old fire came exactly 18 h before the real reset.
+  const real = reset - 25 * 60000
+  db.prepare('INSERT INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)').run(routine.id, `allowance:account:shared@example.com@${new Date(reset).toISOString()}`, real - 18 * H)
+  assert.equal(sweep(17, 40, real).length, 0, 'the 18 h tier fired before the upgrade')
+  assert.match(sweep(7, 60, real)[0], /tier: 35% unused with 8 h left/)
+})
+
+test('allowance_expiring tiers: the next weekly window fires every tier again', async () => {
+  const { db, routine, sweep, reset, H } = await tierRig()
+  assert.equal(sweep(17, 40).length, 1)
+  assert.equal(sweep(7, 60).length, 1)
+  assert.equal(sweep(2, 75).length, 1)
+  const next = reset + 7 * 24 * H
+  // An hour past the reset the old window is forgotten.
+  sweep(7 * 24 - 2, 0, next)
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM routine_trigger_state WHERE routine_id=?').get(routine.id).n, 0, 'forgotten after the reset')
+  assert.equal(sweep(17, 40, next).length, 1, 'the 18 h tier of the next window')
+  assert.equal(sweep(7, 60, next).length, 1, 'the 8 h tier of the next window')
+  assert.equal(sweep(2, 75, next).length, 1, 'the 3 h tier of the next window')
 })
 
 test('allowance_expiring: grouped by account, fires once per weekly window, only while the backlog has an undispatched task', async () => {

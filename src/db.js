@@ -396,6 +396,8 @@ CREATE TABLE IF NOT EXISTS memories(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   scope            TEXT NOT NULL DEFAULT 'global',
+  tier             TEXT NOT NULL DEFAULT 'always' CHECK(tier IN ('always','on_demand')),
+  topic            TEXT,
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, updated_at);
@@ -1973,6 +1975,10 @@ export function openDb(path) {
   const proposalCols = db.prepare('PRAGMA table_info(memory_proposals)').all()
   if (!proposalCols.some((c) => c.name === 'base_updated_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN base_updated_at INTEGER')
   if (!proposalCols.some((c) => c.name === 'told_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN told_at INTEGER')
+  // A proposed save's tier and topic, as asked (NULL tier = not named, so
+  // the cap may place a new memory on_demand when it is approved).
+  if (!proposalCols.some((c) => c.name === 'tier')) db.exec('ALTER TABLE memory_proposals ADD COLUMN tier TEXT')
+  if (!proposalCols.some((c) => c.name === 'topic')) db.exec('ALTER TABLE memory_proposals ADD COLUMN topic TEXT')
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_pending ON memory_proposals(user_id, name) WHERE state='pending'")
   db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_state ON memory_proposals(state, expires_at)')
   db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_item ON memory_proposals(item_id)')
@@ -2261,6 +2267,14 @@ export function openDb(path) {
   if (!memoryCols.some((c) => c.name === 'scope')) {
     db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
   }
+  // Memory tiers: 'always' (listed in full in every session of the scope,
+  // what every memory was before the column) or 'on_demand' (named under
+  // its topic, read when the work needs it). Additive: every
+  // pre-migration row is 'always', which is exactly what it was.
+  if (!memoryCols.some((c) => c.name === 'tier')) {
+    db.exec("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'always' CHECK(tier IN ('always','on_demand'))")
+  }
+  if (!memoryCols.some((c) => c.name === 'topic')) db.exec('ALTER TABLE memories ADD COLUMN topic TEXT')
   // GitHub account linking. One GitHub identity per journal user and one
   // journal user per GitHub identity (the unique index). `token` is the
   // user's read:org OAuth token, stored as-is (spec: "Token at rest").

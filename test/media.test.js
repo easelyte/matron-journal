@@ -176,7 +176,7 @@ test('POST /media over the size cap -> 413 too_large, nothing persisted, tmp fil
   assert.deepEqual(listMediaFiles(mediaDir), [], 'files were left behind on disk after a rejected oversized upload')
 })
 
-test('GET /media/:id sets nosniff + attachment so an uploader-chosen content-type cannot render inline', async (t) => {
+test('GET /media/:id sets nosniff, attachment and a sandbox CSP so an uploader-chosen content-type cannot run on this origin', async (t) => {
   const dbPath = tmpDbPath()
   const s = await startTestServer({ dbPath })
   t.after(() => s.close())
@@ -194,6 +194,7 @@ test('GET /media/:id sets nosniff + attachment so an uploader-chosen content-typ
   assert.equal(down.headers.get('content-type'), 'text/html', 'content-type is still echoed verbatim')
   assert.equal(down.headers.get('x-content-type-options'), 'nosniff')
   assert.equal(down.headers.get('content-disposition'), 'attachment')
+  assert.equal(down.headers.get('content-security-policy'), 'sandbox')
 })
 
 test('POST /media quota: an upload that would overshoot is rejected after receive (413), file cleaned up', async (t) => {

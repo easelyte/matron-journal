@@ -54,6 +54,7 @@ test('bob opens an attachment: his journal pulls it from alice\'s once, then kee
   assert.equal(r.status, 200)
   assert.deepEqual(r.body, w.bytes)
   assert.equal(r.headers.get('content-disposition'), 'attachment')
+  assert.equal(r.headers.get('content-security-policy'), 'sandbox')
   const row = w.b.db.prepare('SELECT * FROM fed_media WHERE id=?').get(att.blob_ref)
   assert.ok(row.disk_path && fs.existsSync(row.disk_path))
   // Counted in bob's quota.

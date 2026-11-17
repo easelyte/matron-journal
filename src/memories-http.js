@@ -10,6 +10,7 @@ import { senderOf, badRequest, notFound } from './http-who.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { validName, validateMemoryFields, getMemory, listMemories, upsertMemory, deleteMemory, privateOrigin, MEMORIES_MAX } from './memories.js'
+import { validateRecall, recallMemories } from './memory-recall.js'
 import { causesFromFrame } from './ask-causes.js'
 import { needsUserAnswer, fileProposal, answerPending } from './memory-proposals-http.js'
 
@@ -145,6 +146,15 @@ export async function handleMemoriesRoute(ctx, req, res, url, who) {
   if (url.pathname === '/memories') {
     if (req.method !== 'GET') return false
     json(res, 200, { memories: listMemories(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }) })
+    return true
+  }
+  // POST /memories/recall: the memories that bear on a text (src/memory-recall.js).
+  // No memory is named "recall" by a POST: PUT/GET/DELETE of that name
+  // still reach the routes below.
+  if (url.pathname === '/memories/recall' && req.method === 'POST') {
+    const v = validateRecall(await readBody(req))
+    if (!v.ok) return badRequest(res)
+    json(res, 200, await recallMemories(db, who.userId, v.value, { excludePrivateOwned: filteredAgent(db, who), semantic: ctx.semantic ?? null }))
     return true
   }
   const m = /^\/memories\/([^/]+)$/.exec(url.pathname)

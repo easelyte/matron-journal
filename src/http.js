@@ -442,7 +442,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker, federationContribute }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleTimelineRoute({ db }, req, res, url, who)) return
-      if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
+      if (await handleMemoriesRoute({ db, hub, semantic }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleBriefingsRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleSeenRoute({ db }, req, res, url, who)) return
@@ -1442,8 +1442,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // mislabeled blob into active content, and attachment forces a
           // download rather than inline rendering — so a blob can never execute
           // as script/HTML in this origin even though media is owner-scoped.
+          // The sandbox CSP is the backstop: should anything ever render the
+          // response anyway, the page runs with a unique opaque origin and
+          // cannot reach this origin's storage or API.
           'x-content-type-options': 'nosniff',
           'content-disposition': 'attachment',
+          'content-security-policy': 'sandbox',
         })
         // pipeline (not .pipe()) so a client abort mid-body destroys the read
         // stream promptly instead of leaking its fd (.pipe() never forwards a

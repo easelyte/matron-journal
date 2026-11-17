@@ -26,7 +26,10 @@ const SOURCES = [
   // A reply the user withdrew (src/withdrawn-comments.js) is not searchable.
   { kind: 'comment', table: 'item_comments', field: 'text', body: (r) => `${r}.body`,
     when: (r) => `${r}.kind = 'comment' AND trim(${r}.body) <> '' AND ${r}.withdrawn_at IS NULL`, recreate: true },
-  { kind: 'memory', table: 'memories', field: 'text', body: (r) => `trim(${r}.name || ' ' || ${r}.description || ' ' || ${r}.body)`, when: () => '1' },
+  // A memory's topic leads its text ("couriers: book-vans …"): it names the
+  // situation the rule is for, which is what recall matches a turn against.
+  { kind: 'memory', table: 'memories', field: 'text',
+    body: (r) => `trim(coalesce(${r}.topic || ': ', '') || ${r}.name || ' ' || ${r}.description || ' ' || ${r}.body)`, when: () => '1', recreate: true },
   { kind: 'project', table: 'projects', field: 'title', body: (r) => `trim(${r}.title || ' ' || ${r}.body)`, when: () => '1' },
   { kind: 'project', table: 'projects', field: 'status', body: (r) => `${r}.status`, when: (r) => `coalesce(${r}.status,'') <> ''` },
   { kind: 'project', table: 'projects', field: 'summary', body: (r) => `${r}.close_summary`, when: (r) => `coalesce(${r}.close_summary,'') <> ''` },
