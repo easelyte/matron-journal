@@ -14,7 +14,6 @@ import { deviceStatuses } from '../src/db.js'
 const LIMITS = { as_of: 1758460000000, lines: [{ id: '5h', label: 'Current session', percent: 42, resets: 'in 2h' }] }
 const ACTIVITY = { live_sessions: 2, last_hour: [{ path: '/home/alice/app', sessions: 1 }] }
 const DISK = { free_bytes: 10, total_bytes: 100 }
-const VITALS = { cpu_pct: 12.5, ram_pct: 63.1, sampled_at_ms: 1758460000000 }
 
 async function fleet(t) {
   const s = await startTestServer()
@@ -161,25 +160,6 @@ test('spawn_targets: a box_status that lands while recent_folders is in flight w
   assert.deepEqual(stored.limits, NEWER, 'the stale reply did not overwrite the row')
   assert.deepEqual(stored.account, { email: 'alice@example.com' })
   assert.equal(stored.reported_at, reportedAt)
-})
-
-test('box_status: a vitals block persists, fans live, and shows on /devices and /roster; a vitals-only report is accepted', async (t) => {
-  const { s, alice, agDev, clientToken, agent, client } = await fleet(t)
-  agent.send({ op: 'box_status', vitals: { ...VITALS, junk: 'x' } })
-  const live = await client.waitFor((f) => f.kind === 'box_status')
-  assert.equal(live.device_id, agDev.deviceId)
-  assert.deepEqual(live.vitals, VITALS)
-  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).vitals, VITALS)
-  const devs = await s.http('/devices', { token: clientToken })
-  assert.deepEqual(devs.json.devices.find((d) => d.device_id === agDev.deviceId).status.vitals, VITALS)
-  const roster = await s.http('/roster', { token: clientToken })
-  assert.deepEqual(roster.json.agents.find((d) => d.device_id === agDev.deviceId).status.vitals, VITALS)
-  // A malformed vitals block is dropped alone; the rest of the report stands.
-  client.frames.length = 0
-  agent.send({ op: 'box_status', disk: DISK, vitals: { ...VITALS, cpu_pct: 101 } })
-  const second = await client.waitFor((f) => f.kind === 'box_status')
-  assert.equal('vitals' in second, false)
-  assert.deepEqual(second.disk, DISK)
 })
 
 // Planned-restart state: a bridge publishes where a restart stands so a
@@ -358,4 +338,114 @@ test('box_status.restart verdicts keep outcome and at through the handler; malfo
   } } } })
   const next = await client.waitFor((f) => f.kind === 'box_status' && f.restart?.id === 'r9')
   assert.deepEqual(next.restart.results.verdicts, { ok: { outcome: 'failed', at: 7 } })
+})
+
+const VITALS = { cpu_pct: 37, ram_pct: 61.5, sampled_at_ms: 1758460000000 }
+
+test('box_status vitals: kept on a full report, and a vitals-only report refreshes them without erasing the other blocks', async (t) => {
+  const { s, alice, agDev, clientToken, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', limits: LIMITS, disk: DISK, vitals: VITALS })
+  const first = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(first.vitals, VITALS)
+  assert.deepEqual(first.limits, LIMITS)
+  client.frames.length = 0
+
+  const later = { cpu_pct: 90, ram_pct: 62, sampled_at_ms: 1758460045000 }
+  agent.send({ op: 'box_status', vitals: later })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  // Fanned as the merged row: new vitals plus the stored blocks.
+  assert.deepEqual(live.vitals, later)
+  assert.deepEqual(live.limits, LIMITS)
+  assert.deepEqual(live.disk, DISK)
+  // Stored row keeps limits and disk, takes the new vitals.
+  const stored = deviceStatuses(s.db, alice.id).get(agDev.deviceId)
+  assert.deepEqual(stored.vitals, later)
+  assert.deepEqual(stored.limits, LIMITS)
+  assert.deepEqual(stored.disk, DISK)
+  assert.equal(stored.reported_at, first.reported_at)
+  assert.equal(live.reported_at, first.reported_at)
+  // A client that connects later reads them from /devices and /roster.
+  const devs = await s.http('/devices', { token: clientToken })
+  const row = devs.json.devices.find((d) => d.device_id === agDev.deviceId)
+  assert.deepEqual(row.status.vitals, later)
+  assert.deepEqual(row.status.limits, LIMITS)
+  const roster = await s.http('/roster', { token: clientToken })
+  assert.deepEqual(roster.json.agents.find((d) => d.device_id === agDev.deviceId).status.vitals, later)
+})
+
+test('box_status vitals: a vitals-only report is a valid report on its own, and a malformed block is dropped', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', vitals: VITALS })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.vitals, VITALS)
+  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).vitals, VITALS)
+  agent.frames.length = 0
+  // Out of range, wrong type, missing time, bad time: each leaves nothing valid.
+  for (const bad of [
+    { cpu_pct: 101, ram_pct: 5, sampled_at_ms: 1758460000000 },
+    { cpu_pct: -1, ram_pct: 5, sampled_at_ms: 1758460000000 },
+    { cpu_pct: '5', ram_pct: 5, sampled_at_ms: 1758460000000 },
+    { cpu_pct: 5, ram_pct: 5 },
+    { cpu_pct: 5, ram_pct: 5, sampled_at_ms: 1.5 },
+    { cpu_pct: 5, ram_pct: 5, sampled_at_ms: 1e17 },
+    [1, 2, 3],
+  ]) {
+    agent.send({ op: 'box_status', vitals: bad })
+    const err = await agent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+    assert.equal(err.code, 'bad_request')
+    agent.frames.length = 0
+  }
+  // A bad vitals block does not cost the rest of the report; extra keys are not copied.
+  client.frames.length = 0
+  agent.send({ op: 'box_status', disk: DISK, vitals: { ...VITALS, cpu_pct: 200, extra: 'x' } })
+  const partial = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(partial.disk, DISK)
+  assert.equal('vitals' in partial, false)
+  agent.send({ op: 'box_status', disk: DISK, vitals: { ...VITALS, extra: 'x' } })
+  const copied = await client.waitFor((f) => f.kind === 'box_status' && f.vitals)
+  assert.deepEqual(copied.vitals, VITALS)
+})
+
+test('box_status vitals: a vitals-only report broadcasts the full merged row and leaves reported_at alone; a full report moves it', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', activity: ACTIVITY, limits: LIMITS, disk: DISK, vitals: VITALS })
+  const full = await client.waitFor((f) => f.kind === 'box_status')
+  client.frames.length = 0
+  await new Promise((r) => setTimeout(r, 15))
+
+  const later = { cpu_pct: 12, ram_pct: 40, sampled_at_ms: 1758460045000 }
+  agent.send({ op: 'box_status', vitals: later })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.activity, ACTIVITY)
+  assert.deepEqual(live.limits, LIMITS)
+  assert.deepEqual(live.disk, DISK)
+  assert.deepEqual(live.vitals, later)
+  assert.equal(live.reported_at, full.reported_at)
+  const stored = deviceStatuses(s.db, alice.id).get(agDev.deviceId)
+  assert.equal(stored.reported_at, full.reported_at)
+  assert.equal(stored.vitals.sampled_at_ms, later.sampled_at_ms)
+  client.frames.length = 0
+
+  await new Promise((r) => setTimeout(r, 15))
+  agent.send({ op: 'box_status', limits: LIMITS })
+  const next = await client.waitFor((f) => f.kind === 'box_status')
+  assert.ok(next.reported_at > full.reported_at)
+  assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).reported_at, next.reported_at)
+})
+
+test('box_status: a plugins list of names is stored and fanned out; junk drops only that block', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', disk: DISK, plugins: ['alpha', 'beta', 'alpha'] })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.plugins, ['alpha', 'beta'])
+  assert.deepEqual(deviceStatuses(s.db, alice.id).get(agDev.deviceId).plugins, ['alpha', 'beta'])
+  client.frames.length = 0
+  const tooMany = Array.from({ length: 33 }, (_, i) => `p${i}`)
+  for (const junk of ['alpha', [1], ['x'.repeat(33)], [''], tooMany]) {
+    agent.send({ op: 'box_status', disk: DISK, plugins: junk })
+    const f = await client.waitFor((x) => x.kind === 'box_status')
+    assert.equal('plugins' in f, false, JSON.stringify(junk).slice(0, 40))
+    assert.deepEqual(f.disk, DISK)
+    client.frames.length = 0
+  }
 })

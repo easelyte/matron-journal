@@ -33,6 +33,7 @@ import {
 import { filteredAgent } from './privacy.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { answerTransferAsk } from './transfer-consent.js'
+import { AUTO_APPROVE_REASON } from './consent.js'
 import { getTransfer, isTransferId } from './transfers.js'
 import { verifyOwnAsk, confirmOwnAsk, spawnAsk, chatAsk } from './consent-own-ask.js'
 import { getSpawn } from './spawns.js'
@@ -80,7 +81,8 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   if (!CONSENT_KINDS.has(body.kind) || !CONSENT_DECISIONS.has(body.decision)) { json(res, 400, { error: 'bad_request' }); return true }
   if (typeof body.reason !== 'string' || body.reason.length > CONSENT_REASON_MAX) { json(res, 400, { error: 'bad_request' }); return true }
   const reason = sanitizePeerText(body.reason, CONSENT_REASON_MAX)
-  if (!reason) { json(res, 400, { error: 'bad_request' }); return true }
+  // Reserved for the journal's automatic approvals (it also keys their hourly count).
+  if (!reason || reason === AUTO_APPROVE_REASON) { json(res, 400, { error: 'bad_request' }); return true }
   const decidedBy = { kind: 'coordinator', deviceId: who.deviceId, convoId: body.convo_id, reason }
   const ordinary = filteredAgent(db, who)
   // Every refusal comes BEFORE any state changes, so a refused answer

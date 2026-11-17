@@ -32,7 +32,7 @@ runs on the CPU, so the install line above sets it, as does
 `MATRON_SEMANTIC_SEARCH` below for memory use and the first-boot model
 download.
 
-Node 20+. A systemd unit template is in
+Node 22+. A systemd unit template is in
 [`deploy/matron-journal.service`](deploy/matron-journal.service).
 
 `npm start` runs `bin/matron-journal`, which starts `src/server.js`. On macOS

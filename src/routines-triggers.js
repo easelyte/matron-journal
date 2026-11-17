@@ -141,15 +141,26 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
 // The group's reading is the freshest report's reset time and the highest
 // percent any box saw: a sleeping box's figure can only be low, never
 // high. A line whose reset has passed is no evidence and is skipped. The
-// subject is the allowance plus its reset time, so one weekly window fires
-// at most once and the next window is a new subject.
+// subject is the allowance plus its reset time, so the next window is a
+// new subject. The legacy band fires a window once; a tiered trigger adds
+// the tier (`#<hours_left>h`) and fires each tier of a window once.
 const isWeekly = (l) => l?.id === 'week_all' || (typeof l?.id === 'string' && l.id.startsWith('codex:') && /· Weekly$/.test(l.label || ''))
 
 // Tiers: any tier met is enough; the window is from now to hours_left out.
 // The legacy form is one band: under pct% used, from_hours..to_hours away.
 export function allowanceMet(trigger, percent, left) {
-  if (Array.isArray(trigger.tiers)) return trigger.tiers.some((t) => 100 - percent >= t.unused_pct && left <= t.hours_left * 3600000)
+  if (Array.isArray(trigger.tiers)) return !!metTier(trigger.tiers, percent, left)
   return percent < trigger.pct && left >= trigger.from_hours * 3600000 && left <= trigger.to_hours * 3600000
+}
+
+// The most urgent tier met (fewest hours left): when the 18 h and the 8 h
+// tiers are both met, the 8 h one fires and the 18 h one is spent with it.
+function metTier(tiers, percent, left) {
+  let best = null
+  for (const t of tiers) {
+    if (100 - percent >= t.unused_pct && left <= t.hours_left * 3600000 && (!best || t.hours_left < best.hours_left)) best = t
+  }
+  return best
 }
 
 function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
@@ -175,15 +186,21 @@ function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
     }
   }
   const out = []
+  const tiered = Array.isArray(trigger.tiers)
   for (const g of groups.values()) {
     const left = g.resetAt - now
-    if (!allowanceMet(trigger, g.percent, left)) continue
+    const tier = tiered ? metTier(trigger.tiers, g.percent, left) : null
+    if (tiered ? !tier : !allowanceMet(trigger, g.percent, left)) continue
     const boxes = [...new Set(g.boxes)].join(', ')
     // Boxes on one account report the same reset a minute apart (11:59 and
     // 12:00, as their /usage text rounds); the subject takes the nearest
     // hour so a weekly window stays one subject whichever box reported last.
     const hour = Math.round(g.resetAt / 3600000) * 3600000
-    out.push({ subject: `allowance:${g.key}@${new Date(hour).toISOString()}`, line: `- ${sanitizePeerText(g.label, 64)} at ${g.percent}%, resets ${g.resetIso} (in ${inWords(left)}); boxes: ${boxes}` })
+    const window = `allowance:${g.key}@${new Date(hour).toISOString()}`
+    const line = `- ${sanitizePeerText(g.label, 64)} at ${g.percent}%, resets ${g.resetIso} (in ${inWords(left)}); boxes: ${boxes}`
+    out.push(tier
+      ? { subject: `${window}#${tier.hours_left}h`, line: `${line}; tier: ${tier.unused_pct}% unused with ${tier.hours_left} h left`, window, tierHours: tier.hours_left }
+      : { subject: window, line })
   }
   return out
 }
@@ -270,12 +287,33 @@ export function currentSubjects(db, routine, { now = Date.now() } = {}) {
 // An allowance subject is kept until its weekly window has reset, not just
 // while it matches: a tiered trigger can stop matching between tiers (the
 // first fire's sessions spend the unused share) and match again at a later
-// tier, and that must not fire the same window twice. The subject's reset
+// tier, and that must not fire the same tier twice. The subject's reset
 // is rounded to the hour, so it is kept an hour past it.
+function allowanceReset(subject) {
+  return Date.parse(subject.slice(subject.lastIndexOf('@') + 1).split('#')[0])
+}
 function allowanceWindowOpen(subject, now) {
   if (!subject.startsWith('allowance:')) return false
-  const reset = Date.parse(subject.slice(subject.lastIndexOf('@') + 1))
+  const reset = allowanceReset(subject)
   return Number.isFinite(reset) && reset + 3600000 > now
+}
+
+// A tier is spent once its window has fired at that tier or a more urgent
+// one: the 8 h tier firing spends the 18 h tier too, so it never fires
+// after it. A record from before tiers were kept in the subject (no `#`)
+// spends every tier at least as far out as the hours left when it fired.
+// Its reset is rounded to the hour, up to half an hour from the real one,
+// so the hours left are read with that half hour of slack: a fire right
+// at a tier's boundary always spends that tier.
+const ROUNDING_SLACK_MS = 1800000
+function tierSpent(s, known) {
+  for (const [k, trippedAt] of known) {
+    if (k === s.window) {
+      const reset = allowanceReset(k)
+      if (Number.isFinite(reset) && s.tierHours * 3600000 + ROUNDING_SLACK_MS >= reset - trippedAt) return true
+    } else if (k.startsWith(`${s.window}#`) && s.tierHours >= Number.parseInt(k.slice(s.window.length + 1), 10)) return true
+  }
+  return false
 }
 
 export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false, record = true } = {}) {
@@ -285,14 +323,14 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
     const live = db.prepare('SELECT enabled FROM routines WHERE id=?').get(routine.id)
     if (!live || !live.enabled) return { fresh: [], matching: [] }
     const matching = evaluateTrigger(db, routine.user_id, routine.trigger, { now, coordinatorConvoId, excludePrivateOwned })
-    const known = new Set(db.prepare('SELECT subject FROM routine_trigger_state WHERE routine_id=?').all(routine.id).map((r) => r.subject))
+    const known = new Map(db.prepare('SELECT subject, tripped_at FROM routine_trigger_state WHERE routine_id=?').all(routine.id).map((r) => [r.subject, r.tripped_at]))
     const still = new Set(matching.map((s) => s.subject))
     const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
-    for (const s of known) if (!still.has(s) && !allowanceWindowOpen(s, now)) forget.run(routine.id, s)
+    for (const s of known.keys()) if (!still.has(s) && !allowanceWindowOpen(s, now)) forget.run(routine.id, s)
     // An allowance with nothing to spend it on is not consumed: it fires
     // when a task lands in the backlog, if that is still inside the window.
     const idle = routine.trigger.kind === 'allowance_expiring' && !spareBacklog(db, routine.user_id, { limit: 1, excludePrivateOwned }).length
-    const fresh = idle ? [] : matching.filter((s) => !known.has(s.subject))
+    const fresh = idle ? [] : matching.filter((s) => !known.has(s.subject) && !(s.window && tierSpent(s, known)))
     if (record) {
       const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')
       for (const s of fresh) mark.run(routine.id, s.subject, now)

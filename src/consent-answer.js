@@ -61,7 +61,8 @@ const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordina
 export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
   if (!byCoordinator(decidedBy)) return
   try {
-    recordConsentDecision(db, {
+    // Automatic spawn claims already recorded their decision atomically.
+    if (!decidedBy.recorded) recordConsentDecision(db, {
       userId, kind, askId, decision, convoId: decidedBy.convoId, reason: decidedBy.reason,
       causeKind: decidedBy.causeKind ?? null, causeRef: decidedBy.causeRef ?? null, verifierNote: decidedBy.verifierNote ?? null,
     })
@@ -74,6 +75,7 @@ export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, 
       userId, convoId, sender: 'journal', type: CONSENT_DECISION_EVENT_TYPE,
       payload: {
         kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason,
+        ...(decidedBy.automatic === true ? { auto: true } : {}),
         cause: decidedBy.causeKind ? { kind: decidedBy.causeKind, ref: decidedBy.causeRef } : null,
       },
     })
@@ -160,7 +162,13 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   // already won — 409, and nothing expensive has started (spec failure
   // table: two approve taps spawn once).
   // For a spawn onto a protected box the claim also checks and stores the
-  // user's signed approval, which the `start` params then carry.
+  // user's signed approval, which the `start` params then carry. Automatic
+  // approvals must consume their hourly allowance durably before any session
+  // starts: the decision is written inside the same guarded transaction as
+  // the claim, so a failed write rolls the claim back.
+  // Set only by the journal's own automatic path (src/ws.js); never derived
+  // from the reason text, which the Coordinator can send itself.
+  const automatic = byCoordinator(decidedBy) && decidedBy.automatic === true
   const refused = guardedApprove(db,
     () => {
       const locked = lockedApprovalRefusal(db, userId)
@@ -171,8 +179,16 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
       if (now?.state !== 'awaiting_user') return CONFLICT
       return consentApproval({ db, journalHost }, userId, decidedBy, 'spawn', now, approval)
     },
-    (signed) => claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed }))
+    (signed) => {
+      if (!claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed })) return false
+      if (automatic) recordConsentDecision(db, {
+        userId, kind: 'spawn', askId: requestId, decision, convoId: decidedBy.convoId,
+        reason: decidedBy.reason, causeKind: decidedBy.causeKind, causeRef: decidedBy.causeRef,
+      })
+      return true
+    })
   if (refused) return refused
+  if (automatic) decidedBy = { ...decidedBy, recorded: true }
   recordApproved({ db, securityLog }, userId, 'spawn_approved', decidedBy, boxTarget(db, row.target_device_id))
   // The ask stopped waiting at the claim, so its tracker item closes now —
   // not at the outcome, which can be minutes away when the target box has

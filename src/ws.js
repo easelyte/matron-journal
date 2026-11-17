@@ -13,11 +13,12 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle, getSpawn } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
-import { answerSpawnAsk } from './consent-answer.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
 import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
 import { securityLogFor, boxTarget, convoTarget } from './security-log.js'
 import { agentJournalFrame } from './hub.js'
+import { answerSpawnAsk } from './consent-answer.js'
+import { resolveAskCause } from './ask-cause.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
@@ -1697,14 +1698,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // the filed card, for the user or the checked POST /consent/answer.
         const autoCause = () => {
           const row = getSpawn(db, spawnId)
-          if (!row) return false
+          if (!row) return null
           const res = resolveAskCause(db, {
             who: { userId: conn.userId, deviceId: conn.deviceId, kind: conn.kind, name: conn.name },
             userId: conn.userId, causes: causes ?? [], createdAt: row.created_at, fromConvoId: msg.from_convo_id,
           })
-          return res.ok && res.root.kind !== 'routine'
+          return res.ok && res.root.kind !== 'routine' ? res.root : null
         }
-        const autoEligible = online && getAutoApproveCoordinatorSpawns(db, conn.userId)
+        const autoRoot = online && getAutoApproveCoordinatorSpawns(db, conn.userId)
           && getConsentEnabled(db, conn.userId)
           && getCoordinatorConvoId(db, conn.userId) === msg.from_convo_id
           && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })
@@ -1727,13 +1728,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           ...(autoEligible ? { auto_approved: true } : {}),
         }))
         let autoApproved = false
-        if (autoEligible) {
+        if (autoRoot) {
           // Keeps the shared answer path for claiming, audit and closing the
           // item. Failure leaves the filed card available for a manual answer.
           try {
-            const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, {
+            const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost, securityLog }, {
               userId: conn.userId, requestId: spawnId, decision: 'approve',
-              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON },
+              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON, automatic: true, causeKind: autoRoot.kind, causeRef: autoRoot.ref },
             })
             autoApproved = result.status === 200
           } catch (err) {
@@ -2779,12 +2780,23 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           if (kept) status.restart = kept
         }
         const reportedAt = Date.now()
-        upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // A report carrying only `vitals` (the bridge's frequent load sample)
+        // refreshes that block and keeps the stored usage, activity and disk
+        // blocks and the stored reported_at (the vitals carry their own
+        // sampled_at_ms, so older limits do not look freshly reported); the
+        // clients get the merged row, since they replace the whole box row on
+        // each box_status frame. Any other report replaces the row as before.
+        let fan = { reported_at: reportedAt, ...status }
+        if (Object.keys(status).every((k) => k === 'vitals')) {
+          const prior = getDeviceStatus(db, conn.userId, conn.deviceId)
+          mergeDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt: prior ? prior.reported_at : reportedAt })
+          fan = getDeviceStatus(db, conn.userId, conn.deviceId) || fan
+        } else upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
         // The same reading, filed in the usage history (best effort: a
         // failed write must not cost the live report).
         try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
         catch (e) { console.warn(`box_status: usage history write failed: ${e.message}`) }
-        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
+        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, ...fan })
         break
       }
       case 'session_control': {

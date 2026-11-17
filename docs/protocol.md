@@ -1990,7 +1990,7 @@ Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, se
 
 Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
 
-**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, vitals?: {cpu_pct, ram_pct, sampled_at_ms}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). `vitals` is the box's host-global CPU/RAM sample: `cpu_pct` and `ram_pct` finite numbers in 0..100, `sampled_at_ms` a positive integer epoch-ms no greater than 8.64e15; all-or-nothing like the other blocks (a wrong type or out-of-range value drops the block, extra keys are not copied). It is distinct from the ephemeral `host_vitals` op (`{cpu, ram, sampled_at_ms}`, unpersisted, opaque): `box_status.vitals` is persisted with the rest of the report so a sleeping box still shows its last known load. A journal predating the block ignores it. Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its `activity`/`limits`/`disk` blocks plus `reported_at`; `account` and `vitals` are served on `/devices` and `/roster` only), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, vitals?: {cpu_pct, ram_pct, sampled_at_ms}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). `vitals` is the box's host CPU and RAM use: `cpu_pct` and `ram_pct` finite numbers in 0..100 and `sampled_at_ms` a positive integer epoch-ms; all-or-nothing, extra keys are not copied. A bridge sends it on its own, as a report whose only block is `vitals`, when CPU or RAM has moved by 8 points or more or about every 45 s; such a report is *merged* into the stored row (the other blocks and the stored `reported_at` are kept; the vitals carry their own `sampled_at_ms`) and the *merged* row is fanned out, so a client that replaces the whole box row on each frame keeps limits, activity and disk. A client should treat a reading older than a minute as stale. Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
 
 **Usage history (`GET /usage/history`).** `device_status` keeps only a box's latest reading; the journal also files every reading of a *weekly* meter (`src/usage-history.js`), so a past week's unused allowance can still be answered. A reading is filed under its **account** — `claude:login:<email>` when the `box_status` names a login (boxes on one login spend one allowance and are one account), else `claude:device:<id>:<paired-at>` (the box's id and when it was paired, so a later box given the same id starts its own history) — and under the weekly **window** its `resets_at` names (rounded to the hour; a reading joins an open window whose reset is within two hours of its own, since boxes print the same reset a minute apart). Codex's weekly meters (`codex:…` ids labelled `… · Weekly`) are taken from a session's `status` op, which carries no login, and are filed under `codex:device:<id>:<paired-at>`. Per window the journal keeps the newest reading (`percent`), the highest (`peak`) and the times of the first and last readings; an older reading arriving late (a box that idled while others spent the meter) can raise the peak but never replaces a newer figure. Dropped rather than guessed at: a reading taken at or after its own reset, one whose reset is more than eight days out, one cached more than eight days ago, and a non-zero reading with no `resets_at`. A `0%` line with no `resets_at` (an untouched week prints no reset time) is filed in the next whole week on from the account's last known window, so an unused week counts as 100% unused once the weekly rhythm is known; it is never filed into a window that is still open or already has a row, so it cannot replace a real reading. One sample per account, meter and hour is also kept (the hour's highest reading) for two years; windows are kept indefinitely.
 
@@ -2999,10 +2999,18 @@ labelled `spare-allowance` and not `dispatched` — is empty), or
 `{kind:'allowance_expiring', tiers:[{unused_pct, hours_left}, …]}` (1–4
 tiers; `unused_pct` 1–99, `hours_left` 1–168: the same meter and subject,
 met when any tier has at least `unused_pct`% of it unused with its reset
-at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — still once
-per weekly window, the first tier to be met firing it: an allowance
-subject is remembered until an hour after its reset, not just while it
-matches, so dropping between tiers does not re-arm it), evaluated against `conversation_status` and `device_status` by a
+at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — each tier
+fires once per weekly window: the subject is
+`allowance:<account or device>@<reset iso>#<hours_left>h` for the most
+urgent tier met (fewest hours left), so a later tier still met fires the
+window again, while one fire spends every tier at least as far out as
+the one that fired, and a tier never fires after a more urgent one; an
+allowance subject is remembered until an hour after its reset, not just
+while it matches, so dropping between tiers does not re-arm a spent tier;
+a record from before tiers were in the subject spends the tiers whose
+`hours_left` is at least the hours that were left when it fired, read
+with half an hour of slack because the subject rounds its reset to the
+hour), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
@@ -3012,7 +3020,8 @@ The fire's `message` is the prompt plus a `Tripped by:` list, one line per
 fresh subject (`- [title](matron://convo/<id>) at 42% of its window
 (420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
 time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`, `- Week (all models) at
-32%, resets <iso> (in 9 h); boxes: a, b`). An `allowance_expiring` fire
+32%, resets <iso> (in 9 h); boxes: a, b`, and for a tiered trigger
+`; tier: 35% unused with 8 h left` after it). An `allowance_expiring` fire
 adds `Next in the spare-allowance backlog:` and the first three such tasks
 (`- #<num> <title>`). Pausing a triggered
 routine or changing its trigger clears its records. A triggered routine
@@ -3190,7 +3199,7 @@ nothing until the bridge is updated; against a bridge older than both the
 memories are stored and shown in the apps only.
 
 ```
-{ id: "me_<16 hex>", name, type, scope, description, body,
+{ id: "me_<16 hex>", name, type, scope, tier, topic, description, body,
   origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
 ```
 
@@ -3207,6 +3216,18 @@ memories are stored and shown in the apps only.
   it; the **bridge** does the matching at spawn (global always, the repo
   scope of the session's workdir, `coordinator` for the Coordinator) and
   the Coordinator's `memory_list` sees every scope.
+- `tier`: how a session is given the memory — `always` (listed in full,
+  name and description, in every session of its scope; what every memory
+  was before the column existed, and the default on create) or
+  `on_demand` (a bridge with the **tiers update** names it under its
+  `topic` and lets the session read it with `GET /memories/:key` or find
+  it with `POST /memories/recall`). Kept when omitted on update.
+- `topic`: a short label (≤40 characters, one line) that groups on-demand
+  memories in a session's list, e.g. `couriers`. Optional; `""` or `null`
+  clears it; kept when omitted on update.
+- Neither tier has a size limit: a memory's tier is the one its writer
+  names, else the stored one, else `always`. How many memories a scope
+  holds in either tier never moves a memory or refuses a write.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -3225,11 +3246,38 @@ memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
+| `POST /memories/recall` | `{text, mode?, scopes?, tier?, exclude?, limit?, min_score?, min_z?}` | 200 `{memories:[{…memory, score, why}], semantic}` (see *Recall* below); 400 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, tier?, topic?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
 | `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
 
+### Recall
+
+`POST /memories/recall` answers with the memories that bear on a text,
+whole (the body included), best first. `text` is 1–4000 characters.
+`mode` is `query` (the default: an agent's own words) or `auto` (the text
+of a turn a bridge is about to hand its agent). A `query` of at most 256
+characters runs unified search's tiers over memories (exact, words,
+stemmed, similar, some words), so it works without the vector index; a
+longer one runs the similar pass alone. `auto` runs only the similar pass
+(any-word matching on a whole message would pull in every memory that
+shares a common word), and a match must clear two bars: cosine similarity
+at least `min_score` (0.5–0.95, default 0.62), and a z-score of at least
+`min_z` (1–6, default 3) against the similarity of every memory the caller
+can see — it must stand out from the rest. A small embedding model scores
+most pairs of texts alike, so a fixed floor alone either misses real
+matches or lets in near-misses. With fewer than 20 memories the floor
+alone applies. A memory's `topic` leads its search text, so a topic that
+names the situation (`booking couriers`) helps it be found. Filters: `scopes` (the session's
+audience, up to 20 scope strings), `tier`, and `exclude` (names already
+given to the session, up to 200). `limit` is 1–10, default 3. `semantic`
+reports the vector index: `ready`, `indexing` or `off`; while it is not
+ready, `auto` recalls nothing. The embedding model runs in the journal's
+process, as for search; no text leaves it. An ordinary agent never
+recalls a memory saved from a private device.
+
 `PUT` is the only write and is an **upsert by name**: the same name from
-any device overwrites `description`, `body`, `type` and `scope` and bumps
+any device overwrites `description`, `body`, `type`, `scope`, `tier` and
+`topic` (the last four kept when omitted) and bumps
 `updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
 `body` on an update **clears** it. Retries are therefore free; there is no
 `Idempotency-Key`. An invalid `:name` is 400, not 404.
@@ -5714,15 +5762,11 @@ stored and read back by `GET /panic`, never written to a line.
 
 ## User settings
 
-`GET /settings` (either device kind) →
-`{notices: boolean, auto_approve_coordinator_spawns: boolean, auto_archive_days: integer}`.
-`PATCH /settings {notices?, auto_approve_coordinator_spawns?, auto_archive_days?}`
-(or `PUT`; any subset, client only, else **403**; an empty object, an unknown
-key, a non-boolean `notices` / `auto_approve_coordinator_spawns` or an
-`auto_archive_days` outside 0–3650 is **400**) → the full new view. Omitted
-keys keep their current values. `auto_archive_days` is the auto-archive
-idle window (see *Archived conversations*), default 30, `0` = off.
-`notices` — "Send things I need to
+`GET /settings` (either device kind) → `{notices: boolean, auto_approve_coordinator_spawns: boolean, auto_archive_days: integer}`.
+`PATCH /settings {notices?, auto_approve_coordinator_spawns?, auto_archive_days?}` (or `PUT`; client only, else **403**;
+an empty object, an unknown key, a non-boolean switch or an `auto_archive_days` outside
+0–3650 is **400**) → the new view. `auto_archive_days` is the auto-archive
+idle window (see *Archived conversations*), default 30, `0` = off. `notices` — "Send things I need to
 read to For you" — defaults to `true` (no row reads as `true`). While on,
 bridges add the notices block to new sessions' instructions, and the
 unseen lists (`GET /unseen`, the nudge) skip what an open item already
@@ -5732,34 +5776,32 @@ listed either way. A change is sent live to every socket of the user as
 `{kind: 'control', op: 'settings', settings}`; `hello_ok` carries the
 current view, so nothing needs replaying.
 
-`auto_approve_coordinator_spawns` defaults to `false`, including for existing
-accounts. When enabled, a spawn requested from the user's current Coordinator
-conversation is approved immediately if the target has a live registered
-socket, Coordinator consent is enabled, neither device is user-only, and the
-ask's `causes` resolve (`src/ask-cause.js`) to the user's verified words or a
-comment/tap on one of the Coordinator conversation's items: the opt-in does
-not waive the own-ask rule (*The Coordinator's own asks*). An ask with no
-cause, an unverified one, or a routine-fire root (which needs the envelope,
-verifier and routine cap) stays parked for a tap or a checked
-`POST /consent/answer`.
-The card and decision item are filed first, then the shared approval flow
-closes the item and starts the session. The requester still receives its
-`spawn/pending` acknowledgement. The decision is recorded as made by the
-Coordinator with reason exactly `auto-approved (Coordinator)`, with the usual
-`consent_decision` event and spawn outcome; no consent nudge is sent.
+`auto_approve_coordinator_spawns` defaults to `false`, also for existing
+accounts. When enabled, requests from the current Coordinator conversation
+are approved automatically only onto the user's own online box, with a live
+registered socket, Coordinator consent enabled, and neither device user-only.
+The ask's causes must resolve through the existing own-ask rules to a verified
+non-routine root: the user's words or an item comment/tap. Missing, unverified
+and routine causes retain the normal approval flow; routine envelopes,
+verification and routine caps are not waived.
 
-This explicit opt-in bypasses the daily approval cap but has its own ceiling
-of 60 automatic approvals per rolling hour (beyond it, asks wait for an answer
-as usual). The requester's `spawn/pending` acknowledgement carries
-`auto_approved: true` (omitted otherwise) and is sent before the approval runs.
-The approval card is still published first, so apps may briefly show a card
-(and send its notification) for a spawn that is already starting. Each approval is recorded
-in the decision history (so it counts toward the cap for later
-answers through `/consent/answer`). Other conversations, chat invites, and
-cross-user requests keep their existing rules. Targets without a live socket
-keep their existing wake and consent flow; being wakeable alone does not
-qualify. If automatic answering fails before the decision is claimed, the
-filed card remains available for manual approval.
+This opt-in loosens the daily approval policy: automatic approvals bypass the
+rolling daily cap and instead have a ceiling of 60 per user per rolling hour.
+At that ceiling, requests wait for an answer as usual. Automatic approvals
+remain in ordinary decision history and count toward the daily cap for later
+`/consent/answer` approvals. Transfer caps are unchanged.
+
+The card and consent item are filed before the pending acknowledgement and
+the shared approval flow. Successful approval closes the item, records the
+verified cause and reason `auto-approved (Coordinator)`, emits the usual
+`consent_decision` (with `auto: true`; the journal marks the automatic path
+itself, and `POST /consent/answer` rejects that reserved reason with **400**)
+and spawn outcome, and skips the consent nudge. A failed
+claim or decision-history write leaves the card available for an answer.
+Asleep targets retain their
+wake and consent flow. Other conversations and chat invites are unchanged.
+Apps may briefly display or notify the card before it closes. The setting is
+included in existing settings and hello frames; no client polling is added.
 
 ## Default model and effort
 

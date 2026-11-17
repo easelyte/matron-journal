@@ -669,13 +669,9 @@ export function sanitizeSpawnDisk(raw) {
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
 }
 
-// Vitals block: the bridge's host-global CPU/RAM sample (hostVitals() in
-// matron-bridge lib/session-status.js), persisted with the box's report so
-// an ops view can show the last known load of a box that is asleep. All-or-
-// nothing like every other block: two finite percentages in 0..100 and a
-// sample time that is a positive integer ms no later than JS's Date ceiling
-// (AS_OF_MAX_MS, same RangeError reason as limits.as_of). Only the three
-// keys are copied; typeof 'number' already rules out nested objects/arrays.
+// Vitals block: the box's host CPU and RAM use as percentages, with the time
+// of the sample so a client can grey a reading that has gone quiet. All-or-
+// nothing like the other blocks; only these three keys are copied.
 function isPct(v) { return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 }
 
 export function sanitizeBoxVitals(raw) {
@@ -691,6 +687,23 @@ export function sanitizeBoxVitals(raw) {
 // with no valid block at all is rejected (nothing to store).
 const ACCOUNT_EMAIL_CAP = 254
 
+// `plugins`: the names of the bridge plugins the box has loaded. A short
+// list of short plain strings; all-or-nothing like the other blocks.
+const PLUGINS_MAX = 32
+const PLUGIN_NAME_CAP = 32
+
+export function sanitizeBoxPlugins(raw) {
+  if (!Array.isArray(raw) || raw.length > PLUGINS_MAX) return null
+  const out = []
+  for (const n of raw) {
+    if (typeof n !== 'string' || !n || n.length > PLUGIN_NAME_CAP) return null
+    const name = sanitizePeerText(n, PLUGIN_NAME_CAP)
+    if (!name) return null
+    if (!out.includes(name)) out.push(name)
+  }
+  return out
+}
+
 export function sanitizeBoxStatus(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const activity = sanitizeSpawnActivity(raw.activity)
@@ -698,6 +711,7 @@ export function sanitizeBoxStatus(raw) {
   const disk = sanitizeSpawnDisk(raw.disk)
   const vitals = sanitizeBoxVitals(raw.vitals)
   const defaults = sanitizeBoxDefaults(raw.defaults)
+  const plugins = sanitizeBoxPlugins(raw.plugins)
   let account = null
   if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
     && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
@@ -705,7 +719,7 @@ export function sanitizeBoxStatus(raw) {
     if (email) account = { email }
   }
   const restart = sanitizeBoxRestart(raw.restart)
-  if (!activity && !limits && !disk && !account && !vitals && !defaults && !restart) return null
+  if (!activity && !limits && !disk && !account && !vitals && !defaults && !plugins && !restart) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
@@ -714,6 +728,7 @@ export function sanitizeBoxStatus(raw) {
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
     ...(restart ? { restart } : {}),
+    ...(plugins ? { plugins } : {}),
   }
 }
 
