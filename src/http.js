@@ -63,6 +63,7 @@ import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { makeInboundHandler } from './inbound-http.js'
+import { isInboundFileBlob } from './inbound-files.js'
 import { isInboundSystem } from './inbound.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
@@ -161,7 +162,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
     db, hub, broker, waker, rateLimiter, wakeWaitMs: spawnWakeWaitMs, timeoutMs: sessionControlTimeoutMs,
     token: alertWebhook?.token ?? null, username: alertWebhook?.username ?? null,
   })
-  const handleInbound = makeInboundHandler({ db, hub, pushPipeline, rateLimiter })
+  const handleInbound = makeInboundHandler({ db, hub, pushPipeline, rateLimiter, mediaDir, mediaMaxBytes, mediaUserQuotaBytes, journalHost })
   // Every request runs in its own scope (src/security-log.js), so a security
   // event recorded anywhere under it carries the caller's address.
   return (req, res) => withRequestScope(req, () => handle(req, res))
@@ -1409,6 +1410,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // come from there on first read (src/federation-media.js).
         if (!blob && federationMedia && await federationMedia.serve(req, res, who, mm[1])) return
         if (!blob) return json(res, 404, { error: 'not_found' })
+        // An inbound source's file (src/inbound-files.js) is for the user's
+        // own apps, like the conversation it is shown in: never an agent.
+        if (who.kind === 'agent' && isInboundFileBlob(db, blob.id)) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId) {
           // Shared visibility (spec 2026-09-23 tracker web/teams): a
           // colleague reaches a blob only through a shared row that

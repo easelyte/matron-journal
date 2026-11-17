@@ -2,8 +2,10 @@
 // workflow service) that the user lets post reports into Matron.
 //
 // A source has a name, a key and one conversation of its own. The key can
-// post a report and nothing else: it reads nothing, and it is not a device
-// token. Each report is one message in the source's conversation.
+// post a report and, when the user has turned replies on for the source,
+// read what the user typed in that one conversation since. It reads nothing
+// else, and it is not a device token. Each report is one message in the
+// source's conversation.
 //
 // That conversation is a system conversation (`conversations.system =
 // 'inbound:<source id>'`), so every guard the People conversation has
@@ -16,14 +18,16 @@
 // Guards that are not settings:
 //   - a size cap, an hourly cap and a daily cap per source;
 //   - an identical report within a day is dropped;
-//   - text only: images become links, raw HTML is escaped, control and
-//     direction-override characters are removed;
+//   - in the text, images become links, raw HTML is escaped, control and
+//     direction-override characters are removed; a picture or a PDF comes
+//     only as an uploaded file (src/inbound-files.js);
 //   - the log says which source, how many bytes and the outcome, never the
 //     text.
 import { createHash, randomBytes } from 'node:crypto'
 import { append, broadcastAppended, toEventShape } from './journal.js'
 import { sanitizeConsentText, plainText } from './peer-text.js'
 import { isPanicLocked } from './panic.js'
+import { takeFiles, fileSums, markFilesUsed, dropUploadAddresses, FILES_PER_REPORT_MAX } from './inbound-files.js'
 
 export const INBOUND_SYSTEM_PREFIX = 'inbound:'
 export const INBOUND_SENDER_PREFIX = 'source:'
@@ -37,6 +41,8 @@ export const REPORT_LINK_MAX = 2000
 export const DEFAULT_HOURLY_MAX = 10
 export const DEFAULT_DAILY_MAX = 40
 export const CAP_MAX = 1000
+export const REPLIES_PER_READ_MAX = 20
+export const REPLY_MAX_CHARS = 4000
 const HOUR = 60 * 60 * 1000
 const DAY = 24 * HOUR
 const JOURNAL = 'journal'
@@ -93,7 +99,14 @@ export function setSourceEnabled(db, id, enabled) {
 // A new key for the same source; the old one stops working at once.
 export function rotateSourceKey(db, id) {
   const key = INBOUND_KEY_PREFIX + randomBytes(32).toString('base64url')
-  return db.prepare('UPDATE inbound_sources SET token_hash=? WHERE id=?').run(sha256(key), id).changes > 0 ? key : null
+  // Upload addresses made under the old key go with it, in the same write:
+  // a request under the old key (reserveFile checks it) cannot slip one in
+  // between.
+  return db.transaction(() => {
+    if (!db.prepare('UPDATE inbound_sources SET token_hash=? WHERE id=?').run(sha256(key), id).changes) return null
+    dropUploadAddresses(db, id)
+    return key
+  })()
 }
 
 export function setSourceCaps(db, id, { hourlyMax, dailyMax }) {
@@ -177,10 +190,12 @@ function cleanLink(link) {
   return title ? `- [${title}](${href})` : `- <${href}>`
 }
 
-// {ok:true, text, bytes} or {ok:false, error:'bad_request'|'too_large', detail}.
+// {ok:true, text, bytes, files} or {ok:false, error:'bad_request'|'too_large', detail}.
+// `files` are the ids the report names, not yet checked.
 export function buildReport(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return { ok: false, error: 'bad_request', detail: 'the report must be a JSON object' }
-  const { title, body, links } = input
+  const { title, body, links, files } = input
+  if (files != null && (!Array.isArray(files) || files.length > FILES_PER_REPORT_MAX || files.some((f) => typeof f !== 'string' || !f))) return { ok: false, error: 'bad_request', detail: `files must be a list of at most ${FILES_PER_REPORT_MAX} file ids` }
   if (typeof body !== 'string') return { ok: false, error: 'bad_request', detail: 'body must be a string of markdown' }
   if (title != null && typeof title !== 'string') return { ok: false, error: 'bad_request', detail: 'title must be a string' }
   if (Buffer.byteLength(body, 'utf8') > REPORT_BODY_MAX_BYTES) return { ok: false, error: 'too_large', detail: `body is over ${REPORT_BODY_MAX_BYTES} bytes` }
@@ -197,7 +212,7 @@ export function buildReport(input) {
     if (lines.length) parts.push(lines.join('\n'))
   }
   const full = parts.join('\n\n')
-  return { ok: true, text: full, bytes: Buffer.byteLength(full, 'utf8') }
+  return { ok: true, text: full, bytes: Buffer.byteLength(full, 'utf8'), files: files ?? [] }
 }
 
 // --- accepting one -------------------------------------------------------
@@ -206,8 +221,8 @@ const senderOf = (source) => `${INBOUND_SENDER_PREFIX}${source.name}`
 
 // Appends happen inside the caller's transaction; `fan` collects what to
 // broadcast once it has committed.
-function say(db, fan, source, sender, type, payload) {
-  const r = append(db, { userId: source.user_id, convoId: source.convo_id, sender, type, payload })
+function say(db, fan, source, sender, type, payload, blobRef = null) {
+  const r = append(db, { userId: source.user_id, convoId: source.convo_id, sender, type, payload, blobRef })
   fan.push({ userId: source.user_id, convoId: source.convo_id, seq: r.seq, ts: r.ts, sender, type, payload })
   return r
 }
@@ -240,11 +255,14 @@ function refuseOverCap(db, fan, source, { windowMs, max, per, now }) {
 export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
   const { db, hub = null, pushPipeline = null } = ctx
   const keyHash = source.token_hash
+  // The replies this report can have answered are the ones handed over
+  // before it was sent: `source` was loaded before the request body, so a
+  // read that lands while the body is on its way is not marked answered.
+  const answered = source.replies_seen_seq ?? 0
   const built = buildReport(input)
   if (!built.ok) return { status: built.error, detail: built.detail }
   // A panic-locked account (src/panic.js) takes nothing new from outside.
   if (isPanicLocked(db, source.user_id)) return { status: 'account_locked' }
-  const hash = sha256(built.text)
   const fan = []
   const out = db.transaction(() => {
     // Read again inside the transaction: the caller's row was loaded before
@@ -253,18 +271,36 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
     source = getSource(db, source.id)
     // ...or its key may have been replaced.
     if (!source || !source.enabled || source.token_hash !== keyHash) return { status: 'bad_request', detail: 'the source is no longer enabled, or its key changed' }
-    if (db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
+    // The same words with other files are another report. A report sent
+    // again names files that were already shown, so the duplicate check
+    // comes before the files are checked for that.
+    const sums = fileSums(db, source, built.files)
+    const hash = sums ? sha256([built.text, ...sums].join('\n')) : null
+    if (hash && db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
+    const taken = takeFiles(db, source, built.files, { now })
+    if (!taken.ok) return { status: 'bad_request', detail: taken.detail }
     const count = (windowMs) => db.prepare('SELECT COUNT(*) AS n FROM inbound_posts WHERE source_id=? AND ts>?').get(source.id, now - windowMs).n
     if (count(HOUR) >= source.hourly_max) return refuseOverCap(db, fan, source, { windowMs: HOUR, max: source.hourly_max, per: 'an hour', now })
     if (count(DAY) >= source.daily_max) return refuseOverCap(db, fan, source, { windowMs: DAY, max: source.daily_max, per: 'a day', now })
     db.prepare('DELETE FROM inbound_posts WHERE source_id=? AND ts<=?').run(source.id, now - 2 * DAY)
     db.prepare('INSERT INTO inbound_posts(source_id, ts, body_hash, bytes) VALUES(?,?,?,?)').run(source.id, now, hash, built.bytes)
-    db.prepare('UPDATE inbound_sources SET last_post_at=? WHERE id=?').run(now, source.id)
+    // The report answers every reply the source has been handed.
+    db.prepare('UPDATE inbound_sources SET last_post_at=?, replies_done_seq=MAX(replies_done_seq, MIN(replies_seen_seq, ?)) WHERE id=?').run(now, answered, source.id)
     announceOnce(db, fan, source)
     // `from: 'source'` and `source` tell an app this is an outside tool's
     // text, not an agent's and not the user's.
     const r = say(db, fan, source, senderOf(source), 'text', { body: built.text, from: 'source', source: { id: source.id, name: source.name } })
-    return { status: 'accepted', seq: r.seq, bytes: built.bytes }
+    // Its files follow it, each a message of its own, as a user's do.
+    for (const f of taken.files) {
+      const image = f.content_type.startsWith('image/')
+      say(db, fan, source, senderOf(source), image ? 'image' : 'file', {
+        blob_ref: f.blob_id, name: f.name, content_type: f.content_type, size: f.size,
+        ...(image && f.width > 0 && f.height > 0 ? { width: f.width, height: f.height } : {}),
+        from: 'source', source: { id: source.id, name: source.name },
+      }, f.blob_id)
+    }
+    markFilesUsed(db, taken.files, now)
+    return { status: 'accepted', seq: r.seq, bytes: built.bytes, files: taken.files.length }
   })()
   for (const f of fan) {
     if (hub) broadcastAppended(db, hub, f)
@@ -286,4 +322,75 @@ export function latestReportBefore(db, source, beforeSeq) {
 
 export function sourceOfConvo(db, userId, convoId) {
   return db.prepare('SELECT * FROM inbound_sources WHERE user_id=? AND convo_id=?').get(userId, convoId) ?? null
+}
+
+// --- replies: what the user typed there, for the source to read ----------
+//
+// Off unless the user turns it on for the source, because it sends their
+// words out of Matron. On, the source's key can read the text messages the
+// user typed in the source's own conversation after that moment, and
+// nothing else. A message stays listed until the source posts its next
+// report: a lost answer costs nothing, and a message typed while a report
+// was being written is not skipped.
+//
+// The switch may be thrown by a command that has no connected apps to tell
+// (matron-admin). Then nothing is handed over until the running journal has
+// sent the "Replies are on" line to them: the first read does that, moves
+// the starting point to that moment and returns nothing.
+
+// Says so in the conversation either way, so the user sees the change where
+// it matters. Returns false for an unknown source.
+export function setSourceReplies(db, id, on, { hub = null } = {}) {
+  const fan = []
+  const ok = db.transaction(() => {
+    const source = getSource(db, id)
+    if (!source) return false
+    if (!!source.replies === !!on) return true
+    announceOnce(db, fan, source)
+    const r = say(db, fan, source, JOURNAL, 'text', { body: on
+      ? `Replies are on. ${source.name} can read what you type in this conversation from now on, and nothing else in Matron. What you type here leaves Matron and goes to ${source.name}.`
+      : `Replies are off. ${source.name} can no longer read what you type in this conversation.` })
+    // Nothing typed before this line is ever handed over.
+    db.prepare('UPDATE inbound_sources SET replies=?, replies_seen_seq=?, replies_done_seq=?, replies_live=? WHERE id=?').run(on ? 1 : 0, r.seq, r.seq, hub ? 1 : 0, id)
+    return true
+  })()
+  if (hub) for (const f of fan) broadcastAppended(db, hub, f)
+  return ok
+}
+
+// `source` is a fresh row (sourceForKey); `hub` is the running journal's.
+// Returns {status: 'ok', replies: [{at, text}], more} | {status:
+// 'replies_off'} | {status: 'account_locked'}.
+export function readReplies(db, source, { hub = null } = {}) {
+  if (!source.replies) return { status: 'replies_off' }
+  if (isPanicLocked(db, source.user_id)) return { status: 'account_locked' }
+  const fan = []
+  const out = db.transaction(() => {
+    const now = getSource(db, source.id)
+    if (!now || !now.enabled || !now.replies || now.token_hash !== source.token_hash) return { status: 'replies_off' }
+    if (!now.replies_live) {
+      // The line saying replies are on (and the conversation's announcement,
+      // when the same command wrote it) has not been sent to connected apps.
+      const lines = db.prepare(`SELECT seq, ts, sender, type, payload FROM events WHERE user_id=? AND convo_id=? AND sender=? AND seq BETWEEN ? AND ?
+        ORDER BY seq`).all(now.user_id, now.convo_id, JOURNAL, now.replies_done_seq - 1, now.replies_done_seq)
+      for (const e of lines) fan.push({ userId: now.user_id, convoId: now.convo_id, seq: e.seq, ts: e.ts, sender: e.sender, type: e.type, payload: JSON.parse(e.payload) })
+      const from = db.prepare('SELECT MAX(seq) AS seq FROM events WHERE user_id=? AND convo_id=?').get(now.user_id, now.convo_id).seq ?? now.replies_done_seq
+      db.prepare('UPDATE inbound_sources SET replies_live=1, replies_seen_seq=?, replies_done_seq=? WHERE id=?').run(from, from, now.id)
+      return { status: 'ok', replies: [], more: false }
+    }
+    const rows = db.prepare(`SELECT seq, ts, payload FROM events WHERE user_id=? AND convo_id=? AND seq>? AND type='text' AND sender LIKE 'user:%'
+      ORDER BY seq LIMIT ?`).all(now.user_id, now.convo_id, now.replies_done_seq, REPLIES_PER_READ_MAX + 1)
+    const more = rows.length > REPLIES_PER_READ_MAX
+    const shown = rows.slice(0, REPLIES_PER_READ_MAX)
+    const replies = shown.map((row) => {
+      let text = ''
+      try { text = String(JSON.parse(row.payload)?.body ?? '') } catch { /* shown as empty */ }
+      return { at: new Date(row.ts).toISOString(), text: text.length > REPLY_MAX_CHARS ? `${text.slice(0, REPLY_MAX_CHARS)} […]` : text }
+    })
+    const last = shown.at(-1)?.seq
+    if (last != null && last > now.replies_seen_seq) db.prepare('UPDATE inbound_sources SET replies_seen_seq=? WHERE id=?').run(last, now.id)
+    return { status: 'ok', replies, more }
+  })()
+  if (hub) for (const f of fan) broadcastAppended(db, hub, f)
+  return out
 }

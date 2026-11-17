@@ -21,7 +21,7 @@ import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { makeSecurityLog, deviceTarget, keyTarget, boxTarget } from '../src/security-log.js'
 import { panicLock, clearPanic } from '../src/panic.js'
-import { createSource, listSources, getSource, setSourceCaps, rotateSourceKey, setSourceEnabled, DEFAULT_HOURLY_MAX, DEFAULT_DAILY_MAX } from '../src/inbound.js'
+import { createSource, listSources, getSource, setSourceCaps, rotateSourceKey, setSourceEnabled, setSourceReplies, DEFAULT_HOURLY_MAX, DEFAULT_DAILY_MAX } from '../src/inbound.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -59,6 +59,7 @@ const USAGE = `usage:
   matron-admin inbound limits <source_id> --hourly N --daily N
   matron-admin inbound rotate <source_id>
   matron-admin inbound disable|enable <source_id>
+  matron-admin inbound replies <source_id> on|off
   matron-admin agent-chat pending <username>
   matron-admin agent-chat approve <username> <room_id> <device_id>
   matron-admin agent-chat deny <username> <room_id> <device_id>
@@ -351,7 +352,7 @@ export async function runAdmin(db, argv, deps = {}) {
       if (!argv[2]) throw new Error(USAGE)
       const rows = listSources(db, requireUser(db, argv[2]).id)
       if (rows.length === 0) return `no inbound sources for ${argv[2]}`
-      return rows.map((r) => `${r.id} name=${JSON.stringify(r.name)} ${r.enabled ? 'enabled' : 'disabled'} hourly=${r.hourly_max} daily=${r.daily_max} last_post_at=${r.last_post_at ?? 'never'}`).join('\n')
+      return rows.map((r) => `${r.id} name=${JSON.stringify(r.name)} ${r.enabled ? 'enabled' : 'disabled'} hourly=${r.hourly_max} daily=${r.daily_max} replies=${r.replies ? 'on' : 'off'} last_post_at=${r.last_post_at ?? 'never'}`).join('\n')
     }
     const id = argv[2]
     if (!id || !getSource(db, id)) throw new Error(id ? `no such source: ${id}` : USAGE)
@@ -361,6 +362,13 @@ export async function runAdmin(db, argv, deps = {}) {
       return `source ${id}: at most ${r.hourly_max} reports an hour, ${r.daily_max} a day`
     }
     if (b === 'rotate') return `source ${id} new key: ${rotateSourceKey(db, id)}\n(the old key no longer works; this one is not shown again)`
+    if (b === 'replies') {
+      if (argv[3] !== 'on' && argv[3] !== 'off') throw new Error(USAGE)
+      setSourceReplies(db, id, argv[3] === 'on')
+      return argv[3] === 'on'
+        ? `source ${id}: replies are on. Its key can now read what the user types in its conversation from now on; that text leaves Matron.`
+        : `source ${id}: replies are off`
+    }
     if (b === 'disable' || b === 'enable') {
       setSourceEnabled(db, id, b === 'enable')
       return `source ${id} is ${b}d`
