@@ -687,19 +687,38 @@ export function sanitizeBoxVitals(raw) {
 // with no valid block at all is rejected (nothing to store).
 const ACCOUNT_EMAIL_CAP = 254
 
-// `plugins`: the names of the bridge plugins the box has loaded. A short
-// list of short plain strings; all-or-nothing like the other blocks.
+// `plugins`: the bridge plugins the box has loaded, as the bridge reports
+// them: `[{ name, methods }]`. `name` follows the bridge's plugin-name rule
+// (lowercase letters and digits, at most 32); `methods` is up to 64 strings,
+// each `x_<name>_...` and at most 64 characters. The older bare-string form
+// is still accepted and becomes `{ name, methods: [] }`. All-or-nothing like
+// the other blocks; entries are de-duplicated by name (first one wins).
 const PLUGINS_MAX = 32
 const PLUGIN_NAME_CAP = 32
+const PLUGIN_NAME_RE = /^[a-z0-9]+$/
+const PLUGIN_METHODS_MAX = 64
+const PLUGIN_METHOD_CAP = 64
 
 export function sanitizeBoxPlugins(raw) {
   if (!Array.isArray(raw) || raw.length > PLUGINS_MAX) return null
   const out = []
-  for (const n of raw) {
-    if (typeof n !== 'string' || !n || n.length > PLUGIN_NAME_CAP) return null
-    const name = sanitizePeerText(n, PLUGIN_NAME_CAP)
-    if (!name) return null
-    if (!out.includes(name)) out.push(name)
+  for (const entry of raw) {
+    let n = entry
+    let rawMethods = []
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      n = entry.name
+      rawMethods = entry.methods === undefined ? [] : entry.methods
+    }
+    if (typeof n !== 'string' || !n || n.length > PLUGIN_NAME_CAP || !PLUGIN_NAME_RE.test(n)) return null
+    if (!Array.isArray(rawMethods) || rawMethods.length > PLUGIN_METHODS_MAX) return null
+    const prefix = `x_${n}_`
+    const methods = []
+    for (const m of rawMethods) {
+      if (typeof m !== 'string' || m.length <= prefix.length || m.length > PLUGIN_METHOD_CAP
+        || !m.startsWith(prefix) || !/^[A-Za-z0-9_]+$/.test(m)) return null
+      if (!methods.includes(m)) methods.push(m)
+    }
+    if (!out.some((p) => p.name === n)) out.push({ name: n, methods })
   }
   return out
 }
