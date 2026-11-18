@@ -176,6 +176,8 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // created with a non-empty title, or a child was created (parent_convo_id
 // set: the linkage must ride the journal even titleless, or a live client
 // would list the child as a normal conversation until its next /snapshot).
+// `kindChanged`: agent_kind was set or switched; ws.js fans out `convo_meta` for
+// it as well, without the title-only pin hint.
 // Callers (ws.js) use the flag to decide whether to fan out a `convo_meta`
 // journal event; no event on an unchanged title, an absent title, or a
 // state-only upsert.
@@ -277,7 +279,10 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   if (existing && convo.title !== existing.title) metaChanged = true
-  return { ...convo, metaChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
+  // agent_kind is live meta too, but not a title: it gets its own flag so the
+  // pin hint (which keys off metaChanged and is title-only) stays untouched.
+  const kindChanged = agentKind != null && agentKind !== (existing?.agent_kind ?? null)
+  return { ...convo, metaChanged, kindChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
 }
 
 // Fan a convo_meta for each conversation the journal itself retitled — a

@@ -2,13 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser } from '../src/auth.js'
-import { upsertConversation, append } from '../src/journal.js'
+import { upsertConversation, append, appendAndBroadcast } from '../src/journal.js'
 import { setCoordinatorConvoId, COORDINATOR_EVENT_TYPE } from '../src/coordinator.js'
 import { ITEM_EVENT_TYPE } from '../src/items-marker.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE } from '../src/missions-marker.js'
 import { MEMORY_EVENT_TYPE } from '../src/memories-http.js'
 import { ROUTINE_EVENT_TYPE } from '../src/routines-marker.js'
-import { FOR_YOU_EVENT_TYPES, parseSyncScope, scopeCarries, noteCoordinator, wakesForYou } from '../src/sync-scope.js'
+import { FOR_YOU_EVENT_TYPES, FOR_YOU_TYPES_SQL, parseSyncScope, scopeCarries, noteCoordinator, wakesForYou } from '../src/sync-scope.js'
+import { openDb } from '../src/db.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 const settle = (ms = 150) => new Promise((r) => setTimeout(r, ms))
 
@@ -34,7 +38,9 @@ test('scopeCarries: markers, the Coordinator and viewed chats only', () => {
   assert.equal(scopeCarries(conn, { type: 'read_marker', convo_id: 'other' }), false)
   assert.equal(scopeCarries(conn, { type: 'item', convo_id: 'other' }), true)
   assert.equal(scopeCarries(conn, { type: 'convo_meta', convo_id: 'other' }), true)
-  assert.equal(scopeCarries(conn, { type: 'session_status', convo_id: 'other' }), true)
+  assert.equal(scopeCarries(conn, { type: 'session_status', convo_id: 'other' }), false)
+  assert.equal(scopeCarries(conn, { type: 'session_status', convo_id: 'coord' }), true)
+  assert.equal(scopeCarries(conn, { type: 'session_status', convo_id: 'open' }), true)
   assert.equal(scopeCarries(conn, { type: 'text', convo_id: 'coord' }), true)
   assert.equal(scopeCarries(conn, { type: 'text', convo_id: 'open' }), true)
   assert.equal(scopeCarries({ syncScope: null }, { type: 'text', convo_id: 'other' }), true)
@@ -124,6 +130,51 @@ test('replay: a for_you socket gets only what its scope carries, then the head a
   assert.equal(cursor.seq, head)
   assert.ok(p.frames.indexOf(cursor) > p.frames.findIndex((f) => f.seq === coordItem), 'cursor comes after the replay')
   p.close()
+})
+
+test('replay: a for_you socket gets the Coordinator\'s session state and no one else\'s', async (t) => {
+  const { s, login, add } = await fixture(t)
+  add('work', 'session_status', { state: 'running' })
+  const coordState = add('coord', 'session_status', { state: 'running' })
+  add('next', 'session_status', { state: 'waiting' })
+  const item = add('work', 'item', { item_id: 'it_1', action: 'created' })
+  const phone = await login('phone')
+  const p = await makeWsClient(s.base, { token: phone.token, cursor: 0, hello: { sync: 'for_you' } })
+  await p.waitFor((f) => f.kind === 'control' && f.op === 'cursor')
+  assert.deepEqual(p.journal().map((f) => f.seq), [coordState, item])
+  p.close()
+})
+
+test('live: a for_you socket hears no session state but the Coordinator\'s', async (t) => {
+  const { s, alice, login } = await fixture(t)
+  const phone = await login('phone')
+  const p = await makeWsClient(s.base, { token: phone.token, cursor: 0, hello: { sync: 'for_you' } })
+  await p.waitFor((f) => f.kind === 'control' && f.op === 'cursor')
+  const status = (convoId) => appendAndBroadcast(s.db, s.hub, {
+    userId: alice.id, convoId, sender: 'agent:box-a', type: 'session_status', payload: { state: 'running' },
+  }).seq
+  status('work')
+  const coord = status('coord')
+  await p.waitFor((f) => f.kind === 'journal' && f.seq === coord)
+  await settle()
+  assert.deepEqual(p.journal().map((f) => f.seq), [coord])
+  p.close()
+})
+
+test('index: a for_you index built for another type list is rebuilt to match', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'for-you-index-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const file = path.join(dir, 'j.db')
+  const first = openDb(file)
+  first.exec('DROP INDEX idx_events_for_you')
+  first.exec("CREATE INDEX idx_events_for_you ON events(user_id, seq) WHERE type IN ('item','session_status')")
+  first.close()
+  const db = openDb(file)
+  t.after(() => db.close())
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name='idx_events_for_you'").get().sql
+  assert.ok(sql.endsWith(`WHERE type IN (${FOR_YOU_TYPES_SQL})`), sql)
+  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM events WHERE user_id=1 AND seq>0 AND type IN (${FOR_YOU_TYPES_SQL}) ORDER BY seq`).all()
+  assert.ok(plan.some((r) => r.detail.includes('idx_events_for_you')), JSON.stringify(plan))
 })
 
 test('replay: an everything socket is unchanged and gets no cursor frame', async (t) => {

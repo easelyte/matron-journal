@@ -1505,7 +1505,7 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
   }
   // Which KIND of agent backs this conversation — e.g. 'claude' or 'codex' —
-  // recorded by convo_upsert (spec: codex forwarder icon). Distinct from
+  // recorded by convo_upsert. Distinct from
   // agent_device_id: one agent device (a bridge) hosts BOTH claude and codex
   // sessions and stamps the same agent_device_id on every conversation it owns,
   // so the owning device cannot distinguish the backend — the kind is a
@@ -2103,7 +2103,16 @@ export function openDb(path) {
   }
   // A for_you replay (src/sync-scope.js) reads only these rows, a small share
   // of the table, so it never walks the conversation content in between.
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) WHERE type IN (${FOR_YOU_TYPES_SQL})`)
+  // The index's WHERE must match the replay's type list exactly, or SQLite
+  // will not use it: rebuilt when the list changes.
+  // One immediate transaction, so a second opener (the admin CLI next to
+  // the server) waits, then reads the rebuilt index and leaves it alone.
+  const forYouWhere = `WHERE type IN (${FOR_YOU_TYPES_SQL})`
+  db.transaction(() => {
+    const forYouIndex = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_for_you'").get()
+    if (forYouIndex && !forYouIndex.sql.endsWith(forYouWhere)) db.exec('DROP INDEX idx_events_for_you')
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) ${forYouWhere}`)
+  }).immediate()
   // Per-box defaults for new sessions (matron-bridge docs/specs/box-defaults.md,
   // src/box-defaults.js): the agent, model and effort a session started on
   // this box gets when nobody names one. Agent devices only; NULL = the
