@@ -577,7 +577,7 @@ the machine-checkable version of this page.
   uses; `defaults` is the box's stored `{agent, model, effort}` as on
   `GET /devices` (see *Box defaults*). `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
-  created_at, last_ts, mission_num, status?}]` — top-level conversations only
+  agent_kind, created_at, last_ts, mission_num, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
   chat targets), ordered by `COALESCE(last_ts, created_at) DESC, id DESC`:
   newest last message first, falling back to `created_at` when there are no
@@ -994,11 +994,12 @@ Rows from before the stamp carry neither, and don't count.
   and what a client that sends nothing gets) carries every event of every
   conversation. `'for_you'` is for a phone that follows only the tracker:
   its socket carries `item`, `mission`, `milestone`, `coordinator`,
-  `memory`, `routine`, `convo_meta` and `session_status` events from every
-  conversation, every event of the Coordinator conversation (following the
-  role when it moves), and every event of the conversations in its
-  `viewing` set. Everything else stays on the server; the app fetches a
-  conversation over `GET /convo/:id/messages` when it opens one. A client
+  `memory`, `routine` and `convo_meta` events from every conversation,
+  every event of the Coordinator conversation (following the role when it
+  moves), and every event of the conversations in its `viewing` set.
+  Everything else stays on the server, `session_status` included: the app
+  fetches a conversation over `GET /convo/:id/messages` when it opens one,
+  and the chat list's session states from `GET /snapshot`. A client
   that sends `sync` gets `hello_ok.sync` back, the scope it got, so it can
   tell a journal that predates the field. Any other value is
   `bad_request` (ref `hello`). Agents ignore the field.
@@ -1110,6 +1111,15 @@ Rows from before the stamp carry neither, and don't count.
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `agent_kind` (non-empty string, at most
+  16 chars; else `bad_request`): which kind of agent backs the conversation,
+  e.g. `claude` or `codex`. One agent device (a bridge) can host both, so the
+  owning device does not say. The journal does not enumerate the values; a
+  client renders an unrecognised one as no marker. Omitted leaves the stored
+  kind unchanged (`COALESCE`); a later value replaces it, so an agent switch
+  updates it. Served as `agent_kind` (`null` when never set) on each
+  conversation in `GET /snapshot` and `GET /roster`, and carried on the
+  `convo_meta` payload.
 - `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
   of the session's git remote (lower-cased host and org, e.g.
   `github.com/matronhq/matron-journal`; regex

@@ -15,10 +15,11 @@ const ROUTINE = 'routine'
 // 'everything' (the default, and what a client that sends nothing gets) is
 // every event of every conversation, live and on replay. 'for_you' is for a
 // phone that only follows the tracker: it gets the tracker, mission and
-// Coordinator events, conversation metadata (titles, session state), every
-// event of the Coordinator conversation, and every event of a conversation
-// it is viewing. Everything else stays on the server, and the app fetches a
-// conversation's history over HTTP when it opens one.
+// Coordinator events, conversation titles, every event of the Coordinator
+// conversation, and every event of a conversation it is viewing. Everything
+// else stays on the server, and the app fetches a conversation's history
+// over HTTP when it opens one, and the chat list's titles, states and
+// unread counts from GET /snapshot when the list is on screen.
 //
 // The scope is the connection's (named in `hello`) and is also kept on the
 // device row, so the push pipeline can stop waking a for_you phone for
@@ -26,18 +27,21 @@ const ROUTINE = 'routine'
 export const SYNC_SCOPES = ['everything', 'for_you']
 
 // Events a for_you socket carries from every conversation. Markers drive the
-// tracker, mission and Coordinator screens; convo_meta and session_status keep
-// the conversation list's titles and session dots current. All are small and
-// rare next to conversation content.
+// tracker, mission and Coordinator screens; convo_meta keeps titles current
+// (an item names the conversation it came from). session_status is not
+// among them: a busy account turns sessions running and waiting tens of
+// thousands of times a day, and only the chat list shows it, which reads
+// it from GET /snapshot. The Coordinator conversation's own status still
+// arrives with the rest of that conversation.
 export const FOR_YOU_EVENT_TYPES = [
-  ITEM, MISSION, MILESTONE, COORDINATOR, MEMORY, ROUTINE, 'convo_meta', 'session_status',
+  ITEM, MISSION, MILESTONE, COORDINATOR, MEMORY, ROUTINE, 'convo_meta',
 ]
 const FOR_YOU_TYPE_SET = new Set(FOR_YOU_EVENT_TYPES)
 export const FOR_YOU_TYPES_SQL = FOR_YOU_EVENT_TYPES.map((t) => `'${t}'`).join(',')
 
 // Events worth a silent background wake to a for_you phone: what changes the
 // For you list and the mission pages, and the Coordinator's messages.
-// convo_meta and session_status are carried but not worth a wake.
+// convo_meta is carried but not worth a wake.
 const FOR_YOU_WAKE_TYPES = new Set([ITEM, MISSION, MILESTONE])
 const MESSAGE_TYPE_SET = new Set(MESSAGE_TYPES)
 

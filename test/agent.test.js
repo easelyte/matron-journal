@@ -214,9 +214,9 @@ test('convo_upsert accepts session_outcome: session_status payload and snapshot 
 test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it; mutable and sticky', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  const ag = createAgent(s.db, dan.id, 'dev-2')
-  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
   await agent.waitFor((f) => f.op === 'hello_ok')
@@ -246,14 +246,46 @@ test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it;
   assert.equal(snap.json.conversations.find((c) => c.id === 'codex-1').agent_kind, 'claude')
   assert.equal(snap.json.conversations.find((c) => c.id === 'plain-1').agent_kind, null)
 
+  // The roster (agent chat targeting) serves it too.
+  const roster = await s.http('/roster', { token: login.json.token })
+  assert.equal(roster.json.conversations.find((c) => c.id === 'codex-1').agent_kind, 'claude')
+  assert.equal(roster.json.conversations.find((c) => c.id === 'plain-1').agent_kind, null)
+
+  agent.close(); client.close()
+})
+
+test('a kind-only change still sends convo_meta; a repeat of the same kind does not', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  const metaCount = () => s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='kind-1' AND type='convo_meta'").get().n
+
+  // Created with a kind but no title: still announced.
+  agent.send({ op: 'convo_upsert', convo_id: 'kind-1', session_state: 'running', agent_kind: 'claude' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'kind-1' && f.type === 'convo_meta' && f.payload.agent_kind === 'claude')
+  assert.equal(metaCount(), 1)
+
+  // Same kind again: nothing new.
+  agent.send({ op: 'convo_upsert', convo_id: 'kind-1', session_state: 'running', agent_kind: 'claude' })
+  // Kind switch, same (absent) title: announced.
+  agent.send({ op: 'convo_upsert', convo_id: 'kind-1', agent_kind: 'codex' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'kind-1' && f.type === 'convo_meta' && f.payload.agent_kind === 'codex')
+  assert.equal(metaCount(), 2)
+
   agent.close(); client.close()
 })
 
 test('convo_upsert rejects a malformed agent_kind with bad_request, connection survives', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
 
