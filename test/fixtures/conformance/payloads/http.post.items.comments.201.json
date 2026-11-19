@@ -44,9 +44,10 @@
           "attachments": [],
           "has_image": false,
           "working": {
-            "state": "running",
+            "state": "queued",
             "since": 1,
-            "until": null
+            "until": null,
+            "behind_turn": true
           }
         },
         "comment": {
