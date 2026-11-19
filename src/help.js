@@ -140,8 +140,12 @@ transcribing is the origin bridge's job); those 404 on refusal.
   \`invalid_actions\`). The user's Seen tap closes it as \`done\` with
   \`chosen_action: 'Seen'\` and a quiet \`closed\` marker carrying
   \`seen: true\` — no wake, not a turn. A typed reply on a notice is an
-  ordinary user comment. Apps see the kind only when they send
-  \`X-Matron-Item-Kinds: notice\`; older ones get it as a \`task\`.
+  ordinary user comment. An agent comment that offers \`actions\` on an open
+  notice turns it into a \`question\` in the same write: \`kind\` becomes
+  \`question\`, the built-in \`Seen\` goes (a Seen tap is then 400
+  \`unknown_action\`), and a status comment records the change. Apps see the
+  kind only when they send \`X-Matron-Item-Kinds: notice\`; older ones get it
+  as a \`task\`.
 - \`POST /items/:id/close\` \`{resolution:'done'|'answered'|'decided'|'reversed'|'cancelled', comment?}\`
   → 200 \`{item, comment}\`; 409 if already closed. Closing clears \`awaiting\`.
 - \`POST /items/:id/reopen\` \`{comment?}\` → 200 \`{item, comment}\`; 409 if

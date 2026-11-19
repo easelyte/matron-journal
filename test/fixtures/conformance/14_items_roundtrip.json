@@ -44,7 +44,7 @@
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
           "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": null, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
-          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
+          "working": { "state": "queued", "since": { "$type": "integer" }, "until": null, "behind_turn": true } },
         "comment": {
           "id": { "$bind": "comment_id" }, "item_id": { "$ref": "item_id" },
           "author": "user", "device_id": { "$type": "integer" }, "kind": "comment", "body": "Use A",
@@ -63,7 +63,7 @@
           "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
           "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "closed_at": { "$type": "integer" }, "mission_id": null, "mission_num": null, "consent": null, "actions": [], "chosen_action": null, "private": false, "origin_convo_title": "Session", "filed_convo_id": null, "step_up": false, "subject": null, "device_name": "box-2", "handover": null,
           "comment_count": 1, "last_comment_at": { "$type": "integer" }, "last_user_input_at": { "$type": "integer" }, "attachments": [], "has_image": false,
-          "working": { "state": "running", "since": { "$type": "integer" }, "until": null } },
+          "working": { "state": "queued", "since": { "$type": "integer" }, "until": null, "behind_turn": true } },
         "comment": {
           "id": { "$type": "string" }, "item_id": { "$ref": "item_id" },
           "author": "agent", "device_id": { "$ref": "bridge.device_id" }, "kind": "status", "body": "",
