@@ -27,7 +27,7 @@ import { handoverPreview } from './handover.js'
 import { handoverChoices, pickableBoxes } from './handover-session.js'
 import { getMission } from './missions.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
-import { getItem, insertComment } from './items.js'
+import { getItem, insertComment, promoteAskingNotices } from './items.js'
 import { withdrawOnClose } from './item-handover-http.js'
 import { CONSENT_LABEL, consentLink } from './consent-items.js'
 import { onIncomingEnded } from './federation-grants.js'
@@ -824,6 +824,18 @@ export function notifyGrantees({ db, hub }, missionId, what, ref = null) {
     const owner = db.prepare('SELECT u.id AS user_id, u.name FROM missions m JOIN users u ON u.id = m.user_id WHERE m.id=?').get(missionId)
     for (const id of ids) hub.sendToClients(id, { kind: 'shared', event: 'mission_changed', mission_id: missionId, what, owner })
   })
+}
+
+// The one-off of src/items.js promoteAskingNotices, run at startup once the
+// share writers are in place: each item it turned into a question is sent on
+// to the copies of its shared mission, here and on other journals. Apps on
+// the owner's side see it in their next items delta (updated_at moved).
+export function promoteAskingNoticesAndTell({ db, hub }, now = Date.now()) {
+  const items = promoteAskingNotices(db, now)
+  for (const item of items) {
+    if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item', item.id)
+  }
+  return items
 }
 
 // The sweep's half: asks an agent parked that nobody answered in 24 h.

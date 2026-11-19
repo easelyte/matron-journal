@@ -23,6 +23,18 @@ test('itemWorking: running while the owning conversation is mid-turn, whatever t
     { state: 'running', since: null, until: null })
 })
 
+test('itemWorking: an ask made after the running turn started waits behind it, with no lapse while it runs', () => {
+  const row = { sessionState: 'running', turnStartedAt: T0, turnEndedAt: T0 - 10_000, turnRequestedAt: T0 + 2_000 }
+  const behind = { state: 'queued', since: T0 + 2_000, until: null, behind_turn: true }
+  assert.deepEqual(itemWorking(row, T0 + 2_001), behind)
+  // A long turn: still waiting, long past the queued TTL.
+  assert.deepEqual(itemWorking(row, T0 + 2 * WORKING_QUEUED_TTL_MS), behind)
+  // The ask's own turn has started: running, and not behind anything.
+  assert.deepEqual(itemWorking({ ...row, turnStartedAt: T0 + 2_500 }, T0 + 3_000), { state: 'running', since: T0 + 2_500, until: null })
+  // The ask and the turn start in the same millisecond: the ask started it.
+  assert.deepEqual(itemWorking({ ...row, turnStartedAt: T0 + 2_000 }, T0 + 3_000), { state: 'running', since: T0 + 2_000, until: null })
+})
+
 test('itemWorking: nothing asked and nothing running is null', () => {
   for (const sessionState of ['waiting', 'done', 'archived']) {
     assert.equal(itemWorking({ sessionState, turnStartedAt: T0, turnEndedAt: T0 + 1, turnRequestedAt: null }, T0 + 5), null)
@@ -184,17 +196,21 @@ test('a task the user files is queued for its session; a notice Seen tap is not'
   assert.equal(seen.json.item.state, 'closed'); assert.equal(seen.json.item.working, null)
 })
 
-test('a tap while the session is mid-turn reads running, then queued across the hand-off', async (t) => {
+test('a tap while the session is mid-turn reads queued behind that turn, then queued across the hand-off', async (t) => {
   const { s, client, mk, setState } = await fleet(t)
   const id = (await mk()).json.item.id
   await setState('running')
   await new Promise((r) => setTimeout(r, 5))
   const tap = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { action: 'Go' } })
-  assert.equal(tap.json.item.working.state, 'running')
+  // The turn in flight is about something else: the tap waits behind it,
+  // and the item must not read as the agent working on it.
+  assert.deepEqual(tap.json.item.working, { state: 'queued', since: tap.json.item.working.since, until: null, behind_turn: true })
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.working.behind_turn, true)
   await new Promise((r) => setTimeout(r, 5))
   await setState('waiting')
   const between = (await s.http(`/items/${id}`, { token: client })).json.item.working
   assert.equal(between.state, 'queued')
+  assert.equal('behind_turn' in between, false, 'the turn it waited behind has ended')
   const ended = s.db.prepare('SELECT turn_ended_at AS e FROM conversations WHERE id=?').get('c1').e
   assert.equal(between.until, ended + WORKING_HANDOFF_GRACE_MS)
   await new Promise((r) => setTimeout(r, 5))

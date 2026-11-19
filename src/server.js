@@ -28,6 +28,7 @@ import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
 import { backfillImageDims } from './items.js'
+import { promoteAskingNoticesAndTell } from './sharing-events.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
@@ -791,6 +792,12 @@ export function startServer({
   const federationContribute = federation.enabled ? makeContributeFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
   // Rooms with contacts on other journals (src/federation-rooms.js).
   const federationRooms = federation.enabled ? makeRoomFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
+  // One-off (src/items.js promoteAskingNotices): open notices already waiting
+  // on a question an agent asked with buttons become questions. After the
+  // share writers above are in place, so the copies of shared missions pick
+  // up the new kind.
+  const promotedNotices = promoteAskingNoticesAndTell({ db, hub })
+  if (promotedNotices.length > 0) console.log(`items: ${promotedNotices.length} notice(s) waiting on a question became questions`)
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
   // One set of abuse limits for both federation routes (federationLimits
