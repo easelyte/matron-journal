@@ -5,10 +5,9 @@
 // paged raw read of one week (GET /timeline/weeks/:week?raw=1), with its
 // index of the whole week (&index=1) and its read of named projects
 // (&projects=); the rest of a week's projects as cards
-// (GET /timeline/weeks/:week/projects); and its two
-// writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
-// one entry per project (POST /timeline/weeks/:week/entries), storage and
-// rules in src/week-stories.js. The read functions in src/timeline.js assume
+// (GET /timeline/weeks/:week/projects); and its write of a week, one entry
+// per project (POST /timeline/weeks/:week/entries), storage and rules in
+// src/week-stories.js. The read functions in src/timeline.js assume
 // valid input, so every parameter is validated here (400) before one is
 // called.
 import { json, readBody } from './http-body.js'
@@ -18,7 +17,7 @@ import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
 import { resolveProject } from './projects.js'
 import { projectPage, projectHistory, PROJECT_HISTORY } from './timeline-project.js'
-import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
+import { validWeekEntries, writeWeekEntries } from './week-stories.js'
 import {
   weeksList, weekDetail, weekProjects, weekRaw, weekIndex, RAW, TIMELINE, WEEK_PROJECTS, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
 } from './timeline.js'
@@ -127,23 +126,23 @@ function handleWeekProjects(db, res, url, who, week, opts) {
   return true
 }
 
-// POST /timeline/weeks/:week — the Coordinator's lede and story cards for one
-// week, and its notes on projects. POST /timeline/weeks/:week/entries — the
-// same week as one entry per project (`entries` true): no lede, no titles,
-// and the reply counts the entries stored. Agents only, gated exactly like
+// POST /timeline/weeks/:week/entries — the Coordinator's cards for one week,
+// one entry per project (no lede, no titles), and its notes on projects; the
+// reply counts the entries stored. Agents only, gated exactly like
 // POST /briefings (the Coordinator naming its own conversation). The
 // Coordinator always writes under the agent privacy sieve, whatever device it
-// runs on.
-async function handleWeekWrite(db, req, res, who, week, { entries = false } = {}) {
+// runs on. The older write of a lede and grouped stories
+// (POST /timeline/weeks/:week) is gone: that path is 404.
+async function handleWeekWrite(db, req, res, who, week) {
   if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
   const body = await readBody(req)
   if (refusedCloser(res, closingConvo(db, who, body.convo_id, { required: true }))) return true
-  const input = entries ? validWeekEntries(body) : validWeekWrite(body)
+  const input = validWeekEntries(body)
   if (!input) return badRequest(res)
-  const r = (entries ? writeWeekEntries : writeWeek)(db, who.userId, week, input, { excludePrivateOwned: true })
+  const r = writeWeekEntries(db, who.userId, week, input, { excludePrivateOwned: true })
   if (r.error === 'conflict') { json(res, 409, { error: 'conflict', detail: r.detail }); return true }
   if (r.error) { json(res, 400, { error: r.error, detail: r.detail, ...(r.ref !== undefined && { ref: r.ref }) }); return true }
-  json(res, 201, { week: r.week, written: true, final: input.final, ...(entries && { entries: r.entries }) })
+  json(res, 201, { week: r.week, written: true, final: input.final, entries: r.entries })
   return true
 }
 
@@ -152,12 +151,11 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   const path = url.pathname
   if (!path.startsWith('/timeline/')) return false
   if (req.method === 'POST') {
-    const e = path.match(/^\/timeline\/weeks\/([^/]+)\/entries$/)
-    const w = e ?? path.match(/^\/timeline\/weeks\/([^/]+)$/)
+    const w = path.match(/^\/timeline\/weeks\/([^/]+)\/entries$/)
     if (!w) return false
     let week
     try { week = decodeURIComponent(w[1]) } catch { return badRequest(res) }
-    return handleWeekWrite(db, req, res, who, week, { entries: Boolean(e) })
+    return handleWeekWrite(db, req, res, who, week)
   }
   if (req.method !== 'GET') return false
   const opts = { excludePrivateOwned: filteredAgent(db, who) }
