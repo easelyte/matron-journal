@@ -1,22 +1,21 @@
 // Weekly timeline stories written by the user's Coordinator (spec 2026-11-09
-// projects timeline, phase 2): the lede and story cards of one local week and
-// one-sentence notes on projects. A week is written either as grouped stories
-// (a lede and titled cards naming several projects) or as one entry per
-// project (no lede, no titles); both land in the same row. This module holds
-// the limits, the body validation, the checked writes and the reads; the HTTP
-// routes are in src/timeline-http.js. Nothing here trusts the Coordinator's
+// projects timeline, phase 2): the cards of one local week and one-sentence
+// notes on projects. A week is written as one entry per project (no lede, no
+// titles), stored as one story per entry. Weeks stored earlier as grouped
+// stories (a lede and titled cards naming several projects) are still read;
+// nothing writes that shape any more. This module holds the limits, the body
+// validation, the checked write and the reads; the HTTP route is in
+// src/timeline-http.js. Nothing here trusts the Coordinator's
 // references: a project, item or picture it names must resolve to the user's
 // own row, and (the Coordinator always writes with the agent privacy sieve)
 // to one an ordinary agent may see, so a private device's work is never put
 // into text the apps show.
 import { parseWeekKey, userTimeZone, weekStartOf, weekEndOf, previousWeekStart } from './timeline.js'
 import { resolveProject } from './projects.js'
-import { ORIGIN_SIEVE } from './missions.js'
-import { privateConvo, filesSql } from './projects-feed.js'
+import { filesSql } from './projects-feed.js'
 
 export const WEEK_LIMITS = {
-  ledeMax: 600, storiesMax: 8, titleMax: 80, sentenceMax: 300, nextMax: 300, noteMax: 300,
-  notesMax: 50, projectsPerStory: 10, itemsPerStory: 10, reachWeeks: 10,
+  storiesMax: 8, sentenceMax: 300, nextMax: 300, noteMax: 300, notesMax: 50, reachWeeks: 10,
 }
 
 // The longest string reference or blob id accepted (ids are far shorter).
@@ -50,28 +49,8 @@ function ref(v) {
   return Number.isInteger(v) && v > 0 ? v : undefined
 }
 
-function refs(v, min, max) {
-  if (v === undefined || v === null) return min === 0 ? [] : undefined
-  if (!Array.isArray(v) || v.length < min || v.length > max) return undefined
-  const out = v.map(ref)
-  return out.includes(undefined) ? undefined : out
-}
-
-function validStory(s) {
-  if (!isObject(s)) return null
-  const title = text(s.title, WEEK_LIMITS.titleMax)
-  const sentence = text(s.sentence, WEEK_LIMITS.sentenceMax)
-  const next = optionalText(s.next, WEEK_LIMITS.nextMax)
-  const project_ids = refs(s.project_ids, 1, WEEK_LIMITS.projectsPerStory)
-  const item_ids = refs(s.item_ids, 0, WEEK_LIMITS.itemsPerStory)
-  const blob = s.media_blob_id
-  if (title === null || sentence === null || next === undefined || !project_ids || !item_ids) return null
-  if (blob !== undefined && blob !== null && (typeof blob !== 'string' || !blob || blob.length > REF_MAX)) return null
-  return { title, sentence, next, project_ids, item_ids, media_blob_id: blob || null }
-}
-
-// The optional `final` flag and `notes` of a write body, shared by both
-// writes: { final, notes } or null when either is malformed.
+// The optional `final` flag and `notes` of a write body: { final, notes } or
+// null when either is malformed.
 function validFinalAndNotes(body) {
   if (body.final !== undefined && body.final !== null && typeof body.final !== 'boolean') return null
   const rawNotes = body.notes ?? []
@@ -84,20 +63,6 @@ function validFinalAndNotes(body) {
   })
   if (notes.includes(null)) return null
   return { final: body.final === true, notes }
-}
-
-// The write body, normalised: { lede, stories, final, notes } or null when
-// malformed. Unknown extra keys are ignored.
-export function validWeekWrite(body) {
-  if (!isObject(body)) return null
-  const lede = optionalText(body.lede, WEEK_LIMITS.ledeMax)
-  if (lede === undefined) return null
-  const rawStories = body.stories ?? []
-  if (!Array.isArray(rawStories) || rawStories.length > WEEK_LIMITS.storiesMax) return null
-  const stories = rawStories.map(validStory)
-  if (stories.includes(null)) return null
-  const rest = validFinalAndNotes(body)
-  return rest && { lede, stories, ...rest }
 }
 
 function validEntry(e) {
@@ -115,11 +80,10 @@ function validEntry(e) {
 // notes } or null when malformed. An entry is { project, sentence, next,
 // media_blob_id }; any other key (a title, a lede, a list of projects or
 // items) is ignored, so it is never stored. `entries` itself is required: a
-// write replaces the stored week, so a body without the list (the grouped
-// write's shape sent here, or notes alone) is malformed rather than a week
-// with no cards. An empty list clears what was
-// written: final, the week has no cards; not final, it reads as unwritten
-// (the computed cards), as an empty stories write always has.
+// write replaces the stored week, so a body without the list (the old grouped
+// shape, or notes alone) is malformed rather than a week with no cards. An
+// empty list clears what was written: final, the week has no cards; not
+// final, it reads as unwritten (the computed cards).
 export function validWeekEntries(body) {
   if (!isObject(body)) return null
   const rawEntries = body.entries
@@ -134,20 +98,6 @@ export function validWeekEntries(body) {
 // project that survived it, under the caller's sieve; null when none.
 function resolveProjectId(db, userId, r, excludePrivateOwned) {
   return resolveProject(db, userId, r, { excludePrivateOwned })?.project.id ?? null
-}
-
-// The id of the user's item a reference names (id or per-user number), on a
-// mission the sieve allows; null when none. Consent cards are not items to
-// write about (the timeline's reads leave them out too).
-function resolveItemId(db, userId, r, excludePrivateOwned) {
-  const byId = typeof r === 'string' && r.startsWith('it_')
-  const n = byId ? null : Number(String(r).replace(/^#/, ''))
-  if (!byId && !(Number.isInteger(n) && n >= 1)) return null
-  const sieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  const row = db.prepare(`SELECT i.id FROM items i JOIN missions m ON m.id = i.mission_id AND m.user_id = i.user_id
-      JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE i.user_id = ? AND ${byId ? 'i.id = ?' : 'i.num = ?'} AND i.consent IS NULL ${sieve}`).get(userId, byId ? r : n)
-  return row?.id ?? null
 }
 
 // Whether the blob is the user's own, an image or a video (a card cannot show
@@ -219,47 +169,19 @@ function storeWeek(db, userId, weekKey, start, { lede, stories, final, notes }, 
   })()
 }
 
-// Check and store one week of grouped stories. Every reference is resolved
-// before anything is written; the rows go in one transaction. { ok: true,
-// week } or { error, detail, ref? }.
-export function writeWeek(db, userId, weekKey, input, { now = Date.now(), excludePrivateOwned = true } = {}) {
-  const week = writableWeek(db, userId, weekKey, input.final, now)
-  if (week.error) return week
-
-  const projectId = (r) => resolveProjectId(db, userId, r, excludePrivateOwned)
-  const stories = []
-  for (const s of input.stories) {
-    const project_ids = []
-    for (const r of s.project_ids) {
-      const id = projectId(r)
-      if (id == null) return unknown('unknown_project', r)
-      if (!project_ids.includes(id)) project_ids.push(id)
-    }
-    const item_ids = []
-    for (const r of s.item_ids) {
-      const id = resolveItemId(db, userId, r, excludePrivateOwned)
-      if (id == null) return unknown('unknown_item', r)
-      if (!item_ids.includes(id)) item_ids.push(id)
-    }
-    if (s.media_blob_id && !blobAllowed(db, userId, s.media_blob_id, excludePrivateOwned)) {
-      return unknown('unknown_blob', s.media_blob_id)
-    }
-    stories.push({ title: s.title, sentence: s.sentence, next: s.next, project_ids, item_ids, media_blob_id: s.media_blob_id })
-  }
-  const notes = resolveNotes(db, userId, input.notes, excludePrivateOwned)
-  if (notes.error) return notes
-
-  storeWeek(db, userId, weekKey, week.start, { lede: input.lede, stories, final: input.final, notes: notes.notes }, now)
-  return { ok: true, week: weekKey }
-}
+// Test seam: stores a week exactly as given (resolved ids, notes as
+// { project_id, note }), with no checks. The read tests use it to set up weeks
+// in the older grouped shape (a lede, titled stories naming several projects
+// and items), which the reads still handle but nothing writes any more.
+export const storeWeekForTest = storeWeek
 
 // Check and store one week written as one entry per project (the input of
-// validWeekEntries), under the same week rules as writeWeek. Each entry is
-// stored as a story with no title, its one project and no items, and the
-// week has no lede. Two entries that resolve to the same project (the same
-// one named twice, or one merged into the other) are refused: the second
-// reference comes back as duplicate_project. { ok: true, week, entries: n }
-// or { error, detail, ref? }.
+// validWeekEntries). Every reference is resolved before anything is written;
+// the rows go in one transaction. Each entry is stored as a story with no
+// title, its one project and no items, and the week has no lede. Two entries
+// that resolve to the same project (the same one named twice, or one merged
+// into the other) are refused: the second reference comes back as
+// duplicate_project. { ok: true, week, entries: n } or { error, detail, ref? }.
 export function writeWeekEntries(db, userId, weekKey, input, { now = Date.now(), excludePrivateOwned = true } = {}) {
   const week = writableWeek(db, userId, weekKey, input.final, now)
   if (week.error) return week
