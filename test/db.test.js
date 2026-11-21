@@ -964,3 +964,15 @@ test('openDb: a failure during search-index bootstrap rolls back the whole schem
   assert.deepEqual(raw.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all(), objects)
   raw.close()
 })
+
+test('openDb adds the partial decisions index on items to a database that predates it', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-decisions-index-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-migration.db')
+  preMigrationDb(dbPath, (raw) => raw.exec('DROP INDEX idx_items_decisions'))
+  const db = openDb(dbPath)
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_items_decisions'").get()
+  assert.match(row?.sql ?? '', /ON items\(mission_id, kind\) WHERE kind IN \('decision', 'question'\)/)
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
+})

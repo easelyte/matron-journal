@@ -278,18 +278,18 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   conversation). The journal writes it into that conversation as your
   message, so do not repeat it in prose; the apps show the latest at the top
   of Projects. Honours \`Idempotency-Key\`.
-- \`POST /timeline/weeks/:week\` \`{convo_id, lede?, stories?, final?, notes?}\`
-  → 201 \`{week, written, final}\` — write the lede and story cards of one
-  week of the projects timeline (:week is its Monday as \`YYYY-MM-DD\` in the
-  user's zone; this week or up to 10 weeks back; Coordinator only, naming its
-  own conversation). \`lede\` ≤ 600 chars; \`stories\` ≤ 8 of \`{title ≤ 80,
-  sentence ≤ 300, next? ≤ 300, project_ids (1..10), item_ids? (≤ 10),
-  media_blob_id? (an image or a video)}\`, ids or per-user numbers; \`notes\`
-  ≤ 50 of \`{project_id, note ≤ 300}\`, one sentence kept on a project (shown
-  on the went-quiet and open-a-long-time lists until the project moves again).
-  A write replaces the week. \`final: true\` closes a week that has ended;
-  after that only a final write replaces it (409 \`week_final\`). 400 with
-  \`detail\` (\`unknown_project\` / \`unknown_item\` / \`unknown_blob\` with the
+- \`POST /timeline/weeks/:week/entries\` \`{convo_id, entries, final?, notes?}\`
+  → 201 \`{week, written, final, entries}\` — write one week of the projects
+  timeline as one card per project (:week is its Monday as \`YYYY-MM-DD\` in
+  the user's zone; this week or up to 10 weeks back; Coordinator only, naming
+  its own conversation). \`entries\` ≤ 8 of \`{project, sentence ≤ 300,
+  next? ≤ 300, media_blob_id? (an image or a video)}\`, \`project\` an id or
+  per-user number, each project once; \`notes\` ≤ 50 of \`{project_id,
+  note ≤ 300}\`, one sentence kept on a project (shown on the went-quiet and
+  open-a-long-time lists until the project moves again). A write replaces the
+  week. \`final: true\` closes a week that has ended; after that only a final
+  write replaces it (409 \`week_final\`). 400 with \`detail\`
+  (\`unknown_project\` / \`duplicate_project\` / \`unknown_blob\` with the
   \`ref\`, \`bad_week\`, \`week_out_of_range\`, \`week_not_ended\`); nothing is
   written on an error. Never names private work: your text cannot be taken
   back if a project later becomes private, so keep it to what the user may see.
@@ -300,9 +300,8 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   projects that moved that week (most moves first, ≤ 40, the rest counted in
   \`more_projects\`), each with its status, milestones, items, pictures and
   \`needs_you\` (every open item awaiting the user, ≤ 10, whatever the week's
-  activity — name these in \`item_ids\` and count them in the lede). A story
-  whose projects are all hidden from you is left out of \`stored\`, so a
-  rewrite from this read drops it. \`GET /timeline/quiet?raw=1\` and
+  activity). A story whose projects are all hidden from you is left out of
+  \`stored\`, so a rewrite from this read drops it. \`GET /timeline/quiet?raw=1\` and
   \`/timeline/long?raw=1\` are the went-quiet and open-a-long-time lists
   (\`rows[].note\`) under the same privacy sieve.
 - \`GET /unseen?convo_id=<coordinator convo>\` → \`{entries, truncated}\` —
