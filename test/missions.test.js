@@ -50,6 +50,7 @@ test('schema: opening an existing pre-missions database adds the guarded columns
 
     const raw = new Database(dbPath)
     raw.exec('DROP INDEX IF EXISTS idx_items_mission')
+    raw.exec('DROP INDEX IF EXISTS idx_items_decisions')
     raw.exec('DROP INDEX IF EXISTS idx_conversations_mission')
     raw.exec('ALTER TABLE items DROP COLUMN mission_id')
     raw.exec('ALTER TABLE conversations DROP COLUMN mission_id')

@@ -58,10 +58,18 @@ function decisionsSql(excludePrivateOwned) {
         WHERE ic.item_id = i.id AND ic.author = 'user' AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL ${answerSieve}
         ORDER BY ic.created_at DESC, ic.id DESC LIMIT 1) END AS answer
     FROM items i JOIN missions m ON m.id = i.mission_id JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL
+    WHERE m.project_id = @projectId AND m.user_id = @userId AND +i.consent IS NULL
+      AND i.kind IN ('decision', 'question')
       AND ((i.kind = 'decision' AND COALESCE(i.resolution, '') <> 'cancelled')
            OR (i.kind = 'question' AND i.state = 'closed' AND i.resolution = 'answered'))
       ${sieve}`
+  // The project's missions are found through idx_missions_project and each
+  // one's decisions and questions through idx_items_decisions (pinned by
+  // a test). That index is partial: `i.kind IN ('decision', 'question')`
+  // must stay exactly as its WHERE is written, or SQLite cannot use it.
+  // `+i.consent` keeps SQLite off idx_items_consent, which it otherwise
+  // prefers without ANALYZE statistics, reading nearly every item of every
+  // user on each request.
 }
 
 // Files and images: (a) attachments on comments of the project's items,
@@ -126,8 +134,9 @@ export function milestonesSql(excludePrivateOwned, projectMatch = 'm.project_id 
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
-// Test seam: the query-plan tests read the files and milestones SQL directly
-// (the timeline's week media reuses the first as filesSql).
+// Test seam: the query-plan tests read the decisions, files and milestones
+// SQL directly (the timeline's week media reuses filesSql).
+export const decisionsSqlForTest = decisionsSql
 export const filesSqlForTest = filesSql
 export const milestonesSqlForTest = milestonesSql
 

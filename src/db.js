@@ -1832,6 +1832,11 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
+  // The project feed's decisions: a project's decision items and answered
+  // questions, read mission by mission and kind by kind. Partial, so it holds
+  // only those two kinds and no other query picks it over idx_items_mission;
+  // a query uses it only when its WHERE names the same `kind IN (...)`.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_items_decisions ON items(mission_id, kind) WHERE kind IN ('decision', 'question')")
   // Item action buttons (2026-09-24 item-actions contract): `actions` is the
   // JSON array of one-tap answer labels an agent offered, `chosen_action` the
   // label of the user's most recent tap (NULL until one, and again whenever

@@ -10,7 +10,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
-import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
+import { storeWeekForTest, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
   weekRaw, weekIndex, INDEX, indexSqlForTest, RAW, cardItemsSqlForTest, cardSqlForTest, weekProjects, WEEK_PROJECTS, allProjects, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
@@ -594,12 +594,14 @@ const blobRow = (db, id, mime = 'image/png') =>
 const attachAt = (db, it, blobId, ts, mime = 'image/png') => addComment(db, {
   userId: 1, itemId: it.id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: blobId, mime, name: `${blobId}.png`, size: 4 }], now: ts,
 })
-// A story as the Coordinator writes it (project_ids etc. are references).
+// A stored story (ids, not references). Weeks are stored directly: a lede
+// and titled stories naming several projects and items are the older grouped
+// shape, which the reads still handle but nothing writes any more.
 const tale = (over = {}) => ({ title: 'Launch', sentence: 'It shipped.', next: null, project_ids: [], item_ids: [], media_blob_id: null, ...over })
-const put = (db, n, { lede = null, stories = [], final = false, notes = [] } = {}, o = {}) => {
-  const r = writeWeek(db, 1, keyOf(n), { lede, stories, final, notes }, { now: NOW, excludePrivateOwned: false, ...o })
-  assert.equal(r.ok, true, JSON.stringify(r))
-}
+const put = (db, n, { lede = null, stories = [], final = false, notes = [] } = {}, { now = NOW } = {}) =>
+  storeWeekForTest(db, 1, keyOf(n), parseWeekKey(keyOf(n), userTimeZone(db, 1)), {
+    lede, stories, final, notes: notes.map((x) => ({ project_id: x.project, note: x.note })),
+  }, now)
 
 test('a stored week wins: lede, stories in the stored order, written_at, final from the store', () => {
   const db = seeded()
