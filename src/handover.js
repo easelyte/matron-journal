@@ -268,10 +268,10 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
   // A contributor's item keeps naming them, but not where their replies
   // went: that was a conversation of theirs talking to the old owner.
   const insItem = db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-      origin_convo_id,origin_device_id,created_by,created_at,updated_at,closed_at,mission_id,actions,chosen_action,contributor_name,contributor_via)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'agent',?,?,?,?,?,?,?,?)`)
-  const insComment = db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,created_at,actions,chosen_action)
-    VALUES(?,?,?,'agent',0,NULL,?,?,?,?,?,?,?)`)
+      origin_convo_id,origin_device_id,created_by,created_at,updated_at,closed_at,mission_id,actions,chosen_action,contributor_name,contributor_via,multi_select,chosen_actions)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'agent',?,?,?,?,?,?,?,?,?,?)`)
+  const insComment = db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,created_at,actions,chosen_action,multi_select,chosen_actions)
+    VALUES(?,?,?,'agent',0,NULL,?,?,?,?,?,?,?,?,?)`)
   const copied = []
   for (const it of items) {
     const itemId = newId('it')
@@ -282,7 +282,7 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
     insItem.run(itemId, toUserId, nextNum(db, toUserId), it.kind, it.state, it.resolution, it.awaiting,
       resolveRank(db, toUserId, { position: 'bottom' }), it.title, rewriteRefs(it.body, blobMap), it.labels, it.links,
       it.supersedes ? itemIds.get(it.supersedes) ?? null : null, peopleConvo, it.created_at, now, it.closed_at, id, it.actions ?? '[]', it.chosen_action ?? null,
-      it.contributor_name ?? null, it.contributor_via ?? null)
+      it.contributor_name ?? null, it.contributor_via ?? null, it.multi_select ? 1 : 0, it.chosen_actions ?? null)
     const commentIds = new Map()
     for (const { c, attachments } of threads) {
       const cid = newId('ic')
@@ -294,7 +294,7 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
       // The withdrawn reply an edit replaced is not copied, so the copy
       // has nothing for `replaces` to name.
       delete meta.replaces
-      insComment.run(cid, itemId, toUserId, c.kind, rewriteRefs(c.body, blobMap), JSON.stringify(attachments), JSON.stringify(meta), c.created_at, c.actions ?? '[]', c.chosen_action ?? null)
+      insComment.run(cid, itemId, toUserId, c.kind, rewriteRefs(c.body, blobMap), JSON.stringify(attachments), JSON.stringify(meta), c.created_at, c.actions ?? '[]', c.chosen_action ?? null, c.multi_select ? 1 : 0, c.chosen_actions ?? null)
     }
     copied.push({ from: it.id, to: itemId })
   }

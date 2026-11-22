@@ -1936,6 +1936,16 @@ export function openDb(path) {
   if (!commentActionCols.some((c) => c.name === 'approval')) {
     db.exec('ALTER TABLE item_comments ADD COLUMN approval TEXT')
   }
+  // Multi-select answers: `multi_select` is 1 when the user may tick several
+  // of the offered labels and send them together, and `chosen_actions` the
+  // JSON array of every label the latest answer picked (NULL until one).
+  // `chosen_action` keeps naming the first of them, so a reader that knows
+  // only the one-tap shape still sees the question as answered. Inert
+  // (0 / NULL) on every row from before the columns.
+  for (const [table, cols] of [['items', itemHandoverCols], ['item_comments', commentActionCols]]) {
+    if (!cols.some((c) => c.name === 'multi_select')) db.exec(`ALTER TABLE ${table} ADD COLUMN multi_select INTEGER NOT NULL DEFAULT 0`)
+    if (!cols.some((c) => c.name === 'chosen_actions')) db.exec(`ALTER TABLE ${table} ADD COLUMN chosen_actions TEXT`)
+  }
   if (!itemHandoverCols.some((c) => c.name === 'turn_requested_at')) {
     db.exec('ALTER TABLE items ADD COLUMN turn_requested_at INTEGER')
   }

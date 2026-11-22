@@ -51,6 +51,10 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
     // — and a hello replay — renders the buttons without refetching.
     actions: item.actions ?? [],
     chosen_action: item.chosen_action ?? null,
+    // Multi-select answers: on a question that lets the user tick several
+    // of the actions, `multi_select: true` and every label the latest answer
+    // picked. Absent on every other item, so a one-tap marker is unchanged.
+    ...(item.multi_select ? { multi_select: true, chosen_actions: item.chosen_actions ?? [] } : {}),
   }
   if (comment && (comment.body || (comment.attachments && comment.attachments.length))) {
     payload.comment = {
@@ -59,6 +63,9 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
       // The tapped label when the comment is an action tap, else null — what
       // a bridge reads to word the turn as "tapped" rather than "replied".
       action: comment.action ?? null,
+      // A multi-select answer: every label the user ticked (`action` is the
+      // first). Absent on every other comment.
+      ...(Array.isArray(comment.selected) ? { selected: comment.selected } : {}),
       // When the comment was left, in ms. A bridge names the comment back to
       // the journal as `item:<num>@<ISO created_at>` in a turn's causes
       // (docs/protocol.md "Causes"), and src/ask-cause.js looks it up by
@@ -72,6 +79,7 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
       // chosen button from the tap's marker without refetching the thread.
       actions: comment.actions ?? [],
       chosen_action: comment.chosen_action ?? null,
+      ...(comment.multi_select ? { multi_select: true, chosen_actions: comment.chosen_actions ?? [] } : {}),
       // An edited resend names the withdrawn reply it stands in for, so an
       // app that draws the thread from markers can leave that one out.
       ...(comment.replaces != null ? { replaces: comment.replaces } : {}),

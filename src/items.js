@@ -28,6 +28,11 @@ export const URL_MAX = 2048
 export const ATTACHMENTS_MAX = 20
 export const ACTIONS_MAX = 4
 export const ACTION_LABEL_MAX = 40
+// A multi-select question (`multi_select`) lists its options as rows with a
+// tick box each rather than as a row of buttons, so it may offer more of
+// them, and longer ones (a list of missions to close, say).
+export const MULTI_ACTIONS_MAX = 12
+export const MULTI_ACTION_LABEL_MAX = 80
 export const RANK_GAP = 1024
 export const RANK_EPSILON = 1e-6
 
@@ -71,14 +76,16 @@ function validateAttachments(list, { allowTranscript = false } = {}) {
 // two buttons read the same. Duplicates are refused, not folded: the agent
 // asked for two buttons and would silently get one.
 const ACTION_BAD_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/
-function validateActions(list) {
-  if (!Array.isArray(list) || list.length > ACTIONS_MAX) return null
+function validateActions(list, { multi = false } = {}) {
+  const max = multi ? MULTI_ACTIONS_MAX : ACTIONS_MAX
+  const labelMax = multi ? MULTI_ACTION_LABEL_MAX : ACTION_LABEL_MAX
+  if (!Array.isArray(list) || list.length > max) return null
   const out = []
   const seen = new Set()
   for (const a of list) {
     if (typeof a !== 'string') return null
     const s = a.trim()
-    if (!s || s.length > ACTION_LABEL_MAX || ACTION_BAD_CHARS.test(s)) return null
+    if (!s || s.length > labelMax || ACTION_BAD_CHARS.test(s)) return null
     const key = s.toLowerCase()
     if (seen.has(key)) return null
     seen.add(key)
@@ -136,9 +143,23 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     // The one field with its own error code: the contract names it
     // (`invalid_actions`) so an agent can tell a bad button list apart from
     // any other malformed field.
-    const actions = validateActions(fields.actions)
+    const actions = validateActions(fields.actions, { multi: fields.multi_select === true })
     if (!actions) return { ok: false, error: 'invalid_actions' }
     value.actions = actions
+  }
+  // Multi-select: the user ticks any of the offered labels and sends them
+  // together. It describes the list it comes with, so it is only ever sent
+  // alongside a non-empty `actions` (a write that sets `actions` without it
+  // asks a one-tap question). A signed tap signs one label, so it cannot be
+  // combined with `step_up` yet.
+  if (fields.multi_select !== undefined) {
+    if (typeof fields.multi_select !== 'boolean') return { ok: false, error: 'invalid_actions' }
+    if (fields.multi_select && !(value.actions?.length > 0)) return { ok: false, error: 'invalid_actions' }
+    if (fields.multi_select && fields.step_up === true) return { ok: false, error: 'invalid_actions' }
+    if (fields.actions === undefined) return { ok: false, error: 'invalid_actions' }
+    value.multi_select = fields.multi_select
+  } else if (value.actions !== undefined) {
+    value.multi_select = false
   }
   // Approval keys: `step_up` marks the item (or a comment's buttons) as
   // needing a signed tap; `subject` is the flat string map shown with it.
@@ -160,6 +181,18 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
 }
 
 const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return fallback } }
+
+// Every label the latest answer picked: the stored list for a multi-select
+// answer, else the one-tap label as a list of one, else [].
+function chosenActionsOf(row) {
+  const list = row.chosen_actions == null ? null : parseJson(row.chosen_actions, null)
+  if (Array.isArray(list) && list.length) return list.filter((a) => typeof a === 'string')
+  return row.chosen_action == null ? [] : [row.chosen_action]
+}
+
+// The labels a multi-select answer picked, from a tap comment's meta: null
+// on every other comment.
+const selectedOf = (m) => (Array.isArray(m?.selected) && m.selected.every((a) => typeof a === 'string') ? m.selected : null)
 
 // What to store for a write that asked for step_up: only an owner with an
 // active approval key can have one, so for anyone else the item stays
@@ -194,6 +227,8 @@ export function rowToItem(row) {
     attachments: parseJson(attachments ?? '[]', []),
     actions: parseJson(actions ?? '[]', []),
     chosen_action: rest.chosen_action ?? null,
+    multi_select: !!rest.multi_select,
+    chosen_actions: chosenActionsOf(rest),
     // Owner-only (see db.js): never on another person's wire, so a row
     // that reaches one is always false there.
     private: !!rest.private,
@@ -307,8 +342,9 @@ export function rowToComment(row) {
   // (addComment). Absent on every other comment, like attribution.
   if (typeof m?.replaces === 'string') attribution.replaces = m.replaces
   return {
-    ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
+    ...rest, attachments: parseJson(attachments, []), meta: m, action, selected: selectedOf(m), reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
+    multi_select: !!rest.multi_select, chosen_actions: chosenActionsOf(rest),
     step_up: !!stepUp, subject: subject == null ? null : parseJson(subject, null),
     approval: approval == null ? null : parseJson(approval, null),
   }
@@ -410,7 +446,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 }
 
 export function createItem(db, {
-  userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], stepUp = false, subject = null, awaiting, position, after, before,
+  userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], multiSelect = false, stepUp = false, subject = null, awaiting, position, after, before,
   originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, isPrivate = false, now = Date.now(),
 }) {
   return db.transaction(() => {
@@ -423,7 +459,8 @@ export function createItem(db, {
       if (!sup) throw new Error('bad_supersedes')
     }
     // The route has already refused any other list on a notice.
-    if (kind === 'notice') actions = NOTICE_ACTIONS
+    if (kind === 'notice') { actions = NOTICE_ACTIONS; multiSelect = false }
+    if (!actions.length) multiSelect = false
     const rank = resolveRank(db, userId, { position, after, before })
     const id = newId('it')
     const num = nextNum(db, userId)
@@ -431,10 +468,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private,step_up,subject)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private,step_up,subject,multi_select)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0, stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0, stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null, multiSelect ? 1 : 0)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -720,7 +757,7 @@ function rowToSharedItem(row) {
   if (orgShared === 0) {
     Object.assign(item, {
       shared_via: 'grant', origin_convo_id: '', origin_device_id: 0, origin_convo_title: null, repo: null,
-      actions: [], chosen_action: null,
+      actions: [], chosen_action: null, multi_select: false, chosen_actions: [],
     })
   }
   return item
@@ -730,7 +767,7 @@ function rowToSharedItem(row) {
 // device. A comment's action buttons are the owner's to tap, so they are not
 // offered — the same strip rowToSharedItem applies to the item's own.
 export function listGrantedComments(db, itemId) {
-  return listSharedComments(db, itemId).map((c) => ({ ...c, device_id: 0, actions: [], chosen_action: null }))
+  return listSharedComments(db, itemId).map((c) => ({ ...c, device_id: 0, actions: [], chosen_action: null, multi_select: false, chosen_actions: [] }))
 }
 
 // Another person's view of a thread: the handover lines (src/item-handover.js)
@@ -810,12 +847,12 @@ export function withImageDims(db, attachments) {
 }
 
 // `approval` is a signed tap's {statement, signature}, stored as received.
-export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], stepUp = false, subject = null, approval = null, idemKey, now }) {
+export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], multiSelect = false, stepUp = false, subject = null, approval = null, idemKey, now }) {
   attachments = withImageDims(db, attachments)
   const id = newId('ic')
-  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions,step_up,subject,approval)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []), stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null, approval == null ? null : JSON.stringify({ statement: approval.statement, signature: approval.signature }))
+  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions,step_up,subject,approval,multi_select)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []), stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null, approval == null ? null : JSON.stringify({ statement: approval.statement, signature: approval.signature }), multiSelect && actions?.length ? 1 : 0)
   return commentById(db, id)
 }
 
@@ -832,6 +869,16 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // chosen_action follows it in the same write: the asking comment's for a
 // reply, the item's otherwise — never both. An idempotent replay is answered
 // before the check — the original tap was valid when it landed.
+//
+// `selected` (a user's multi-select answer: every label they ticked, already
+// trimmed by the caller) answers a question asked with `multi_select`. Each
+// label must be one of its current actions, with no repeats, or it is
+// Error('unknown_action'); so is `selected` on a one-tap question. One
+// `action` on a multi-select question is an answer that picked just that
+// label (an app that only knows the one-tap shape), and is stored as one.
+// The comment records meta.selected, plus meta.action = the first label so a
+// one-tap reader sees an answer; the answered row's chosen_actions becomes
+// the whole list and its chosen_action the first.
 //
 // `actions` (already validated; an agent's comment only — the route refuses
 // a client's) are the one-tap answers this comment offers. A non-empty list
@@ -855,7 +902,7 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // subject) as this transaction reads them, so an edit cannot slip between
 // the check and the write. It answers the approval to store, or null, or
 // throws; a throw rolls back everything, the spent nonce included.
-export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], stepUp = false, subject = null, idemKey = null, keepStatus = false, approve = null, now = Date.now() }) {
+export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, selected = null, replyTo = null, replaces = null, actions = [], multiSelect = false, stepUp = false, subject = null, idemKey = null, keepStatus = false, approve = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -870,14 +917,29 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     }
     const asks = actions.length > 0
     if (asks && row.state === 'closed') throw new Error('item_closed')
+    // A step-up item's mark covers its follow-ups' buttons, and a
+    // multi-select answer cannot be signed: decided on the row as it is now.
+    if (asks && multiSelect && row.step_up) throw new Error('invalid_actions')
     let asked = null
+    if (selected != null && action != null) throw new Error('unknown_action')
     if (replyTo != null) {
       // No tap without a label: a bare reply_to is not a thing in v1.
-      if (action == null) throw new Error('unknown_action')
-      asked = db.prepare("SELECT id, actions, body, step_up, subject FROM item_comments WHERE id=? AND item_id=? AND kind='comment'").get(replyTo, itemId)
-      if (!asked || !parseJson(asked.actions, []).includes(action)) throw new Error('unknown_action')
-    } else if (action != null && !parseJson(row.actions, []).includes(action)) {
-      throw new Error('unknown_action')
+      if (action == null && selected == null) throw new Error('unknown_action')
+      asked = db.prepare("SELECT id, actions, body, step_up, subject, multi_select FROM item_comments WHERE id=? AND item_id=? AND kind='comment'").get(replyTo, itemId)
+      if (!asked) throw new Error('unknown_action')
+    }
+    const answered = asked ?? row
+    if (action != null || selected != null) {
+      const offered = parseJson(answered.actions, [])
+      if (selected != null) {
+        if (!answered.multi_select || !Array.isArray(selected) || selected.length === 0) throw new Error('unknown_action')
+        if (new Set(selected).size !== selected.length || !selected.every((a) => offered.includes(a))) throw new Error('unknown_action')
+      } else if (!offered.includes(action)) {
+        throw new Error('unknown_action')
+      }
+      // One label on a multi-select question is an answer that picked it.
+      if (answered.multi_select && selected == null) selected = [action]
+      if (selected != null) action = selected[0]
     }
     // A notice's Seen tap (mission: For you) is the user's last word on it:
     // the item closes as done in this write instead of being handed to the
@@ -887,6 +949,7 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     const seen = row.kind === 'notice' && author === 'user' && action === NOTICE_ACTION && asked == null && !keepStatus
     if (seen && row.state === 'closed') return { item: getItem(db, userId, itemId), comment: null, duplicate: true, seen: true }
     let meta = action == null ? null : (asked ? { action, reply_to: asked.id } : { action })
+    if (meta && selected != null) meta.selected = selected
     if (replaces != null && author === 'user') {
       const original = db.prepare("SELECT id FROM item_comments WHERE id=? AND item_id=? AND kind='comment' AND author='user' AND withdrawn_at IS NOT NULL").get(replaces, itemId)
       if (original) meta = { ...(meta ?? {}), replaces: original.id }
@@ -894,7 +957,7 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     const approval = approve && action != null ? approve({ row, asked }) : null
     let comment
     try {
-      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, stepUp, subject, approval, idemKey, now })
+      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, multiSelect, stepUp, subject, approval, idemKey, now })
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err
@@ -924,8 +987,9 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     // The tap is recorded whoever's status rule applied above: a consent
     // mirror keeps its status (keepStatus) but the choice was still made.
     if (author === 'user' && action != null) {
-      if (asked) db.prepare('UPDATE item_comments SET chosen_action=? WHERE id=?').run(action, asked.id)
-      else if (!keepStatus) db.prepare('UPDATE items SET chosen_action=? WHERE id=?').run(action, itemId)
+      const chosen = JSON.stringify(selected ?? [action])
+      if (asked) db.prepare('UPDATE item_comments SET chosen_action=?, chosen_actions=? WHERE id=?').run(action, chosen, asked.id)
+      else if (!keepStatus) db.prepare('UPDATE items SET chosen_action=?, chosen_actions=? WHERE id=?').run(action, chosen, itemId)
     }
     return { item: getItem(db, userId, itemId), comment, duplicate: false }
   })()
@@ -939,7 +1003,7 @@ const statusOf = (row) => ({ state: row.state, resolution: row.resolution, await
 // agent's own words, and the agent did not write one. The item's header
 // already says it is a question. `row` is the item as it was before this write.
 function promoteNotice(db, { row, userId, deviceId, convoId = null, now }) {
-  db.prepare("UPDATE items SET kind='question', actions='[]', chosen_action=NULL, updated_at=? WHERE id=? AND kind='notice'").run(now, row.id)
+  db.prepare("UPDATE items SET kind='question', actions='[]', chosen_action=NULL, chosen_actions=NULL, multi_select=0, updated_at=? WHERE id=? AND kind='notice'").run(now, row.id)
   const to = { state: 'open', resolution: null, awaiting: 'user' }
   return insertComment(db, {
     itemId: row.id, userId, author: 'agent', deviceId, convoId, kind: 'status', body: '', attachments: [],
@@ -998,7 +1062,7 @@ export function reopenItem(db, { userId, itemId, author, deviceId, convoId = nul
     const to = { state: 'open', resolution: null, awaiting }
     db.prepare("UPDATE items SET state='open', resolution=NULL, awaiting=?, closed_at=NULL, updated_at=? WHERE id=?").run(awaiting, now, itemId)
     // A reopened notice is unread again: its Seen button goes back live.
-    if (row.kind === 'notice') db.prepare('UPDATE items SET chosen_action=NULL WHERE id=?').run(itemId)
+    if (row.kind === 'notice') db.prepare('UPDATE items SET chosen_action=NULL, chosen_actions=NULL WHERE id=?').run(itemId)
     const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { ...meta, from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
@@ -1027,8 +1091,16 @@ export function updateItem(db, { userId, itemId, fields, missionId, now = Date.n
       // A different list is a different question: the old tap no longer
       // answers it. Re-sending the list unchanged (an agent patching every
       // field at once) keeps the user's choice.
-      if (next !== row.actions) sets.push('chosen_action=NULL')
+      // Switching between one-tap and multi-select is a different question too.
+      const multi = fields.multi_select === true ? 1 : 0
+      sets.push('multi_select=?'); args.push(multi)
+      if (next !== row.actions || multi !== (row.multi_select ? 1 : 0)) sets.push('chosen_action=NULL', 'chosen_actions=NULL')
     }
+    // A multi-select question cannot be signed: checked on the row as this
+    // transaction reads it, so a concurrent PATCH cannot pair the two.
+    const multiAfter = fields.actions !== undefined ? fields.multi_select === true : !!row.multi_select
+    const stepUpAfter = fields.step_up !== undefined ? fields.step_up : !!row.step_up
+    if (multiAfter && stepUpAfter) throw new Error('invalid_actions')
     if (fields.step_up !== undefined) {
       sets.push('step_up=?'); args.push(fields.step_up ? 1 : 0)
       if (!fields.step_up) sets.push('subject=NULL')

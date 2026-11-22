@@ -30,8 +30,8 @@ const parse = (s) => { try { return JSON.parse(s) } catch { return null } }
 export function presentWithdrawn(c) {
   if (!c || c.withdrawn_at == null) return c
   const meta = c.meta && typeof c.meta === 'object' ? { ...c.meta } : c.meta
-  if (meta) delete meta.action
-  return { ...c, body: '', attachments: [], meta, action: null, withdrawn: true }
+  if (meta) { delete meta.action; delete meta.selected }
+  return { ...c, body: '', attachments: [], meta, action: null, selected: null, withdrawn: true }
 }
 
 // The bridge's cancel release for one of its queue cards (a `prompt_reply`
@@ -83,7 +83,7 @@ function undoTap(db, { itemId, meta }) {
   const action = typeof meta?.action === 'string' ? meta.action : null
   if (!action) return null
   const replyTo = typeof meta.reply_to === 'string' ? meta.reply_to : null
-  const latest = db.prepare(`SELECT json_extract(meta, '$.action') AS action FROM item_comments
+  const latest = db.prepare(`SELECT json_extract(meta, '$.action') AS action, json_extract(meta, '$.selected') AS selected FROM item_comments
     WHERE item_id=? AND author='user' AND kind='comment' AND withdrawn_at IS NULL
       AND json_extract(meta, '$.action') IS NOT NULL
       AND ${replyTo ? "json_extract(meta, '$.reply_to')=?" : "json_extract(meta, '$.reply_to') IS NULL"}
@@ -93,13 +93,21 @@ function undoTap(db, { itemId, meta }) {
   const offered = replyTo
     ? db.prepare('SELECT actions FROM item_comments WHERE id=? AND item_id=?').get(replyTo, itemId)?.actions
     : db.prepare('SELECT actions FROM items WHERE id=?').get(itemId)?.actions
-  const restored = latest?.action != null && (parse(offered) ?? []).includes(latest.action) ? latest.action : null
+  // A multi-select answer stands only while every label it picked does.
+  const picked = latest?.action == null ? null : (Array.isArray(parse(latest.selected)) ? parse(latest.selected) : [latest.action])
+  // ...and, for more than one label, while the question still takes several.
+  const multiNow = replyTo
+    ? db.prepare('SELECT multi_select FROM item_comments WHERE id=? AND item_id=?').get(replyTo, itemId)?.multi_select
+    : db.prepare('SELECT multi_select FROM items WHERE id=?').get(itemId)?.multi_select
+  const ok = picked != null && (picked.length === 1 || !!multiNow) && picked.every((a) => (parse(offered) ?? []).includes(a))
+  const restored = ok ? latest.action : null
+  const restoredList = ok ? JSON.stringify(picked) : null
   if (replyTo) {
-    db.prepare('UPDATE item_comments SET chosen_action=? WHERE id=? AND item_id=? AND chosen_action IS ?').run(restored, replyTo, itemId, action)
+    db.prepare('UPDATE item_comments SET chosen_action=?, chosen_actions=? WHERE id=? AND item_id=? AND chosen_action IS ?').run(restored, restoredList, replyTo, itemId, action)
     return { action, itemChosen: undefined }
   }
-  db.prepare('UPDATE items SET chosen_action=? WHERE id=? AND chosen_action IS ?').run(restored, itemId, action)
-  return { action, itemChosen: restored }
+  db.prepare('UPDATE items SET chosen_action=?, chosen_actions=? WHERE id=? AND chosen_action IS ?').run(restored, restoredList, itemId, action)
+  return { action, itemChosen: restored, itemChosenList: ok ? picked : [] }
 }
 
 // Every user's log: a reply on an item a contributor filed was also copied
@@ -118,6 +126,7 @@ function scrubEvents(db, { userId, itemId, commentId, cardSeq, chosen }) {
     const p = parse(m.payload)
     if (!p?.comment) continue
     p.comment = { ...p.comment, body: '', attachments: [], action: null, withdrawn: true }
+    delete p.comment.selected
     update.run(JSON.stringify(p), m.user_id, m.seq)
     if (p.action !== 'commented') continue
     const fb = fallbackAfter.get(m.user_id, m.convo_id, m.sender, m.seq, m.seq + FALLBACK_WINDOW, itemId)
@@ -138,6 +147,7 @@ function scrubEvents(db, { userId, itemId, commentId, cardSeq, chosen }) {
       const p = parse(r.payload)
       if (!p) continue
       p.chosen_action = chosen.itemChosen
+      if ('chosen_actions' in p) p.chosen_actions = chosen.itemChosenList ?? []
       update.run(JSON.stringify(p), userId, r.seq)
     }
   }

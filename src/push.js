@@ -134,8 +134,10 @@ export function pushContent(event, convo, cls, itemBody = () => null) {
   // The buttons on offer: the comment's own when it asks something, else the
   // item's while nobody has tapped one.
   const labels = (list) => (Array.isArray(list) ? list.filter((a) => typeof a === 'string' && a).slice(0, 4) : [])
-  const asked = labels(c?.actions)
-  const actions = asked.length ? asked : (p.chosen_action == null ? labels(p.actions) : [])
+  // A multi-select question is answered in the app (tick, then Send): a
+  // notification button would send one label, so it offers none.
+  const asked = c?.multi_select ? [] : labels(c?.actions)
+  const actions = asked.length || c?.multi_select ? asked : (p.chosen_action == null && !p.multi_select ? labels(p.actions) : [])
   const label = ITEM_KIND_LABELS[p.kind] || 'Item'
   return {
     ...base,
@@ -171,15 +173,15 @@ function itemStillNeedsUser(db, userId, itemId) {
 // button that has already been tapped or replaced.
 export function freshItemEvent(db, userId, event) {
   const p = event.payload
-  const row = db.prepare('SELECT actions, chosen_action FROM items WHERE id=? AND user_id=?').get(p.item_id, userId)
+  const row = db.prepare('SELECT actions, chosen_action, multi_select FROM items WHERE id=? AND user_id=?').get(p.item_id, userId)
   if (!row) return event
   const parse = (json) => { try { const v = JSON.parse(json); return Array.isArray(v) ? v : [] } catch { return [] } }
   let comment = p.comment
   if (comment && typeof comment === 'object' && typeof comment.id === 'string') {
-    const c = db.prepare('SELECT actions, chosen_action FROM item_comments WHERE id=? AND item_id=?').get(comment.id, p.item_id)
-    if (c) comment = { ...comment, actions: c.chosen_action == null ? parse(c.actions) : [] }
+    const c = db.prepare('SELECT actions, chosen_action, multi_select FROM item_comments WHERE id=? AND item_id=?').get(comment.id, p.item_id)
+    if (c) comment = { ...comment, actions: c.chosen_action == null ? parse(c.actions) : [], multi_select: !!c.multi_select }
   }
-  return { ...event, payload: { ...p, actions: parse(row.actions), chosen_action: row.chosen_action ?? null, ...(comment !== undefined ? { comment } : {}) } }
+  return { ...event, payload: { ...p, actions: parse(row.actions), chosen_action: row.chosen_action ?? null, multi_select: !!row.multi_select, ...(comment !== undefined ? { comment } : {}) } }
 }
 
 // APNs answers that mean the token itself will never be delivered to: 410
