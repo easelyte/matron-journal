@@ -2344,9 +2344,9 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items` | `convo, kind (one or several, comma-separated), state=open\|closed\|done, awaiting, label, sort=rank\|updated\|acted, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only, and not state=done; rows carry owner{user_id,name,github_login} and repo)`. `state=done` is For you's Done view: closed items, plus open agent-filed ones with a `last_user_input_at` that are not awaiting the user (answered, waiting on their agent). `sort=acted` orders by the user's last action on the item (`last_user_input_at`), falling back to `closed_at`, then `updated_at`; newest first | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, step_up?, subject?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only), private?: boolean (an owner-only item — see *Sharing between people → What a grantee reads*)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, step_up?, subject?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, replaces?, approval?, actions?, step_up?, subject?, as_convo_id?}` (body or attachments required, unless `action` is given; `step_up`/`subject` with an agent's `actions` only) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, multi_select?, step_up?, subject?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only), private?: boolean (an owner-only item — see *Sharing between people → What a grantee reads*)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, multi_select?, step_up?, subject?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
+| `POST /items/:id/comments` | `{body?, attachments?, action?, selected?, reply_to?, replaces?, approval?, actions?, multi_select?, step_up?, subject?, as_convo_id?}` (body or attachments required, unless `action` is given; `step_up`/`subject` with an agent's `actions` only) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?, as_convo_id?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?, as_convo_id?}` | `{item, comment}`; 409 if already open |
@@ -2549,6 +2549,44 @@ the item's own `chosen_action` is left alone. Without `reply_to` a tap
 answers the item's own `actions`, exactly as before this contract. Each
 question in a thread keeps its own buttons and its own answer; a later
 question does not clear an earlier one. A typed reply marks no button.
+
+**Multi-select answers.** An agent may let the user tick several of the
+offered labels and send them together, instead of tapping one: it sends
+`multi_select: true` alongside a non-empty `actions` on `POST /items`,
+`PATCH /items/:id` or an agent's `POST /items/:id/comments`. Such a list may
+hold up to **12** labels of up to **80** characters (the one-tap limits stay
+4 and 40); the other label rules are the same. `multi_select` without a
+non-empty `actions` in the same write, a non-boolean, `multi_select: true`
+together with `step_up` (this write's or, on a PATCH or a follow-up, the
+item's), or on a notice is **400 `invalid_actions`**. A write that sets
+`actions` without `multi_select` asks a one-tap question, and a `PATCH` that
+switches between the two modes clears the answer as a changed list does.
+Every item and comment carries `multi_select` (boolean) and
+`chosen_actions`: every label the latest answer picked, `[]` before one (a
+one-tap answer reads as a list of its one label).
+
+The user answers with `selected: ["<label>", …]` on `POST /items/:id/comments`
+(plus `reply_to` for a follow-up question, as with `action`), and may type a
+`body` with it. Each label must be one of the current `actions` of a
+multi-select question, after trimming, with no repeats; an empty list, a
+non-array, `selected` together with `action`, `selected` on a one-tap
+question or on one of the journal's own questions (consent cards, mirrors,
+hand-over offers) is **400 `unknown_action`**, and an agent sending it is
+**403**. An empty `body` becomes the labels joined with `", "`. The comment
+stores `meta.selected` and `meta.action` = the first label, and returns them
+as `comment.selected` and `comment.action`; the answered row's
+`chosen_actions` becomes the list and its `chosen_action` the first label,
+so a reader that only knows one-tap answers still sees the question as
+answered. A single `action` on a multi-select question (an older app) is an
+answer that picked that one label and is stored as one. Withdrawing an
+answer puts back the previous answer still standing, whole.
+
+On markers, `multi_select: true` and `chosen_actions` appear on the item,
+and on the `comment` object of a comment that asks, only when the question
+is multi-select, and `comment.selected` only on a multi-select answer, so a
+one-tap marker is unchanged. A push for a multi-select question offers no
+notification buttons: it is answered in the app. A step-up item cannot take
+a multi-select answer of more than one label.
 
 The `commented` marker's `comment` object carries `actions`,
 `chosen_action` and `reply_to` too, so a connected app draws the buttons

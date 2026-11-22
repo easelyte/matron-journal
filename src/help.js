@@ -128,6 +128,12 @@ transcribing is the origin bridge's job); those 404 on refusal.
   A tap is a user comment whose body is the label, with \`comment.action\` set
   to it and the item's \`chosen_action\` = the latest tap (changing
   \`actions\` clears it). Only the user taps: \`action\` on your comment is 403.
+- \`multi_select: true\` with \`actions\` (item or comment): the user ticks
+  any of the labels and sends them together. Up to 12 labels of 1–80 chars;
+  not with \`step_up\` or on a notice (400 \`invalid_actions\`). The answer
+  is one user comment with \`comment.selected\` = every label picked
+  (\`comment.action\` = the first) and the answered row's
+  \`chosen_actions\` = the list.
 - \`PATCH /items/:id/comments/:cid\` \`{blob_ref, transcript}\` — agent-only
   write-back after transcribing a voice-note attachment; one sent on a
   create/comment is dropped. When the journal transcribes itself, a user's
