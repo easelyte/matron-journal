@@ -11,7 +11,7 @@ import { joinedAgentIds } from './participants.js'
 import { json, readBody } from './http-body.js'
 import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import {
-  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, resolveStepUp, createItem, getItem, listItems, listComments,
+  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, MULTI_ACTIONS_MAX, validateItemFields, resolveStepUp, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
   markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
   requestTurn,
@@ -76,11 +76,11 @@ function replyItems(who, res, code, body) {
 // The item transitions in items.js signal their one recoverable failure by
 // throwing a tagged Error; each maps to exactly one of the existing error
 // shapes. Anything else is a bug and must reach http.js's 500.
-const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409, unknown_action: 400, item_closed: 409 }
+const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409, unknown_action: 400, item_closed: 409, invalid_actions: 400 }
 // The failures the item-actions contract names answer with their own code
 // rather than the generic one, so an app can tell "that button is gone" (the
 // agent changed the offer under it) from a malformed request.
-const NAMED_ERRORS = new Set(['unknown_action'])
+const NAMED_ERRORS = new Set(['unknown_action', 'invalid_actions'])
 // Wake keys off the ACTION as well as the writer: a reorder is bookkeeping,
 // not something a sleeping box needs to be booted for.
 const WAKE_ACTIONS = new Set(['created', 'commented', 'closed', 'reopened'])
@@ -390,6 +390,7 @@ async function handleCreate(ctx, req, res, who) {
   if (body.kind === 'notice' && !noticeActionsOk(v.value.actions)) return badFields(res, { error: 'invalid_actions' })
   // A notice has one built-in button and nothing to sign.
   if (body.kind === 'notice' && v.value.step_up === true) return badFields(res, { error: 'invalid_actions' })
+  if (body.kind === 'notice' && v.value.multi_select === true) return badFields(res, { error: 'invalid_actions' })
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
   // `position` is exclusive: given alongside either neighbour, the intent is
@@ -443,7 +444,7 @@ async function handleCreate(ctx, req, res, who) {
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
       supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
-      stepUp: su.stepUp, subject: su.subject,
+      stepUp: su.stepUp, subject: su.subject, multiSelect: v.value.multi_select === true,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true
@@ -480,6 +481,10 @@ async function handlePatch(ctx, req, res, who, item) {
   // stored one); a notice never is one.
   if (fields.subject !== undefined && !(fields.step_up ?? item.step_up)) return badFields(res, { error: 'invalid_subject' })
   if (item.kind === 'notice' && fields.step_up === true) return badFields(res, { error: 'invalid_actions' })
+  // A multi-select question cannot be signed (yet): neither half may be
+  // added to an item that has the other.
+  if (item.kind === 'notice' && fields.multi_select === true) return badFields(res, { error: 'invalid_actions' })
+  if ((fields.multi_select ?? (fields.actions === undefined ? item.multi_select : false)) && (fields.step_up ?? item.step_up)) return badFields(res, { error: 'invalid_actions' })
   let stepUpIgnored = false
   if (fields.step_up === true) {
     const su = resolveStepUp(db, who.userId, fields)
@@ -489,6 +494,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // a patch of nothing else changes nothing.
   if (item.kind === 'notice' && 'actions' in fields) {
     delete fields.actions
+    delete fields.multi_select
     if (Object.keys(fields).length === 0 && body.awaiting === undefined && body.mission === undefined) {
       replyItems(who, res, 200, { item })
       return true
@@ -556,6 +562,7 @@ async function handlePatch(ctx, req, res, who, item) {
     })()
   } catch (err) {
     if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
+    if (err?.message === 'invalid_actions') return badFields(res, { error: 'invalid_actions' })
     throw err
   }
   // Every mutating route appends a marker, this one included: a retitle or a
@@ -664,9 +671,12 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 // `refusal` is the answer to send. The journal's handover question
 // (handleApprovalTap) is answered through the same check.
 const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
-function tapApprover(ctx, who, approval, action) {
+function tapApprover(ctx, who, approval, action, selected = null) {
   return ({ row, asked }) => {
     if (!row.step_up && !asked?.step_up && approval == null) return null
+    // A statement signs one label: a multi-select answer of several cannot be
+    // signed, so a step-up item refuses it rather than signing part of it.
+    if (selected != null && selected.length > 1) refuse(400, { error: 'unknown_action', detail: 'multi_select_step_up' })
     // Decided once more inside requireApproval; asked first here so that
     // nothing below can fail a keyless account's tap.
     if (!hasActiveKey(ctx.db, who.userId)) return null
@@ -723,6 +733,20 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // actions inside addComment's transaction (unknown_action otherwise);
     // everything else is the ordinary user-comment path.
     let action = null
+    // `selected` (multi-select answers): every label the user ticked on a
+    // question asked with `multi_select`, sent together. A user's field like
+    // `action`, and never alongside it. Matched exactly (after trim) against
+    // the current actions inside addComment's transaction.
+    let selected = null
+    if (body.selected != null) {
+      if (who.kind === 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+      if (body.action != null || !Array.isArray(body.selected) || body.selected.length === 0 || body.selected.length > MULTI_ACTIONS_MAX
+        || !body.selected.every((a) => typeof a === 'string' && a.trim())) { json(res, 400, { error: 'unknown_action' }); return true }
+      selected = body.selected.map((a) => a.trim())
+      // The journal's own questions (consent cards, mirrors, hand-over
+      // offers) are one-tap only.
+      if (item.consent != null || isSharingMirror(item) || isPeopleRoomMirror(item)) { json(res, 400, { error: 'unknown_action' }); return true }
+    }
     if (body.action != null) {
       if (who.kind === 'agent') { json(res, 403, { error: 'forbidden' }); return true }
       if (typeof body.action !== 'string' || !body.action.trim()) { json(res, 400, { error: 'unknown_action' }); return true }
@@ -756,13 +780,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // item's own buttons, as every client before the contract sends it.
     let replyTo = null
     if (body.reply_to != null) {
-      if (action == null || typeof body.reply_to !== 'string' || !body.reply_to) { json(res, 400, { error: 'unknown_action' }); return true }
+      if ((action == null && selected == null) || typeof body.reply_to !== 'string' || !body.reply_to) { json(res, 400, { error: 'unknown_action' }); return true }
       replyTo = body.reply_to
       // The journal's own "Hand this item over?" question (item handover):
       // its tap is the journal's to act on, not a turn for the owner.
       const handoverId = approvalQuestionOf(db, item.id, replyTo)
       // Its buttons are the item's too: on a step-up item the tap is signed
       // like any other (tapApprover).
+      if (handoverId && selected != null) { json(res, 400, { error: 'unknown_action' }); return true }
       if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey, approve: tapApprover(ctx, who, body.approval, action) })
     }
     // `replaces`: the id of the user's own withdrawn reply this one is the
@@ -777,8 +802,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // refused like an agent's `action` is. `[]` is "none", same as absent.
     const offers = body.actions != null && !(Array.isArray(body.actions) && body.actions.length === 0)
     if (offers && who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
-    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined, step_up: body.step_up, subject: body.subject }, { partial: true })
+    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined, multi_select: offers ? body.multi_select : undefined, step_up: body.step_up, subject: body.subject }, { partial: true })
     if (!v.ok) return badFields(res, v)
+    // A step-up item's mark covers its follow-ups' buttons too, and a
+    // multi-select answer cannot be signed.
+    if (v.value.multi_select === true && item.step_up) return badFields(res, { error: 'invalid_actions' })
+    if (body.multi_select != null && !offers && body.multi_select !== false) return badFields(res, { error: 'invalid_actions' })
     // Signing applies to the buttons a comment offers; a subject needs it.
     if (v.value.step_up === true && !offers) return badFields(res, { error: 'invalid_actions' })
     if (v.value.subject !== undefined && v.value.step_up !== true) return badFields(res, { error: 'invalid_subject' })
@@ -786,7 +815,8 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (strayRef(res, v.value.body, v.value.attachments)) return true
     // An empty body on a tap reads as the label: an old client, the fallback
     // text and the agent's turn all see exactly what the user chose.
-    const text = action != null && !(v.value.body ?? '').trim() ? action : (v.value.body ?? '')
+    const tapped = selected ?? (action != null ? [action] : null)
+    const text = tapped != null && !(v.value.body ?? '').trim() ? tapped.join(', ') : (v.value.body ?? '')
     // A user's voice note is transcribed here, on upload, when this journal
     // has whisper (ctx.itemTranscription.enabled): stored and announced as
     // pending so the origin bridge holds the turn for the words instead of
@@ -811,8 +841,8 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // to see the item, let alone close it again.
       // A tap's approval-key check runs inside the write (tapApprover); a
       // typed reply is never a tap, and its `approval` is ignored.
-      const approve = action != null ? tapApprover(ctx, who, body.approval, action) : null
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null, approve })
+      const approve = tapped != null ? tapApprover(ctx, who, body.approval, tapped[0], selected) : null
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, selected, replyTo, replaces, actions: v.value.actions ?? [], multiSelect: v.value.multi_select === true, stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null, approve })
     } catch (err) {
       if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
       if (answerKnownError(res, err)) return true
