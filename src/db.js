@@ -2436,6 +2436,17 @@ export function openDb(path) {
       created_at INTEGER NOT NULL
     );
   `)
+  // An Android app's Firebase Cloud Messaging registration (src/fcm.js): its
+  // token, and the public key its notifications are sealed to (NULL: none).
+  // One per device; a token is held by one device at a time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fcm_registrations(
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      token TEXT NOT NULL UNIQUE,
+      push_key TEXT,
+      created_at INTEGER NOT NULL
+    );
+  `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
@@ -2678,15 +2689,44 @@ export function pruneWebPushSubscription(db, deviceId, endpoint) {
   return db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=? AND endpoint=?').run(deviceId, endpoint).changes > 0
 }
 
+// An Android device's FCM registration. Registering CLAIMS the token, as
+// setApnsRegistration does: a token names one app install, and a re-pair or
+// a phone handed to someone else must not leave an older row receiving its
+// pushes. `pushKey` (already validated, or null) is replaced on every
+// registration, so one without a key ends sealed content for the device.
+export function setFcmRegistration(db, deviceId, { token, pushKey = null }) {
+  db.transaction(() => {
+    db.prepare('DELETE FROM fcm_registrations WHERE token=? AND device_id<>?').run(token, deviceId)
+    db.prepare(`INSERT INTO fcm_registrations(device_id, token, push_key, created_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(device_id) DO UPDATE SET token=excluded.token, push_key=excluded.push_key, created_at=excluded.created_at`)
+      .run(deviceId, token, pushKey, Date.now())
+  })()
+}
+
+export function clearFcmRegistration(db, deviceId) {
+  db.prepare('DELETE FROM fcm_registrations WHERE device_id=?').run(deviceId)
+}
+
+// Called by the push pipeline when FCM says a token is dead (404
+// UNREGISTERED). Clears only while the device still holds that token, so a
+// late answer never drops a registration made since. Returns whether
+// anything was cleared, so a burst of failures is logged once.
+export function pruneFcmToken(db, deviceId, token) {
+  return db.prepare('DELETE FROM fcm_registrations WHERE device_id=? AND token=?').run(deviceId, token).changes > 0
+}
+
 // Client devices (never agent — agents are never pushed to) with a
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
     `SELECT d.id, d.kind, d.created_at, d.last_seen_at, d.apns_token, d.apns_env,
       d.cursor, d.push_level, d.sync_scope, d.push_key,
-      w.endpoint AS wp_endpoint, w.p256dh AS wp_p256dh, w.auth AS wp_auth
+      w.endpoint AS wp_endpoint, w.p256dh AS wp_p256dh, w.auth AS wp_auth,
+      f.token AS fcm_token, f.push_key AS fcm_key
       FROM devices d LEFT JOIN web_push_subscriptions w ON w.device_id=d.id
-      WHERE d.user_id=? AND d.kind='client' AND (d.apns_token IS NOT NULL OR w.device_id IS NOT NULL)`
+      LEFT JOIN fcm_registrations f ON f.device_id=d.id
+      WHERE d.user_id=? AND d.kind='client'
+        AND (d.apns_token IS NOT NULL OR w.device_id IS NOT NULL OR f.device_id IS NOT NULL)`
   ).all(userId)
 }
 

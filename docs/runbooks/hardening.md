@@ -33,6 +33,11 @@ it — the simplest is under the service's own tree, e.g.
 `ProtectSystem=strict` leaves readable. Set the four `MATRON_APNS_*` vars via a
 drop-in (`systemctl edit matron-journal`).
 
+The Firebase service-account key for Android push is handled the same way:
+e.g. `/opt/matron-journal/fcm-service-account.json` (owned `matron:matron`,
+mode `600`), with `MATRON_FCM_SERVICE_ACCOUNT_FILE` pointing at it in the
+same drop-in.
+
 ## Single-user / dev-box deployment (in-place hardening)
 
 If the service runs as a normal login user out of that user's home (the dev-box

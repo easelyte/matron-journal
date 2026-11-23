@@ -5,7 +5,7 @@ import { makeFilesReadHandler, isFilesPath } from './files-read-http.js'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, setWebPushSubscription, clearWebPushSubscription, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, setWebPushSubscription, clearWebPushSubscription, setFcmRegistration, clearFcmRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -138,7 +138,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, webPushClient, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, fileReads, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, webPushClient, fcmClient, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, fileReads, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
   const handleFileReads = makeFilesReadHandler(fileReads)
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
@@ -568,6 +568,28 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           validator.computeSecret(point)
         } catch { return json(res, 400, { error: 'bad_request' }) }
         setWebPushSubscription(db, who.deviceId, { endpoint: stored, p256dh, auth })
+        return json(res, 200, { ok: true })
+      }
+      if (req.method === 'POST' && url.pathname === '/push/fcm/register') {
+        // The Android app's Firebase Cloud Messaging token, with the public
+        // key its notifications are sealed to. `{token: null}` unregisters,
+        // even when sending is off.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        if (body?.token === null) {
+          clearFcmRegistration(db, who.deviceId)
+          return json(res, 200, { ok: true })
+        }
+        if (!fcmClient) return json(res, 404, { error: 'fcm_disabled' })
+        const token = body?.token
+        // FCM tokens are opaque; bound them and keep them to the characters
+        // FCM uses, so nothing else is stored under the name.
+        if (typeof token !== 'string' || token.length < 16 || token.length > 4096 || !/^[A-Za-z0-9_:.-]+$/.test(token)) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        const pushKey = body.push_key == null ? null : parsePushKey(body.push_key)
+        if (body.push_key != null && !pushKey) return json(res, 400, { error: 'bad_request' })
+        setFcmRegistration(db, who.deviceId, { token, pushKey })
         return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
