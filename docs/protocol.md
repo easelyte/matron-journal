@@ -453,6 +453,15 @@ the machine-checkable version of this page.
   included: what needs the user arrives as a tracker item awaiting them, and
   that pushes. The `coordinator_done` switch turns the Coordinator's turns
   back on.
+- `POST /push/fcm/register` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): `{token, push_key}` registers an Android device's
+  Firebase Cloud Messaging token; `{token: null}` unregisters, even when FCM
+  is off. `token` is a string of 16 to 4096 characters from
+  `A-Z a-z 0-9 _ : . -`, otherwise 400 `{error:'bad_request'}`. `push_key` is
+  optional and as for `/push/register`. A token is held by one device at a
+  time: registering it takes it from any other. When the journal has no FCM
+  key, registering is 404 `{error:'fcm_disabled'}`. Response `{ok:true}`.
+  See *Android push (FCM)* under *Push notifications*.
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -3275,7 +3284,7 @@ memories are stored and shown in the apps only.
   device's privacy flag **snapshotted at save time** (a revoked device, or
   a new device reusing its id, never changes who may read the memory).
   `created_by` / `updated_by` are `user` or `agent`.
-- At most **200 memories per user**.
+- At most **400 memories per user**.
 
 ### Routes (Bearer, either device kind)
 
@@ -9326,6 +9335,52 @@ Agent-to-agent file transfers have their own always-on sweep, with no env
 knob — see "Agent-to-agent file transfers" → "Retention" above. In short:
 a collected copy is deleted an hour after receipt, and an uncollected one
 is marked `expired` and deleted a week after it was created.
+
+### Android push (FCM)
+
+Android devices are pushed through Firebase Cloud Messaging's HTTP v1 API.
+Disabled unless the journal has a service-account key:
+
+    MATRON_FCM_SERVICE_ACCOUNT_FILE=/path/to/service-account.json
+    MATRON_FCM_PROJECT_ID=...   # optional; defaults to the file's project_id
+    MATRON_FCM_DISABLED=1       # optional kill switch
+
+An unreadable or malformed key file fails startup. The journal signs an RS256
+JWT with the key, exchanges it at the key file's `token_uri` for an access
+token, caches the token until five minutes before it expires, and sends
+`POST /v1/projects/<project>/messages:send`. A transport failure is retried
+once; a 401 is retried once with a freshly minted token. When the token
+endpoint refuses the key, sends fail fast for a minute before it is tried
+again.
+
+Every message is data-only (no `notification` block), so the app builds the
+notification itself. All values are strings:
+
+| key | when | value |
+|---|---|---|
+| `type` | always | `alert`, or `read` |
+| `convo_id` | always | the conversation |
+| `badge` | always | unread count at send time |
+| `seq` | `alert` | the event the alert shows |
+| `kind` | `alert` | `attention`, `done` or `activity` |
+| `item_id` | `alert` about an item | the item |
+| `box` | `alert`, device registered a key | sealed content (below) |
+| `title`, `body` | `alert`, device registered no key | the text in the clear |
+
+An `alert` follows the same rules as an APNs alert: notification settings,
+the device's own level, holds, coalescing, the viewing and read-state
+filters. It goes at `HIGH` priority with a TTL of 1 hour for `activity` and
+1 day otherwise. A device that registered a key never gets content in the
+clear: if the box cannot be made, the alert carries neither `box` nor text,
+and the app shows fixed text for its `kind`.
+
+A `read` message goes at `NORMAL` priority to every other Android device of
+the user when a conversation is read elsewhere (a `read_marker`), so the app
+can take that conversation's notifications off the shade and update its
+badge. It shows nothing and ignores the notification settings.
+
+An answer of 404, or the error code `UNREGISTERED`, prunes the token; every
+other failure keeps it. `/metrics` counts FCM under `push.fcm`.
 
 ## Web Push
 

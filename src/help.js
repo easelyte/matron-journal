@@ -235,7 +235,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   omitted), tier?: always|on_demand, topic? (≤40 chars), convo_id?
   (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
   The same name overwrites — the whole memory, so send the body back when
-  updating; tier and topic are kept when omitted. 409 \`too_many\` at 200
+  updating; tier and topic are kept when omitted. 409 \`too_many\` at 400
   memories. Neither tier has a size limit. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's. An agent's save or delete applies

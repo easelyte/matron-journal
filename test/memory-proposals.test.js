@@ -1,6 +1,7 @@
 // Memory proposals (src/memory-proposals.js, src/memory-proposals-http.js):
 // which agent writes apply at once, which wait for the user, and what the
 // user's answer does.
+import { MEMORIES_MAX } from '../src/memories.js'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
@@ -98,11 +99,13 @@ test('a write with no user behind it becomes a proposal: 202, nothing saved, a q
   }
   assert.ok(item.body.includes(fenced('Never use opal.'))); assert.ok(item.body.includes(fenced('**Why:** reserved.')))
   // It is in the user's list, and in no agent's: not the proposer's, not the Coordinator's.
+  // Only the proposer can open it by id, to read the thread it is answered in.
   assert.ok((await s.http('/items', { token: client })).json.items.some((i) => i.id === item.id))
   for (const token of [a.token, b.token]) {
-    assert.equal((await s.http(`/items/${item.id}`, { token })).status, 404)
     assert.ok(!(await s.http('/items', { token })).json.items.some((i) => i.id === item.id))
   }
+  assert.equal((await s.http(`/items/${item.id}`, { token: a.token })).status, 200)
+  assert.equal((await s.http(`/items/${item.id}`, { token: b.token })).status, 404)
   // The item marker is a client's only; the proposer can still read memories as before.
   const marker = events(s, 'item').at(-1)
   assert.equal(marker.payload.consent, 'memory'); assert.equal(marker.payload.action, 'created'); assert.equal(marker.sender, 'agent:box-a')
@@ -222,8 +225,11 @@ test('no agent can answer a proposal: not the proposer, not the Coordinator, not
         const body = path.endsWith('close') ? { resolution: 'done' } : { action: 'Save it' }
         assert.ok([403, 404].includes((await s.http(path, { method: 'POST', token, body })).status))
       }
-      assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token, body: { body: 'Save it' } })).status, 404)
-      assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token, body: { title: 'Harmless', actions: ['Save it'] } })).status, 404)
+      // A plain comment is the proposer's reply in the thread (and nobody
+      // else's); it answers nothing. Editing the question is never allowed.
+      const own = (token === a.token && id === r.json.item.id) || (token === b.token && id === mine.json.item.id)
+      assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token, body: { body: 'Save it' } })).status, own ? 201 : 404)
+      assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token, body: { title: 'Harmless', actions: ['Save it'] } })).status, own ? 403 : 404)
     }
   }
   // No item an agent files can stand in for the question.
@@ -550,7 +556,33 @@ test('a proposal with no conversation lives on the Coordinator conversation; the
   assert.equal((await memory(s, client, 'loose')).json.memory.origin_convo_id, null)
   assert.deepEqual(outcomes(s), []) // no conversation to tell
   const ins = s.db.prepare(`INSERT INTO memories(id, user_id, name, type, description, created_by, updated_by, created_at, updated_at) VALUES(?,?,?,'feedback','x','user','user',1,1)`)
-  for (let i = 0; i < 199; i++) ins.run(`me_fill${i}`, alice.id, `fill-${i}`)
+  for (let i = 0; i < MEMORIES_MAX - 1; i++) ins.run(`me_fill${i}`, alice.id, `fill-${i}`)
   assert.equal((await put(s, a.token, 'one-too-many', { convo_id: 'c1' })).status, 409)
   assert.equal((await put(s, a.token, 'fill-1', { convo_id: 'c1' })).status, 202) // an update is never refused
+})
+
+test('the proposer can discuss its proposal in the thread: read the user reply and answer, but only with words', async (t) => {
+  const { s, a, client } = await fleet(t)
+  const r = await put(s, a.token, 'avoid-opal', { convo_id: 'c1' })
+  const id = r.json.item.id
+  assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'Not a never rule, please.' } })).status, 201)
+  const read = await s.http(`/items/${id}`, { token: a.token })
+  assert.equal(read.status, 200)
+  assert.ok(read.json.comments.some((c) => c.author === 'user' && c.body === 'Not a never rule, please.'))
+  const reply = await s.http(`/items/${id}/comments`, { method: 'POST', token: a.token, body: { body: 'Reworded: ask first.', convo_id: 'c1' } })
+  assert.equal(reply.status, 201)
+  const after = (await s.http(`/items/${id}`, { token: client })).json
+  assert.ok(after.comments.some((c) => c.author === 'agent' && c.body === 'Reworded: ask first.'))
+  assert.equal(after.item.state, 'open'); assert.equal(after.item.awaiting, 'user')
+  // Words only: no buttons, no step-up, no answering a follow-up, no close, no edit.
+  for (const extra of [{ actions: ['Save it'] }, { step_up: true, actions: ['Save it'] }, { reply_to: 'ic_x' }, { action: 'Save it' }, { selected: ['Save it'] }]) {
+    assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: a.token, body: { body: 'x', ...extra } })).status, 403, JSON.stringify(extra))
+  }
+  assert.equal((await s.http(`/items/${id}/close`, { method: 'POST', token: a.token, body: { resolution: 'done' } })).status, 403)
+  // From another conversation on the same box, it is not the proposer's thread.
+  const other = await put(s, a.token, 'other-rule', { convo_id: 'c2' })
+  s.db.prepare('UPDATE memory_proposals SET from_convo_id=? WHERE item_id=?').run('c1', other.json.item.id)
+  assert.equal((await s.http(`/items/${other.json.item.id}`, { token: a.token })).status, 404)
+  assert.equal((await memory(s, client, 'avoid-opal')).status, 404)
+  assert.deepEqual(proposals(s).find((p) => p.name === 'avoid-opal').state, 'pending')
 })

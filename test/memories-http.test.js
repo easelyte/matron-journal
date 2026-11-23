@@ -1,3 +1,4 @@
+import { MEMORIES_MAX } from '../src/memories.js'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
@@ -117,7 +118,7 @@ test('GET /memories and /memories/:key; 409 too_many at the cap', async (t) => {
   assert.equal((await s.http('/memories/nope', { token: client })).status, 404)
   assert.equal((await s.http('/memories/Bad%20Name', { token: client })).status, 400)
   assert.equal((await s.http('/memories', { method: 'POST', token: client, body: {} })).status, 404)
-  for (let i = 0; i < 198; i++) assert.equal((await put(s, client, `m-${i}`, {})).status, 201)
+  for (let i = 0; i < MEMORIES_MAX - 2; i++) assert.equal((await put(s, client, `m-${i}`, {})).status, 201)
   const over = await put(s, client, 'one-more', {})
   assert.equal(over.status, 409); assert.equal(over.json.error, 'too_many')
   assert.equal((await put(s, client, 'a-one', { description: 'still fine' })).status, 200)

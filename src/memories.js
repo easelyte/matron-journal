@@ -9,7 +9,7 @@ export const DEFAULT_TYPE = 'feedback'
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 export const DESCRIPTION_MAX = 200
 export const BODY_MAX = 8192 // bytes
-export const MEMORIES_MAX = 200
+export const MEMORIES_MAX = 400
 // Scopes (spec 2026-10-01 memory scopes): who a memory is for. `global` is
 // every session (how every memory worked before scopes), `coordinator` the
 // user's Coordinator only, `repo:<name>` the sessions whose working

@@ -29,7 +29,7 @@ import { forwardMirrorReply, isPeopleConvo } from './people-replies.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
-import { handleMemoryProposalTap, declineOnClose, proposerOwnsMirror, MEMORY_CONSENT } from './memory-proposals-http.js'
+import { handleMemoryProposalTap, declineOnClose, proposerOwnsMirror, proposerMayDiscuss, MEMORY_CONSENT } from './memory-proposals-http.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
 import { requireApproval, hasActiveKey, refuse, ApprovalRefused } from './approval-keys.js'
@@ -114,7 +114,10 @@ function badFields(res, v) {
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure.
 // A consent mirror (isConsentMirror, items.js) is invisible to EVERY agent,
-// private ones included — it is the user's card in item form.
+// private ones included — it is the user's card in item form. One exception:
+// a memory proposal's mirror is visible to the agent that proposed it
+// (proposerMayDiscuss), which may read it and add plain comments, nothing
+// else (agentOnMirrorAllowed).
 // The owner conversation can receive a turn: it exists for this user and has
 // an assigned or joined agent to wake.
 function ownerHasAgent(db, userId, convoId) {
@@ -127,8 +130,19 @@ function visibleItem(db, who, idOrNum) {
   const item = getItem(db, who.userId, idOrNum)
   if (!item) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, item.origin_convo_id)) return null
-  if (who.kind === 'agent' && isConsentMirror(db, item.id)) return null
+  if (who.kind === 'agent' && isConsentMirror(db, item.id) && !proposerMayDiscuss(db, who, item)) return null
   return item
+}
+
+// The only things an agent may do on a consent mirror it can see (a memory
+// proposal it made): read it, and post a plain comment, with no action,
+// selection, buttons or step-up. Everything else answers 403.
+function agentOnMirrorAllowed(req, sub, subId, body = null) {
+  if (!sub) return req.method === 'GET'
+  if (sub !== 'comments' || subId != null || req.method !== 'POST') return false
+  if (!body) return true
+  const offers = body.actions != null && !(Array.isArray(body.actions) && body.actions.length === 0)
+  return body.action == null && body.selected == null && !offers && body.step_up == null && body.subject == null && body.reply_to == null
 }
 
 // Does a user's reply on this consent mirror belong in front of the agents
@@ -641,6 +655,11 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   // is gated on the item's origin conversation because transcribing a
   // voice-note attachment is specifically the origin bridge's job.
 
+  if (who.kind === 'agent' && item.consent != null && !agentOnMirrorAllowed(req, sub, subId)) {
+    json(res, 403, { error: 'forbidden' })
+    return true
+  }
+
   if (!sub) {
     if (req.method === 'GET') {
       let comments = listComments(db, item.id)
@@ -721,6 +740,10 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
 
   if (sub === 'comments' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
+    if (who.kind === 'agent' && item.consent != null && !agentOnMirrorAllowed(req, sub, subId, body)) {
+      json(res, 403, { error: 'forbidden' })
+      return true
+    }
     const convoId = asConvo(body)
     if (convoId === undefined) return badRequest(res)
     const idemKey = idemKeyOf(req, who)

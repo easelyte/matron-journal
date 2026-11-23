@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import { snippetOf } from './journal.js'
 import { clientIdleExpired } from './auth.js'
-import { clientDevicesForPush, pruneApnsToken, pruneWebPushSubscription, unreadBadge } from './db.js'
+import { clientDevicesForPush, pruneApnsToken, pruneWebPushSubscription, pruneFcmToken, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { wakesForYou } from './sync-scope.js'
 import {
@@ -198,17 +198,29 @@ function isDeadToken({ status, reason }) {
   return status === 410 || (status === 400 && reason === 'BadDeviceToken')
 }
 
+// FCM answers that mean the token will never be delivered to: 404, which
+// FCM sends with UNREGISTERED when the app was removed or the token
+// retired. Everything else keeps the token: INVALID_ARGUMENT can mean the
+// message rather than the token, and SENDER_ID_MISMATCH means the journal's
+// Firebase project is not the app's, where pruning would drop every token.
+function isDeadFcmToken({ status, reason }) {
+  return status === 404 || reason === 'UNREGISTERED'
+}
+
 // Wired in server.js after a successful journal append fans out (see the
 // `fanOut` choke point in ws.js). `apnsClient` is the makeApnsClient()
 // instance, or undefined when push is disabled (all onAppend calls become a
-// cheap no-op).
+// cheap no-op). `fcmClient` (src/fcm.js) and `webPushClient` are the
+// Android and browser transports, each undefined when off.
 // `classify` is injectable (defaults to the real classifier above) purely
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, itemHoldMs = 0, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, itemHoldMs = 0, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
   const webCounters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
+  const fcmCounters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
+  const anyTransport = () => Boolean(apnsClient || webPushClient || fcmClient)
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${transport}:${convoId}`.
   // A process restart loses any pending trailing push — acceptable for v1;
@@ -316,7 +328,54 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
     }
   }
 
+  // One FCM message to an Android device. `opts` is {build, priority,
+  // ttlSeconds, collapseKey}: `build(key)` makes the data payload for the
+  // key the device holds at send time, so a registration changed while the
+  // push waited never gets a box sealed to the key it replaced.
+  function sendFcm(device, userId, opts) {
+    if (isPanicLocked(db, userId)) return
+    if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
+    // A trailing push must not use a token unregistered or claimed by
+    // another device while it waited in the coalescing window.
+    // The registration as it is now: a push that waited in the coalescing
+    // window goes to the token the phone holds now, sealed to its key now.
+    // The row is this device's own, so a token claimed by another device has
+    // already left it; an unregistered phone gets nothing.
+    const current = db.prepare('SELECT token, push_key FROM fcm_registrations WHERE device_id=?').get(device.id)
+    if (!current) return
+    const failed = (reason) => {
+      fcmCounters.failed += 1
+      fcmCounters.byReason[reason] = (fcmCounters.byReason[reason] || 0) + 1
+    }
+    try {
+      const data = opts.build(current.push_key ?? null)
+      // Badge as of the send, as doSend does for APNs.
+      data.badge = String(notifyBadge(db, userId, unreadBadge))
+      Promise.resolve(fcmClient.send({ token: current.token, data, priority: opts.priority, ttlSeconds: opts.ttlSeconds, collapseKey: opts.collapseKey }))
+        .then((result) => {
+          if (result.status >= 200 && result.status < 300) {
+            fcmCounters.sent += 1
+            return
+          }
+          failed(result.reason || (result.status === 0 ? 'transport' : String(result.status)))
+          if (isDeadFcmToken(result)) {
+            if (pruneFcmToken(db, device.id, current.token)) {
+              fcmCounters.pruned += 1
+              console.error(`fcm: device ${device.id} token rejected (${result.status}${result.reason ? ' ' + result.reason : ''}) — token pruned until the app registers again`)
+            }
+          } else {
+            console.error(`fcm: device ${device.id} push failed: status=${result.status}${result.reason ? ' reason=' + result.reason : ''}`)
+          }
+        })
+        .catch(() => failed('internal'))
+    } catch (err) {
+      failed('internal')
+      console.error('fcm: could not build a message', err)
+    }
+  }
+
   function sendTransport(device, userId, opts, transport) {
+    if (transport === 'fcm') return sendFcm(device, userId, opts)
     if (transport !== 'web') return doSend(device, userId, opts)
     // The same send-time checks as doSend, so a push queued before a panic
     // lock (a coalesced trailing push, a held consent push) or a sign-out is
@@ -432,7 +491,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // can pass through to classify(). Every other call site omits it.
   // `noHold` is internal: a held push's own, already-waited send.
   function onAppend(userId, event, originDeviceId, pushHint, { noHold = false } = {}) {
-    if (!apnsClient && !webPushClient) return
+    if (!anyTransport()) return
     // A panic-locked account: nothing pushed (doSend, sendTransport), nothing queued.
     if (isPanicLocked(db, userId)) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
@@ -454,7 +513,24 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
 
     if (event.type === 'read_marker') {
       for (const device of devices) {
+        // A routine alert still waiting in this conversation's coalescing
+        // window is about an event the read covers (events arrive in seq
+        // order): it must not land after the read and bring it back, on the
+        // device that read as much as on the others.
+        const pending = coalesceState.get(`${device.id}:fcm:${event.convo_id}`)
+        if (pending) pending.pendingBuild = null
         if (device.id === originDeviceId) continue // never push a device its own read_marker
+        // An Android phone: a quiet message that takes the conversation's
+        // notifications off the shade and updates the badge. It shows
+        // nothing, so it is sent whatever the notification settings say.
+        if (fcmClient && device.fcm_token) {
+          sendFcm(device, userId, {
+            build: () => ({ type: 'read', convo_id: event.convo_id }),
+            priority: 'normal',
+            ttlSeconds: 3600,
+            collapseKey: `read:${event.convo_id}`.slice(0, 64),
+          })
+        }
         if (!apnsClient || !device.apns_env) continue
         // A for_you phone has nothing to fetch for a read elsewhere, only a
         // badge to update, so its read wakes share the paced wakes' budget.
@@ -577,6 +653,31 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
         if (cls.coalesce) scheduleRoutine(device, userId, event.convo_id, buildWeb, 'web')
         else sendTransport(device, userId, buildWeb(), 'web')
       }
+      if (fcmClient && device.fcm_token) {
+        // Data only, so the app builds the notification itself: it opens the
+        // box, picks the channel for the kind and adds the item's buttons.
+        // A device that registered a key never gets its content in the
+        // clear; one without gets the title and text, as APNs does.
+        const fcmOpts = {
+          build: (key) => {
+            const box = sealedFor(device, key, plaintext)
+            return {
+              type: 'alert',
+              convo_id: event.convo_id,
+              seq: String(event.seq),
+              kind: cls.kind,
+              ...(itemId ? { item_id: itemId } : {}),
+              ...(box ? { box } : key || device.fcm_key ? {} : { title: String(title).slice(0, 200), body: String(body ?? "").slice(0, 1000) }),
+            }
+          },
+          // High priority for every alert: each one shows a notification,
+          // which is what Android asks of a high-priority message.
+          priority: 'high',
+          ttlSeconds: cls.kind === 'activity' ? 3600 : 86400,
+        }
+        if (cls.coalesce) scheduleRoutine(device, userId, event.convo_id, () => fcmOpts, 'fcm')
+        else sendFcm(device, userId, fcmOpts)
+      }
       if (!apnsClient || !device.apns_token || !device.apns_env) continue
       if (cls.coalesce) {
         scheduleRoutine(device, userId, event.convo_id, buildOpts)
@@ -614,7 +715,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // The partial index idx_events_permission_request keeps this off a full
   // events scan.
   function resumeHeldConsent(now = Date.now()) {
-    if (!apnsClient && !webPushClient) return 0
+    if (!anyTransport()) return 0
     const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
       WHERE type='permission_request' AND ts > ?`).all(now - consentHoldMs - resumeSlackMs)
     let n = 0
@@ -640,7 +741,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // skipped here too. The partial index idx_events_item keeps this off a
   // full events scan.
   function resumeHeldItems(now = Date.now()) {
-    if ((!apnsClient && !webPushClient) || itemHoldMs <= 0) return 0
+    if (!anyTransport() || itemHoldMs <= 0) return 0
     const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
       WHERE type='item' AND ts > ? ORDER BY seq`).all(now - itemHoldMs - resumeSlackMs)
     let n = 0
@@ -670,5 +771,5 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
 
   // _coalesceState is exposed for tests (eviction assertions) and as a
   // cheap gauge candidate for Task 5's /metrics; not part of the public API.
-  return { onAppend, resumeHeldConsent, resumeHeldItems, counters, webCounters, close, _coalesceState: coalesceState, _held: held }
+  return { onAppend, resumeHeldConsent, resumeHeldItems, counters, webCounters, fcmCounters, close, _coalesceState: coalesceState, _held: held }
 }

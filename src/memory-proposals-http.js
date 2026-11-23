@@ -311,6 +311,17 @@ export function proposerOwnsMirror(db, item) {
   return !!p && p.from_convo_id != null && p.from_convo_id === item.origin_convo_id
 }
 
+// May this agent read the memory mirror and reply on it? Only the agent that
+// made the proposal, from the conversation the mirror lives on: the user's
+// typed reply there reaches it as a turn (proposerOwnsMirror), so it must be
+// able to read the thread and answer in it. It may only comment: the tap,
+// close and every other change stay the user's (items-http.js).
+export function proposerMayDiscuss(db, who, item) {
+  if (who?.kind !== 'agent' || item?.consent !== MEMORY_CONSENT) return false
+  const p = db.prepare('SELECT from_device_id, from_convo_id FROM memory_proposals WHERE item_id=? ORDER BY created_at DESC LIMIT 1').get(item.id)
+  return !!p && p.from_device_id === who.deviceId && p.from_convo_id != null && p.from_convo_id === item.origin_convo_id
+}
+
 // The sweep's half (src/ws.js). Proposals nobody answered in 7 days expire
 // and their items close in one write, all of them or none. Then whatever a
 // settled proposal is still owed is made good: an item left open is closed,

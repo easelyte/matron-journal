@@ -18,6 +18,7 @@ import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
+import { makeFcmClient, fcmConfigFromEnv } from './fcm.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS, CONSENT_HOLD_MS, FOR_YOU_HOLD_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
@@ -523,6 +524,19 @@ function warnIfBindTrustsSpoofableIp(bind) {
   }
 }
 
+// Android push (src/fcm.js). Injected (tests) or from MATRON_FCM_*; off,
+// with one log line, when neither. A key file that is named but unusable
+// fails startup, as a bad VAPID key does.
+export function resolveFcmClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const config = fcmConfigFromEnv(process.env)
+  if (!config) {
+    console.log('push: Android (FCM) off — set MATRON_FCM_SERVICE_ACCOUNT_FILE to enable')
+    return { client: undefined, owned: false }
+  }
+  return { client: makeFcmClient(config), owned: true }
+}
+
 // Injected clients belong to the caller; configured clients belong to the server.
 export function resolveWebPushClient(injected) {
   if (injected) return { client: injected, owned: false }
@@ -531,7 +545,7 @@ export function resolveWebPushClient(injected) {
 }
 
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, fcmClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   // Negotiate compression only with peers offering it; set MATRON_WS_DEFLATE=0 to disable.
   wsDeflate = process.env.MATRON_WS_DEFLATE !== '0',
@@ -624,6 +638,7 @@ export function startServer({
   backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
   const { client: resolvedWebPushClient, owned: ownsWebPushClient } = resolveWebPushClient(webPushClient)
+  const { client: resolvedFcmClient, owned: ownsFcmClient } = resolveFcmClient(fcmClient)
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -719,7 +734,7 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const clientIdleMs = resolveClientIdleMs(clientIdleDays)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, itemHoldMs: pushHoldMs, consentHoldMs: Math.max(CONSENT_HOLD_MS, pushHoldMs), clientIdleMs, now: clientIdleClock })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, fcmClient: resolvedFcmClient, backgroundWakeMs: BACKGROUND_WAKE_MS, itemHoldMs: pushHoldMs, consentHoldMs: Math.max(CONSENT_HOLD_MS, pushHoldMs), clientIdleMs, now: clientIdleClock })
   // A device signed out for invalid approval signatures: its notice and push.
   installApprovalLockdown({ db, hub, pushPipeline })
   // The security event log, one per journal: handed to the HTTP and
@@ -862,7 +877,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
-    hub, pushPipeline, webPushClient: resolvedWebPushClient, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    hub, pushPipeline, webPushClient: resolvedWebPushClient, fcmClient: resolvedFcmClient, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     fileReads,
@@ -1072,6 +1087,7 @@ export function startServer({
             pushPipeline.close()
             if (ownsApnsClient) resolvedApnsClient.close()
             if (ownsWebPushClient) resolvedWebPushClient.close()
+            if (ownsFcmClient) resolvedFcmClient.close()
             // The transcription queue touches the DB between awaits: abort its
             // child and let it drain before the handle closes.
             const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])

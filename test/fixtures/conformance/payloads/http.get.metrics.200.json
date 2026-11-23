@@ -31,6 +31,12 @@
             "failed": 0,
             "pruned": 0,
             "by_reason": {}
+          },
+          "fcm": {
+            "sent": 0,
+            "failed": 0,
+            "pruned": 0,
+            "by_reason": {}
           }
         },
         "summarise": {
@@ -70,6 +76,12 @@
           "pruned": 0,
           "by_reason": {},
           "web": {
+            "sent": 0,
+            "failed": 0,
+            "pruned": 0,
+            "by_reason": {}
+          },
+          "fcm": {
             "sent": 0,
             "failed": 0,
             "pruned": 0,

@@ -182,6 +182,9 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_WEBPUSH_SUBJECT` | unset | Web Push contact URL (`mailto:` or `https:`); set together with the key file |
 | `MATRON_WEBPUSH_DISABLED` | unset | `1` or `true` switches Web Push off |
 | `MATRON_WEBPUSH_EXTRA_HOSTS` | unset | Comma-separated extra push-service hosts beyond `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.push.apple.com`, and `*.notify.windows.com`; exact hosts or `*.suffix` |
+| `MATRON_FCM_SERVICE_ACCOUNT_FILE` | unset | Firebase service-account JSON key file for Android push (FCM HTTP v1). Unset = Android push off; an unreadable or invalid file fails startup — see Android push section |
+| `MATRON_FCM_PROJECT_ID` | the key file's `project_id` | Firebase project to send through, when it differs from the key file's |
+| `MATRON_FCM_DISABLED` | unset | `1` or `true` switches Android push off |
 | `MATRON_PUSH_HOLD_MS` | `60000` | How long a push about an item that needs the user waits; it goes out only if the item still needs them then. `0` sends at once. Consent cards in Coordinator mode wait as long, but at least 30 s |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
@@ -243,7 +246,9 @@ on each dev box, then sign in from an app with your journal URL + username.
   on-disk storage.
 - **Push** — direct HTTP/2 APNs (ES256 provider JWT, `node:http2`), no
   sygnal: priority tiers, per-conversation coalescing, silent badge-clear
-  pushes, dead-token pruning, per-device sandbox/prod environment.
+  pushes, dead-token pruning, per-device sandbox/prod environment. Android
+  phones through Firebase Cloud Messaging (HTTP v1, RS256 service-account
+  token), and browsers through Web Push.
 - **Retention** — old `tool_output` payloads offload from the hot table to
   blob files on a schedule, and a TTL pass deletes those blobs after
   `MATRON_TOOL_LOG_TTL_HOURS` (default 24); journal rows are never deleted.
@@ -273,6 +278,28 @@ Only `fcm.googleapis.com`, `updates.push.services.mozilla.com`, subdomains of
 default. Extend this list with `MATRON_WEBPUSH_EXTRA_HOSTS`, a comma-separated
 list of exact hosts or `*.suffix` entries. A wildcard matches subdomains
 only, not the suffix itself.
+
+### Android push (FCM)
+
+The Android app receives notifications through Firebase Cloud Messaging. In
+the Firebase console, open the project the Android app is built against,
+then Project settings → Service accounts → Generate new private key, and
+point `MATRON_FCM_SERVICE_ACCOUNT_FILE` at the JSON file it downloads. Keep
+that file outside source control and readable only by the journal's user.
+The project id is read from the file; `MATRON_FCM_PROJECT_ID` overrides it.
+
+The journal mints a one-hour OAuth access token from the key (an RS256 JWT,
+`node:crypto` only), caches it, and sends each notification as a data-only,
+high-priority message. The app registers its token with
+`POST /push/fcm/register` with a public key, and what each notification
+says travels sealed to that key, exactly as for APNs. A registration without
+a key (the key is optional, as for APNs) gets the title and text in the clear
+through FCM; the Matron Android app always registers one. Tokens FCM reports as
+`UNREGISTERED` are pruned. With no key file, Android push is off and the
+app's registration answers 404.
+
+The key file must belong to the same Firebase project the app was built
+with: FCM refuses messages to another project's tokens.
 
 ## Push relay (self-hosted journals)
 
