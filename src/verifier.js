@@ -5,7 +5,8 @@
 // pasted from an email, an alert, a pull request or another agent).
 //
 // Optional by construction: with no key the verifier is off and every
-// routine-born ask stays for the user. Fails closed: any error, timeout,
+// routine-born ask stays for the user. The same goes for a system prompt
+// file (MATRON_VERIFIER_SYSTEM_FILE) that is set but unreadable or empty. Fails closed: any error, timeout,
 // refusal, unparseable answer or missing field is `ok: false` or a refusal,
 // never an approval, and verify never throws. The input text and the model's
 // text are never logged: one line per call, outcome only.
@@ -55,6 +56,19 @@ export function resolveVerifierKey(env = process.env) {
   if (env.MATRON_VERIFIER_API_KEY) return env.MATRON_VERIFIER_API_KEY.trim()
   if (env.MATRON_VERIFIER_API_KEY_FILE) return fs.readFileSync(env.MATRON_VERIFIER_API_KEY_FILE, 'utf8').trim()
   return ''
+}
+
+// The system prompt is VERIFIER_SYSTEM unless MATRON_VERIFIER_SYSTEM_FILE
+// names a file, whose trimmed text is used instead: a deployment can then
+// judge by its own wording without publishing it. Read once at boot. Never
+// logged. An unreadable file throws, and so does an empty one (code EMPTY):
+// the caller turns the verifier off rather than fall back to the built-in
+// prompt, which the deployment chose not to use.
+export function resolveVerifierSystem(env = process.env) {
+  if (!env.MATRON_VERIFIER_SYSTEM_FILE) return VERIFIER_SYSTEM
+  const text = fs.readFileSync(env.MATRON_VERIFIER_SYSTEM_FILE, 'utf8').trim()
+  if (!text) throw Object.assign(new Error('the system prompt file is empty'), { code: 'EMPTY' })
+  return text
 }
 
 // Only the fields the verifier is meant to judge are sent. The routine is its
@@ -108,6 +122,15 @@ export function makeVerifier({
   log = console,
   Client = Anthropic,
 } = {}) {
+  const off = { enabled: false, verify: async () => ({ ok: false, reason: 'disabled' }) }
+  // A prompt file that is set but unreadable or empty turns the verifier off
+  // (asks stay for the user), said once at boot, whatever client or key
+  // there is; it never stops the journal starting.
+  let system
+  try { system = resolveVerifierSystem(env) } catch (err) {
+    log.error(`journal: verifier: MATRON_VERIFIER_SYSTEM_FILE is set but unreadable or empty (${err.code ?? err.message}) — verifier is OFF`)
+    return off
+  }
   if (!client) {
     let apiKey = ''
     // A key file that is set but unreadable turns the verifier off (asks stay
@@ -120,7 +143,8 @@ export function makeVerifier({
     // redirect the call or print request bodies.
     if (apiKey) client = new Client({ apiKey, timeout: timeoutMs, maxRetries: 0, baseURL: 'https://api.anthropic.com', logLevel: 'warn' })
   }
-  if (!client) return { enabled: false, verify: async () => ({ ok: false, reason: 'disabled' }) }
+  if (!client) return off
+  if (system !== VERIFIER_SYSTEM) log.log('journal: verifier: system prompt read from MATRON_VERIFIER_SYSTEM_FILE')
 
   const fail = (why) => {
     log.error(`journal: verifier error ${why}`)
@@ -133,7 +157,7 @@ export function makeVerifier({
       const r = await withDeadline(timeoutMs, (signal) => client.messages.create({
         model,
         max_tokens: VERIFIER_MAX_TOKENS,
-        system: VERIFIER_SYSTEM,
+        system,
         output_config: { effort: 'medium', format: VERIFIER_FORMAT },
         messages: [{ role: 'user', content: JSON.stringify(input) }],
       }, { signal }))

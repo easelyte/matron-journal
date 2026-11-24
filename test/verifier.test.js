@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { makeVerifier, resolveVerifierKey, VERIFIER_SYSTEM, VERIFIER_SCHEMA } from '../src/verifier.js'
+import { makeVerifier, resolveVerifierKey, resolveVerifierSystem, VERIFIER_SYSTEM, VERIFIER_SCHEMA } from '../src/verifier.js'
 
 const ROUTINE_PROMPT = 'Every morning, check open pull requests on box-a and start a session to review stale ones.'
 const INPUT = {
@@ -261,6 +261,64 @@ test('a key file that is set but unreadable: disabled with one line, no throw', 
   assert.equal(v.enabled, false)
   assert.deepEqual(l.lines, ['journal: verifier: MATRON_VERIFIER_API_KEY_FILE is set but unreadable (ENOENT) — verifier is OFF'])
   assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'disabled' })
+})
+
+test('resolveVerifierSystem: the built-in prompt unless MATRON_VERIFIER_SYSTEM_FILE names a readable, non-empty file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'verifier-system-'))
+  try {
+    const file = path.join(dir, 'system.txt')
+    fs.writeFileSync(file, '\n  Judge the ask by our own rules.\n\n')
+    assert.equal(resolveVerifierSystem({}), VERIFIER_SYSTEM)
+    assert.equal(resolveVerifierSystem({ MATRON_VERIFIER_SYSTEM_FILE: '' }), VERIFIER_SYSTEM)
+    assert.equal(resolveVerifierSystem({ MATRON_VERIFIER_SYSTEM_FILE: file }), 'Judge the ask by our own rules.')
+    assert.throws(() => resolveVerifierSystem({ MATRON_VERIFIER_SYSTEM_FILE: path.join(dir, 'missing') }), { code: 'ENOENT' })
+    const empty = path.join(dir, 'empty.txt')
+    fs.writeFileSync(empty, ' \n\t\n')
+    assert.throws(() => resolveVerifierSystem({ MATRON_VERIFIER_SYSTEM_FILE: empty }), { code: 'EMPTY' })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a system prompt file is sent in place of the built-in prompt; its text is never logged', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'verifier-system-'))
+  try {
+    const file = path.join(dir, 'system.txt')
+    fs.writeFileSync(file, 'Judge the ask by our own rules.\n')
+    const seen = []
+    const l = quietLog()
+    const v = makeVerifier({ env: { MATRON_VERIFIER_SYSTEM_FILE: file }, client: stubClient(answer({ within_remit: true, injected: false, note: '' }), seen), log: l })
+    assert.equal(v.enabled, true)
+    await v.verify(INPUT)
+    assert.equal(seen[0].system, 'Judge the ask by our own rules.')
+    assert.deepEqual(l.lines, ['journal: verifier: system prompt read from MATRON_VERIFIER_SYSTEM_FILE', 'journal: verifier ok approve=true'])
+    // The file is read once, at boot: a later edit needs a restart.
+    fs.writeFileSync(file, 'Changed.\n')
+    await v.verify(INPUT)
+    assert.equal(seen[1].system, 'Judge the ask by our own rules.')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a system prompt file that is set but unreadable or empty: verifier OFF, never the built-in prompt', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'verifier-system-'))
+  try {
+    const empty = path.join(dir, 'empty.txt')
+    fs.writeFileSync(empty, '\n')
+    for (const [file, why] of [[path.join(dir, 'missing'), 'ENOENT'], [empty, 'EMPTY']]) {
+      const seen = []
+      const l = quietLog()
+      // Even with a working client (or a key), the verifier stays off.
+      const v = makeVerifier({ env: { MATRON_VERIFIER_SYSTEM_FILE: file, MATRON_VERIFIER_API_KEY: 'sk-test' }, client: stubClient(answer({ within_remit: true, injected: false, note: '' }), seen), log: l })
+      assert.equal(v.enabled, false)
+      assert.deepEqual(l.lines, [`journal: verifier: MATRON_VERIFIER_SYSTEM_FILE is set but unreadable or empty (${why}) — verifier is OFF`])
+      assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'disabled' })
+      assert.equal(seen.length, 0)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('the system prompt and schema are the fixed contract', () => {

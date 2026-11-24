@@ -3600,7 +3600,10 @@ chat's invitee, or for a join the room's owner) whose name is not in
 **verifier** (`src/verifier.js`): a model shown the routine's name and
 prompt (never its title, which changes without the user's ask), the ask (task or justification, target box, workdir, topic)
 and the reason, asked whether the ask is within the routine's remit and not
-injected. Off (no `MATRON_VERIFIER_API_KEY` / `_FILE`), failing or timing
+injected. Its system prompt is the built-in one unless
+`MATRON_VERIFIER_SYSTEM_FILE` names a file to read it from. Off (no
+`MATRON_VERIFIER_API_KEY` / `_FILE`, or a system prompt file that is set
+but unreadable or empty), failing or timing
 out is **409** `verifier_unavailable`; a no is **403** `verifier`. Its
 `why` is one fixed sentence: the model's note is not part of the answer. It
 is kept, with the count of refusals for that ask, in
