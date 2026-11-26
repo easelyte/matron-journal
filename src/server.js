@@ -22,7 +22,7 @@ import { makeFcmClient, fcmConfigFromEnv } from './fcm.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS, CONSENT_HOLD_MS, FOR_YOU_HOLD_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { offloadPass, expireLogsPass, reapMediaPass, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { resolveFileReads } from './files-read-http.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
@@ -348,7 +348,7 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
     }
     if (reapPcts !== null) {
       try {
-        const r = runReapMedia(db, { quotaBytes: mediaUserQuotaBytes, highPct: reapPcts.highPct, lowPct: reapPcts.lowPct })
+        const r = yield* reapMediaPass(db, { quotaBytes: mediaUserQuotaBytes, highPct: reapPcts.highPct, lowPct: reapPcts.lowPct })
         if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
       } catch (err) {
         console.error('retention: media reap run failed', err)

@@ -7,7 +7,7 @@ import http from 'node:http'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, contentTombstone } from '../src/retention.js'
+import { drainSync, runOffload, runExpireLogs, runReapMedia, reapMediaPass, commentsByBlob, runExpireVoiceNotes, runExpireDeviceContent, contentTombstone } from '../src/retention.js'
 import { resolveReapPcts, resolveDeviceRetention } from '../src/server.js'
 import { searchMessages, searchRecent, backfillSearchIndex } from '../src/search.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
@@ -1707,4 +1707,131 @@ test('the first retention pass defaults to two minutes, runs async, accepts an o
   t.mock.timers.tick(200)
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(errors.mock.callCount(), 0, 'closed server must not run retention against its closed database')
+})
+
+// ---------------------------------------------------------------------------
+// reapMediaPass yields (25 Nov 2026: one synchronous reap of 3377 blobs held
+// the journal for 638 s, a LIKE over every item comment per blob)
+// ---------------------------------------------------------------------------
+
+test('reapMediaPass hands the loop back every sliceSize blobs and reaps what runReapMedia reaps', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  // 10 x 100 = 1000 used, quota 1000: down to 700 means the oldest 3 go;
+  // with a high-water of 50% and low of 10%, 9 go.
+  const seeded = Array.from({ length: 10 }, (_, i) => seedAttachment(db, mediaDir, { userId: alice.id, bytes: 100, daysAgo: 50 - i }))
+  const gen = reapMediaPass(db, { quotaBytes: 1000, highPct: 50, lowPct: 10, sliceSize: 2 })
+  let yields = 0
+  let r
+  for (;;) {
+    const step = gen.next()
+    if (step.done) { r = step.value; break }
+    yields += 1
+  }
+  assert.deepEqual(r, { reaped: 9, bytesFreed: 900 })
+  assert.equal(yields, 4, '9 blobs in stretches of 2 is 4 yields (none after the last)')
+  assert.ok(getBlob(db, seeded[9].blob.id), 'the newest stays')
+})
+
+test('a comment added between stretches is tombstoned with the blob it names', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const first = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 300, daysAgo: 30 })
+  const second = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 300, daysAgo: 20 })
+  seedAttachment(db, mediaDir, { userId: alice.id, bytes: 300, daysAgo: 10 })
+  const gen = reapMediaPass(db, { quotaBytes: 1000, highPct: 80, lowPct: 40, sliceSize: 1 })
+  assert.equal(gen.next().done, false, 'yields after the first blob')
+  assert.equal(getBlob(db, first.blob.id), undefined)
+  // While the loop is free, someone attaches the second blob to a comment.
+  const c = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: second.blob.id, mime: 'application/pdf', name: 'doc.pdf', size: 300 }] }).comment
+  drainSync(gen)
+  assert.equal(getBlob(db, second.blob.id), undefined)
+  const [entry] = JSON.parse(db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(c.id).attachments)
+  assert.equal(entry.expired, true, 'the comment added mid-pass must not point at a deleted blob without saying so')
+})
+
+test('an orphan attached to an item comment between stretches is kept', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const old = Date.now() - 3 * 86400000
+  const orphans = [0, 1].map(() => seedBlob(db, mediaDir, { userId: alice.id, bytes: 400, contentType: 'image/png' }))
+  for (const o of orphans) db.prepare('UPDATE blobs SET created_at=? WHERE id=?').run(old, o.id)
+  seedAttachment(db, mediaDir, { userId: alice.id, bytes: 200, daysAgo: 10 })
+  const gen = reapMediaPass(db, { quotaBytes: 1000, highPct: 50, lowPct: 10, sliceSize: 1 })
+  assert.equal(gen.next().done, false)
+  const reapedFirst = orphans.find((o) => !getBlob(db, o.id))
+  const late = orphans.find((o) => o !== reapedFirst)
+  addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: late.id, mime: 'image/png', name: 'late.png', size: 400 }] })
+  drainSync(gen)
+  assert.ok(reapedFirst, 'one orphan went in the first stretch')
+  assert.ok(getBlob(db, late.id), 'an orphan a comment now names is no longer garbage')
+  assert.ok(fs.existsSync(late.diskPath))
+})
+
+test('commentsByBlob indexes each comment once per blob it names and reports unreadable ones', async () => {
+  const { db, alice } = await setup()
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const both = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [
+    { blob_ref: 'blob-a', mime: 'image/png', name: 'a.png', size: 1 },
+    { blob_ref: 'blob-a', mime: 'image/png', name: 'a2.png', size: 1 },
+    { blob_ref: 'blob-b', mime: 'image/png', name: 'b.png', size: 1 },
+  ] }).comment
+  const broken = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: 'blob-c', mime: 'image/png', name: 'c.png', size: 1 }] }).comment
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run('[{"blob_ref":"blob-c", broken', broken.id)
+  const index = commentsByBlob(db, alice.id)
+  assert.deepEqual(index.holders('blob-a').map((h) => h.id), [both.id])
+  assert.equal(index.holders('blob-a')[0], index.holders('blob-b')[0], 'one parsed copy per comment, shared')
+  assert.deepEqual(index.holders('blob-c'), [])
+  assert.equal(index.unreadable('blob-c'), true)
+  assert.equal(index.unreadable('blob-a'), false)
+})
+
+test('a kept copy purged while the pass yields no longer counts, so the owner\'s own blobs stay', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Two kept copies (300 each) and one own attachment (300): 900 used.
+  // Quota 1000, high 50% (500), low 40% (400): dropping both copies is enough.
+  const keep = (id, at) => {
+    const file = path.join(mediaDir, `${id}.bin`)
+    fs.writeFileSync(file, Buffer.alloc(300, 7))
+    db.prepare('INSERT INTO fed_media(id, fg_id, user_id, ref, mime, size, sha256, disk_path, fetched_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .run(id, 'fg1', alice.id, id, 'image/png', 300, '0'.repeat(64), file, at, at)
+    return file
+  }
+  keep('copy-x', 1)
+  const y = keep('copy-y', 2)
+  const own = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 300, daysAgo: 30 })
+  const gen = reapMediaPass(db, { quotaBytes: 1000, highPct: 50, lowPct: 40, sliceSize: 1 })
+  assert.equal(gen.next().done, false, 'yields after dropping copy-x')
+  // Meanwhile the replica purge removes copy-y (an inactive share).
+  db.prepare('DELETE FROM fed_media WHERE id=?').run('copy-y')
+  fs.unlinkSync(y)
+  const r = drainSync(gen)
+  assert.equal(r.reaped, 1, 'only copy-x was this pass\'s doing')
+  assert.ok(getBlob(db, own.blob.id), 'usage is 300 now: the owner\'s attachment must stay')
+})
+
+test('a blob that an unreadable comment names is never deleted, and its readable holders keep their references', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const a = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 600, daysAgo: 30 })
+  const ok = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: a.blob.id, mime: 'application/pdf', name: 'a.pdf', size: 600 }] }).comment
+  const bad = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: a.blob.id, mime: 'application/pdf', name: 'a.pdf', size: 600 }] }).comment
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(`[{"blob_ref":"${a.blob.id}", broken`, bad.id)
+  // The candidate queries read every comment with json_each, so today a
+  // malformed row stops the pass before anything is deleted; the
+  // unreadable() guard in the delete loop keeps it safe if that changes.
+  let r
+  try { r = runReapMedia(db, { quotaBytes: 1000, highPct: 50, lowPct: 10 }) } catch (err) { assert.match(String(err), /malformed JSON/) }
+  if (r) assert.equal(r.reaped, 0)
+  assert.ok(getBlob(db, a.blob.id))
+  assert.ok(fs.existsSync(a.blob.diskPath))
+  assert.equal(JSON.parse(db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(ok.id).attachments)[0].expired, undefined)
 })
