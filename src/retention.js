@@ -29,6 +29,41 @@ export function drainSync(gen) {
 
 const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve))
 
+// The item comments of one user that name each blob in their attachments,
+// from one pass over that user's comments. The reaper and the voice-note
+// expiry used to find them with a LIKE per blob, which reads every comment
+// of the user each time: on 25 Nov 2026 the media reap took about 190 ms a
+// blob that way, 3377 blobs in one stretch, and the journal answered
+// nothing for 10 minutes. `holders(ref)` returns { id, created_at, atts }
+// with `atts` parsed once and shared, so a caller that marks an entry and
+// writes JSON.stringify(atts) back keeps the index and the row in step.
+// Valid until the next yield (or a write by anyone else); rebuild after.
+// `unreadable(ref)`: a comment whose attachments do not parse names the
+// blob as text, which the LIKE probe would have caught; callers treat it
+// as a holder they cannot rewrite.
+export function commentsByBlob(db, userId) {
+  const byRef = new Map()
+  const bad = []
+  const rows = db.prepare("SELECT id, created_at, attachments FROM item_comments WHERE user_id = ? AND attachments <> '[]'")
+  for (const row of rows.iterate(userId)) {
+    let atts
+    try { atts = JSON.parse(row.attachments) } catch { atts = null }
+    if (!Array.isArray(atts)) { bad.push(row.attachments); continue }
+    const holder = { id: row.id, created_at: row.created_at, atts }
+    const refs = new Set()
+    for (const a of atts) if (a && typeof a.blob_ref === 'string' && a.blob_ref) refs.add(a.blob_ref)
+    for (const ref of refs) {
+      const list = byRef.get(ref)
+      if (list) list.push(holder)
+      else byRef.set(ref, [holder])
+    }
+  }
+  return {
+    holders: (ref) => byRef.get(ref) ?? [],
+    unreadable: (ref) => bad.some((text) => text.includes(`"blob_ref":"${ref}"`)),
+  }
+}
+
 // Runs `gen`, giving the event loop a turn (setImmediate: pending I/O and
 // timers run first) at every yield. `shouldStop` is checked after each
 // turn: when it returns true the generator is closed (its finally blocks
@@ -291,7 +326,10 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
     `SELECT id, user_id, created_at, attachments FROM item_comments
      WHERE attachments LIKE '%"mime":"audio/%' AND attachments LIKE '%"transcript":"%' ORDER BY created_at`
   ).all()
-  const naming = db.prepare(`SELECT id, created_at, attachments FROM item_comments WHERE user_id = ? AND attachments LIKE ?`)
+  // One index per user for the whole run: nothing else writes in between
+  // (this pass does not yield), and its own writes go through the index.
+  const indexes = new Map()
+  const indexFor = (userId) => indexes.get(userId) ?? indexes.set(userId, commentsByBlob(db, userId)).get(userId)
   const update = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
 
@@ -316,14 +354,12 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
       if (blob && blob.owner_user_id !== row.user_id) continue
       // Every comment of this user naming the blob: all due, or none go.
       const holders = []
-      let allDue = true
-      for (const h of naming.all(row.user_id, `%"blob_ref":"${blobRef}"%`)) {
-        let hatts
-        try { hatts = JSON.parse(h.attachments) } catch { allDue = false; break }
-        if (!Array.isArray(hatts)) { allDue = false; break }
-        const mine = hatts.filter((x) => x.blob_ref === blobRef && isLive(x))
+      const index = indexFor(row.user_id)
+      let allDue = !index.unreadable(blobRef)
+      for (const h of allDue ? index.holders(blobRef) : []) {
+        const mine = h.atts.filter((x) => x && x.blob_ref === blobRef && isLive(x))
         if (mine.some((x) => !isDue(x, h.created_at))) { allDue = false; break }
-        if (mine.length) holders.push({ id: h.id, atts: hatts, mine })
+        if (mine.length) holders.push({ id: h.id, atts: h.atts, mine })
       }
       if (!allDue || !holders.length) continue
       db.transaction(() => {
@@ -489,7 +525,26 @@ export const ORPHAN_GRACE_MS = 24 * 3600000
 // validateAttachments guarantees blob_ref is a non-empty string there).
 const ITEM_REFS_CTE = "item_refs AS (SELECT DISTINCT json_extract(j.value, '$.blob_ref') AS blob_ref FROM item_comments ic, json_each(ic.attachments) j)"
 
-export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphanGraceMs = ORPHAN_GRACE_MS, now = Date.now() }) {
+// Blobs reaped per uninterrupted stretch. Each stretch starts by indexing
+// the user's item comments once (commentsByBlob), so it costs one pass over
+// them plus this many small transactions and unlinks.
+export const REAP_SLICE = 25
+
+// The synchronous form, for tests, the admin CLI and the run-at-boot path.
+// The 6-hourly schedule drives reapMediaPass with drainAsync instead.
+export function runReapMedia(db, opts) {
+  return drainSync(reapMediaPass(db, opts))
+}
+
+// A generator like offloadPass: it yields between users and after every
+// `sliceSize` reaped blobs, so the journal answers while a big reap runs.
+// It used to be one synchronous call; on 25 Nov 2026 it reaped 3377 blobs
+// in a 638 s stretch and the journal answered nothing for 10 minutes.
+// Everything a stretch acts on is re-read after the yield before it: the
+// blob row (getBlob), the events naming it (refs) and the comments naming
+// it (the index is rebuilt). Each blob is still its own transaction, so a
+// restart part-way keeps what was done and the next pass carries on.
+export function* reapMediaPass(db, { quotaBytes, highPct = 90, lowPct = 70, orphanGraceMs = ORPHAN_GRACE_MS, now = Date.now(), sliceSize = REAP_SLICE }) {
   // This pass deletes user data; a nonsense quota must disable it loudly,
   // never run it. (quotaBytes=0 would make high=target=0: every user with
   // any blob selected, and `used <= target` unreachable.)
@@ -542,7 +597,6 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
      WHERE b.owner_user_id = ?
        AND NOT EXISTS (SELECT 1 FROM events x WHERE x.blob_ref = b.id AND x.type = 'tool_output')`
   )
-  const itemHolders = db.prepare(`SELECT id, attachments FROM item_comments WHERE user_id = ? AND attachments LIKE ?`)
   const updateComment = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
   // Orphans past the grace period: no event names the blob in its column
   // and no item comment names it in its attachments. The events probe is
@@ -576,13 +630,35 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   let reaped = 0
   let bytesFreed = 0
   const graceCutoff = now - orphanGraceMs
+  // The user's comments by blob, built at most once per stretch: null after
+  // every yield, because comments may have been added or changed meanwhile.
+  let index = null
+  let inSlice = 0
+  // Call after each blob reaped; true when the stretch is full and the
+  // caller must yield (then the index is stale).
+  const sliceFull = () => {
+    inSlice += 1
+    if (inSlice < sliceSize) return false
+    inSlice = 0
+    index = null
+    return true
+  }
   for (const user of users) {
+    if (reaped > 0) { yield; index = null; inSlice = 0 }
     // Kept copies go even when the rest cannot get the user under target:
     // dropping them loses nothing.
     let used = user.bytes
     for (const copy of kept.all(user.userId)) {
       if (used <= target) break
-      if (!forget.run(copy.id, copy.disk_path).changes) continue
+      if (!forget.run(copy.id, copy.disk_path).changes) {
+        // Gone or forgotten by someone else while this pass yielded (the
+        // replica purge): it no longer counts, so it must not keep `used`
+        // high and push the reap into the user's own blobs. A copy that was
+        // pulled again to a new path still counts.
+        const now = db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(copy.id)
+        if (!now || now.disk_path == null) used -= copy.size
+        continue
+      }
       try {
         fs.unlinkSync(copy.disk_path)
       } catch (err) {
@@ -591,6 +667,7 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       used -= copy.size
       bytesFreed += copy.size
       reaped += 1
+      if (sliceFull()) yield
     }
     const garbage = orphans.all(user.userId, graceCutoff)
     // One list, oldest reference first, a blob once (a blob both a chat
@@ -625,6 +702,9 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       // still, never delete a blob a row now names).
       const attached = db.prepare('SELECT 1 FROM events WHERE blob_ref = ? LIMIT 1').get(blob.id)
       if (attached) continue
+      // Since this pass yields, an item comment may have attached it too.
+      index ??= commentsByBlob(db, user.userId)
+      if (index.holders(blob.id).length || index.unreadable(blob.id)) continue
       deleteBlobRow.run(blob.id)
       try {
         fs.unlinkSync(blob.disk_path)
@@ -634,6 +714,7 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       used -= orphan.size
       bytesFreed += orphan.size
       reaped += 1
+      if (sliceFull()) yield
     }
     for (const cand of cands) {
       if (used <= target) break
@@ -644,6 +725,10 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
         used -= cand.size
         continue
       }
+      index ??= commentsByBlob(db, user.userId)
+      // A comment whose attachments do not parse names it: keep the blob,
+      // and its readable holders keep their references too.
+      if (index.unreadable(cand.blobRef)) continue
       db.transaction(() => {
         // A voice note the journal transcribed keeps its words (stamped, so
         // said.js can still vouch for them; it takes audio only); everything
@@ -657,15 +742,12 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
           const prior = payload && typeof payload.transcript === 'string' ? payload.transcript : null
           updateEvent.run(JSON.stringify(attachmentTombstone(ref.payload, words ?? prior, !!words)), ref.user_id, ref.seq)
         }
-        for (const h of itemHolders.all(user.userId, `%"blob_ref":"${cand.blobRef}"%`)) {
-          let atts
-          try { atts = JSON.parse(h.attachments) } catch { continue }
-          if (!Array.isArray(atts)) continue
+        for (const h of index.holders(cand.blobRef)) {
           let changed = false
-          for (const a of atts) {
+          for (const a of h.atts) {
             if (a && a.blob_ref === cand.blobRef && !a.expired) { a.expired = true; changed = true }
           }
-          if (changed) updateComment.run(JSON.stringify(atts), h.id)
+          if (changed) updateComment.run(JSON.stringify(h.atts), h.id)
         }
         deleteBlobRow.run(cand.blobRef)
       })()
@@ -677,6 +759,7 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       used -= cand.size
       bytesFreed += cand.size
       reaped += 1
+      if (sliceFull()) yield
     }
   }
   return { reaped, bytesFreed }
